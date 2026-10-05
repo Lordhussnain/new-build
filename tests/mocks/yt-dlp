@@ -1,0 +1,216 @@
+#!/usr/bin/env bun
+// tests/mocks/yt-dlp — a fake yt-dlp for offline integration tests.
+//
+// Speaks just enough of yt-dlp's CLI surface for the engine to run its whole
+// pipeline against it:
+//   • --version
+//   • --flat-playlist --print "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s"
+//   • download mode (-o TEMPLATE …): writes a fake media file, prints
+//     PROGRESS lines and the final path
+//   • --skip-download (metadata): writes sidecar files
+//   • -U (self-update)
+//
+// Failure injection via environment variables:
+//   FAKE_FAIL_TIMES=2        fail the first N download attempts (leaves a .part)
+//   FAKE_FAIL_MODE=transient|permanent|corrupt   what the failure looks like
+//   FAKE_HANG=1             hang forever (watchdog test)
+//   FAKE_DELAY_MS=250       per-attempt delay (progress parsing)
+
+import { rename } from "node:fs/promises";
+
+const argv = process.argv.slice(2);
+
+function flag(name: string): boolean {
+  return argv.includes(name);
+}
+function flagValue(name: string): string | null {
+  const i = argv.indexOf(name);
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
+}
+const num = (name: string, dflt: number): number => {
+  const v = process.env[name];
+  const n = v ? parseInt(v, 10) : NaN;
+  return Number.isFinite(n) ? n : dflt;
+};
+
+if (flag("--version")) {
+  console.log("2026.01.01-mock");
+  process.exit(0);
+}
+
+if (flag("-U")) {
+  console.log("yt-dlp is up to date (mock)");
+  process.exit(0);
+}
+
+// --- single-JSON dump (audio-track probe / cookie validation) ---------------
+// Mirrors a YouTube video with multi-language audio: three audio tracks
+// (original + two dubs), each in two quality variants plus a -drc duplicate
+// the engine must ignore.
+if (flag("--dump-single-json")) {
+  console.log(
+    JSON.stringify({
+      id: "mockvid001",
+      title: "First Mock Video",
+      formats: [
+        { format_id: "137", vcodec: "avc1.640028", acodec: "none", tbr: 2500 },
+        { format_id: "251-0", vcodec: "none", acodec: "opus", tbr: 160, language: "en", audio_track: { id: "en.0", display_name: "English (original)" } },
+        { format_id: "249-0", vcodec: "none", acodec: "opus", tbr: 70, language: "en", audio_track: { id: "en.0", display_name: "English (original)" } },
+        { format_id: "251-0-drc", vcodec: "none", acodec: "opus", tbr: 160, language: "en" },
+        { format_id: "251-1", vcodec: "none", acodec: "opus", tbr: 150, language: "es", audio_track: { id: "es.1", display_name: "Spanish (auto-dubbed)" } },
+        { format_id: "249-1", vcodec: "none", acodec: "opus", tbr: 65, language: "es" },
+        { format_id: "251-2", vcodec: "none", acodec: "opus", tbr: 140, language: "hi", audio_track: { id: "hi.2", display_name: "Hindi (auto-dubbed)" } },
+      ],
+    }),
+  );
+  process.exit(0);
+}
+
+// --- metadata-only pass (sidecar fetching) -----------------------------------
+if (flag("--skip-download")) {
+  const outTemplate = flagValue("-o") || "./video.%(ext)s";
+  const base = outTemplate.replace(/\.%\(ext\)s$/, "");
+  const written: string[] = [];
+  const write = (suffix: string, content: string) => {
+    Bun.write(`${base}${suffix}`, content);
+    written.push(`${base}${suffix}`);
+  };
+  if (flag("--write-subs")) write(".en.vtt", "WEBVTT\n\n00:00.000 --> 00:01.000\nmock subtitle\n");
+  if (flag("--write-thumbnail")) write(".jpg", "fake-jpeg-bytes");
+  if (flag("--write-description")) write(".description", "mock description");
+  if (flag("--write-info-json")) write(".info.json", JSON.stringify({ id: "mock", title: "Mock Video" }));
+  for (const w of written) console.log(w);
+  process.exit(0);
+}
+
+// --- flat playlist listing ----------------------------------------------------
+if (flag("--flat-playlist")) {
+  const lines = [
+    "Mock Playlist|||mockvid001|||First Mock Video|||125",
+    "Mock Playlist|||mockvid002|||Second Mock Video|||640",
+    "Mock Playlist|||mockvid003|||Third Mock Video (long)|||7320",
+  ];
+  console.log(lines.join("\n"));
+  process.exit(0);
+}
+
+// --- download -----------------------------------------------------------------
+const outTemplate = flagValue("-o") || "./video.%(ext)s";
+const base = outTemplate.replace(/\.%\(ext\)s$/, "");
+// --audio-multistreams + --merge-output-format mkv means a multi-audio
+// download: the real yt-dlp would mux every track into one MKV, so the mock
+// produces (and the mock ffmpeg probes) an .mkv with two audio streams.
+const multiAudio = flag("--audio-multistreams");
+const finalPath = multiAudio ? `${base}.mkv` : `${base}.mp4`;
+const partPath = `${base}.f137.mp4.part`;
+// Record the argv so tests can assert which format selector / flags arrived.
+await Bun.write(`${base}.ytdlp-args`, argv.join(" "));
+
+const failTimes = num("FAKE_FAIL_TIMES", 0);
+const failMode = process.env.FAKE_FAIL_MODE || "transient";
+const delayMs = num("FAKE_DELAY_MS", 60);
+const counterFile = `${base}.attempts`;
+// The engine always puts the video URL first (yt-dlp <url> --flags …).
+const url = argv[0] && !argv[0].startsWith("-") ? argv[0] : "";
+
+// Count attempts across processes so a retry loop sees the same counter.
+let attempts = 0;
+try {
+  attempts = parseInt(await Bun.file(counterFile).text(), 10) || 0;
+} catch {}
+attempts += 1;
+await Bun.write(counterFile, String(attempts));
+
+if (process.env.FAKE_HANG === "1") {
+  // Simulate a wedged download: never exits, ignores the abort signal enough
+  // for the watchdog to fire.
+  await new Promise(() => {});
+}
+
+if (failTimes > 0 && attempts <= failTimes) {
+  // Leave a partial file behind — exactly like a real interrupted download —
+  // so the engine's resume path has something to continue from.
+  await Bun.write(partPath, "x".repeat(4096));
+  await Bun.sleep(delayMs);
+  const msg =
+    failMode === "permanent"
+      ? "ERROR: [youtube] mockvid001: Video unavailable. This video is private"
+      : failMode === "corrupt"
+        ? "ERROR: unable to resume download, incomplete or corrupt data"
+        : "ERROR: Unable to download webpage: Connection reset by peer (transient mock failure)";
+  console.error(msg);
+  process.exit(1);
+}
+
+// --- external downloader (aria2c) --------------------------------------------
+// yt-dlp hands the transfer to aria2c with its own argument set. Faithfully
+// forward: the parsed --downloader-args, --limit-rate mapped to aria2c's
+// --max-overall-download-limit, the .part temp file as --out, and the URL.
+// The engine hands yt-dlp the *resolved* aria2c binary (`--downloader <path>`),
+// because a bare name would have to be re-discovered on the child's PATH and on
+// Windows it often is not there. Match the basename so both forms work.
+const downloaderArg = flagValue("--downloader") || "";
+if (/(^|[\\/])aria2c(\.exe)?$/i.test(downloaderArg)) {
+  const raw = flagValue("--downloader-args") || "";
+  // Strip the aria2c: prefix (plus any legacy wrapping quotes — the engine no
+  // longer emits them) — a simplified shlex — and split into argv.
+  const inner = raw.replace(/^aria2c:"?/, "").replace(/"?$/, "").split(/\s+/).filter(Boolean);
+  const limit = flagValue("--limit-rate");
+  // FAKE_ARIA2C_BIN pins the sibling mock by absolute path (set by the
+  // integration harness) so this hop never depends on PATH lookups.
+  const aria2cBin = process.env.FAKE_ARIA2C_BIN || "aria2c";
+  const forwarded = [
+    aria2cBin,
+    "--no-conf",
+    ...inner,
+    ...(limit ? ["--max-overall-download-limit", limit] : []),
+    "--file-allocation=none",
+    "--remove-control-file=true",
+    "--out",
+    partPath,
+    url,
+  ];
+  const proc = Bun.spawn(forwarded, { stdout: "inherit", stderr: "inherit" });
+
+  // A hard-killed engine takes the whole chain with it. Without this the mock
+  // survives as an orphan and finishes the download, so a crash test would see
+  // no partial file at all — unlike a real interrupted run.
+  const parentPid = process.ppid;
+  const watcher = (async () => {
+    while (true) {
+      if (process.ppid !== parentPid) {
+        try {
+          proc.kill(9);
+        } catch {}
+        return;
+      }
+      await Bun.sleep(50);
+    }
+  })();
+
+  const code = await proc.exited;
+  if (code !== 0) {
+    console.error(`ERROR: aria2c exited with code ${code}`);
+    process.exit(1);
+  }
+  // aria2c downloaded into the .part file; adopt it as the media file so the
+  // directory ends up exactly like a native yt-dlp run (no leftover .part).
+  try {
+    await rename(partPath, finalPath);
+  } catch {}
+}
+
+// Progress output in the engine's PROGRESS format, then the final path.
+console.log(`PROGRESS:10.0|1.0MiB|12|10485760|1048576`);
+await Bun.sleep(delayMs);
+console.log(`PROGRESS:55.5|2.5MiB|6|10485760|5820416`);
+await Bun.sleep(delayMs);
+console.log(`PROGRESS:100.0|2.5MiB|0|10485760|10485760`);
+
+await Bun.write(finalPath, "fake-mp4-bytes");
+// Clean up the bookkeeping file so reruns start fresh.
+try {
+  await Bun.file(counterFile).unlink();
+} catch {}
+console.log(finalPath);
+process.exit(0);

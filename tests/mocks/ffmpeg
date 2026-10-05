@@ -1,0 +1,42 @@
+#!/usr/bin/env bun
+// tests/mocks/ffmpeg — a fake ffmpeg for offline integration tests.
+//
+// The engine only uses ffmpeg to transcode (mp3) and remux (mp4), so the mock
+// just produces the output file it was asked to write. `-version` is answered
+// for the dependency probe.
+
+const argv = process.argv.slice(2);
+
+if (argv[0] === "-version") {
+  console.log("ffmpeg version 7.0.2-mock https://example.invalid/ffmpeg");
+  process.exit(0);
+}
+
+// Stream probe: `ffmpeg -hide_banner -i <file>` with no output argument — the
+// engine uses it to count audio streams (multi-audio archives must not be
+// remuxed). Behave like the real ffmpeg: print the stream list to stderr and
+// exit non-zero. Mock yt-dlp writes multi-track downloads as .mkv, so an mkv
+// input reports two audio streams.
+if (argv[0] === "-hide_banner" && argv[1] === "-i") {
+  const input = argv[2] || "";
+  const lines = [
+    `Input #0, matroska,webm, from '${input}':`,
+    "  Duration: 00:02:05.00, start: 0.000000, bitrate: 2500 kb/s",
+    "  Stream #0:0: Video: vp9 (Profile 0), yuv420p(tv), 1920x1080, 25 fps",
+    "  Stream #0:1: Audio: opus, 48000 Hz, stereo, fltp",
+  ];
+  if (input.endsWith(".mkv")) lines.push("  Stream #0:2: Audio: opus, 48000 Hz, stereo, fltp");
+  console.error(lines.join("\n"));
+  console.error("At least one output file must be specified");
+  process.exit(1);
+}
+
+// The output path is the last argument that does not start with "-".
+const out = [...argv].reverse().find((a) => !a.startsWith("-") && a.length > 0);
+if (out) {
+  await Bun.write(out, "fake-ffmpeg-output");
+  console.error("ffmpeg mock: wrote " + out);
+  process.exit(0);
+}
+console.error("ffmpeg mock: no output path found");
+process.exit(1);

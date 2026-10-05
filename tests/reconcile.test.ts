@@ -1,0 +1,269 @@
+// tests/reconcile.test.ts — partial-file housekeeping, with and without aria2c.
+//
+// The engine must be able to throw a partial download away and have the next
+// attempt start clean. With yt-dlp's native downloader that means deleting the
+// `.part`; with aria2c there is a second file — the `.aria2` control file — and
+// stranding it wedges the download permanently (see removePartialFiles). These
+// tests pin both halves of that contract.
+
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile, mkdir, utimes } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { db, initDatabase } from "../src/db";
+import {
+  ARIA2_CONTROL_SUFFIX,
+  cleanOrphanedFiles,
+  findPartialFile,
+  partialSidecars,
+  removePartialFiles,
+  recordPartialPaths,
+} from "../src/reconcile";
+import { DEFAULT_CONFIG, type Config } from "../src/config";
+
+const tmpDirs: string[] = [];
+
+afterAll(async () => {
+  while (tmpDirs.length) {
+    const d = tmpDirs.pop();
+    if (d) await rm(d, { recursive: true, force: true });
+  }
+});
+
+async function makeDir(): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "yta-reconcile-"));
+  tmpDirs.push(dir);
+  return dir;
+}
+
+/** A partial download as aria2c leaves it: data file plus control file. */
+async function writeAria2Partial(dir: string, name: string): Promise<string> {
+  const part = join(dir, name);
+  await writeFile(part, "partial-bytes");
+  await writeFile(`${part}${ARIA2_CONTROL_SUFFIX}`, "control-bytes");
+  return part;
+}
+
+function testConfig(overrides: Partial<Config> = {}): Config {
+  return { ...DEFAULT_CONFIG, ...overrides };
+}
+
+beforeEach(() => {
+  initDatabase(":memory:");
+});
+
+describe("partialSidecars", () => {
+  test("pairs the data file with its aria2c control file", () => {
+    expect(partialSidecars("/d/v.part")).toEqual(["/d/v.part", "/d/v.part.aria2"]);
+    expect(partialSidecars("/d/v.ytdl")).toEqual(["/d/v.ytdl", "/d/v.ytdl.aria2"]);
+  });
+});
+
+describe("removePartialFiles", () => {
+  test("removes the .part and its .aria2 control file together", async () => {
+    const dir = await makeDir();
+    const part = await writeAria2Partial(dir, "v.part");
+    await removePartialFiles(part);
+    expect(existsSync(part)).toBe(false);
+    expect(existsSync(`${part}${ARIA2_CONTROL_SUFFIX}`)).toBe(false);
+  });
+
+  test("removes a lone .part (native downloader) without complaint", async () => {
+    const dir = await makeDir();
+    const part = join(dir, "v.part");
+    await writeFile(part, "bytes");
+    await removePartialFiles(part);
+    expect(existsSync(part)).toBe(false);
+  });
+
+  test("removes a lone control file left behind by an interrupted cleanup", async () => {
+    const dir = await makeDir();
+    const control = join(dir, "v.part.aria2");
+    await writeFile(control, "control-bytes");
+    await removePartialFiles(join(dir, "v.part"));
+    expect(existsSync(control)).toBe(false);
+  });
+
+  test("is a no-op when nothing exists", async () => {
+    await removePartialFiles("/nonexistent/dir/v.part");
+    // No throw = pass.
+    expect(true).toBe(true);
+  });
+
+  test("reports fatal and keeps the data file when the control file cannot be removed", async () => {
+    const dir = await makeDir();
+    const part = join(dir, "v.part");
+    await writeFile(part, "partial-bytes");
+    // A directory where the control file belongs makes unlink fail with a
+    // real (non-ENOENT) error on every platform — a stand-in for the lock an
+    // orphaned aria2c or an antivirus scan holds on Windows.
+    const control = `${part}${ARIA2_CONTROL_SUFFIX}`;
+    await mkdir(control, { recursive: true });
+    const result = await removePartialFiles(part);
+    expect(result.fatal).toBe(true);
+    expect(result.controlRemoved).toBe(false);
+    expect(result.dataRemoved).toBe(false);
+    expect(existsSync(part)).toBe(true); // data untouched: no stranded control
+  });
+
+  test("removal continues when only the control file is absent (native path)", async () => {
+    const dir = await makeDir();
+    const part = join(dir, "v.part");
+    await writeFile(part, "partial-bytes");
+    const result = await removePartialFiles(part);
+    expect(result.fatal).toBe(false);
+    expect(result.controlRemoved).toBe(false);
+    expect(result.dataRemoved).toBe(true);
+    expect(existsSync(part)).toBe(false);
+  });
+
+});
+
+describe("findPartialFile", () => {
+  test("finds the .part data file, not the control file", async () => {
+    const dir = await makeDir();
+    const part = await writeAria2Partial(dir, "001 - Video.part");
+    expect(await findPartialFile(dir, "001 - Video")).toBe(part);
+  });
+
+  test("returns '' when only a control file survives (nothing resumable)", async () => {
+    const dir = await makeDir();
+    await writeFile(join(dir, "001 - Video.part.aria2"), "control-bytes");
+    expect(await findPartialFile(dir, "001 - Video")).toBe("");
+  });
+});
+
+describe("recordPartialPaths", () => {
+  // Regression: an interrupted job used to be marked paused+interrupted with
+  // partial_file_path = NULL, so "interrupted jobs resume from their partial"
+  // was a status the next start silently re-downloaded from scratch.
+  test("writes the on-disk .part path into a downloading job with none recorded", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rec-"));
+    writeFileSync(join(dir, "001 - First Mock Video.f137.mp4.part"), "bytes");
+    db.run(
+      `INSERT INTO jobs (id, url, title, "index", output_directory, download_status, partial_file_path)
+       VALUES ('v1', 'https://y', 'First Mock Video', 1, ?, 'downloading', NULL)`,
+      [dir],
+    );
+
+    const recorded = recordPartialPaths();
+    expect(recorded).toBe(1);
+    const row = db.query("SELECT partial_file_path FROM jobs WHERE id = 'v1'").get() as any;
+    expect(row.partial_file_path).toBe(join(dir, "001 - First Mock Video.f137.mp4.part"));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("leaves a job alone when no partial is on disk", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rec-"));
+    db.run(
+      `INSERT INTO jobs (id, url, title, "index", output_directory, download_status, partial_file_path)
+       VALUES ('v2', 'https://y', 'Second Mock Video', 2, ?, 'downloading', NULL)`,
+      [dir],
+    );
+    expect(recordPartialPaths()).toBe(0);
+    const row = db.query("SELECT partial_file_path FROM jobs WHERE id = 'v2'").get() as any;
+    expect(row.partial_file_path).toBeNull();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does not overwrite a partial that is already recorded", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rec-"));
+    const known = join(dir, "001 - Third Mock Video.part");
+    writeFileSync(known, "bytes");
+    db.run(
+      `INSERT INTO jobs (id, url, title, "index", output_directory, download_status, partial_file_path)
+       VALUES ('v3', 'https://y', 'Third Mock Video', 3, ?, 'downloading', ?)`,
+      [dir, known],
+    );
+    recordPartialPaths();
+    const row = db.query("SELECT partial_file_path FROM jobs WHERE id = 'v3'").get() as any;
+    expect(row.partial_file_path).toBe(known);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("ignores jobs that are not downloading (a paused job keeps its state)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rec-"));
+    writeFileSync(join(dir, "001 - Paused Video.part"), "bytes");
+    db.run(
+      `INSERT INTO jobs (id, url, title, "index", output_directory, download_status, partial_file_path)
+       VALUES ('v4', 'https://y', 'Paused Video', 4, ?, 'paused', NULL)`,
+      [dir],
+    );
+    expect(recordPartialPaths()).toBe(0);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("cleanOrphanedFiles with aria2c control files", () => {
+  test("deletes an exhausted failed job's .part AND its control file", async () => {
+    const dir = await makeDir();
+    const part = await writeAria2Partial(dir, "v.part");
+    db.run(
+      `INSERT INTO jobs (id, url, title, output_directory, download_status, retry_count, partial_file_path)
+       VALUES ('x', 'https://y', 'V', ?, 'failed', 99, ?)`,
+      [dir, part],
+    );
+    await cleanOrphanedFiles(dir, testConfig({ maxRetryAttempts: 5 }));
+    expect(existsSync(part)).toBe(false);
+    expect(existsSync(`${part}${ARIA2_CONTROL_SUFFIX}`)).toBe(false);
+  });
+
+  test("KEEPS a retryable job's .part and control file so resume works", async () => {
+    const dir = await makeDir();
+    const part = await writeAria2Partial(dir, "v.part");
+    db.run(
+      `INSERT INTO jobs (id, url, title, output_directory, download_status, retry_count, partial_file_path)
+       VALUES ('x', 'https://y', 'V', ?, 'pending', 1, ?)`,
+      [dir, part],
+    );
+    await cleanOrphanedFiles(dir, testConfig({ maxRetryAttempts: 5 }));
+    expect(existsSync(part)).toBe(true);
+    expect(existsSync(`${part}${ARIA2_CONTROL_SUFFIX}`)).toBe(true);
+  });
+
+  test("sweeps a stranded control file whose data file is gone", async () => {
+    const dir = await makeDir();
+    const control = join(dir, "orphan.part.aria2");
+    await writeFile(control, "control-bytes");
+    // Age it past the 24h orphan threshold.
+    const old = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    await utimes(control, old, old);
+    await cleanOrphanedFiles(dir, testConfig());
+    expect(existsSync(control)).toBe(false);
+  });
+
+  test("does NOT sweep a fresh control file (a download may be starting)", async () => {
+    const dir = await makeDir();
+    const control = join(dir, "live.part.aria2");
+    await writeFile(control, "control-bytes");
+    await cleanOrphanedFiles(dir, testConfig());
+    expect(existsSync(control)).toBe(true);
+  });
+
+  test("does NOT sweep a control file whose data file is still present", async () => {
+    const dir = await makeDir();
+    const part = await writeAria2Partial(dir, "v.part");
+    const old = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    await utimes(`${part}${ARIA2_CONTROL_SUFFIX}`, old, old); // aged control file
+    // No job claims it, so the .part is an orphan — but the pair is still
+    // resumable state and the data file is there, so the control file stays.
+    await cleanOrphanedFiles(dir, testConfig());
+    expect(existsSync(`${part}${ARIA2_CONTROL_SUFFIX}`)).toBe(true);
+  });
+
+  test("recurses into playlist subdirectories", async () => {
+    const dir = await makeDir();
+    const sub = join(dir, "Mock Playlist");
+    await mkdir(sub, { recursive: true });
+    const part = await writeAria2Partial(sub, "v.part");
+    db.run(
+      `INSERT INTO jobs (id, url, title, output_directory, download_status, retry_count, partial_file_path)
+       VALUES ('x', 'https://y', 'V', ?, 'failed', 99, ?)`,
+      [sub, part],
+    );
+    await cleanOrphanedFiles(dir, testConfig({ maxRetryAttempts: 5 }));
+    expect(existsSync(part)).toBe(false);
+    expect(existsSync(`${part}${ARIA2_CONTROL_SUFFIX}`)).toBe(false);
+  });
+});

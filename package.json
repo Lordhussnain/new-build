@@ -1,0 +1,23 @@
+{
+  "name": "youtube-playlist-downloader",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run batch_playlist_downloader.ts",
+    "config": "bun run update_config.ts",
+    "configure": "bun run update_config.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun run test",
+    "build:win": "bun build --compile --target=bun-windows-x64 batch_playlist_downloader.ts --outfile dist/youtube-archive.exe",
+    "build:win:config": "bun build --compile --target=bun-windows-x64 update_config.ts --outfile dist/archive-config.exe",
+    "build:win:all": "bun run build:win && bun run build:win:config"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  }
+}
