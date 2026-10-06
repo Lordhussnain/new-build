@@ -126,56 +126,54 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
   let timedOut = false;
   const downloadCtl = new AbortController();
   const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: downloadCtl.signal });
-  activeProcs.set(id, proc);
-  const downloadTimer = setTimeout(() => {
-    timedOut = true;
-    downloadCtl.abort();
-  }, timeoutMs);
-
+  let downloadTimer: ReturnType<typeof setTimeout> | undefined;
   let finalFilePath = "";
   let lastProgressUpdate = 0;
-  const stdoutPromise = readProcessOutput(proc.stdout, (line) => {
-    if (line.startsWith("PROGRESS:")) {
-      const parts = line.replace("PROGRESS:", "").split("|");
-      const bps = parseSpeedToBytesPerSec(parts[1]);
-      if (bps > 0) autoscaler.recordSpeed(id, bps);
-      const sizeNum = parseInt(parts[3], 10);
-      const dlNum = parseInt(parts[4], 10);
-      let pctNum = parseFloat(parts[0]);
-      if (Number.isNaN(pctNum) && dlNum > 0 && sizeNum > 0) pctNum = (dlNum / sizeNum) * 100;
-      if (!Number.isNaN(pctNum) && pctNum >= 0 && Date.now() - lastProgressUpdate > 500) {
-        // Backfill file_size from progress so the global ETA has a total to work with.
-        const totalBytes = Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : null;
-        // best_progress is the high-water mark of this job's attempts: it is
-        // what lets the retry budget forgive repeated failures at increasing
-        // completion percentages (see handleDownloadFailure).
-        updateJobProgress(job.id, `dl-${id}`, pctNum, bps, parseFloat(parts[2]) || 0, totalBytes);
-        const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
-        const etaNum = parseFloat(parts[2]);
-        const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
-        updateWorkerLine(id, `⬇️ ${pctNum.toFixed(1)}% @ ${speedTxt}${etaTxt} | ${job.title}`, config);
-        lastProgressUpdate = Date.now();
-      }
-    } else {
-      const path = parseDownloadPath(line);
-      if (path) finalFilePath = path;
-    }
-  });
-
-  // Drain both pipes concurrently, with bounded tails for error reporting.
-  // A native Bun panic cannot be caught in JS, so no arbitrary stdout string
-  // reaches existsSync: only a size/control-checked FILEPATH record below.
   let output: [string, string, number];
   try {
+    // Keep registration, timer setup, stream construction, and draining in the
+    // same protected region: any throw after spawn must stop the child before
+    // the worker can release the job claim and retry it.
+    activeProcs.set(id, proc);
+    downloadTimer = setTimeout(() => {
+      timedOut = true;
+      downloadCtl.abort();
+    }, timeoutMs);
+
+    const stdoutPromise = readProcessOutput(proc.stdout, (line) => {
+      if (line.startsWith("PROGRESS:")) {
+        const parts = line.replace("PROGRESS:", "").split("|");
+        const bps = parseSpeedToBytesPerSec(parts[1]);
+        if (bps > 0) autoscaler.recordSpeed(id, bps);
+        const sizeNum = parseInt(parts[3], 10);
+        const dlNum = parseInt(parts[4], 10);
+        let pctNum = parseFloat(parts[0]);
+        if (Number.isNaN(pctNum) && dlNum > 0 && sizeNum > 0) pctNum = (dlNum / sizeNum) * 100;
+        if (!Number.isNaN(pctNum) && pctNum >= 0 && Date.now() - lastProgressUpdate > 500) {
+          // Backfill file_size from progress so the global ETA has a total to work with.
+          const totalBytes = Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : null;
+          // best_progress is the high-water mark of this job's attempts: it is
+          // what lets the retry budget forgive repeated failures at increasing
+          // completion percentages (see handleDownloadFailure).
+          updateJobProgress(job.id, `dl-${id}`, pctNum, bps, parseFloat(parts[2]) || 0, totalBytes);
+          const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
+          const etaNum = parseFloat(parts[2]);
+          const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
+          updateWorkerLine(id, `⬇️ ${pctNum.toFixed(1)}% @ ${speedTxt}${etaTxt} | ${job.title}`, config);
+          lastProgressUpdate = Date.now();
+        }
+      } else {
+        const path = parseDownloadPath(line);
+        if (path) finalFilePath = path;
+      }
+    });
+
+    // Drain both pipes concurrently, with bounded tails for error reporting.
+    // A native Bun panic cannot be caught in JS, so no arbitrary stdout string
+    // reaches existsSync: only a size/control-checked FILEPATH record below.
     output = await Promise.all([stdoutPromise, readProcessOutput(proc.stderr), proc.exited]);
   } finally {
-    clearTimeout(downloadTimer);
-    // If a stream/parser failed, don't leave yt-dlp running behind a retry.
-    if (proc.exitCode === null) {
-      downloadCtl.abort();
-      await proc.exited;
-    }
-    activeProcs.delete(id);
+    await cleanupDownloadProcess(id, proc, downloadTimer);
   }
   const [stdoutText, stderrText, code] = output;
 
@@ -213,6 +211,60 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
       .slice(-4)
       .join(" ");
     throw new Error(tail || `yt-dlp exited with code ${code}`);
+  }
+}
+
+const DOWNLOAD_PROCESS_CLEANUP_GRACE_MS = 2_000;
+
+/**
+ * Stop and reap a spawned downloader on every exit path. SIGINT gives yt-dlp a
+ * chance to stop its external downloader (aria2c) cleanly; SIGKILL is the
+ * bounded fallback if it does not exit. Tracking is removed even if waiting
+ * for the subprocess itself fails.
+ */
+export async function cleanupDownloadProcess(
+  id: number,
+  proc: Bun.Subprocess,
+  timer?: ReturnType<typeof setTimeout>,
+): Promise<void> {
+  try {
+    if (timer !== undefined) clearTimeout(timer);
+    if (proc.exitCode === null) {
+      if (!proc.killed) {
+        try {
+          proc.kill("SIGINT");
+        } catch {
+          // It may have exited between the exitCode check and kill().
+        }
+      }
+
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      let exited: boolean;
+      try {
+        exited = await Promise.race([
+          proc.exited.then(
+            () => true,
+            () => true,
+          ),
+          new Promise<boolean>((resolve) => {
+            graceTimer = setTimeout(() => resolve(false), DOWNLOAD_PROCESS_CLEANUP_GRACE_MS);
+          }),
+        ]);
+      } finally {
+        if (graceTimer !== undefined) clearTimeout(graceTimer);
+      }
+
+      if (!exited && proc.exitCode === null) {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // The subprocess may have exited just before the force-kill.
+        }
+      }
+    }
+    await proc.exited;
+  } finally {
+    activeProcs.delete(id);
   }
 }
 

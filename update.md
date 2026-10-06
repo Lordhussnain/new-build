@@ -67,7 +67,7 @@ rows that still held a download claim.
 
 These routes now use `withIdleJobs()` and an immediate SQLite transaction to reject
 active downloads, conversions, metadata work, and lingering download/conversion claims
-with HTTP 409 `{ok:false, error:"job is in progress"}` before changing files or rows.
+with HTTP 409 `{ ok: false, error: "Job is currently in progress" }` before changing files or rows.
 Bulk operations are all-or-nothing; purge also explicitly deletes only rows with
 `download_claimed_by IS NULL` and no active side-stage claim. Both retry route aliases
 share the same guard. Startup reconciliation clears orphaned claims from legacy
@@ -78,25 +78,24 @@ its archive/file untouched; single delete, mixed bulk delete, bulk pause, and pu
 return 409 without mutating active or idle rows. Startup recovery releases an orphaned
 user-pause claim while preserving the user pause.
 
-### 1.3 `runDownload` leaks a live yt-dlp on any throw
+### 1.3 `runDownload` can leave a live downloader on an unexpected failure — RESOLVED
 
-`src/workers/download.ts:112-170`: `clearTimeout(downloadTimer)`,
-`activeProcs.delete(id)` and `await proc.exited` all sit **after** the progress loop. The
-worker `finally` (`:70-73`) has already removed the id, so the orphan is invisible to
-`killActiveChildren()`.
+The initial report overstated two paths in this checkout: the output-drain
+`Promise.all` already had a `finally`, so an asynchronous `updateJobProgress` throw
+rejected the stdout-reader promise and reached cleanup; `existsSync` ran only after
+`proc.exited` had completed. However, setup between `Bun.spawn()` and that `try` was
+not protected, and cleanup only aborted the signal then waited indefinitely if the
+child did not exit.
 
-A throw at `updateJobProgress` (`:148` — `SQLITE_BUSY` after the 5 s busy timeout) or
-`existsSync` (`:157`) exits without killing the child. It survives shutdown and keeps
-writing to a `.part` another worker has claimed — the exact "file written under a live
-worker" class the rest of the codebase works hard to prevent.
+All post-spawn setup and output handling now share one `try/finally`. The cleanup
+clears the watchdog, sends SIGINT so yt-dlp can stop aria2c cleanly, escalates to
+SIGKILL after a bounded grace period, awaits `proc.exited`, and removes `activeProcs`
+in a nested `finally`. Thus an output/progress callback error cannot release the job
+for retry while its downloader is still writing.
 
-**Fix:** wrap spawn → cleanup in
-`try { … } finally { clearTimeout(downloadTimer); activeProcs.delete(id); if (!proc.killed) proc.kill(); }`,
-moving the work into a `runSpawnedDownload()` so success/failure classification stays
-outside. Audit the same pattern in `metadata.ts:81` and `convert.ts:27`.
-
-**Test:** integration — a mid-transfer throw leaves no live child (assert via the
-`/api/status` worker list) and the `.part` stays resumable.
+**Test** (`tests/download-process.test.ts`): a simulated `SQLITE_BUSY` from the
+progress callback rejects the output-drain promise; the regression asserts that cleanup
+reaps the child and clears its active-process tracking entry.
 
 ### 1.4 The `yt-dlp -U` self-heal can wedge the pool
 

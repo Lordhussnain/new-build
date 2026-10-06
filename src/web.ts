@@ -246,7 +246,7 @@ function withIdleJobs<T>(ids: string[], operation: () => T): IdleJobResult<T> {
 }
 
 function jobInProgressResponse(): Response {
-  return Response.json({ ok: false, error: "job is in progress" }, { status: 409 });
+  return Response.json({ ok: false, error: "Job is currently in progress" }, { status: 409 });
 }
 
 /**

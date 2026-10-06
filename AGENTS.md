@@ -471,7 +471,7 @@ Job retry, delete, queue purge, and per-job pause mutations must check all
 pipeline stages and claims inside an immediate SQLite transaction (`withIdleJobs()`
 for id-based operations). If any targeted row is downloading, converting, fetching
 metadata, or still holds a download/conversion claim, return HTTP 409 with
-`{ok:false, error:"job is in progress"}` and make no partial bulk changes.
+`{ ok: false, error: "Job is currently in progress" }` and make no partial bulk changes.
 
 | Method | Route | Purpose |
 | --- | --- | --- |
@@ -517,7 +517,7 @@ bun run typecheck              # tsc --noEmit (tsconfig covers *.ts, src/**, tes
 bun run check                  # typecheck + full suite (what CI/the definition of done means)
 ```
 
-310 tests across 22 files. Tests share one process, so any file that touches the
+358 tests across 24 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -536,6 +536,7 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | `tests/report.test.ts` | run report contents |
 | `tests/download-args.test.ts` | downloader-engine selection, aria2c args, bandwidth split, fragment/chunk/buffer flags, watchdog scaling, multi-audio selector/multistream flags |
 | `tests/download-output.test.ts` | bounded CR/LF pipe parsing, split UTF-8, oversized-record discard, validated final-path markers |
+| `tests/download-process.test.ts` | a progress-callback failure kills/reaps the downloader and clears active process tracking |
 | `tests/audio-tracks.test.ts` | track parsing (variant collapse, drc drop, ordering), selection policy incl. per-job override, selector splicing, JSON column round-trips |
 | `tests/metadata.test.ts` | `subtitleArgs` — `all`/blank keep fetch-everything, explicit language lists pass through verbatim |
 | `tests/autoscale.test.ts` | slot ramp step, backlog/ceiling clamps, idle collapse, disabled mode |

@@ -40,7 +40,7 @@ const api = (path: string, init?: RequestInit) => handleRequest(req(path, init),
 
 async function expectInProgress(response: Response): Promise<void> {
   expect(response.status).toBe(409);
-  expect(await response.json()).toEqual({ ok: false, error: "job is in progress" });
+  expect(await response.json()).toEqual({ ok: false, error: "Job is currently in progress" });
 }
 
 beforeEach(() => {
