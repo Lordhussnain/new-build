@@ -16,6 +16,7 @@ import { abortController, getConfig, isPaused, stats, workerStatuses } from "../
 import { notePipelineFailure, notePipelineSuccess } from "../resilience";
 import { logError } from "../logger";
 import { ffmpeg } from "../tools";
+import { effectiveTargetFormat } from "../download-args";
 import type { Config } from "../config";
 
 /** Run ffmpeg with a hard timeout so a wedged encode can never pin a worker. */
@@ -210,8 +211,8 @@ async function convertJob(job: Job, config: Config, id: number): Promise<void> {
   const workerId = `cv-${id}`;
   updateConvertWorkerLine(id, `🔄 Converting | ${job.title}`, config);
   const sourcePath = job.file_path!;
-  const targetFmt = (job.target_format || config.targetFormat || "mp4").toLowerCase();
-  const wantsMp3 = targetFmt === "mp3" || config.videoQuality === "audio";
+  const targetFmt = effectiveTargetFormat(job, config);
+  const wantsMp3 = targetFmt === "mp3";
   if (!sourcePath || !existsSync(sourcePath)) {
     // Crash-window recovery: a previous attempt may have finished the encode
     // and died before recording it. Adopt the finished output instead of

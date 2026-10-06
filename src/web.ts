@@ -21,11 +21,11 @@ import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
 import { aria2cPath } from "./tools";
 import { applySettings, readSettings } from "./settings";
-import { resolveDownloaderEngine } from "./download-args";
+import { effectiveTargetFormat, effectiveVideoQuality, resolveDownloaderEngine } from "./download-args";
 import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-tracks";
 import { formatBytesPerSec, formatDuration } from "./util";
 import { errorLogPath, logError } from "./logger";
-import { withConfigWriteLock, type Config } from "./config";
+import { QUALITY_FORMATS, withConfigWriteLock, type Config } from "./config";
 
 // --- Web UI auth (optional shared-secret token) ------------------------------
 // When webToken is set, every request must present it — as a cookie (set after
@@ -193,7 +193,7 @@ function matchRoute(pattern: string, segments: string[]): RouteParams | null {
 }
 
 // The jobs list and the single-job endpoint must return identical shapes.
-const JOB_COLUMNS = `id, url, title, folder, output_directory, file_path, target_format,
+const JOB_COLUMNS = `id, url, title, folder, output_directory, file_path, target_format, video_quality,
                 download_status, conversion_status, metadata_status, pause_reason, metadata_files,
                 retry_count, conversion_retry_count, resume_count, best_progress, last_error,
                 file_size, progress, speed, eta, duration, partial_file_path,
@@ -249,6 +249,87 @@ function jobInProgressResponse(): Response {
   return Response.json({ ok: false, error: "Job is currently in progress" }, { status: 409 });
 }
 
+interface JobOverride {
+  targetFormat?: string | null;
+  videoQuality?: string | null;
+  /** Language codes from the track picker; null restores the global audio mode. */
+  audioTracks?: string[] | null;
+}
+
+const JOB_TARGET_FORMATS = new Set(["mp4", "mkv", "webm", "mp3", "m4a"]);
+
+function parseJobOverride(body: unknown): { ok: true; value: JobOverride } | { ok: false; error: string } {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { ok: false, error: "A JSON object with at least one override is required" };
+  }
+  const raw = body as Record<string, unknown>;
+  const allowed = new Set(["targetFormat", "videoQuality", "audioTracks", "retry"]);
+  const unexpected = Object.keys(raw).find((key) => !allowed.has(key));
+  if (unexpected) return { ok: false, error: `Unknown override field: ${unexpected}` };
+  const value: JobOverride = {};
+  let provided = false;
+
+  if (Object.hasOwn(raw, "targetFormat")) {
+    provided = true;
+    if (raw.targetFormat !== null && (typeof raw.targetFormat !== "string" || !JOB_TARGET_FORMATS.has(raw.targetFormat))) {
+      return { ok: false, error: "targetFormat must be mp4, mkv, webm, mp3, m4a, or null" };
+    }
+    value.targetFormat = raw.targetFormat as string | null;
+  }
+  if (Object.hasOwn(raw, "videoQuality")) {
+    provided = true;
+    if (raw.videoQuality !== null && (typeof raw.videoQuality !== "string" || !Object.hasOwn(QUALITY_FORMATS, raw.videoQuality))) {
+      return { ok: false, error: `videoQuality must be one of ${Object.keys(QUALITY_FORMATS).join(", ")} or null` };
+    }
+    value.videoQuality = raw.videoQuality as string | null;
+  }
+  if (Object.hasOwn(raw, "audioTracks")) {
+    provided = true;
+    if (raw.audioTracks !== null && !Array.isArray(raw.audioTracks)) {
+      return { ok: false, error: "audioTracks must be an array of language codes or null" };
+    }
+    if (Array.isArray(raw.audioTracks)) {
+      if (raw.audioTracks.length > 40 || raw.audioTracks.some((track) =>
+        typeof track !== "string" || !track.trim() || track.trim().length > 32
+      )) {
+        return { ok: false, error: "audioTracks must contain up to 40 non-empty language codes (32 characters max)" };
+      }
+      const languages = [...new Set(raw.audioTracks.map((track) => (track as string).trim()))];
+      value.audioTracks = languages.length ? languages : null;
+    } else {
+      value.audioTracks = null;
+    }
+  }
+
+  if (raw.retry !== undefined && typeof raw.retry !== "boolean") {
+    return { ok: false, error: "retry must be a boolean" };
+  }
+  if (!provided && raw.retry !== true) {
+    return { ok: false, error: "Provide at least one of: targetFormat, videoQuality, audioTracks" };
+  }
+  return { ok: true, value };
+}
+
+/** Apply a validated override inside the surrounding SQLite transaction. */
+function persistJobOverride(id: string, override: JobOverride): void {
+  const sets: string[] = [];
+  const values: (string | null)[] = [];
+  if (Object.hasOwn(override, "targetFormat")) {
+    sets.push("target_format = ?");
+    values.push(override.targetFormat ?? null);
+  }
+  if (Object.hasOwn(override, "videoQuality")) {
+    sets.push("video_quality = ?");
+    values.push(override.videoQuality ?? null);
+  }
+  if (Object.hasOwn(override, "audioTracks")) {
+    sets.push("audio_selection = ?");
+    values.push(override.audioTracks?.length ? JSON.stringify(override.audioTracks) : null);
+  }
+  if (sets.length === 0) return;
+  db.run(`UPDATE jobs SET ${sets.join(", ")}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [...values, id]);
+}
+
 /**
  * Re-queue a job with fresh budgets (download + any failed side stages).
  *
@@ -265,11 +346,20 @@ function jobInProgressResponse(): Response {
  * Active download, conversion, and metadata claims return "in-progress" before
  * the archive or any media file is touched.
  */
-function retryJobById(id: string, config: Config): number | "in-progress" {
+function retryJobById(id: string, config: Config, override?: JobOverride): number | "in-progress" {
   const result = withIdleJobs([id], () => {
-    const row = db.query("SELECT id, file_path FROM jobs WHERE id = ?").get(id) as {
+    const existing = db.query("SELECT id, target_format, video_quality FROM jobs WHERE id = ?").get(id) as
+      | { id: string; target_format: string | null; video_quality: string | null }
+      | null;
+    if (!existing) return 0;
+    if (override) persistJobOverride(id, override);
+
+    const row = db.query("SELECT id, file_path, target_format, video_quality, conversion_status FROM jobs WHERE id = ?").get(id) as {
       id: string;
       file_path: string | null;
+      target_format: string | null;
+      video_quality: string | null;
+      conversion_status: string;
     } | null;
     if (!row) return 0;
     removeFromArchive(config.archiveFile, id);
@@ -279,15 +369,25 @@ function retryJobById(id: string, config: Config): number | "in-progress" {
     // cannot be renamed — the route then answers 500 instead of starting a
     // download that would silently no-op.
     stashDownloadedFile(id, row.file_path);
-    // Re-queue download AND any failed metadata/conversion work; preserve
-    // conversion_status='not_needed'. Also clears a user pause and resets the
-    // per-stage retry budgets so a manual retry always gets a fresh budget.
+
+    // A per-job format/quality change must pass through conversion even when
+    // the previous download needed no post-processing. Otherwise an audio-only
+    // or container override could leave a file in yt-dlp's source container.
+    const formatOrQualityChanged = !!override && (
+      (Object.hasOwn(override, "targetFormat") && override.targetFormat !== existing.target_format) ||
+      (Object.hasOwn(override, "videoQuality") && override.videoQuality !== existing.video_quality)
+    );
+    const needsConversion =
+      formatOrQualityChanged || effectiveTargetFormat(row, config) !== "mp4" || effectiveVideoQuality(row, config) === "audio";
+    const conversionStatus = !needsConversion && row.conversion_status === "not_needed" ? "not_needed" : "pending";
+
+    // Re-queue download AND any failed side stages. Also clears a user pause and
+    // resets the per-stage retry budgets so a manual retry always gets a fresh budget.
     return db.run(
       `UPDATE jobs SET
          download_status = 'pending', pause_reason = NULL, progress = 0, retry_count = 0,
          best_progress = 0, resume_count = 0, speed = 0, eta = 0,
-         conversion_status = CASE WHEN conversion_status = 'not_needed' THEN 'not_needed' ELSE 'pending' END,
-         conversion_retry_count = 0,
+         conversion_status = ?, conversion_retry_count = 0,
          metadata_status = CASE
            WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
            ELSE metadata_status END,
@@ -295,8 +395,40 @@ function retryJobById(id: string, config: Config): number | "in-progress" {
          last_error = NULL, download_claimed_by = NULL, download_claimed_at = NULL,
          conversion_claimed_by = NULL, conversion_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE id = ? AND NOT (${ACTIVE_JOB_PREDICATE})`,
-      [id],
+      [conversionStatus, id],
     ).changes;
+  });
+  return result.ok ? result.value : "in-progress";
+}
+
+/** Save per-job settings without queuing a download. */
+function saveJobOverrideById(id: string, config: Config, override: JobOverride): number | "in-progress" {
+  const result = withIdleJobs([id], () => {
+    const row = db.query("SELECT id, download_status, target_format, video_quality FROM jobs WHERE id = ?").get(id) as
+      | { id: string; download_status: string; target_format: string | null; video_quality: string | null }
+      | null;
+    if (!row) return 0;
+    persistJobOverride(id, override);
+    const fresh = db.query("SELECT target_format, video_quality FROM jobs WHERE id = ?").get(id) as {
+      target_format: string | null;
+      video_quality: string | null;
+    };
+    const formatOrQualityChanged =
+      (Object.hasOwn(override, "targetFormat") && override.targetFormat !== row.target_format) ||
+      (Object.hasOwn(override, "videoQuality") && override.videoQuality !== row.video_quality);
+    const needsConversion =
+      formatOrQualityChanged || effectiveTargetFormat(fresh, config) !== "mp4" || effectiveVideoQuality(fresh, config) === "audio";
+    // A queued job will use the new container on its next fetch. Leave an
+    // already-downloaded job alone unless retry=true (which stashes/re-fetches
+    // it atomically), but make sure queued work gets its post-download remux.
+    if (row.download_status !== "downloaded" && needsConversion) {
+      db.run(
+        `UPDATE jobs SET conversion_status = 'pending', conversion_retry_count = 0,
+           updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [id],
+      );
+    }
+    return 1;
   });
   return result.ok ? result.value : "in-progress";
 }
@@ -442,6 +574,34 @@ const ROUTES: Route[] = [
       const row = db.query(`SELECT ${JOB_COLUMNS} FROM jobs WHERE id = ?`).get(params.id) as any;
       if (!row) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
       return Response.json({ ok: true, job: mapJobRow(row) });
+    },
+  },
+  {
+    methods: ["POST"],
+    pattern: "/api/jobs/:id/override",
+    handler: async ({ req, params, config }) => {
+      const body = await req.json().catch(() => null);
+      const parsed = parseJobOverride(body);
+      if (!parsed.ok) return Response.json({ ok: false, error: parsed.error }, { status: 400 });
+      const retry = (body as Record<string, unknown>).retry === true;
+
+      try {
+        const changed = retry
+          ? retryJobById(params.id, config, parsed.value)
+          : saveJobOverrideById(params.id, config, parsed.value);
+        if (changed === "in-progress") return jobInProgressResponse();
+        if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+        const saved = db.query("SELECT target_format, video_quality, audio_selection FROM jobs WHERE id = ?").get(params.id) as any;
+        return Response.json({
+          ok: true,
+          queued: retry,
+          targetFormat: saved.target_format,
+          videoQuality: saved.video_quality,
+          audioTracks: parseSelectionJson(saved.audio_selection),
+        });
+      } catch (e: any) {
+        return Response.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
+      }
     },
   },
   {

@@ -319,6 +319,123 @@ import { existsSync } from "node:fs";
 const cfgWith = (overrides: Partial<Config>): Config => ({ ...DEFAULT_CONFIG, ...overrides });
 const apiWith = (path: string, config: Config, init?: RequestInit) => handleRequest(req(path, init), config);
 
+describe("POST /api/jobs/:id/override", () => {
+  test("persists quality, target format, and selected audio languages", async () => {
+    insertJob("over01", { download_status: "pending" });
+    const res = await api("/api/jobs/over01/override", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetFormat: "mkv", videoQuality: "4k", audioTracks: ["en", "es"] }),
+    });
+    const data = await res.json();
+    expect(res.status).toBe(200);
+    expect(data).toMatchObject({ ok: true, queued: false, targetFormat: "mkv", videoQuality: "4k", audioTracks: ["en", "es"] });
+    expect(getJob("over01")).toMatchObject({
+      target_format: "mkv",
+      video_quality: "4k",
+      audio_selection: '["en","es"]',
+      download_status: "pending",
+    });
+
+    const detail = await (await api("/api/jobs/over01")).json();
+    expect(detail.job).toMatchObject({ target_format: "mkv", video_quality: "4k", audio_selection: ["en", "es"] });
+  });
+
+  test("a one-click override retry saves settings and safely replaces a downloaded file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-job-override-"));
+    const archive = join(dir, "downloaded_videos.txt");
+    const media = join(dir, "001 - Video.mp4");
+    await writeFile(archive, "youtube keep01\nyoutube over02\n");
+    await writeFile(media, "previous media");
+    insertJob("over02", { download_status: "downloaded", file_path: media, conversion_status: "not_needed" });
+
+    const res = await apiWith("/api/jobs/over02/override", cfgWith({ archiveFile: archive }), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetFormat: "mp3", videoQuality: "audio", audioTracks: ["ja"], retry: true }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, queued: true, targetFormat: "mp3", videoQuality: "audio", audioTracks: ["ja"] });
+    expect(getJob("over02")).toMatchObject({
+      download_status: "pending",
+      conversion_status: "pending",
+      target_format: "mp3",
+      video_quality: "audio",
+      audio_selection: '["ja"]',
+      file_path: null,
+      superseded_file: `${media}.superseded`,
+    });
+    expect(existsSync(media)).toBe(false);
+    expect(existsSync(`${media}.superseded`)).toBe(true);
+    expect((await readFile(archive, "utf-8")).trim()).toBe("youtube keep01");
+  });
+
+  test("retry:true alone retries the job with its current overrides", async () => {
+    insertJob("over06", { download_status: "failed", retry_count: 3, last_error: "network" });
+    const res = await api("/api/jobs/over06/override", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ retry: true }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, queued: true });
+    expect(getJob("over06")).toMatchObject({ download_status: "pending", retry_count: 0, last_error: null });
+  });
+
+  test("an audio-track-only retry preserves the existing no-conversion policy", async () => {
+    insertJob("over05", { download_status: "downloaded", conversion_status: "not_needed" });
+    const res = await api("/api/jobs/over05/override", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audioTracks: ["es"], retry: true }),
+    });
+    expect(res.status).toBe(200);
+    expect(getJob("over05")).toMatchObject({
+      download_status: "pending",
+      conversion_status: "not_needed",
+      audio_selection: '["es"]',
+    });
+  });
+
+  test("resetting nullable overrides restores global behavior without re-queuing", async () => {
+    insertJob("over03", {
+      download_status: "paused",
+      target_format: "mkv",
+      video_quality: "4k",
+      audio_selection: '["es"]',
+    });
+    const res = await api("/api/jobs/over03/override", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetFormat: null, videoQuality: null, audioTracks: null }),
+    });
+    expect(res.status).toBe(200);
+    expect(getJob("over03")).toMatchObject({
+      download_status: "paused",
+      target_format: null,
+      video_quality: null,
+      audio_selection: null,
+    });
+  });
+
+  test("rejects invalid settings and refuses to mutate active jobs", async () => {
+    insertJob("over04", { download_status: "downloading", download_claimed_by: "dl-1" });
+    const invalid = await api("/api/jobs/over04/override", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetFormat: "exe", videoQuality: "4k" }),
+    });
+    expect(invalid.status).toBe(400);
+    const active = await api("/api/jobs/over04/override", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetFormat: "mkv", videoQuality: "4k", retry: true }),
+    });
+    await expectInProgress(active);
+    expect(getJob("over04")).toMatchObject({ target_format: "mp4", video_quality: null, download_status: "downloading" });
+  });
+});
+
 describe("retry as a deliberate re-download", () => {
   test("scrubs the yt-dlp archive and stashes the existing file", async () => {
     const dir = await mkdtemp(join(tmpdir(), "yta-webretry-"));

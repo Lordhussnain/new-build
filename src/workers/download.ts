@@ -28,7 +28,7 @@ import {
   isTransientDownloadError,
   progressAwareRetryState,
 } from "../retry";
-import { buildDownloadPlan, jobBaseFilename } from "../download-args";
+import { buildDownloadPlan, effectiveVideoQuality, jobBaseFilename } from "../download-args";
 import { parseDownloadPath, readProcessOutput } from "../download-output";
 import {
   parseSelectionJson,
@@ -570,7 +570,7 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
  * the classic single-track plan.
  */
 async function resolveJobAudioTracks(job: Job, config: Config): Promise<AudioTrack[] | null> {
-  if (config.videoQuality === "audio") return null;
+  if (effectiveVideoQuality(job, config) === "audio") return null;
   const known = parseTracksJson(job.audio_tracks);
   if (known) return known;
   const selection = parseSelectionJson(job.audio_selection) || [];

@@ -210,6 +210,28 @@ describe("buildDownloadPlan", () => {
     expect(flagValue(build({ videoQuality: "audio" }).args, "--format")).toBe("ba/bestaudio");
   });
 
+  test("per-job quality and container overrides take precedence over global settings", () => {
+    const highQuality = buildDownloadPlan({
+      job: { ...job, target_format: "mkv", video_quality: "4k" },
+      config: cfg({ videoQuality: "480p", targetFormat: "mp4" }),
+      activeSlots: 2,
+      aria2cAvailable: false,
+    });
+    expect(flagValue(highQuality.args, "--format")).toBe("bv[height<=2160]+ba/b[height<=2160]");
+    expect(flagValue(highQuality.args, "--merge-output-format")).toBe("mkv");
+
+    const audioOnly = buildDownloadPlan({
+      job: { ...job, target_format: "mp3", video_quality: "audio" },
+      config: cfg({ videoQuality: "1080p", targetFormat: "mp4" }),
+      activeSlots: 1,
+      aria2cAvailable: false,
+      audioTracks: [{ formatId: "251-0", language: "en", label: "English", tbr: 160, acodec: "opus", isDefault: true }],
+    });
+    expect(flagValue(audioOnly.args, "--format")).toBe("ba/bestaudio");
+    expect(audioOnly.args).not.toContain("--audio-multistreams");
+    expect(audioOnly.args).not.toContain("--merge-output-format");
+  });
+
   test("scales the watchdog with the video duration", () => {
     // The fixture is a 10-minute video: 3×600s + 300s = 35 min, inside the window
     expect(build().timeoutMs).toBe(35 * 60_000);

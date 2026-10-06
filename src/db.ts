@@ -12,7 +12,9 @@ export interface Job {
   url: string;
   title: string;
   output_directory: string;
-  target_format: string;
+  target_format: string | null;
+  /** Per-job quality override; null means use the current global setting. */
+  video_quality: string | null;
   want_subtitles: number;
   want_thumbnail: number;
   want_description: number;
@@ -81,6 +83,7 @@ export function initDatabase(path: string = "archive.db"): void {
       title TEXT,
       output_directory TEXT,
       target_format TEXT,
+      video_quality TEXT,
       want_subtitles INTEGER DEFAULT 0,
       want_thumbnail INTEGER DEFAULT 0,
       want_description INTEGER DEFAULT 0,
@@ -142,6 +145,7 @@ export function initDatabase(path: string = "archive.db"): void {
 
   // Schema migrations for databases created by older versions.
   ensureColumn("jobs", "metadata_status", "metadata_status TEXT DEFAULT 'not_needed'");
+  ensureColumn("jobs", "video_quality", "video_quality TEXT");
   ensureColumn("jobs", "metadata_files", "metadata_files TEXT");
   ensureColumn("jobs", "pause_reason", "pause_reason TEXT");
   ensureColumn("jobs", "metadata_retry_count", "metadata_retry_count INTEGER DEFAULT 0");

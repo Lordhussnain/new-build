@@ -178,7 +178,8 @@ dependency-free — it is the module that breaks every import cycle.
 | `url` | canonical `https://www.youtube.com/watch?v=<id>` |
 | `title`, `folder`, `index` | display name, output folder, `001`-style ordering |
 | `output_directory` | absolute-ish path where files land |
-| `target_format` | `mp4` \| `mkv` \| `webm` \| `mp3` \| `m4a` |
+| `target_format` | `mp4` \| `mkv` \| `webm` \| `mp3` \| `m4a`; editable per job (NULL follows the live global format) |
+| `video_quality` | nullable per-job override (`highest`, `4k`, `1440p`, `1080p`, `720p`, `480p`, `audio`); NULL follows global quality |
 | `want_subtitles` / `want_thumbnail` / `want_description` | 0/1 sidecar flags |
 | `duration` | seconds from the listing (drives the watchdog) |
 | `download_status` | `pending` \| `downloading` \| `downloaded` \| `paused` \| `failed` \| `waiting_live` |
@@ -407,8 +408,11 @@ Dynamic Range Compression duplicates. `src/audio-tracks.ts` owns this:
 Dashboard: `/api/jobs` returns `audio_tracks` / `audio_selection` as parsed
 arrays; `POST /api/jobs/<id>/audio-probe` refreshes the list;
 `POST /api/jobs/<id>/audio-tracks` saves (`{tracks:[…]}`) or resets
-(`{tracks:null}`) the per-job selection, applied on the next attempt. The job
-drawer offers "Save & re-download" for finished videos: save + immediate retry.
+(`{tracks:null}`) the per-job selection, applied on the next attempt. The
+`POST /api/jobs/<id>/override` route edits target format / quality / audio
+language overrides; `{retry:true}` saves and re-queues in one idle-job
+transaction (so a downloaded file is archived/stashed before workers can claim
+it). The job drawer offers one-click save & re-download.
 
 #### Re-downloading an archived video (retry = replace)
 
@@ -498,6 +502,7 @@ metadata, or still holds a download/conversion claim, return HTTP 409 with
 | POST | `/api/queue/purge` | delete every idle pending / paused / waiting_live / failed job; returns `{ok, deleted}` or 409 if any candidate still holds an active claim |
 | POST | `/api/pause` · `/api/resume` | global pause / resume-all |
 | POST | `/api/jobs/:id/retry` | re-queue one idle job (all stages, budgets reset); 404 for an unknown id, 409 while any pipeline stage/claim is active. For a downloaded job this is a deliberate re-download: the id is scrubbed from the yt-dlp archive and the existing file stashed as `.superseded` first (§7.2). 500 when the previous file cannot be moved aside |
+| POST | `/api/jobs/:id/override` | partial `{targetFormat?, videoQuality?, audioTracks?}` edit; nullable values reset to global behavior. Optional `retry:true` applies the override and queues a deliberate re-download atomically (or retries current settings when sent alone); 400 invalid payload, 404 unknown id, 409 active pipeline stage |
 | POST | `/api/jobs/:id/reset-failures` | zero the per-stage retry counters; 404 for an unknown id |
 | POST | `/api/jobs/:id/sidecars` | per-job sidecar toggles: `{subtitles?, thumbnail?, description?}` (booleans). Flipping a flag on for a finished download re-opens the metadata stage so the worker fetches the files against the existing media; flipping off never deletes fetched files. 400 for an empty/non-boolean body |
 | POST | `/api/jobs/pause` | bulk user-pause by `{ids: []}`; 409 and no changes if any requested job has an active stage/claim |
@@ -558,7 +563,7 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/convert.test.ts` | `findConvertedOutput` crash-window adoption: adopts a finished mp3/mp4, never the source itself, empty for unrelated sidecars |
 | `tests/logger.test.ts` | `errorLogPath()` routes test-run logs to the temp dir, never the operator's `error.log` |
 | `tests/disk.test.ts` | `diskUsage()` happy path, the `-1/-1` degraded path, and `checkDiskSpace`'s allow-through when free space is unknown |
-| `tests/web-routes.test.ts` | the `ROUTES` table: canonical per-job routes, the legacy aliases, JSON 404/405 + `Allow`, trailing-slash collapse, active-stage 409 guards across retry/delete/pause/purge, retry-as-re-download (archive scrub + `.superseded` stash), and per-job sidecars |
+| `tests/web-routes.test.ts` | the `ROUTES` table: canonical per-job routes, the legacy aliases, JSON 404/405 + `Allow`, trailing-slash collapse, active-stage 409 guards across retry/delete/pause/purge, retry-as-re-download (archive scrub + `.superseded` stash), per-job format/quality/audio overrides, and sidecars |
 | `tests/settings.test.ts` | the dashboard settings allow-list, type coercion, Zod + cross-field validation, persistence, live-config propagation, and auth |
 | `tests/config-manager.test.ts` | every schema key is reachable from `update_config.ts`; the manager reads the sweep thresholds from `STALE_CLAIM_THRESHOLDS` and counts partials with the engine's predicate |
 | `tests/dashboard.test.ts` | `formatHeaderLine` counters, and the `Res:n` field appearing only when partials are held |

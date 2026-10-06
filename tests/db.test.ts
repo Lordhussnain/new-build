@@ -134,6 +134,7 @@ describe("schema & migrations", () => {
       expect(row.conversion_retry_count).toBe(0);
       expect(row.resume_count).toBe(0);
       expect(row.best_progress).toBe(0);
+      expect(row.video_quality).toBeNull();
       // A legacy row with want_subtitles=1 gets metadata_status backfilled.
       expect(row.metadata_status).toBe("pending");
     } finally {

@@ -33,6 +33,22 @@ export function resolveDownloaderEngine(config: Config, aria2cAvailable: boolean
   return config.useAria2c && aria2cAvailable ? "aria2c" : "native";
 }
 
+/** Resolve a job's nullable quality override against the live global setting. */
+export function effectiveVideoQuality(job: { video_quality?: string | null }, config: Config): string {
+  const override = job.video_quality;
+  return override && Object.hasOwn(QUALITY_FORMATS, override) ? override : config.videoQuality;
+}
+
+/** Resolve the requested output container, including the audio-only default. */
+export function effectiveTargetFormat(
+  job: { target_format?: string | null; video_quality?: string | null },
+  config: Config,
+): string {
+  const quality = effectiveVideoQuality(job, config);
+  const stored = typeof job.target_format === "string" ? job.target_format.trim().toLowerCase() : "";
+  return stored || (quality === "audio" ? "mp3" : (config.targetFormat || "mp4").toLowerCase());
+}
+
 /**
  * The value for yt-dlp's `--downloader-args aria2c:…` — one argv element,
  * without inner quotes (see the call site in `buildDownloadPlan` for why).
@@ -93,7 +109,8 @@ export interface DownloadPlan {
 }
 
 export interface BuildDownloadPlanOptions {
-  job: Pick<Job, "id" | "url" | "title" | "index" | "output_directory" | "duration">;
+  job: Pick<Job, "id" | "url" | "title" | "index" | "output_directory" | "duration"> &
+    Partial<Pick<Job, "target_format" | "video_quality">>;
   config: Config;
   /** Slots currently allowed to claim work (drives the bandwidth split). */
   activeSlots: number;
@@ -122,11 +139,13 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
   const { job, config, activeSlots, aria2cAvailable } = opts;
 
   const engine = resolveDownloaderEngine(config, aria2cAvailable);
-  const format = QUALITY_FORMATS[config.videoQuality] || QUALITY_FORMATS["1080p"];
+  const videoQuality = effectiveVideoQuality(job, config);
+  const targetFormat = effectiveTargetFormat(job, config);
+  const format = QUALITY_FORMATS[videoQuality] || QUALITY_FORMATS["1080p"];
   // Multi-audio: splice the discovered track ids into the quality preset so
   // every wanted language is downloaded (YouTube's "Audio track" menu). The
   // audio-only preset is exempt — an mp3 cannot carry several tracks.
-  const audioTracks = config.videoQuality === "audio" ? [] : opts.audioTracks ?? [];
+  const audioTracks = videoQuality === "audio" ? [] : opts.audioTracks ?? [];
   const effectiveFormat =
     audioTracks.length > 0 ? multiAudioFormatSelector(format, audioTracks) : format;
   const baseFilename = fitBaseFilename(
@@ -192,11 +211,12 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
   if (config.archiveLiveStreams) args.push("--match-filters", "!is_live");
 
   // Several audio tracks in one file: yt-dlp only keeps more than one audio
-  // stream with --audio-multistreams, and MKV is the container that holds any
-  // codec/track combination (with per-track language metadata). One selected
-  // track merges exactly like a classic download.
-  if (audioTracks.length >= 2) {
-    args.push("--audio-multistreams");
+  // stream with --audio-multistreams, and MKV is the safe container for every
+  // codec/track combination. A single-track MKV override can also be muxed
+  // directly; MP4/MP3 are left to the conversion stage so yt-dlp cannot fail
+  // on a source codec that the requested container does not support.
+  if (audioTracks.length >= 2) args.push("--audio-multistreams");
+  if (audioTracks.length >= 2 || targetFormat === "mkv") {
     args.push("--merge-output-format", "mkv");
   }
 

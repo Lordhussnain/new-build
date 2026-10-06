@@ -201,6 +201,8 @@ export const DEFAULT_CONFIG: Config = {
 // yt-dlp format selectors per quality preset.
 export const QUALITY_FORMATS: Record<string, string> = {
   highest: "bv+ba/b",
+  "4k": "bv[height<=2160]+ba/b[height<=2160]",
+  "1440p": "bv[height<=1440]+ba/b[height<=1440]",
   "1080p": "bv[height<=1080]+ba/b[height<=1080]",
   "720p": "bv[height<=720]+ba/b[height<=720]",
   "480p": "bv[height<=480]+ba/b[height<=480]",

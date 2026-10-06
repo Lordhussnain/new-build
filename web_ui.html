@@ -620,6 +620,13 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 0.72rem;
     }
+    .override-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; }
+    .override-field { display: flex; flex-direction: column; gap: 5px; font-size: 0.73rem; color: var(--text-secondary); }
+    .override-field select {
+      width: 100%; padding: 7px 8px; border-radius: 7px; border: 1px solid var(--border);
+      background: var(--bg-secondary); color: var(--text-primary); font-size: 0.76rem;
+    }
+    @media (max-width: 420px) { .override-fields { grid-template-columns: 1fr; } }
     .jobs-table tbody tr { cursor: pointer; }
     .jobs-table tbody tr:hover { background: rgba(255, 255, 255, 0.03); }
     .jobs-table tbody tr.selected { background: rgba(59, 130, 246, 0.12); }
@@ -1847,6 +1854,9 @@
     // Per-job detail drawer.
     // ---------------------------------------------------------------------
     let lastJobs = [];
+    let audioOverrideDirty = false;
+    let jobQualityDirty = false;
+    let jobTargetFormatDirty = false;
 
     async function openJobDetailById(id, event) {
       if (event && event.target && event.target.closest('input,button,a')) return;
@@ -1867,6 +1877,54 @@
     function detailRow(k, v, mono) {
       if (v === undefined || v === null || v === '') return '';
       return `<div class="detail-row"><div class="k">${escapeHtml(k)}</div><div class="v${mono ? ' mono' : ''}">${escapeHtml(String(v))}</div></div>`;
+    }
+
+    // ------------------------------------------------------------------
+    // Per-video quality / output-container controls. The global settings remain
+    // untouched; the override endpoint can save these and retry atomically.
+    // ------------------------------------------------------------------
+    function renderJobOverrideSection(job) {
+      const qualityOptions = [
+        ['', 'Use global quality'],
+        ['highest', 'Highest available'],
+        ['4k', '4K (up to 2160p)'],
+        ['1440p', '1440p'],
+        ['1080p', '1080p'],
+        ['720p', '720p'],
+        ['480p', '480p'],
+        ['audio', 'Best audio only'],
+      ];
+      const formatOptions = [
+        ['', 'Use global format'],
+        ['mp4', 'MP4'],
+        ['mkv', 'MKV'],
+        ['mp3', 'MP3 (extract audio)'],
+      ];
+      const quality = job.video_quality || '';
+      const targetFormat = job.target_format || '';
+      const active = job.download_status === 'downloading' ||
+        job.conversion_status === 'in_progress' || job.metadata_status === 'in_progress';
+      const qualitySelect = qualityOptions.map(([value, label]) =>
+        `<option value="${value}" ${quality === value ? 'selected' : ''}>${label}</option>`).join('');
+      const formatSelect = formatOptions.map(([value, label]) =>
+        `<option value="${value}" ${targetFormat === value ? 'selected' : ''}>${label}</option>`).join('');
+      const actionLabel = job.download_status === 'downloaded' ? '💾 Save & re-download' : '💾 Save overrides & retry';
+      return `<div class="audio-tracks-box">
+          <div class="k" style="margin-bottom:6px;">Per-video download overrides</div>
+          <div class="override-fields">
+            <label class="override-field">Quality
+              <select id="jobOverrideQuality" onchange="jobQualityDirty = true">${qualitySelect}</select>
+            </label>
+            <label class="override-field">Target format
+              <select id="jobOverrideTargetFormat" onchange="jobTargetFormatDirty = true">${formatSelect}</select>
+            </label>
+          </div>
+          <div style="font-size:0.7rem; color:var(--text-secondary); margin:4px 0 9px; line-height:1.4;">
+            These choices affect only this video. “Use global” follows the current app setting. Audio-track changes below are included if you edit them.
+            ${job.download_status === 'downloaded' ? ' The existing file is kept until the replacement succeeds.' : ''}
+          </div>
+          <button class="btn btn-success" style="padding:6px 10px; font-size:0.74rem;" onclick="saveJobOverride('${job.id}')" ${active ? 'disabled title="Wait for the active job stage to finish"' : ''}>${actionLabel}</button>
+        </div>`;
     }
 
     // ------------------------------------------------------------------
@@ -1891,7 +1949,7 @@
         const badge = t.isDefault ? ' <span style="opacity:0.65;">· original</span>' : '';
         const tbr = t.tbr ? ` <span style="opacity:0.55;">· ${Math.round(t.tbr)} kbps</span>` : '';
         return `<label style="display:flex; align-items:center; gap:8px; margin:4px 0; font-size:0.76rem; cursor:pointer;">
-            <input type="checkbox" class="audio-track-check" data-lang="${escapeHtml(t.language)}" ${checked ? 'checked' : ''} />
+            <input type="checkbox" class="audio-track-check" data-lang="${escapeHtml(t.language)}" onchange="audioOverrideDirty = true" ${checked ? 'checked' : ''} />
             <span>${escapeHtml(t.label)} <span class="mono" style="opacity:0.55;">(${escapeHtml(t.language)} · ${escapeHtml(t.formatId)})</span>${badge}${tbr}</span>
           </label>`;
       }).join('');
@@ -1911,6 +1969,52 @@
         </div>`;
     }
 
+    function jobOverridePayload(audioTracks, retry) {
+      const quality = document.getElementById('jobOverrideQuality')?.value || '';
+      const targetFormat = document.getElementById('jobOverrideTargetFormat')?.value || '';
+      const payload = { retry };
+      if (jobQualityDirty) payload.videoQuality = quality || null;
+      if (jobTargetFormatDirty) payload.targetFormat = targetFormat || null;
+      if (audioTracks !== undefined) payload.audioTracks = audioTracks;
+      return payload;
+    }
+
+    async function submitJobOverride(id, audioTracks, retry, successText) {
+      const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/override`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(jobOverridePayload(audioTracks, retry)),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Could not save the per-video override');
+      audioOverrideDirty = false;
+      jobQualityDirty = false;
+      jobTargetFormatDirty = false;
+      showNotification(successText, 'success');
+      const fresh = await fetchJob(id);
+      if (fresh) openJobDetail(fresh);
+      refreshData();
+      return data;
+    }
+
+    async function saveJobOverride(id) {
+      const boxes = document.querySelectorAll('#drawerBody .audio-track-check');
+      const tracks = audioOverrideDirty && boxes.length
+        ? [...boxes].filter(b => b.checked).map(b => b.dataset.lang)
+        : undefined;
+      try {
+        await submitJobOverride(
+          id,
+          tracks,
+          true,
+          '🎬 Saved per-video settings and queued a fresh download',
+        );
+      } catch (err) {
+        showNotification(`❌ ${err.message}`, 'error');
+        refreshData();
+      }
+    }
+
     async function probeJobAudioTracks(id) {
       try {
         const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/audio-probe`, { method: 'POST' });
@@ -1926,30 +2030,20 @@
     }
 
     async function saveAudioSelection(id, andRedownload) {
-      // Scope to the drawer: only this job's checkboxes count.
+      // Scope to the drawer: only this job's checkboxes count. The quality and
+      // target-format controls are included too, so this button is one atomic
+      // save/re-download action rather than a second save followed by retry.
       const boxes = document.querySelectorAll('#drawerBody .audio-track-check');
       const tracks = [...boxes].filter(b => b.checked).map(b => b.dataset.lang);
       try {
-        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/audio-tracks`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tracks }),
-        });
-        const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || 'Save failed');
-        const job = lastJobs.find(j => j.id === id);
-        if (job) { job.audio_selection = data.audio_selection; }
-        if (andRedownload) {
-          const retryRes = await fetch(`/api/jobs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
-          const retryData = await retryRes.json().catch(() => ({}));
-          if (!retryRes.ok || !retryData.ok) throw new Error(retryData.error || 'Re-download could not be queued');
-          showNotification(`🎧 Re-downloading with ${tracks.length} audio track(s) — the previous file is kept until it succeeds`, 'success');
-        } else {
-          showNotification(`🎧 Saved ${tracks.length} audio track(s) for the next download`, 'success');
-        }
-        const fresh = await fetchJob(id);
-        if (fresh) openJobDetail(fresh);
-        refreshData();
+        await submitJobOverride(
+          id,
+          tracks,
+          !!andRedownload,
+          andRedownload
+            ? `🎧 Re-downloading with ${tracks.length} selected audio track(s)`
+            : `🎧 Saved ${tracks.length} audio track(s) for the next download`,
+        );
       } catch (err) {
         showNotification(`❌ ${err.message}`, 'error');
         refreshData();
@@ -1969,15 +2063,16 @@
 
     async function resetAudioSelection(id) {
       try {
-        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/audio-tracks`, {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/override`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tracks: null }),
+          body: JSON.stringify({ audioTracks: null }),
         });
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Reset failed');
-        const job = lastJobs.find(j => j.id === id);
-        if (job) { job.audio_selection = null; openJobDetail(job); }
+        audioOverrideDirty = false;
+        const fresh = await fetchJob(id);
+        if (fresh) openJobDetail(fresh);
         showNotification('🎧 Following the global multi-audio setting', 'success');
         refreshData();
       } catch (err) {
@@ -2040,6 +2135,9 @@
     }
 
     function openJobDetail(job) {
+      audioOverrideDirty = false;
+      jobQualityDirty = false;
+      jobTargetFormatDirty = false;
       document.getElementById('drawerTitle').textContent = job.title || 'Job';
       const parts = job.partial_file_path || '';
       // aria2c keeps a control file beside the partial; show it so the resume
@@ -2054,6 +2152,8 @@
           ${detailRow('Output dir', job.output_directory, true)}
           ${detailRow('Download', job.download_status)}
           ${detailRow('Conversion', job.conversion_status)}
+          ${detailRow('Quality override', job.video_quality || 'Global setting')}
+          ${detailRow('Target format', job.target_format || 'Global setting')}
           ${detailRow('Metadata', job.metadata_status)}
           ${detailRow('File', job.file_path, true)}
           ${detailRow('Size', job.file_size ? formatBytes(job.file_size) : null)}
@@ -2066,6 +2166,7 @@
           ${detailRow('aria2c control', control, true)}
           ${detailRow('Last error', job.last_error)}
         </div>
+        ${renderJobOverrideSection(job)}
         ${renderAudioTrackSection(job)}
         ${renderSidecarSection(job)}
         ${job.superseded_file ? `<div style="margin-top:12px; padding:8px 10px; border-radius:8px; background:rgba(59,130,246,0.10); font-size:0.73rem; color: var(--text-secondary);">🔁 Re-download in progress — the previous file is kept as <span class="mono">${escapeHtml(job.superseded_file)}</span> until the new download succeeds, and restored automatically if the re-download fails permanently.</div>` : ''}
