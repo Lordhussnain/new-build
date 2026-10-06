@@ -416,6 +416,37 @@ describe("integration: transient failures and resume", () => {
       for (const job of jobs) {
         expect(job.download_status).toBe("downloaded");
         expect(job.file_path).toBeTruthy();
+        expect(job.retry_count).toBe(2); // each failed attempt made no forward progress
+      }
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("forgives failed attempts that keep advancing the partial download", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      4002,
+      BASE_CONFIG(4002, {
+        videoQuality: "audio",
+        retryBackoffBaseSeconds: 1,
+        retryBackoffMaxSeconds: 2,
+        maxRetryAttempts: 3,
+        maxFailuresPerVideo: 3,
+      }),
+      { FAKE_FAIL_TIMES: "2", FAKE_FAIL_MODE: "transient", FAKE_FAIL_PROGRESS_SEQUENCE: "20,40", FAKE_DELAY_MS: "40" },
+    );
+
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done" && j.conversion_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+      for (const job of jobs) {
+        expect(job.retry_count).toBe(0);
+        expect(job.best_progress).toBe(100);
       }
     } finally {
       await engine.stop();
@@ -476,7 +507,7 @@ describe("integration: corrupt partials", () => {
 
 // ---------------------------------------------------------------------------
 describe("integration: permanent failures", () => {
-  test("parks as failed and is never auto-requeued", async () => {
+  test("fails fast and is never auto-requeued", async () => {
     const dir = await makeRunDir();
     const engine = await startEngine(
       dir,
@@ -494,9 +525,12 @@ describe("integration: permanent failures", () => {
       const jobs = await waitForAllJobs(engine, (j) => j.download_status === "failed");
       expect(jobs).toHaveLength(3);
       for (const job of jobs) {
-        expect(job.retry_count).toBeGreaterThanOrEqual(2); // budget spent
+        expect(job.retry_count).toBe(0); // the permanent failure spends no retry budget
         expect(job.last_error).toContain("Video unavailable");
       }
+      const attempts = (await readdir(join(dir, "downloads", "Mock Playlist"))).filter((f) => f.endsWith(".attempts"));
+      expect(attempts).toHaveLength(3);
+      for (const file of attempts) expect(await Bun.file(join(dir, "downloads", "Mock Playlist", file)).text()).toBe("1");
 
       // The failed tab lists them…
       const failed = await engine.api("/api/failed");

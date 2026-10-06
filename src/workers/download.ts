@@ -14,7 +14,13 @@ import { aria2cPath, ytDlp } from "../tools";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
 import { findPartialFile, recordJobPartial, removePartialFiles } from "../reconcile";
 import { removeFromArchive } from "../archive";
-import { computeBackoffMs, isDownloaderArgsError, isTransientDownloadError } from "../retry";
+import {
+  computeBackoffMs,
+  isDownloaderArgsError,
+  isPermanentDownloadError,
+  isTransientDownloadError,
+  progressAwareRetryState,
+} from "../retry";
 import { buildDownloadPlan, jobBaseFilename } from "../download-args";
 import { parseDownloadPath, readProcessOutput } from "../download-output";
 import {
@@ -26,7 +32,7 @@ import {
 } from "../audio-tracks";
 import { findDownloadedFile, formatBytesPerSec, parseSpeedToBytesPerSec } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
-import { abortController, activeProcs, getConfig, isPaused, stats, workerStatuses } from "../state";
+import { abortController, activeDownloadJobs, activeProcs, getConfig, isPaused, stats, workerStatuses } from "../state";
 import { logError } from "../logger";
 import type { Config } from "../config";
 
@@ -63,12 +69,14 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
       await Bun.sleep(500);
       continue;
     }
+    activeDownloadJobs.set(id, job.id);
 
     try {
       await runDownload(id, job, config);
     } catch (err: any) {
       await handleDownloadFailure(id, job, config, err);
     } finally {
+      activeDownloadJobs.delete(id);
       activeProcs.delete(id);
       autoscaler.clearWorker(id);
     }
@@ -134,7 +142,7 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
         // best_progress is the high-water mark of this job's attempts: it is
         // what lets the retry budget forgive repeated failures at increasing
         // completion percentages (see handleDownloadFailure).
-        updateJobProgress(job.id, pctNum, bps, parseFloat(parts[2]) || 0, totalBytes);
+        updateJobProgress(job.id, `dl-${id}`, pctNum, bps, parseFloat(parts[2]) || 0, totalBytes);
         const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
         const etaNum = parseFloat(parts[2]);
         const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
@@ -246,48 +254,99 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
     return;
   }
 
-  // Corrupt/incomplete partial: delete the .part file so yt-dlp restarts that
-  // transfer — but only after the resume budget is spent. Until then we keep
-  // the partial and let --continue resume from it.
+  // Corrupt/incomplete partial: keep resuming up to maxResumeAttempts, then
+  // discard the pair and restart. Every failed attempt still goes through the
+  // progress-aware budget so repeated corruptions cannot loop forever.
   if (lower.includes("unable to resume") || lower.includes("incomplete") || lower.includes("corrupt")) {
     const resumeCount = (job.resume_count || 0) + 1;
     const partial =
       job.partial_file_path && existsSync(job.partial_file_path)
         ? job.partial_file_path
         : await findPartialFile(job.output_directory, base);
-    if (resumeCount >= Math.max(1, config.maxResumeAttempts) || !partial) {
-      // Budget spent (or nothing to resume): throw the partial away and
-      // restart this video from scratch. The aria2c control file goes first —
-      // stranding it makes aria2c refuse to restart (see removePartialFiles).
-      if (partial) {
-        const removal = await removePartialFiles(partial);
-        if (removal.fatal) {
-          // The control file is locked (orphaned aria2c, an antivirus scan).
-          // Deleting only the data file now would wedge this video forever,
-          // so keep both files, surface exactly what is blocking, and let a
-          // later attempt retry once the handle is released.
-          const msg = `partial file locked, cannot restart cleanly (${removal.error}). Close the program holding it — usually an orphaned aria2c/ffmpeg or antivirus scanning the download folder.`;
-          db.run(
-            `UPDATE jobs SET download_status = 'pending', download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-            [msg.slice(0, 500), job.id],
-          );
-          logError("download", `${job.id} ${job.title}: ${msg}`);
+    const current = readProgressState(job.id);
+    const retry = progressAwareRetryState(
+      current.retryCount,
+      current.bestProgress,
+      current.progress,
+      perVideoCap(config),
+    );
+    const restartFromScratch = resumeCount >= Math.max(1, config.maxResumeAttempts) || !partial;
+    let partialRemoved = false;
+
+    if (restartFromScratch && partial) {
+      // The aria2c control file goes first — stranding it makes aria2c refuse
+      // to restart (see removePartialFiles).
+      const removal = await removePartialFiles(partial);
+      if (removal.fatal) {
+        // Keep both files if a process/antivirus holds either one. This is a
+        // retryable failure, but its no-progress attempt still spends budget.
+        const msg = `partial file locked, cannot restart cleanly (${removal.error}). Close the program holding it — usually an orphaned aria2c/ffmpeg or antivirus scanning the download folder.`;
+        const status = retry.exhausted ? "failed" : "pending";
+        db.run(
+          `UPDATE jobs SET download_status = ?, retry_count = ?, resume_count = ?,
+             partial_file_path = ?, best_progress = ?, download_claimed_by = NULL,
+             download_claimed_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+          [status, retry.retryCount, resumeCount, partial, retry.bestProgress, msg.slice(0, 500), job.id],
+        );
+        logError("download", `${job.id} ${job.title}: ${msg}`);
+        if (retry.exhausted) {
+          stats.failed++;
+          notePipelineFailure("dl", config);
+          updateWorkerLine(id, `❌ Retry budget spent — waiting for cooldown | ${job.title}`, config);
+        } else {
           updateWorkerLine(id, `🔒 Partial locked — will retry | ${job.title}`, config);
-          await Bun.sleep(computeBackoffMs(2, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
-          return;
+          await Bun.sleep(computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
         }
+        return;
       }
-      resetForRetry(job.id, { incrementRetry: true, clearPartial: true });
-      updateWorkerLine(id, `🗑️ Restarting from scratch | ${job.title}`, config);
+      partialRemoved = true;
+    }
+
+    if (retry.exhausted) {
+      const keepPartial = partial && !partialRemoved ? partial : null;
+      db.run(
+        `UPDATE jobs SET download_status = 'failed', retry_count = ?, resume_count = ?,
+           partial_file_path = ?, best_progress = ?, download_claimed_by = NULL,
+           download_claimed_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [
+          retry.retryCount,
+          restartFromScratch ? 0 : resumeCount,
+          keepPartial,
+          retry.bestProgress,
+          errMsg.slice(0, 500),
+          job.id,
+        ],
+      );
+      stats.failed++;
+      notePipelineFailure("dl", config);
+      logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
+      updateWorkerLine(id, `❌ Retry budget spent — waiting for cooldown | ${job.title}`, config);
       return;
     }
-    // Keep the partial, count the resume attempt, and try again shortly.
+
+    if (restartFromScratch) {
+      db.run(
+        `UPDATE jobs SET download_status = 'pending', retry_count = ?, resume_count = 0,
+           partial_file_path = NULL, progress = 0, best_progress = ?, speed = 0, eta = 0,
+           download_claimed_by = NULL, download_claimed_at = NULL, last_error = ?,
+           updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [retry.retryCount, retry.bestProgress, errMsg.slice(0, 500), job.id],
+      );
+      updateWorkerLine(id, `🗑️ Restarting from scratch | ${job.title}`, config);
+      await Bun.sleep(computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
+      return;
+    }
+
+    // Keep and record the partial, count the resume attempt, and try again
+    // shortly. Commit the high-water mark only at this failure boundary.
     db.run(
-      `UPDATE jobs SET download_status = 'pending', resume_count = ?, download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [resumeCount, errMsg.slice(0, 500), job.id],
+      `UPDATE jobs SET download_status = 'pending', retry_count = ?, resume_count = ?,
+         partial_file_path = ?, best_progress = ?, download_claimed_by = NULL,
+         download_claimed_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [retry.retryCount, resumeCount, partial, retry.bestProgress, errMsg.slice(0, 500), job.id],
     );
     updateWorkerLine(id, `⏳ Resuming (attempt ${resumeCount}/${config.maxResumeAttempts}) | ${job.title}`, config);
-    await Bun.sleep(computeBackoffMs(resumeCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
+    await Bun.sleep(computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
     return;
   }
 
@@ -296,8 +355,30 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
   // so yt-dlp will actually download it on the retry.
   if (lower.includes("output file could not be located")) {
     removeFromArchive(config.archiveFile, job.id);
-    resetForRetry(job.id, { incrementRetry: true, clearPartial: true });
-    updateWorkerLine(id, `Re-downloading (archive entry scrubbed) | ${job.title}`, config);
+    const current = readProgressState(job.id);
+    const retry = progressAwareRetryState(
+      current.retryCount,
+      current.bestProgress,
+      current.progress,
+      perVideoCap(config),
+    );
+    const status = retry.exhausted ? "failed" : "pending";
+    const partial = await findPartialFile(job.output_directory, base);
+    db.run(
+      `UPDATE jobs SET download_status = ?, retry_count = ?, best_progress = ?,
+         partial_file_path = ?, resume_count = 0, download_claimed_by = NULL,
+         download_claimed_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [status, retry.retryCount, retry.bestProgress, partial || null, errMsg.slice(0, 500), job.id],
+    );
+    if (retry.exhausted) {
+      stats.failed++;
+      notePipelineFailure("dl", config);
+      logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
+      updateWorkerLine(id, `❌ Retry budget spent — waiting for cooldown | ${job.title}`, config);
+    } else {
+      updateWorkerLine(id, `Re-downloading (archive entry scrubbed) | ${job.title}`, config);
+      await Bun.sleep(computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
+    }
     return;
   }
 
@@ -313,42 +394,52 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
     return;
   }
 
-  // Transient failure: remember where the .part file is so the next attempt
-  // can resume from it, then requeue with exponential backoff.
-  if (isTransientDownloadError(errMsg)) {
+  // Video-level failures that cannot be fixed by retrying are parked
+  // immediately. Keep any partial around for a deliberate manual retry (e.g. a
+  // new cookies.txt), but the cooldown sweep will never auto-requeue this row.
+  if (isPermanentDownloadError(errMsg)) {
     const partial = await findPartialFile(job.output_directory, base);
-    const { retryCount, bestProgress, progress } = readProgressState(job.id);
-    // The retry budget only shrinks when the video makes no forward progress:
-    // a flaky connection that keeps advancing is forgiven, a video stuck at
-    // the same percentage eventually exhausts its budget.
-    const nextRetry = progress > bestProgress ? retryCount : retryCount + 1;
     db.run(
-      `UPDATE jobs SET download_status = 'pending', retry_count = ?, best_progress = ?, partial_file_path = ?,
-         download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [nextRetry, Math.max(bestProgress, progress), partial || null, errMsg.slice(0, 500), job.id],
+      `UPDATE jobs SET download_status = 'failed', partial_file_path = ?, download_claimed_by = NULL,
+         download_claimed_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [partial || null, errMsg.slice(0, 500), job.id],
     );
-    const backoff = computeBackoffMs(nextRetry, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
-    updateWorkerLine(id, `🌐 Transient error, retrying in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
-    await Bun.sleep(backoff);
+    stats.failed++;
+    logError("download", `${job.id} ${job.title}: permanent failure: ${errMsg.slice(0, 500)}`);
+    updateWorkerLine(id, `🚫 Permanent failure | ${job.title}`, config);
     return;
   }
 
-  // Permanent or unknown error: spend the retry budget, then park as failed
-  // for the periodic sweep (which skips permanent errors entirely).
-  const { retryCount } = readProgressState(job.id);
-  const cap = perVideoCap(config);
-  const newStatus = retryCount + 1 >= cap ? "failed" : "pending";
-  const partial = newStatus === "failed" ? null : await findPartialFile(job.output_directory, base);
-  db.run(
-    `UPDATE jobs SET download_status = ?, retry_count = ?, partial_file_path = ?, download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [newStatus, retryCount + 1, partial, errMsg.slice(0, 500), job.id],
+  // Both transient and otherwise-unclassified failures use the same
+  // progress-aware budget. A retry only costs budget when this attempt failed
+  // without beating the previous attempt's high-water mark.
+  const partial = await findPartialFile(job.output_directory, base);
+  const current = readProgressState(job.id);
+  const retry = progressAwareRetryState(
+    current.retryCount,
+    current.bestProgress,
+    current.progress,
+    perVideoCap(config),
   );
+  const newStatus = retry.exhausted ? "failed" : "pending";
+  db.run(
+    `UPDATE jobs SET download_status = ?, retry_count = ?, best_progress = ?, partial_file_path = ?,
+       download_claimed_by = NULL, download_claimed_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [newStatus, retry.retryCount, retry.bestProgress, partial || null, errMsg.slice(0, 500), job.id],
+  );
+
   if (newStatus === "failed") {
     stats.failed++;
     logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
     notePipelineFailure("dl", config);
+    updateWorkerLine(id, `❌ Retry budget spent — waiting for cooldown | ${job.title}`, config);
+    return;
   }
-  updateWorkerLine(id, `❌ Failed | ${job.title}`, config);
+
+  const backoff = computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
+  const message = isTransientDownloadError(errMsg) ? "🌐 Transient error" : "⚠️ Download error";
+  updateWorkerLine(id, `${message}, retrying in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
+  await Bun.sleep(backoff);
 }
 
 // --- small DB helpers --------------------------------------------------------
@@ -390,17 +481,21 @@ function baseNameOf(job: Job): string {
 /** Record progress, keeping best_progress as the high-water mark. */
 function updateJobProgress(
   id: string,
+  workerId: string,
   pct: number,
   bps: number,
   eta: number,
   totalBytes: number | null,
 ): void {
+  // Keep the current attempt's progress separate from best_progress. The latter
+  // is committed only when an attempt fails so failure handling can tell whether
+  // this attempt advanced; eagerly taking MAX here would make that comparison
+  // always false.
   db.run(
-    `UPDATE jobs SET progress = ?, speed = ?, eta = ?,
-       best_progress = MAX(COALESCE(best_progress, 0), ?),
-       file_size = COALESCE(?, file_size)
-     WHERE id = ?`,
-    [pct, bps, eta, pct, totalBytes, id],
+    `UPDATE jobs SET progress = ?, speed = ?, eta = ?, file_size = COALESCE(?, file_size),
+       download_claimed_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND download_status = 'downloading' AND download_claimed_by = ?`,
+    [pct, bps, eta, totalBytes, id, workerId],
   );
 }
 
@@ -417,7 +512,8 @@ function readProgressState(id: string): { retryCount: number; bestProgress: numb
 
 function parkPaused(job: Job): void {
   db.run(
-    `UPDATE jobs SET download_status = 'paused', download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
+       download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
     [job.id],
   );
   // Freeze the resume point: the .part is on disk, and without recording it the
@@ -426,27 +522,21 @@ function parkPaused(job: Job): void {
   recordJobPartial(job);
 }
 
-function resetForRetry(id: string, opts: { incrementRetry?: boolean; clearPartial?: boolean } = {}): void {
-  const clearPartial = opts.clearPartial ? 1 : 0;
-  if (opts.incrementRetry) {
-    db.run(
-      `UPDATE jobs SET download_status = 'pending', retry_count = retry_count + 1, download_claimed_by = NULL,
-         partial_file_path = CASE WHEN ? THEN NULL ELSE partial_file_path END, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [clearPartial, id],
-    );
-  } else {
-    db.run(
-      `UPDATE jobs SET download_status = 'pending', retry_count = 0, download_claimed_by = NULL,
-         partial_file_path = CASE WHEN ? THEN NULL ELSE partial_file_path END, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [clearPartial, id],
-    );
-  }
+function resetForRetry(id: string): void {
+  db.run(
+    `UPDATE jobs SET download_status = 'pending', retry_count = 0,
+       download_claimed_by = NULL, download_claimed_at = NULL,
+       progress = 0, best_progress = 0, speed = 0, eta = 0, resume_count = 0,
+       updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [id],
+  );
 }
 
 function recordSuccess(id: string, filePath: string, fileSize: number): void {
   db.run(
     `UPDATE jobs SET download_status = 'downloaded', file_path = ?, file_size = ?, partial_file_path = NULL,
-       progress = 100, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+       progress = 100, best_progress = 100, last_error = NULL,
+       download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
     [filePath, fileSize, id],
   );
 }

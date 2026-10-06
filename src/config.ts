@@ -88,7 +88,7 @@ export const ConfigSchema = z
     // engine throws the partial away and restarts that download from scratch.
     maxResumeAttempts: z.number().min(0).max(100),
     // Auto-requeue of failed jobs after a cooldown (0 disables the sweep).
-    // Permanent errors (private/removed/age-gated videos) are never requeued.
+    // Each sweep starts a fresh retry window; permanent video errors are never requeued.
     requeueFailedAfterMinutes: z.number().min(0).max(20_160),
     // On startup, verify that files recorded as downloaded still exist; missing
     // ones are scrubbed from the yt-dlp archive and queued again.

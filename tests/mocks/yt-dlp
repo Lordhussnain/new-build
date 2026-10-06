@@ -13,6 +13,7 @@
 // Failure injection via environment variables:
 //   FAKE_FAIL_TIMES=2        fail the first N download attempts (leaves a .part)
 //   FAKE_FAIL_MODE=transient|permanent|corrupt   what the failure looks like
+//   FAKE_FAIL_PROGRESS_SEQUENCE=20,40 emit progress before failed attempts
 //   FAKE_HANG=1             hang forever (watchdog test)
 //   FAKE_DELAY_MS=250       per-attempt delay (progress parsing)
 //   FAKE_OUTPUT_STRESS=1    noisy pipes + split Unicode final path without LF
@@ -149,6 +150,15 @@ if (failTimes > 0 && attempts <= failTimes) {
   // Leave a partial file behind — exactly like a real interrupted download —
   // so the engine's resume path has something to continue from.
   await Bun.write(partPath, "x".repeat(4096));
+  const progressSequence = (process.env.FAKE_FAIL_PROGRESS_SEQUENCE || "")
+    .split(",")
+    .map((x) => parseFloat(x.trim()))
+    .filter((x) => Number.isFinite(x));
+  const progressPct = progressSequence[Math.min(attempts - 1, progressSequence.length - 1)];
+  if (progressPct !== undefined && progressPct > 0) {
+    const downloaded = Math.round((10_485_760 * Math.min(progressPct, 100)) / 100);
+    console.log(`PROGRESS:${progressPct.toFixed(1)}|1.0MiB|12|10485760|${downloaded}`);
+  }
   await Bun.sleep(delayMs);
   const msg =
     failMode === "permanent"

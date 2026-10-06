@@ -1,8 +1,8 @@
 // src/state.ts — mutable runtime state shared across the engine.
 //
-// This module deliberately depends on nothing but types: it is the leaf that
-// every other module can import without creating cycles. ESM exports are
-// read-only bindings, so mutations go through the setters below.
+// This is a shared leaf module (it imports config defaults/types only) so
+// workers and recovery code can coordinate state without creating cycles. ESM
+// exports are read-only bindings, so mutations go through setters below.
 
 import { DEFAULT_CONFIG, type Config } from "./config";
 
@@ -28,6 +28,8 @@ export const workerStatuses = new Map<string, string>();
 
 // Child processes, so a pause/shutdown can interrupt in-flight work.
 export const activeProcs = new Map<number, Bun.Subprocess>();
+// Logical download claims held through probing, child execution, and result handling.
+export const activeDownloadJobs = new Map<number, string>();
 export const activeMetadataProcs = new Map<number, Bun.Subprocess>();
 
 export const abortController = new AbortController();

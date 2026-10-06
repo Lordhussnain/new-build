@@ -19,6 +19,7 @@ import {
   partialSidecars,
   removePartialFiles,
   recordPartialPaths,
+  reconcileCrashedJobs,
 } from "../src/reconcile";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 
@@ -195,6 +196,28 @@ describe("recordPartialPaths", () => {
   });
 });
 
+describe("crash recovery with aria2c partials", () => {
+  test("records the partial before re-queueing a hard-killed download", async () => {
+    const dir = await makeDir();
+    const part = await writeAria2Partial(dir, "001 - Crashed Video.f137.mp4.part");
+    db.run(
+      `INSERT INTO jobs (id, url, title, "index", output_directory, download_status, partial_file_path)
+       VALUES ('crashed', 'https://y', 'Crashed Video', 1, ?, 'downloading', NULL)`,
+      [dir],
+    );
+
+    reconcileCrashedJobs();
+    const row = db.query("SELECT download_status, pause_reason, partial_file_path FROM jobs WHERE id = 'crashed'").get() as any;
+    expect(row.download_status).toBe("paused");
+    expect(row.pause_reason).toBe("interrupted");
+    expect(row.partial_file_path).toBe(part);
+
+    await cleanOrphanedFiles(dir, testConfig({ requeueFailedAfterMinutes: 30 }));
+    expect(existsSync(part)).toBe(true);
+    expect(existsSync(`${part}${ARIA2_CONTROL_SUFFIX}`)).toBe(true);
+  });
+});
+
 describe("cleanOrphanedFiles with aria2c control files", () => {
   test("deletes an exhausted failed job's .part AND its control file", async () => {
     const dir = await makeDir();
@@ -204,9 +227,22 @@ describe("cleanOrphanedFiles with aria2c control files", () => {
        VALUES ('x', 'https://y', 'V', ?, 'failed', 99, ?)`,
       [dir, part],
     );
-    await cleanOrphanedFiles(dir, testConfig({ maxRetryAttempts: 5 }));
+    await cleanOrphanedFiles(dir, testConfig({ maxRetryAttempts: 5, requeueFailedAfterMinutes: 0 }));
     expect(existsSync(part)).toBe(false);
     expect(existsSync(`${part}${ARIA2_CONTROL_SUFFIX}`)).toBe(false);
+  });
+
+  test("KEEPS a failed retryable job's partial pair while it waits for cooldown", async () => {
+    const dir = await makeDir();
+    const part = await writeAria2Partial(dir, "cooldown.part");
+    db.run(
+      `INSERT INTO jobs (id, url, title, output_directory, download_status, retry_count, last_error, partial_file_path)
+       VALUES ('cooldown', 'https://y', 'V', ?, 'failed', 99, 'connection reset', ?)`,
+      [dir, part],
+    );
+    await cleanOrphanedFiles(dir, testConfig({ maxRetryAttempts: 5, requeueFailedAfterMinutes: 30 }));
+    expect(existsSync(part)).toBe(true);
+    expect(existsSync(`${part}${ARIA2_CONTROL_SUFFIX}`)).toBe(true);
   });
 
   test("KEEPS a retryable job's .part and control file so resume works", async () => {
@@ -262,7 +298,7 @@ describe("cleanOrphanedFiles with aria2c control files", () => {
        VALUES ('x', 'https://y', 'V', ?, 'failed', 99, ?)`,
       [sub, part],
     );
-    await cleanOrphanedFiles(dir, testConfig({ maxRetryAttempts: 5 }));
+    await cleanOrphanedFiles(dir, testConfig({ maxRetryAttempts: 5, requeueFailedAfterMinutes: 0 }));
     expect(existsSync(part)).toBe(false);
     expect(existsSync(`${part}${ARIA2_CONTROL_SUFFIX}`)).toBe(false);
   });

@@ -45,12 +45,15 @@ export function computeDownloadTimeoutMs(
 // failed-job sweep and the transient-retry path both skip them.
 const PERMANENT_ERROR_PATTERNS: RegExp[] = [
   /video unavailable/i,
+  /video (?:is )?not available\b/i,
   /private video/i,
   /members[- ]only/i,
   /sign in to confirm your age/i,
   /age[- ]restricted/i,
+  /age verification required/i,
   /inappropriate for some users/i,
   /removed by the uploader/i,
+  /video has been removed/i,
   /has been terminated/i,
   /account associated with this video has been terminated/i,
   /this video does not exist/i,
@@ -61,11 +64,13 @@ const PERMANENT_ERROR_PATTERNS: RegExp[] = [
   /http error 404/i,
   /http error 410/i,
   /copyright/i,
-  /blocked it in your country/i,
-  /not available in your country/i,
-  /(?:not )?available in your country/i,
-  /geo restriction/i,
-  /video is unavailable in your country/i,
+  /blocked it in your (?:country|region|location)/i,
+  /not available (?:in|from) your (?:country|region|location)/i,
+  /unavailable (?:in|from) your (?:country|region|location)/i,
+  /not made this video available in your (?:country|region|location)/i,
+  /geo[- ]?restrict(?:ed|ion)/i,
+  /geo[- ]?blocked/i,
+  /blocked (?:in|from) your (?:country|region|location)/i,
 ];
 
 /**
@@ -75,6 +80,44 @@ const PERMANENT_ERROR_PATTERNS: RegExp[] = [
 export function isPermanentDownloadError(message: string | null | undefined): boolean {
   if (!message) return false;
   return PERMANENT_ERROR_PATTERNS.some((re) => re.test(message));
+}
+
+export interface ProgressAwareRetryState {
+  /** Number of no-progress failures in the current retry window. */
+  retryCount: number;
+  /** Highest progress observed at a failed attempt boundary. */
+  bestProgress: number;
+  /** Whether this failed attempt advanced past the previous high-water mark. */
+  madeProgress: boolean;
+  /** Whether the no-progress retry budget is exhausted. */
+  exhausted: boolean;
+}
+
+/**
+ * Charge a retry only when the current attempt did not beat the previous
+ * high-water mark. Call this when an attempt fails, not on every progress
+ * update: eagerly writing `bestProgress` while the transfer is running would
+ * make the failure-time comparison impossible (current progress would always
+ * equal the high-water mark).
+ */
+export function progressAwareRetryState(
+  retryCount: number,
+  bestProgress: number,
+  progress: number,
+  retryCap: number,
+): ProgressAwareRetryState {
+  const count = Math.max(0, Math.floor(Number.isFinite(retryCount) ? retryCount : 0));
+  const best = Math.min(100, Math.max(0, Number.isFinite(bestProgress) ? bestProgress : 0));
+  const current = Math.min(100, Math.max(0, Number.isFinite(progress) ? progress : 0));
+  const madeProgress = current > best;
+  const nextCount = madeProgress ? count : count + 1;
+  const cap = Math.max(1, Math.floor(Number.isFinite(retryCap) ? retryCap : 1));
+  return {
+    retryCount: nextCount,
+    bestProgress: Math.max(best, current),
+    madeProgress,
+    exhausted: nextCount >= cap,
+  };
 }
 
 /**

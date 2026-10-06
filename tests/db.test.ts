@@ -19,6 +19,7 @@ import {
   perVideoCap,
 } from "../src/db";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
+import { activeDownloadJobs } from "../src/state";
 import { ingestItems } from "../src/scanner";
 import {
   cleanOrphanedFiles,
@@ -215,6 +216,21 @@ describe("reconcileCrashedJobs", () => {
 });
 
 describe("reapStaleClaims", () => {
+  test("does not reclaim a stale-looking download while a worker still owns its claim", () => {
+    insertJob("long-download", {
+      download_status: "downloading",
+      download_claimed_by: "dl-7",
+      download_claimed_at: "2020-01-01 00:00:00",
+    });
+    activeDownloadJobs.set(7, "long-download");
+    try {
+      reapStaleClaims();
+      expect(getJob("long-download").download_status).toBe("downloading");
+    } finally {
+      activeDownloadJobs.delete(7);
+    }
+  });
+
   test("re-queues claims older than the watchdog windows", () => {
     insertJob("stale-dl", {
       download_status: "downloading",
@@ -314,22 +330,31 @@ describe("requeueFailedJobs", () => {
     const result = requeueFailedJobs(config);
     expect(result.downloads).toBe(1);
     expect(getJob("flaky").download_status).toBe("pending");
-    expect(getJob("flaky").retry_count).toBe(2);
+    // Queueing does not spend a retry; failure of the next attempt does.
+    expect(getJob("flaky").retry_count).toBe(0);
   });
 
-  test("never re-queues permanent failures", () => {
+  test("never re-queues permanent failures, even when cooldown is ignored", () => {
     insertJob("private", {
       download_status: "failed",
       retry_count: 1,
       last_error: "ERROR: [youtube] xyz: Video unavailable",
       updated_at: "2020-01-01 00:00:00",
     });
+    insertJob("geo", {
+      download_status: "failed",
+      retry_count: 1,
+      last_error: "This video is geo-restricted in your location",
+      updated_at: "2020-01-01 00:00:00",
+    });
     const config = testConfig({ requeueFailedAfterMinutes: 30 });
     expect(requeueFailedJobs(config).downloads).toBe(0);
+    expect(requeueFailedJobs(config, { ignoreCooldown: true }).downloads).toBe(0);
     expect(getJob("private").download_status).toBe("failed");
+    expect(getJob("geo").download_status).toBe("failed");
   });
 
-  test("respects the per-video retry cap", () => {
+  test("starts a fresh bounded retry window after a failed job cools down", () => {
     insertJob("spent", {
       download_status: "failed",
       retry_count: 99,
@@ -337,7 +362,31 @@ describe("requeueFailedJobs", () => {
       updated_at: "2020-01-01 00:00:00",
     });
     const config = testConfig({ requeueFailedAfterMinutes: 30, maxRetryAttempts: 3, maxFailuresPerVideo: 4 });
-    expect(requeueFailedJobs(config).downloads).toBe(0);
+    expect(requeueFailedJobs(config).downloads).toBe(1);
+    expect(getJob("spent").download_status).toBe("pending");
+    expect(getJob("spent").retry_count).toBe(0);
+  });
+
+  test("cooldown requeue retains the aria2c resume pair for the next claim", async () => {
+    const dir = await makeTmpDir();
+    const part = join(dir, "video.part");
+    const control = `${part}.aria2`;
+    await writeFile(part, "partial-bytes");
+    await writeFile(control, "control-bytes");
+    insertJob("resume-after-cooldown", {
+      download_status: "failed",
+      retry_count: 99,
+      partial_file_path: part,
+      last_error: "The read operation timed out",
+      updated_at: "2020-01-01 00:00:00",
+    });
+
+    expect(requeueFailedJobs(testConfig({ requeueFailedAfterMinutes: 30 })).downloads).toBe(1);
+    expect(getJob("resume-after-cooldown").retry_count).toBe(0);
+    expect(getJob("resume-after-cooldown").partial_file_path).toBe(part);
+    expect(existsSync(part)).toBe(true);
+    expect(existsSync(control)).toBe(true);
+    expect(claimDownloadJob("dl-resume")?.id).toBe("resume-after-cooldown");
   });
 
   test("skips jobs that have not cooled down yet", () => {
@@ -383,8 +432,9 @@ describe("requeueFailedJobs", () => {
     expect(result.conversions).toBe(1);
     expect(result.metadata).toBe(1); // the one whose file still exists
     expect(getJob("convfail").conversion_status).toBe("pending");
-    expect(getJob("convfail").conversion_retry_count).toBe(1);
+    expect(getJob("convfail").conversion_retry_count).toBe(0);
     expect(getJob("metafail").metadata_status).toBe("pending");
+    expect(getJob("metafail").metadata_retry_count).toBe(0);
     expect(getJob("metafail-nofile").metadata_status).toBe("failed");
   });
 
@@ -433,7 +483,10 @@ describe("findPartialFile & cleanOrphanedFiles", () => {
     const part = join(dir, "001 - Video.mp4.part");
     await writeFile(part, "partial");
     insertJob("v1", { download_status: "failed", retry_count: 9, partial_file_path: part });
-    await cleanOrphanedFiles(dir, testConfig({ maxRetryAttempts: 3, maxFailuresPerVideo: 4 }));
+    await cleanOrphanedFiles(
+      dir,
+      testConfig({ maxRetryAttempts: 3, maxFailuresPerVideo: 4, requeueFailedAfterMinutes: 0 }),
+    );
     expect(existsSync(part)).toBe(false);
   });
 

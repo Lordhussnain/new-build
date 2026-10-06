@@ -131,8 +131,8 @@ duplicate sources or duplicate jobs, even if all videos were already queued.
 | Key | Meaning |
 | --- | --- |
 | `maxResumeAttempts` | How many times one video may resume from its `.part` file before the partial is discarded and the download restarts from scratch |
-| `retryBackoffBaseSeconds` / `retryBackoffMaxSeconds` | Exponential backoff window (with jitter) for transient failures — base doubles per retry, capped at the max |
-| `requeueFailedAfterMinutes` | Cooldown before failed jobs are retried automatically (`0` disables the sweep). Permanent failures are never re-queued |
+| `retryBackoffBaseSeconds` / `retryBackoffMaxSeconds` | Exponential backoff window (with jitter) for transient failures — base doubles per no-progress retry, capped at the max |
+| `requeueFailedAfterMinutes` | Cooldown before failed jobs start a fresh retry window (`0` disables the sweep). Permanent download failures are never re-queued |
 | `verifyExistingFiles` | On startup, verify that files recorded as downloaded still exist; missing ones are scrubbed from the yt-dlp archive and queued again |
 | `downloadTimeoutMinutes` | Minimum per-video download timeout |
 | `maxDownloadMinutes` | Ceiling for the timeout. The effective timeout scales with the video's real duration (3× realtime + 5 min) between the two |
@@ -325,7 +325,9 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
    through aria2c (multi-connection) when available, otherwise yt-dlp's native
    downloader. Failures keep the `.part` file and retry with exponential
    backoff; the retry budget only shrinks while the video makes no forward
-   progress
+   progress. If a retry window is exhausted, a later cooldown sweep opens a
+   fresh window and continues from the retained partial (permanent video errors
+   stay parked).
 4. **Metadata workers** — fetch subtitles, thumbnails, and descriptions per video, based on config flags
 5. **Converter workers** — convert completed downloads into the target format,
    optionally moving them (with sidecars) to a secondary storage path
@@ -354,7 +356,8 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
   (dead cookies overnight, a YouTube outage) the engine pauses itself with
   `TOO_MANY_FAILURES` instead of burning through the queue. Resume from the
   UI when you're ready. Per-video, the effective retry cap is
-  `min(maxRetryAttempts, maxFailuresPerVideo)`.
+  `min(maxRetryAttempts, maxFailuresPerVideo)` within each retry window; an
+  eligible failure starts a fresh window after the configured cooldown.
 - **yt-dlp download archive** — `archiveFile` is passed to
   `--download-archive` as a second idempotence layer; if a downloaded file
   disappears (moved/deleted by hand) the archive entry is scrubbed and the

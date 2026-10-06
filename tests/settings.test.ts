@@ -11,7 +11,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
-import { getConfig, setConfig } from "../src/state";
+import { activeDownloadJobs, getConfig, setConfig } from "../src/state";
 import { db, initDatabase } from "../src/db";
 import { EDITABLE_SETTINGS, applySettings, isEditableSetting, readSettings } from "../src/settings";
 import { STALE_CLAIM_THRESHOLDS } from "../src/reconcile";
@@ -284,10 +284,20 @@ describe("GET /api/reliability — resume + self-healing state", () => {
       download_claimed_by: "dl-2",
       download_claimed_at: "2000-01-01 00:00:00",
     });
+    insertJob("active-but-old", {
+      download_status: "downloading",
+      download_claimed_by: "dl-3",
+      download_claimed_at: "2000-01-01 00:00:00",
+    });
+    activeDownloadJobs.set(3, "active-but-old");
 
-    const res = await handleRequest(new Request("http://x/api/reliability"), getConfig());
-    const body = await res.json();
-    expect(body.resume.staleClaims).toBe(1);
+    try {
+      const res = await handleRequest(new Request("http://x/api/reliability"), getConfig());
+      const body = await res.json();
+      expect(body.resume.staleClaims).toBe(1);
+    } finally {
+      activeDownloadJobs.delete(3);
+    }
   });
 
   test("describes all four self-healing sweeps with a pending count", async () => {

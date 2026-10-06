@@ -108,13 +108,13 @@ tests/           bun test suite (see section 9)
 ### Import graph (acyclic — keep it that way)
 
 ```
-state.ts ──────────────────────────────────────┐ (imports only config types)
+state.ts → config defaults/types ──────────────┐ (shared runtime-state leaf)
 config.ts, util.ts, logger.ts, retry.ts,
 archive.ts, tools.ts, download-output.ts         │ (leaf modules, zero deps)
 audio-tracks.ts → config (types), tools          │ (pure parsing/selection + -J probe)
 db.ts → config                                  │
 resilience.ts → config, db, logger, state       │
-reconcile.ts → archive, config, db, logger, retry│
+reconcile.ts → archive, config, db, download-args, logger, retry, state, tools│
 sources.ts → config, state                     │
 scanner.ts → config, db, state, tools, util     │
 autoscale.ts → db, state                        │
@@ -175,7 +175,7 @@ dependency-free — it is the module that breaks every import cycle.
 | `metadata_status` | `pending` \| `in_progress` \| `done` \| `failed` \| `not_needed` |
 | `pause_reason` | `user` \| `interrupted` \| `waiting_live` \| NULL |
 | `*_claimed_by` / `*_claimed_at` | worker id + timestamp of the atomic claim |
-| `retry_count` | download attempts spent |
+| `retry_count` | no-progress download failures in the current retry window |
 | `conversion_retry_count`, `metadata_retry_count` | per-stage attempt budgets |
 | `resume_count` | `--continue` resumes spent for this job |
 | `best_progress` | high-water mark of progress % (drives budget forgiveness) |
@@ -194,10 +194,10 @@ ingest ──► pending ──claim──► downloading ──success──►
               ▲                    │
               │                    ├─ transient ──► pending (keep .part, backoff)
               │                    ├─ corrupt ────► pending (resume_count++, .part kept)
-              │                    ├─ permanent ──► pending … budget spent ──► failed
+              │                    ├─ permanent ──► failed immediately (never auto-requeued)
               │                    ├─ live ───────► waiting_live (requeued by next scan)
               │                    └─ shutdown ───► paused + interrupted (auto-resume)
-              └── sweep (cooldown) ── failed (transient only, budget permitting)
+              └── sweep (cooldown) ── retryable failed → pending + fresh retry window
 
 downloaded ──► metadata worker ──► metadata: pending → in_progress → done | failed
 downloaded ──► convert worker ──► conversion: pending → in_progress → done | failed
@@ -264,7 +264,7 @@ re-queues a failed sidecar pass on an already-converted job.
 | Download watchdog | `retry.ts computeDownloadTimeoutMs()` | 3× duration + 5 min, clamped to config min/max; unknown duration → min |
 | Transient vs permanent errors | `retry.ts isTransientDownloadError / isPermanentDownloadError` | permanent = private/removed/age-gated/geo-blocked/404/410/copyright |
 | Bad downloader arguments | `retry.ts isDownloaderArgsError` → pause in `workers/download.ts` | aria2c exit 28 + option help block; parks the job, pauses the engine (`BAD_DOWNLOADER_ARGS`) |
-| Retry-budget forgiveness | `workers/download.ts handleDownloadFailure()` | `retry_count` only increments when `progress <= best_progress` |
+| Retry-budget forgiveness | `workers/download.ts handleDownloadFailure()` + `retry.ts progressAwareRetryState()` | `retry_count` only increments when `progress <= best_progress`; `best_progress` is committed at a failure boundary, not every progress update |
 | Resume budget | `workers/download.ts` corrupt branch | `.part` kept until `resume_count >= maxResumeAttempts`, then discarded |
 | Partial-file bookkeeping | `workers/download.ts` + `reconcile.ts findPartialFile()` | recorded on failure, cleared on success |
 | Partial-path freeze | `reconcile.ts recordJobPartial() / recordPartialPaths()` | records the on-disk `.part` before a job stops being `downloading`, so a paused/interrupted job really resumes instead of restarting |
@@ -275,10 +275,10 @@ re-queues a failed sidecar pass on an already-converted job.
 | Cookies watcher | `reconcile.ts cookiesWatch()` + `tools.ts detectCookiesChange()` | 60s sweep: reports cookies.txt appearing / changing / vanishing mid-run and counts the credential-blocked jobs it may rescue (never auto-requeues them) |
 | Disk guard | `resilience.ts diskUsage()` → `checkDiskSpace()` | `diskUsage` is the **only** `statfs` caller: statfs → PowerShell `Get-PSDrive` fallback → `-1/-1` degraded mode (never bricks the engine, never 500s `/api/status`) |
 | Crash recovery | `reconcile.ts reconcileCrashedJobs()` | `downloading` → `paused + interrupted` (auto-claimable) |
-| Stale-claim reaper | `reconcile.ts reapStaleClaims()` | downloads >20 min, conversions >3 h, metadata >15 min; thresholds live in `STALE_CLAIM_THRESHOLDS` so the dashboard cannot drift from them |
+| Stale-claim reaper | `reconcile.ts reapStaleClaims()` | downloads idle >20 min (actively owned jobs are protected and progress heartbeats the claim), conversions >3 h, metadata >15 min; thresholds live in `STALE_CLAIM_THRESHOLDS` so the dashboard cannot drift from them |
 | Missing-file reconciliation | `reconcile.ts reconcileMissingFiles()` | scrubs the yt-dlp archive + re-queues |
-| Failed-job sweep | `reconcile.ts requeueFailedJobs()` | cooldown + per-video cap + permanent-error skip; `ignoreCooldown` for the UI button |
-| Partial-file cleanup | `reconcile.ts cleanOrphanedFiles()` | keeps resume-able partials, deletes exhausted (>cap) and day-old orphans |
+| Failed-job sweep | `reconcile.ts requeueFailedJobs()` | after cooldown, non-permanent failures start a fresh per-video retry window; permanent download errors are skipped; `ignoreCooldown` for the UI button |
+| Partial-file cleanup | `reconcile.ts cleanOrphanedFiles()` | keeps resume-able partials, including retryable failures waiting for cooldown; deletes exhausted partials when auto-requeue is disabled and day-old orphans |
 | Archive scrubbing | `archive.ts removeFromArchive()` | needed whenever a file disappears, else yt-dlp skips it forever |
 | Signature self-heal | `workers/download.ts` | auto-runs `yt-dlp -U` and retries with a clean budget |
 | WAL checkpoint | `lifecycle.ts handleShutdown()` | keeps `archive.db` self-contained after exit |
@@ -286,7 +286,7 @@ re-queues a failed sidecar pass on an already-converted job.
 **Adding a new failure class:** extend the classifiers in `retry.ts` (pure,
 unit-tested), then handle it in `workers/download.ts handleDownloadFailure()`
 in the right precedence order: signature → downloader-args → corrupt →
-archive-scrub → live → transient → permanent/budget.
+archive-scrub → live → permanent → transient/other retryable budget.
 
 The **downloader-args** class (`retry.ts isDownloaderArgsError`, aria2c exit 28
 + the option's help block) is a global misconfiguration, not a video problem:

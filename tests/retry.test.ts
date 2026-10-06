@@ -7,6 +7,7 @@ import {
   isDownloaderArgsError,
   isPermanentDownloadError,
   isTransientDownloadError,
+  progressAwareRetryState,
 } from "../src/retry";
 
 describe("computeBackoffMs", () => {
@@ -87,6 +88,9 @@ describe("isPermanentDownloadError", () => {
     expect(isPermanentDownloadError("HTTP Error 404: Not Found")).toBe(true);
     expect(isPermanentDownloadError("This video has been removed by the uploader")).toBe(true);
     expect(isPermanentDownloadError("The uploader has not made this video available in your country")).toBe(true);
+    expect(isPermanentDownloadError("This video is not available from your location")).toBe(true);
+    expect(isPermanentDownloadError("This video is geo-restricted")).toBe(true);
+    expect(isPermanentDownloadError("This video is age restricted")).toBe(true);
   });
 
   test("does not flag transient errors", () => {
@@ -96,6 +100,48 @@ describe("isPermanentDownloadError", () => {
     expect(isPermanentDownloadError(null)).toBe(false);
     expect(isPermanentDownloadError(undefined)).toBe(false);
     expect(isPermanentDownloadError("")).toBe(false);
+  });
+});
+
+describe("progressAwareRetryState", () => {
+  test("does not spend the retry budget when progress advances", () => {
+    expect(progressAwareRetryState(2, 20, 35, 4)).toEqual({
+      retryCount: 2,
+      bestProgress: 35,
+      madeProgress: true,
+      exhausted: false,
+    });
+  });
+
+  test("spends one retry when there is no forward progress", () => {
+    expect(progressAwareRetryState(2, 35, 35, 3)).toEqual({
+      retryCount: 3,
+      bestProgress: 35,
+      madeProgress: false,
+      exhausted: true,
+    });
+  });
+
+  test("treats a lower resumed percentage as no forward progress", () => {
+    const state = progressAwareRetryState(0, 35, 20, 3);
+    expect(state.retryCount).toBe(1);
+    expect(state.bestProgress).toBe(35);
+    expect(state.madeProgress).toBe(false);
+  });
+
+  test("sanitizes invalid state, clamps percentages, and keeps the cap at least one", () => {
+    expect(progressAwareRetryState(NaN, NaN, NaN, 0)).toEqual({
+      retryCount: 1,
+      bestProgress: 0,
+      madeProgress: false,
+      exhausted: true,
+    });
+    expect(progressAwareRetryState(0, 99, 150, 4)).toMatchObject({
+      retryCount: 0,
+      bestProgress: 100,
+      madeProgress: true,
+      exhausted: false,
+    });
   });
 });
 

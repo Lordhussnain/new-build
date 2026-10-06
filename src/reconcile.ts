@@ -19,6 +19,7 @@ import { logError } from "./logger";
 import { detectCookiesChange, type CookiesChange } from "./tools";
 import { isPermanentDownloadError } from "./retry";
 import { jobBaseFilename } from "./download-args";
+import { activeDownloadJobs } from "./state";
 import type { Config } from "./config";
 
 /**
@@ -27,6 +28,10 @@ import type { Config } from "./config";
  * off via yt-dlp --continue). User-paused jobs stay held.
  */
 export function reconcileCrashedJobs(): void {
+  // Persist the on-disk resume point before flipping the status. This is also
+  // needed at startup after a hard kill, where the normal shutdown hook never
+  // had a chance to run its partial-path freeze.
+  const recorded = recordPartialPaths();
   const stmt = db.run(
     `UPDATE jobs SET
        download_status = CASE WHEN download_status = 'downloading' THEN 'paused' ELSE download_status END,
@@ -42,7 +47,9 @@ export function reconcileCrashedJobs(): void {
         OR metadata_status = 'in_progress'`,
   );
   if (stmt.changes > 0) {
-    console.log(`🔄 Reconciled ${stmt.changes} interrupted job(s) — paused/interrupted jobs will resume automatically.`);
+    console.log(
+      `🔄 Reconciled ${stmt.changes} interrupted job(s) (${recorded} partial(s) recorded) — paused/interrupted jobs will resume automatically.`,
+    );
   }
 }
 
@@ -60,10 +67,10 @@ export const STALE_CLAIM_THRESHOLDS = {
 
 /**
  * Periodic safety net: if a worker process/thread dies mid-job the claim can
- * be left behind. Downloads have a duration-aware watchdog, so any claim older
- * than `STALE_CLAIM_THRESHOLDS.download` is definitely dead → mark
- * paused+interrupted for auto-resume. Conversion and metadata claims past their
- * thresholds are re-queued.
+ * be left behind. A download claim past `STALE_CLAIM_THRESHOLDS.download` is
+ * reclaimed only when no worker still owns that job; progress events heartbeat
+ * the claim timestamp. Conversion and metadata claims past their thresholds
+ * are re-queued.
  */
 export function reapStaleClaims(): void {
   try {
@@ -71,14 +78,19 @@ export function reapStaleClaims(): void {
     // 'downloading' (that is this function's own filter) — otherwise the
     // reclaimed job resumes without a partial and restarts from scratch.
     const recorded = recordPartialPaths();
-    const dl = db.run(
+    const activeJobIds = Array.from(activeDownloadJobs.values());
+    const activeJobFilter = activeJobIds.length
+      ? `AND id NOT IN (${activeJobIds.map(() => "?").join(", ")})`
+      : "";
+    const dlQuery =
       `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
          download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE download_status = 'downloading'
-         AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.download}'))`,
-    );
+         AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.download}')) ${activeJobFilter}`;
+    const dl = activeJobIds.length ? db.run(dlQuery, activeJobIds) : db.run(dlQuery);
     const cv = db.run(
-      `UPDATE jobs SET conversion_status = 'pending', conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
+      `UPDATE jobs SET conversion_status = 'pending', conversion_claimed_by = NULL,
+         conversion_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE conversion_status = 'in_progress'
          AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.conversion}'))`,
     );
@@ -89,7 +101,7 @@ export function reapStaleClaims(): void {
     const total = dl.changes + cv.changes + md.changes;
     if (total > 0) {
       console.log(
-        `🧟 Reclaimed ${dl.changes} stale download(s) (${recorded} partial(s) marked resumable), ${cv.changes} conversion(s), ${md.changes} metadata job(s).`,
+        `🧟 Reclaimed ${dl.changes} stale download(s) (${recorded} partial path(s) recorded), ${cv.changes} conversion(s), ${md.changes} metadata job(s).`,
       );
       logError("reaper", `reclaimed stale claims: downloads=${dl.changes} conversions=${cv.changes} metadata=${md.changes}`);
     }
@@ -189,7 +201,7 @@ export function cookiesWatch(config: Config): CookiesChange {
     );
     if (blocked > 0) {
       console.log(
-        `   ${blocked} failed job(s) look credential-related — use "Requeue all failed" (or Retry) to spend the new cookies on them.`,
+        `   ${blocked} failed job(s) look credential-related — use each job's manual Retry action to spend the new cookies on it.`,
       );
     }
     logError(
@@ -212,19 +224,20 @@ export interface RequeueResult {
 }
 
 /**
- * Re-queue failed jobs whose failure was transient, once they have cooled down
- * for `requeueFailedAfterMinutes`. Permanent failures (private, removed,
- * age-gated, geo-blocked, dead URLs) are never retried, and every stage keeps
- * its own retry counter so the sweep is bounded by the per-video cap.
+ * Re-queue failed jobs once they have cooled down for
+ * `requeueFailedAfterMinutes`. Permanent download failures (private, removed,
+ * age-gated, geo-blocked, dead URLs) are never retried. A cooldown starts a
+ * fresh retry window for each stage; the worker's per-video cap still bounds
+ * each burst of immediate retries, while a later sweep can recover from a
+ * longer outage without operator intervention.
  *
  * Pass `ignoreCooldown: true` (used by the "Requeue all failed" web button) to
- * retry everything eligible immediately.
+ * retry every eligible job immediately.
  */
 export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boolean } = {}): RequeueResult {
   const result: RequeueResult = { downloads: 0, conversions: 0, metadata: 0 };
   const ignoreCooldown = !!opts.ignoreCooldown;
   if (!ignoreCooldown && config.requeueFailedAfterMinutes <= 0) return result;
-  const cap = perVideoCap(config);
   // SQLite modifier built only from a validated integer — never user text.
   // With ignoreCooldown there is no age filter at all (a `-0 minutes` modifier
   // would still exclude rows whose updated_at falls in the current second).
@@ -234,15 +247,17 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
     // --- Downloads -----------------------------------------------------------
     const failedDownloads = db
       .query(
-        `SELECT id, retry_count, last_error FROM jobs
-         WHERE download_status = 'failed' AND retry_count < ? ${modifier}`,
+        `SELECT id, last_error FROM jobs
+         WHERE download_status = 'failed' ${modifier}`,
       )
-      .all(cap) as any[];
+      .all() as any[];
     for (const row of failedDownloads) {
       if (isPermanentDownloadError(row.last_error)) continue;
+      // Scheduling a retry is not itself a failed attempt. Reset the current
+      // no-progress budget here; the next worker outcome is what spends it.
       db.run(
-        `UPDATE jobs SET download_status = 'pending', retry_count = retry_count + 1,
-           download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        `UPDATE jobs SET download_status = 'pending', retry_count = 0, pause_reason = NULL,
+           download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
         [row.id],
       );
       result.downloads++;
@@ -251,14 +266,14 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
     // --- Conversions -----------------------------------------------------------
     const failedConversions = db
       .query(
-        `SELECT id, conversion_retry_count FROM jobs
-         WHERE conversion_status = 'failed' AND conversion_retry_count < ? ${modifier}`,
+        `SELECT id FROM jobs
+         WHERE conversion_status = 'failed' ${modifier}`,
       )
-      .all(cap) as any[];
+      .all() as any[];
     for (const row of failedConversions) {
       db.run(
-        `UPDATE jobs SET conversion_status = 'pending', conversion_retry_count = conversion_retry_count + 1,
-           conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        `UPDATE jobs SET conversion_status = 'pending', conversion_retry_count = 0,
+           conversion_claimed_by = NULL, conversion_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
         [row.id],
       );
       result.conversions++;
@@ -267,15 +282,15 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
     // --- Metadata -------------------------------------------------------------
     const failedMetadata = db
       .query(
-        `SELECT id, metadata_retry_count, file_path FROM jobs
-         WHERE metadata_status = 'failed' AND metadata_retry_count < ? ${modifier}`,
+        `SELECT id, file_path FROM jobs
+         WHERE metadata_status = 'failed' ${modifier}`,
       )
-      .all(cap) as any[];
+      .all() as any[];
     for (const row of failedMetadata) {
       // Without the media file the metadata fetch can never succeed.
       if (!row.file_path || !existsSync(row.file_path)) continue;
       db.run(
-        `UPDATE jobs SET metadata_status = 'pending', metadata_retry_count = metadata_retry_count + 1,
+        `UPDATE jobs SET metadata_status = 'pending', metadata_retry_count = 0,
            updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
         [row.id],
       );
@@ -482,12 +497,13 @@ export function recordJobPartial(
 
 /**
  * Housekeeping for leftover partial downloads at startup:
- *   • a .part belonging to a FAILED job whose retry budget is exhausted, or
- *     one older than a week, is deleted (it can never complete)
+ *   • a .part belonging to a FAILED job whose immediate retry window is spent
+ *     is deleted when cooldown requeue is disabled; any partial older than a
+ *     week is deleted
  *   • orphan .part files with no matching job (DB reset, manual cleanup) are
  *     deleted once they are a day old
  *   • everything else — including in-flight downloads from a previous run and
- *     resume-able partials of failed-but-retryable jobs — is kept so
+ *     resume-able partials of failed jobs waiting for cooldown — is kept so
  *     `--continue` can pick up exactly where the download stopped
  *
  * Deleting a partial also deletes its aria2c control file, and control files
@@ -498,12 +514,16 @@ export async function cleanOrphanedFiles(rootDir: string, config?: Config): Prom
   try {
     const cap = config ? perVideoCap(config) : 0;
     const rows = db
-      .query("SELECT partial_file_path, download_status, retry_count FROM jobs WHERE partial_file_path IS NOT NULL")
+      .query("SELECT partial_file_path, download_status, retry_count, last_error FROM jobs WHERE partial_file_path IS NOT NULL")
       .all() as any[];
-    const owners = new Map<string, { status: string; retries: number }>();
+    const owners = new Map<string, { status: string; retries: number; lastError: string | null }>();
     for (const r of rows) {
       if (r.partial_file_path) {
-        owners.set(r.partial_file_path, { status: r.download_status, retries: r.retry_count || 0 });
+        owners.set(r.partial_file_path, {
+          status: r.download_status,
+          retries: r.retry_count || 0,
+          lastError: r.last_error || null,
+        });
       }
     }
 
@@ -517,7 +537,12 @@ export async function cleanOrphanedFiles(rootDir: string, config?: Config): Prom
       const ageMs = Date.now() - s.mtimeMs;
       const owner = owners.get(fullPath);
       if (owner) {
-        const exhausted = owner.status === "failed" && cap > 0 && owner.retries >= cap;
+        const waitingForCooldownRetry =
+          owner.status === "failed" &&
+          !!config &&
+          config.requeueFailedAfterMinutes > 0 &&
+          !isPermanentDownloadError(owner.lastError);
+        const exhausted = owner.status === "failed" && cap > 0 && owner.retries >= cap && !waitingForCooldownRetry;
         const ancient = ageMs > 7 * 24 * 60 * 60 * 1000;
         if (exhausted || ancient) {
           // Take the aria2c control file with it, or the next attempt wedges.

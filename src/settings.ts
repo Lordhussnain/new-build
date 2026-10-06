@@ -218,7 +218,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     min: 1,
     unit: "s",
     group: "reliability",
-    help: "Exponential backoff base for transient failures.",
+    help: "Base delay for retryable download failures; backoff grows with no-progress retries.",
   },
   {
     key: "retryBackoffMaxSeconds",
@@ -227,7 +227,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     min: 1,
     unit: "s",
     group: "reliability",
-    help: "Ceiling for the backoff window.",
+    help: "Ceiling for the exponential delay between no-progress retries.",
   },
   {
     key: "requeueFailedAfterMinutes",
@@ -236,7 +236,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     min: 0,
     unit: "min",
     group: "reliability",
-    help: "Cooldown before failed jobs retry automatically. 0 disables the sweep. Permanent failures are never re-queued.",
+    help: "Cooldown before failed jobs start a fresh retry window. 0 disables the sweep. Permanent download failures are never re-queued.",
   },
   {
     key: "downloadTimeoutMinutes",

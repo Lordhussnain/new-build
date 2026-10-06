@@ -11,7 +11,7 @@ import { timingSafeEqual } from "node:crypto";
 import os from "node:os";
 import { db } from "./db";
 import { autoscaler, activeDlSlots } from "./autoscale";
-import { getConfig, getPauseReason, isPaused, workerStatuses } from "./state";
+import { activeDownloadJobs, getConfig, getPauseReason, isPaused, workerStatuses } from "./state";
 import { scanAndIngest } from "./scanner";
 import { parseSourceUrl, saveSource, type SourceUrl } from "./sources";
 import { diskUsage, triggerPause, triggerResume } from "./resilience";
@@ -215,13 +215,15 @@ function retryJobById(id: string): number {
   return db.run(
     `UPDATE jobs SET
        download_status = 'pending', pause_reason = NULL, progress = 0, retry_count = 0,
+       best_progress = 0, resume_count = 0, speed = 0, eta = 0,
        conversion_status = CASE WHEN conversion_status = 'not_needed' THEN 'not_needed' ELSE 'pending' END,
        conversion_retry_count = 0,
        metadata_status = CASE
          WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
          ELSE metadata_status END,
        metadata_retry_count = 0,
-       last_error = NULL, download_claimed_by = NULL, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
+       last_error = NULL, download_claimed_by = NULL, download_claimed_at = NULL,
+       conversion_claimed_by = NULL, conversion_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
      WHERE id = ?`,
     [id],
   ).changes;
@@ -589,8 +591,8 @@ const ROUTES: Route[] = [
     methods: ["POST"],
     pattern: "/api/failed/requeue",
     handler: ({ config }) => {
-      // Re-queue every failed job that is eligible (transient errors, retry
-      // budget remaining) immediately, ignoring the cooldown.
+      // Re-queue retryable failed stages immediately, ignoring cooldown and
+      // starting fresh windows; permanent downloads stay parked.
       const result = requeueFailedJobs(config, { ignoreCooldown: true });
       return Response.json({ ok: true, requeued: result });
     },
@@ -712,17 +714,16 @@ function reliabilityHandler(config: Config): Response {
       `SELECT COUNT(*) as count, COALESCE(SUM(file_size), 0) as bytes FROM jobs WHERE partial_file_path IS NOT NULL`,
     )
     .get() as any;
-  // Same eligibility rules as the sweep itself: retry budget remaining and a
-  // non-permanent last error. Uses the shared classifier so the dashboard and
-  // the sweep can never disagree about what is retryable.
-  const cap = Math.min(config.maxRetryAttempts, config.maxFailuresPerVideo);
+  // Same eligibility rules as the sweep itself: all failed downloads except
+  // permanent video-level errors get another retry window after cooldown.
+  // Uses the shared classifier so the dashboard and sweep cannot disagree.
   const failedDownloads = db
     .query(
-      `SELECT retry_count, last_error FROM jobs WHERE download_status = 'failed'`,
+      `SELECT last_error FROM jobs WHERE download_status = 'failed'`,
     )
     .all() as any[];
   const resumableFailed = failedDownloads.filter(
-    (r) => (r.retry_count || 0) < cap && !isPermanentDownloadError(r.last_error),
+    (r) => !isPermanentDownloadError(r.last_error),
   ).length;
   const waitingLive = db
     .query(`SELECT COUNT(*) as count FROM jobs WHERE download_status = 'waiting_live'`)
@@ -747,21 +748,24 @@ function reliabilityHandler(config: Config): Response {
         WHERE download_status = 'paused' AND pause_reason = 'interrupted'`,
     )
     .get() as any;
-  // What the stale-claim reaper would reclaim right now — same thresholds the
-  // sweep enforces (imported, so they cannot drift apart).
+  // What the stale-claim reaper would reclaim right now — same thresholds and
+  // active-download protection as the sweep itself, so the panel cannot drift.
   const t = STALE_CLAIM_THRESHOLDS;
-  const staleClaims = db
-    .query(
-      `SELECT
-         (SELECT COUNT(*) FROM jobs WHERE download_status = 'downloading'
-            AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${t.download}')))
-       + (SELECT COUNT(*) FROM jobs WHERE conversion_status = 'in_progress'
-            AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', '${t.conversion}')))
-       + (SELECT COUNT(*) FROM jobs WHERE metadata_status = 'in_progress'
-            AND updated_at < datetime('now', '${t.metadata}'))
-       AS count`,
-    )
-    .get() as any;
+  const activeJobIds = Array.from(activeDownloadJobs.values());
+  const activeJobFilter = activeJobIds.length
+    ? `AND id NOT IN (${activeJobIds.map(() => "?").join(", ")})`
+    : "";
+  const staleClaimsQuery = db.query(
+    `SELECT
+       (SELECT COUNT(*) FROM jobs WHERE download_status = 'downloading'
+          AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${t.download}')) ${activeJobFilter})
+     + (SELECT COUNT(*) FROM jobs WHERE conversion_status = 'in_progress'
+          AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', '${t.conversion}')))
+     + (SELECT COUNT(*) FROM jobs WHERE metadata_status = 'in_progress'
+          AND updated_at < datetime('now', '${t.metadata}'))
+     AS count`,
+  );
+  const staleClaims = (activeJobIds.length ? staleClaimsQuery.get(...activeJobIds) : staleClaimsQuery.get()) as any;
 
   // The four self-healing sweeps, with what each currently has in scope.
   // `pending: null` means "not counted here" — the missing-files sweep has to
@@ -778,7 +782,7 @@ function reliabilityHandler(config: Config): Response {
       id: "staleClaims",
       label: "Stale claims reclaimed",
       cadence: "every 60s",
-      detail: "Claims orphaned by a dead worker are re-queued after a timeout.",
+      detail: "Inactive download claims are re-queued after a timeout; live worker-owned jobs are protected.",
       pending: staleClaims?.count || 0,
     },
     {

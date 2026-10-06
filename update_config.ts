@@ -288,9 +288,13 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
 
   // Failure handling (circuit breaker + backoff)
   console.log("\n— Failure Handling —");
-  config.maxRetryAttempts = await askNumber("Retries per video before it fails", config.maxRetryAttempts, 1);
+  config.maxRetryAttempts = await askNumber(
+    "No-progress retries per video before cooldown requeue",
+    config.maxRetryAttempts,
+    1,
+  );
   config.maxFailuresPerVideo = await askNumber(
-    "Max failures per video (effective cap = min with retries)",
+    "Max no-progress failures per video per retry window (effective cap = min with retries)",
     config.maxFailuresPerVideo,
     1,
   );
@@ -431,7 +435,7 @@ async function changeReliabilitySettings(config: Config): Promise<Config> {
 
   console.log("\n— Failed-job sweep —");
   config.requeueFailedAfterMinutes = await askNumber(
-    "Re-queue transiently failed jobs after (minutes; 0 = never)",
+    "Re-queue retryable failed jobs after (minutes; 0 = never)",
     config.requeueFailedAfterMinutes,
     0,
   );
@@ -446,11 +450,11 @@ async function changeReliabilitySettings(config: Config): Promise<Config> {
   console.log("\n— Self-healing sweeps (run by the engine, not configurable here) —");
   console.log(`   • Crashed jobs resume        on startup`);
   console.log(
-    `   • Stale claims reclaimed      every 60s — downloads ${STALE_CLAIM_THRESHOLDS.download.replace("-", "older than ")}, conversions ${STALE_CLAIM_THRESHOLDS.conversion.replace("-", "")}, metadata ${STALE_CLAIM_THRESHOLDS.metadata.replace("-", "")}`,
+    `   • Stale claims reclaimed      every 60s — inactive downloads ${STALE_CLAIM_THRESHOLDS.download.replace("-", "idle longer than ")}, conversions ${STALE_CLAIM_THRESHOLDS.conversion.replace("-", "")}, metadata ${STALE_CLAIM_THRESHOLDS.metadata.replace("-", "")}`,
   );
   console.log(`   • Deleted files re-fetched   on startup`);
   console.log(
-    `   • Failed jobs retried         every 60s after a ${config.requeueFailedAfterMinutes} min cooldown` +
+    `   • Retryable failed jobs      fresh window every 60s after a ${config.requeueFailedAfterMinutes} min cooldown` +
       (config.requeueFailedAfterMinutes === 0 ? " (disabled)" : ""),
   );
 
