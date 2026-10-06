@@ -10,7 +10,7 @@
 //   requeueFailedJobs      — failed jobs are retried after a cooldown, with
 //                            permanent errors (private/removed videos) skipped
 
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { readdir, stat, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { db, perVideoCap, type Job } from "./db";
@@ -577,4 +577,112 @@ export async function cleanOrphanedFiles(rootDir: string, config?: Config): Prom
 
     if (removed > 0) console.log(`🧹 Cleaned ${removed} stale partial file(s).`);
   } catch {}
+}
+
+// --- Superseded media files (deliberate re-downloads) ------------------------
+// Retrying an already-downloaded job from the dashboard — the usual case being
+// a new multi-audio track selection that needs a fresh download — must not
+// delete the existing file up front: the re-download can still fail, and the
+// engine's core rule is to never throw away work that has already been done.
+// Instead the old media file is renamed aside (`.superseded`), which also
+// frees the output path: yt-dlp refuses to re-download while the target file
+// exists (`--no-overwrites`) and `--download-archive` must be scrubbed by the
+// caller. The new download deletes the backup on success
+// (`dropSupersededFile`); a permanent re-download failure restores it
+// (`restoreSupersededFile`).
+
+export const SUPERSEDED_SUFFIX = ".superseded";
+
+/**
+ * Move a downloaded job's media file aside so a re-download gets a free
+ * output path. Clears `file_path` (it no longer exists) and records the
+ * backup in `superseded_file`. Returns the backup path, or null when the job
+ * had no file on disk to protect. Throws when an existing file cannot be
+ * renamed — the caller should refuse the retry rather than start a download
+ * that yt-dlp will skip against the still-present file.
+ */
+export function stashDownloadedFile(jobId: string, filePath: string | null): string | null {
+  if (!filePath) return null;
+  if (!existsSync(filePath)) {
+    // DB says downloaded but the file is already gone — nothing to protect.
+    db.run(
+      `UPDATE jobs SET file_path = NULL, file_size = 0, superseded_file = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [jobId],
+    );
+    return null;
+  }
+  const backup = `${filePath}${SUPERSEDED_SUFFIX}`;
+  try {
+    renameSync(filePath, backup);
+  } catch (err: any) {
+    throw new Error(`could not move the previous file aside (${filePath}): ${err?.message || err}`);
+  }
+  db.run(
+    `UPDATE jobs SET file_path = NULL, file_size = 0, superseded_file = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [backup, jobId],
+  );
+  return backup;
+}
+
+/**
+ * The re-download succeeded — the backup of the previous file is no longer
+ * needed. Safe to call for jobs without a backup (no-op).
+ */
+export function dropSupersededFile(jobId: string): void {
+  const row = db.query("SELECT superseded_file FROM jobs WHERE id = ?").get(jobId) as
+    | { superseded_file: string | null }
+    | null;
+  const backup = row?.superseded_file || null;
+  db.run(`UPDATE jobs SET superseded_file = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [jobId]);
+  if (!backup) return;
+  try {
+    unlinkSync(backup);
+  } catch {
+    // Leftover backup is litter, not an error — the new file is in place.
+  }
+}
+
+/**
+ * The re-download failed permanently — put the previous file back and mark
+ * the job downloaded again, so the operator keeps exactly what was archived
+ * before the retry. Returns false when there was nothing to restore.
+ */
+export function restoreSupersededFile(jobId: string, reason: string): boolean {
+  const row = db
+    .query(
+      `SELECT superseded_file, COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) AS wants
+       FROM jobs WHERE id = ?`,
+    )
+    .get(jobId) as { superseded_file: string | null; wants: number } | null;
+  const backup = row?.superseded_file || null;
+  if (!row || !backup || !backup.endsWith(SUPERSEDED_SUFFIX)) return false;
+  if (!existsSync(backup)) {
+    db.run(`UPDATE jobs SET superseded_file = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [jobId]);
+    return false;
+  }
+  const original = backup.slice(0, -SUPERSEDED_SUFFIX.length);
+  try {
+    renameSync(backup, original);
+  } catch (err: any) {
+    logError("reconcile", `${jobId} could not restore superseded file ${backup}: ${err?.message || err}`);
+    return false;
+  }
+  let size = 0;
+  try {
+    size = statSync(original).size;
+  } catch {}
+  // The restored file is the previous pipeline OUTPUT (already converted and
+  // in its final location), so conversion is not needed again; sidecars are
+  // re-fetched lazily if any are wanted.
+  db.run(
+    `UPDATE jobs SET file_path = ?, file_size = ?, superseded_file = NULL,
+       download_status = 'downloaded', progress = 100, best_progress = 100,
+       partial_file_path = NULL, retry_count = 0, resume_count = 0,
+       conversion_status = 'not_needed',
+       metadata_status = CASE WHEN ? > 0 THEN 'pending' ELSE 'not_needed' END,
+       download_claimed_by = NULL, download_claimed_at = NULL,
+       last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [original, size, row.wants, reason, jobId],
+  );
+  return true;
 }

@@ -6,7 +6,8 @@
 //   • --version
 //   • --flat-playlist --print "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s"
 //   • download mode (-o TEMPLATE …): writes a fake media file, prints
-//     PROGRESS lines and the final path
+//     PROGRESS lines and the final path; honours --download-archive (skips
+//     ids already recorded with yt-dlp's real message, records successes)
 //   • --skip-download (metadata): writes sidecar files
 //   • -U (self-update)
 //
@@ -103,6 +104,37 @@ if (flag("--flat-playlist")) {
 }
 
 // --- download -----------------------------------------------------------------
+// The engine always puts the video URL first (yt-dlp <url> --flags …).
+const url = argv[0] && !argv[0].startsWith("-") ? argv[0] : "";
+let videoId = "";
+try {
+  const u = new URL(url);
+  videoId =
+    (u.hostname === "youtu.be" ? u.pathname.slice(1).split("/")[0] : u.searchParams.get("v")) || "";
+} catch {}
+
+// --download-archive fidelity: ids already recorded are skipped with yt-dlp's
+// real message and exit 0 — NO file is written, NO progress is printed. This
+// is exactly the behaviour that makes deliberate re-downloads require an
+// archive scrub, so the integration tests exercise that contract for real.
+const archiveFile = flagValue("--download-archive");
+if (archiveFile && videoId) {
+  try {
+    const alreadyRecorded = (await Bun.file(archiveFile).text())
+      .split("\n")
+      .some((line) => {
+        const parts = line.trim().split(/\s+/);
+        return parts.length > 0 && parts[parts.length - 1] === videoId;
+      });
+    if (alreadyRecorded) {
+      console.log(`[youtube] ${videoId}: has already been recorded in the archive`);
+      process.exit(0);
+    }
+  } catch {
+    // no archive file yet — nothing recorded, proceed with the download
+  }
+}
+
 const outTemplate = flagValue("-o") || "./video.%(ext)s";
 const base = outTemplate.replace(/\.%\(ext\)s$/, "");
 // --audio-multistreams + --merge-output-format mkv means a multi-audio
@@ -121,8 +153,6 @@ const failTimes = num("FAKE_FAIL_TIMES", 0);
 const failMode = process.env.FAKE_FAIL_MODE || "transient";
 const delayMs = num("FAKE_DELAY_MS", 60);
 const counterFile = `${base}.attempts`;
-// The engine always puts the video URL first (yt-dlp <url> --flags …).
-const url = argv[0] && !argv[0].startsWith("-") ? argv[0] : "";
 
 // Count attempts across processes so a retry loop sees the same counter.
 let attempts = 0;
@@ -236,6 +266,10 @@ await Bun.sleep(delayMs);
 console.log(`PROGRESS:100.0|2.5MiB|0|10485760|10485760`);
 
 await Bun.write(finalPath, "fake-mp4-bytes");
+// Record the successful download in the archive, like real yt-dlp does.
+if (archiveFile && videoId) {
+  await appendFile(archiveFile, `youtube ${videoId}\n`);
+}
 // Clean up the bookkeeping file so reruns start fresh.
 try {
   await Bun.file(counterFile).unlink();

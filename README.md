@@ -182,9 +182,28 @@ a single selected track merges exactly like a classic download. `videoQuality:
 Per-video override: open a job in the dashboard and use the **Audio tracks**
 section — *Find audio tracks* lists what YouTube offers (original + dubs, with
 language and bitrate), checkboxes pick what the next attempt keeps, and *Use
-global setting* returns the job to the mode above. The selection applies to the
-next download attempt (use **Retry job** to re-fetch an already downloaded
-video with different tracks).
+global setting* returns the job to the mode above. For a video that is already
+downloaded, **Save & re-download** applies the selection immediately: the
+engine scrubs the video from the yt-dlp download archive, moves the old file
+aside (`.superseded`), and downloads again with the new tracks. The previous
+file is kept until the new download succeeds and is restored automatically if
+the re-download fails permanently — a retry never destroys what is already
+archived. If YouTube renumbers its formats after a probe, the engine detects
+the stale format ids, re-probes, and retries instead of parking the job.
+
+### Subtitles & sidecar files
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `downloadSubtitles` | `true` | Fetch subtitle files for newly added videos. |
+| `subtitleLanguages` | `"all"` | Which subtitle languages to fetch: comma-separated codes (`"en, es, ja"` — regexes like `en.*` work), or `"all"` for every available language including auto-generated captions. |
+| `subtitleFormat` | `"srt"` | Container for the fetched subtitles (converted by yt-dlp). |
+| `writeThumbnail` / `writeDescription` / `writeInfoJson` | `true` | Thumbnail / description / info.json sidecars for newly added videos. |
+
+Per-video control: every job's detail drawer has a **Sidecar files** section
+(subtitles / thumbnail / description). Flipping a flag on an
+already-downloaded video fetches the files right away against the existing
+media — no re-download; flipping one off never deletes files already fetched.
 
 ### Tuning from the dashboard
 
@@ -244,10 +263,11 @@ Bearer`, `X-Web-Token`, or `?token=`).
 | `GET /api/status` | Stats, aggregate speed, workers, pause state, disk/RAM, ETA. |
 | `GET /api/jobs` | The 500 newest jobs. |
 | `GET /api/jobs/:id` | One job, fresh from the DB (what the detail drawer shows). |
-| `POST /api/jobs/:id/retry` | Re-queue with fresh budgets (alias: `POST /api/retry/:id`). |
+| `POST /api/jobs/:id/retry` | Re-queue with fresh budgets (alias: `POST /api/retry/:id`). For a downloaded job this is a real re-download: the id is scrubbed from the yt-dlp archive and the old file stashed as `.superseded` first (restored if the re-download fails permanently). |
 | `POST /api/jobs/:id/reset-failures` | Clear the per-stage failure counters (alias: `POST /api/failcount/reset/:id`). |
 | `POST /api/jobs/:id/audio-tracks` | Save the per-video audio-track selection (`tracks: null` resets). |
 | `POST /api/jobs/:id/audio-probe` | Discover the audio tracks YouTube offers for this video. |
+| `POST /api/jobs/:id/sidecars` | Toggle per-video sidecars (`{subtitles?, thumbnail?, description?}`); enabling one on a finished download fetches it immediately. |
 | `DELETE /api/jobs/:id` | Delete one job row. |
 | `POST /api/jobs/pause` | Bulk user-pause `{ "ids": [...] }`. |
 | `DELETE /api/jobs` | Bulk delete `{ "ids": [...] }` (alias: `POST /api/jobs/delete`). |

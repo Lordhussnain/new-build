@@ -180,3 +180,135 @@ describe("the route table", () => {
     expect(Array.isArray(data.workers)).toBe(true);
   });
 });
+
+// --- Deliberate re-downloads and per-job sidecars -----------------------------
+import { mkdtemp, writeFile, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { existsSync } from "node:fs";
+
+const cfgWith = (overrides: Partial<Config>): Config => ({ ...DEFAULT_CONFIG, ...overrides });
+const apiWith = (path: string, config: Config, init?: RequestInit) => handleRequest(req(path, init), config);
+
+describe("retry as a deliberate re-download", () => {
+  test("scrubs the yt-dlp archive and stashes the existing file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-webretry-"));
+    const archive = join(dir, "downloaded_videos.txt");
+    await writeFile(archive, "youtube other01\nyoutube redl01\n");
+    const media = join(dir, "001 - Video.mp4");
+    await writeFile(media, "old-bytes");
+    insertJob("redl01", { download_status: "downloaded", file_path: media, file_size: 9 });
+    const config = cfgWith({ archiveFile: archive });
+
+    const res = await apiWith("/api/jobs/redl01/retry", config, { method: "POST" });
+    expect(res.status).toBe(200);
+    expect((await res.json()).ok).toBe(true);
+
+    // The id left the archive so yt-dlp will actually download it again…
+    const lines = (await readFile(archive, "utf-8")).split("\n").filter(Boolean);
+    expect(lines).toEqual(["youtube other01"]);
+    // …and the previous file is kept as a backup instead of being deleted.
+    expect(existsSync(media)).toBe(false);
+    expect(existsSync(`${media}.superseded`)).toBe(true);
+    const job = getJob("redl01");
+    expect(job.download_status).toBe("pending");
+    expect(job.file_path).toBeNull();
+    expect(job.superseded_file).toBe(`${media}.superseded`);
+  });
+
+  test("the legacy alias applies the same re-download contract", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-webretry-"));
+    const archive = join(dir, "downloaded_videos.txt");
+    await writeFile(archive, "youtube redl02\n");
+    insertJob("redl02", { download_status: "downloaded" });
+    const config = cfgWith({ archiveFile: archive });
+
+    const res = await apiWith("/api/retry/redl02", config, { method: "POST" });
+    expect((await res.json()).ok).toBe(true);
+    expect((await readFile(archive, "utf-8")).trim()).toBe("");
+  });
+});
+
+describe("POST /api/jobs/:id/sidecars", () => {
+  test("toggles flags and re-opens the metadata stage for a downloaded job", async () => {
+    insertJob("side01", {
+      download_status: "downloaded",
+      metadata_status: "not_needed",
+      want_subtitles: 0,
+      want_thumbnail: 0,
+      want_description: 0,
+    });
+    const res = await api("/api/jobs/side01/sidecars", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subtitles: true }),
+    });
+    const data = await res.json();
+    expect(res.status).toBe(200);
+    expect(data).toMatchObject({ ok: true, want_subtitles: true, metadata_status: "pending" });
+    const job = getJob("side01");
+    expect(job.want_subtitles).toBe(1);
+    expect(job.metadata_status).toBe("pending");
+  });
+
+  test("turning every flag off leaves a terminal metadata stage alone", async () => {
+    insertJob("side02", {
+      download_status: "downloaded",
+      metadata_status: "done",
+      want_subtitles: 1,
+      want_thumbnail: 1,
+      want_description: 0,
+    });
+    const res = await api("/api/jobs/side02/sidecars", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subtitles: false, thumbnail: false }),
+    });
+    const data = await res.json();
+    expect(data).toMatchObject({ ok: true, want_subtitles: false, want_thumbnail: false, metadata_status: "done" });
+  });
+
+  test("rejects empty bodies and non-boolean flags", async () => {
+    insertJob("side03", { download_status: "downloaded" });
+    const empty = await api("/api/jobs/side03/sidecars", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(empty.status).toBe(400);
+    const bad = await api("/api/jobs/side03/sidecars", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subtitles: "yes" }),
+    });
+    expect(bad.status).toBe(400);
+  });
+
+  test("unknown job is a JSON 404", async () => {
+    const res = await api("/api/jobs/nope/sidecars", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subtitles: true }),
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("job payloads", () => {
+  test("GET /api/jobs/:id parses metadata_files and boolean sidecar flags", async () => {
+    insertJob("shape01", {
+      download_status: "downloaded",
+      want_subtitles: 1,
+      want_thumbnail: 0,
+      want_description: 1,
+      metadata_files: JSON.stringify(["001.en.srt", "001.jpg"]),
+    });
+    const res = await api("/api/jobs/shape01");
+    const data = await res.json();
+    expect(data.job.metadata_files).toEqual(["001.en.srt", "001.jpg"]);
+    expect(data.job.want_subtitles).toBe(true);
+    expect(data.job.want_thumbnail).toBe(false);
+    expect(data.job.want_description).toBe(true);
+    expect(data.job.superseded_file).toBeNull();
+  });
+});

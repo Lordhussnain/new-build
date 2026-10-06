@@ -36,6 +36,12 @@ export interface Job {
   audio_tracks: string | null;
   /** JSON array of selected language codes (null = follow global mode). */
   audio_selection: string | null;
+  /**
+   * Backup of the previous media file while a deliberate re-download runs
+   * (dashboard "Retry job" on a downloaded video). Deleted once the new
+   * download succeeds; restored if the re-download fails permanently.
+   */
+  superseded_file: string | null;
   folder: string;
   index: number;
   duration: number | null;
@@ -148,6 +154,9 @@ export function initDatabase(path: string = "archive.db"): void {
   // and which languages the user picked for this specific job.
   ensureColumn("jobs", "audio_tracks", "audio_tracks TEXT");
   ensureColumn("jobs", "audio_selection", "audio_selection TEXT");
+  // Re-download safety net: the previous media file, moved aside while a
+  // manual retry re-fetches the video (see reconcile.ts superseded helpers).
+  ensureColumn("jobs", "superseded_file", "superseded_file TEXT");
   db.run(
     `UPDATE jobs SET metadata_status = CASE
        WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'

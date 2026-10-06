@@ -181,6 +181,9 @@ dependency-free — it is the module that breaks every import cycle.
 | `best_progress` | high-water mark of progress % (drives budget forgiveness) |
 | `partial_file_path` | the `.part` file to resume from (NULL once complete); always absolute, so it resolves from any cwd |
 | `file_path`, `file_size`, `integrity` | final location + SHA-256 |
+| `audio_tracks` | JSON array of discovered audio tracks (null = not probed yet) |
+| `audio_selection` | JSON array of per-job language codes (null = follow the global multi-audio mode) |
+| `superseded_file` | backup path of the previous media file while a deliberate re-download runs (see §7.2) |
 | `progress`, `speed`, `eta` | live values for the dashboard |
 | `last_error` | last failure message (classified by `retry.ts`) |
 
@@ -379,17 +382,51 @@ Dynamic Range Compression duplicates. `src/audio-tracks.ts` owns this:
   QUALITY_FORMATS preset; `buildDownloadPlan` then adds `--audio-multistreams
   --merge-output-format mkv` for 2+ tracks. One track = a normal merge with
   that track pinned; `videoQuality: "audio"` never multi-streams.
-- `probeAudioTracks(url, config)` is the single `-J` call. The download worker
-  runs it once per job (only when a mode/selection will consume it), caches the
-  result in `jobs.audio_tracks`, and a probe failure logs and falls back to
-  single audio — it never fails a download.
+- `probeAudioTracks(url, config)` is the single `-J` call, hard-capped at
+  `PROBE_TIMEOUT_MS` (it runs inside a download slot and behind a dashboard
+  button, so it must surface a timeout instead of hanging). The download
+  worker runs it once per job (only when a mode/selection will consume it),
+  caches the result in `jobs.audio_tracks`, and a probe failure logs and
+  falls back to single audio — it never fails a download.
 - `workers/convert.ts countAudioStreams()` keeps files with 2+ audio streams in
   their container (remuxing an MKV to mp4 would drop/re-encode the dubs).
 
 Dashboard: `/api/jobs` returns `audio_tracks` / `audio_selection` as parsed
 arrays; `POST /api/jobs/<id>/audio-probe` refreshes the list;
 `POST /api/jobs/<id>/audio-tracks` saves (`{tracks:[…]}`) or resets
-(`{tracks:null}`) the per-job selection, applied on the next attempt.
+(`{tracks:null}`) the per-job selection, applied on the next attempt. The job
+drawer offers "Save & re-download" for finished videos: save + immediate retry.
+
+#### Re-downloading an archived video (retry = replace)
+
+Retrying a downloaded job — the flow that applies a saved audio selection —
+must get past two yt-dlp gates, and the engine does both in `retryJobById`
+(web.ts) **before** the job becomes claimable:
+
+1. `removeFromArchive()` scrubs the id from the archive file, otherwise yt-dlp
+   answers *"has already been recorded in the archive"* and exits 0 without
+   downloading anything (the old silent no-op bug).
+2. `stashDownloadedFile()` (reconcile.ts) renames the existing media file to
+   `<file>.superseded`, because `--no-overwrites` skips a download whose
+   target file still exists. The job's `file_path` is cleared and the backup
+   path recorded in `superseded_file`.
+
+The backup is the safety net: the download worker deletes it on success
+(`dropSupersededFile`) and — if the re-download fails permanently — restores
+it and marks the job downloaded again (`restoreSupersededFile`), so a failed
+re-fetch never destroys the previously archived file. A rename failure aborts
+the retry with a 500 instead of starting a download yt-dlp would skip.
+
+#### Stale audio formats recover instead of parking the job
+
+`retry.ts isFormatAvailabilityError()` matches yt-dlp's *"Requested format is
+not available"* — which `isPermanentDownloadError` ALSO matches. The download
+worker checks it FIRST: when a job carried stored `audio_tracks`, YouTube has
+most likely renumbered its formats since the probe, so the worker clears
+`audio_tracks` (forcing a fresh probe; the per-job language selection
+survives) and retries within the normal budget instead of parking the job
+permanently. Only jobs with no multi-audio state fall through to the
+permanent-error classification.
 
 #### Control files: never delete a `.part` without its `.aria2`
 
@@ -436,13 +473,14 @@ segment as an id (gotcha 21).
 | GET · HEAD | `/api/ping` | liveness probe used by the UI |
 | GET | `/api/version` | engine/runtime info (`Bun.version`, platform/arch, uptime seconds) |
 | GET | `/api/status` | stats, speed, ETA, disk, live worker lines, pause state, `runtime`; `diskSpace.free` reads `"unknown"` when no disk probe could answer |
-| GET | `/api/jobs` | up to 500 jobs with status/retry/progress fields, plus parsed `audio_tracks` / `audio_selection` |
+| GET | `/api/jobs` | up to 500 jobs with status/retry/progress fields, plus parsed `audio_tracks` / `audio_selection` / `metadata_files` and boolean `want_*` sidecar flags |
 | GET | `/api/jobs/:id` | one job, read fresh from the DB — the detail drawer fetches this instead of trusting a poll-cycle-old list row |
 | POST | `/api/scan` | `{url, folder?}` → validate/canonicalize → save source to `config.json` → scan & ingest; returns `saved`, `source: {url, key, added}`, and counts. Save failure starts no scan; scan failure keeps the saved source. Folder override applies only to this scan |
 | POST | `/api/queue/purge` | delete every pending / paused / waiting_live / failed job; returns `{ok, deleted}` |
 | POST | `/api/pause` · `/api/resume` | global pause / resume-all |
-| POST | `/api/jobs/:id/retry` | re-queue one job (all stages, budgets reset); 404 for an unknown id |
+| POST | `/api/jobs/:id/retry` | re-queue one job (all stages, budgets reset); 404 for an unknown id. For a downloaded job this is a deliberate re-download: the id is scrubbed from the yt-dlp archive and the existing file stashed as `.superseded` first (§7.2). 500 when the previous file cannot be moved aside |
 | POST | `/api/jobs/:id/reset-failures` | zero the per-stage retry counters; 404 for an unknown id |
+| POST | `/api/jobs/:id/sidecars` | per-job sidecar toggles: `{subtitles?, thumbnail?, description?}` (booleans). Flipping a flag on for a finished download re-opens the metadata stage so the worker fetches the files against the existing media; flipping off never deletes fetched files. 400 for an empty/non-boolean body |
 | POST | `/api/jobs/pause` | bulk user-pause by `{ids: []}` |
 | DELETE | `/api/jobs` | bulk delete by `{ids: []}` |
 | POST | `/api/jobs/:id/audio-tracks` | per-job audio-track selection: `{tracks:["es",…]}` saves it, `{tracks:null}` returns the job to the global mode |
@@ -493,12 +531,13 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | `tests/download-args.test.ts` | downloader-engine selection, aria2c args, bandwidth split, fragment/chunk/buffer flags, watchdog scaling, multi-audio selector/multistream flags |
 | `tests/download-output.test.ts` | bounded CR/LF pipe parsing, split UTF-8, oversized-record discard, validated final-path markers |
 | `tests/audio-tracks.test.ts` | track parsing (variant collapse, drc drop, ordering), selection policy incl. per-job override, selector splicing, JSON column round-trips |
+| `tests/metadata.test.ts` | `subtitleArgs` — `all`/blank keep fetch-everything, explicit language lists pass through verbatim |
 | `tests/autoscale.test.ts` | slot ramp step, backlog/ceiling clamps, idle collapse, disabled mode |
-| `tests/reconcile.test.ts` | `removePartialFiles` (control-file-first order and its `fatal` result), `partialSidecars`, `findPartialFile`, and `cleanOrphanedFiles` control-file handling |
+| `tests/reconcile.test.ts` | `removePartialFiles` (control-file-first order and its `fatal` result), `partialSidecars`, `findPartialFile`, `cleanOrphanedFiles` control-file handling, and the superseded-file lifecycle (`stash`/`drop`/`restore` for deliberate re-downloads) |
 | `tests/convert.test.ts` | `findConvertedOutput` crash-window adoption: adopts a finished mp3/mp4, never the source itself, empty for unrelated sidecars |
 | `tests/logger.test.ts` | `errorLogPath()` routes test-run logs to the temp dir, never the operator's `error.log` |
 | `tests/disk.test.ts` | `diskUsage()` happy path, the `-1/-1` degraded path, and `checkDiskSpace`'s allow-through when free space is unknown |
-| `tests/web-routes.test.ts` | the `ROUTES` table: canonical per-job routes, the legacy aliases, the `{ok}` envelope, JSON 404 and 405 + `Allow`, trailing-slash collapse |
+| `tests/web-routes.test.ts` | the `ROUTES` table: canonical per-job routes, the legacy aliases, the `{ok}` envelope, JSON 404 and 405 + `Allow`, trailing-slash collapse, retry-as-re-download (archive scrub + `.superseded` stash), and the per-job sidecars endpoint |
 | `tests/settings.test.ts` | the dashboard settings allow-list, type coercion, Zod + cross-field validation, persistence, live-config propagation, and auth |
 | `tests/config-manager.test.ts` | every schema key is reachable from `update_config.ts`; the manager reads the sweep thresholds from `STALE_CLAIM_THRESHOLDS` and counts partials with the engine's predicate |
 | `tests/dashboard.test.ts` | `formatHeaderLine` counters, and the `Res:n` field appearing only when partials are held |
@@ -561,6 +600,13 @@ is how the integration test proves the format selector and the multistream/MKV
 flags really reached yt-dlp. The mock ffmpeg answers the stream probe
 (`ffmpeg -hide_banner -i <file>`, no output arg) with a two-audio-stream banner
 for `.mkv` inputs and one otherwise, which is what `countAudioStreams()` sees.
+
+The mock also honours `--download-archive` the way real yt-dlp does: an id
+already recorded is skipped with yt-dlp's exact *"has already been recorded in
+the archive"* message and exit 0 (no file, no progress), and a successful
+download appends `youtube <id>`. This fidelity is load-bearing — it is what
+makes the deliberate-re-download contract (§7.2) observable in tests: without
+scrubbing the archive, the retry integration test would hang on a silent skip.
 
 Mock controls (environment variables):
 

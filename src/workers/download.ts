@@ -12,11 +12,18 @@ import { claimDownloadJob, db, perVideoCap, type Job } from "../db";
 import { activeDlSlots, autoscaler } from "../autoscale";
 import { aria2cPath, ytDlp } from "../tools";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
-import { findPartialFile, recordJobPartial, removePartialFiles } from "../reconcile";
+import {
+  dropSupersededFile,
+  findPartialFile,
+  recordJobPartial,
+  removePartialFiles,
+  restoreSupersededFile,
+} from "../reconcile";
 import { removeFromArchive } from "../archive";
 import {
   computeBackoffMs,
   isDownloaderArgsError,
+  isFormatAvailabilityError,
   isPermanentDownloadError,
   isTransientDownloadError,
   progressAwareRetryState,
@@ -189,6 +196,10 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     }
     const fileSize = (await stat(filePath)).size;
     recordSuccess(job.id, filePath, fileSize);
+    // This attempt replaces a previously downloaded file (dashboard retry):
+    // the new file is in place, so the stashed backup can finally go. Until
+    // this moment the engine never deletes work that has already been done.
+    dropSupersededFile(job.id);
     stats.downloaded++;
     notePipelineSuccess("dl");
     updateWorkerLine(id, `✅ Downloaded | ${job.title}`, config);
@@ -251,6 +262,41 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
     parkPaused(job);
     triggerPause(`BAD_DOWNLOADER_ARGS (${errMsg.slice(0, 120)})`);
     updateWorkerLine(id, `⚙️ aria2c rejected downloader args — paused | ${job.title}`, config);
+    return;
+  }
+
+  // Stale multi-audio probe: the selector carried explicit audio format ids
+  // from an earlier -J probe, and YouTube renumbers formats over time, so
+  // yt-dlp answers "Requested format is not available". That is a selector
+  // problem, not a video problem — forget the stored tracks (the next attempt
+  // re-probes, and the per-job language selection survives the reset) instead
+  // of parking the job permanently. Must run before the permanent-error check,
+  // which matches the same message. Still bounded by the no-progress budget.
+  if (isFormatAvailabilityError(errMsg) && job.audio_tracks) {
+    const current = readProgressState(job.id);
+    const retry = progressAwareRetryState(
+      current.retryCount,
+      current.bestProgress,
+      current.progress,
+      perVideoCap(config),
+    );
+    const status = retry.exhausted ? "failed" : "pending";
+    db.run(
+      `UPDATE jobs SET download_status = ?, retry_count = ?, best_progress = ?,
+         audio_tracks = NULL, download_claimed_by = NULL, download_claimed_at = NULL,
+         last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [status, retry.retryCount, retry.bestProgress, errMsg.slice(0, 500), job.id],
+    );
+    if (retry.exhausted) {
+      stats.failed++;
+      notePipelineFailure("dl", config);
+      logError("download", `${job.id} ${job.title}: stale audio formats kept failing: ${errMsg.slice(0, 300)}`);
+      updateWorkerLine(id, `❌ Retry budget spent — waiting for cooldown | ${job.title}`, config);
+    } else {
+      const backoff = computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
+      updateWorkerLine(id, `🎧 Audio formats went stale — re-probing in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
+      await Bun.sleep(backoff);
+    }
     return;
   }
 
@@ -398,6 +444,18 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
   // immediately. Keep any partial around for a deliberate manual retry (e.g. a
   // new cookies.txt), but the cooldown sweep will never auto-requeue this row.
   if (isPermanentDownloadError(errMsg)) {
+    // A deliberate re-download (dashboard retry on an archived video) stashed
+    // the previous file. The re-fetch can never succeed, so put the previous
+    // file back instead of leaving the job empty-handed — the archive keeps
+    // exactly what it had before the retry.
+    if (restoreSupersededFile(job.id, `re-download failed permanently: ${errMsg.slice(0, 300)}`)) {
+      logError(
+        "download",
+        `${job.id} ${job.title}: permanent re-download failure, previous file restored: ${errMsg.slice(0, 300)}`,
+      );
+      updateWorkerLine(id, `🚫 Re-download failed permanently — previous file restored | ${job.title}`, config);
+      return;
+    }
     const partial = await findPartialFile(job.output_directory, base);
     db.run(
       `UPDATE jobs SET download_status = 'failed', partial_file_path = ?, download_claimed_by = NULL,

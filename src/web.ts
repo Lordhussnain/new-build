@@ -15,7 +15,8 @@ import { activeDownloadJobs, getConfig, getPauseReason, isPaused, workerStatuses
 import { getPlaylistItems, scanAndIngest } from "./scanner";
 import { parseSourceUrl, removeSource, saveSource, SOURCE_KEYS, sourceIdentity, type SourceUrl } from "./sources";
 import { diskUsage, triggerPause, triggerResume } from "./resilience";
-import { requeueFailedJobs, STALE_CLAIM_THRESHOLDS } from "./reconcile";
+import { removeFromArchive } from "./archive";
+import { requeueFailedJobs, stashDownloadedFile, STALE_CLAIM_THRESHOLDS } from "./reconcile";
 import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
 import { aria2cPath } from "./tools";
@@ -196,19 +197,58 @@ const JOB_COLUMNS = `id, url, title, folder, output_directory, file_path, target
                 download_status, conversion_status, metadata_status, pause_reason, metadata_files,
                 retry_count, conversion_retry_count, resume_count, best_progress, last_error,
                 file_size, progress, speed, eta, duration, partial_file_path,
-                audio_tracks, audio_selection`;
+                audio_tracks, audio_selection, superseded_file,
+                want_subtitles, want_thumbnail, want_description`;
 
-/** Audio-track columns are JSON in SQLite; hand the dashboard real values. */
+/** JSON-valued columns in SQLite; hand the dashboard real arrays/nulls. */
 function mapJobRow(r: any) {
+  let metadataFiles: string[] = [];
+  try {
+    const v = JSON.parse(r.metadata_files);
+    if (Array.isArray(v)) metadataFiles = v.filter((x: unknown) => typeof x === "string");
+  } catch {
+    // null / missing / legacy — treat as no sidecars recorded
+  }
   return {
     ...r,
     audio_tracks: parseTracksJson(r.audio_tracks) ?? [],
     audio_selection: parseSelectionJson(r.audio_selection),
+    metadata_files: metadataFiles,
+    want_subtitles: !!r.want_subtitles,
+    want_thumbnail: !!r.want_thumbnail,
+    want_description: !!r.want_description,
   };
 }
 
-/** Re-queue a job with fresh budgets (download + any failed side stages). */
-function retryJobById(id: string): number {
+/**
+ * Re-queue a job with fresh budgets (download + any failed side stages).
+ *
+ * A retry of an already-downloaded video is a DELIBERATE re-fetch — the usual
+ * reason is a new multi-audio track selection from the dashboard — so two
+ * extra steps make the re-download actually happen:
+ *   • the video id is scrubbed from the yt-dlp archive file, otherwise yt-dlp
+ *     answers "has already been recorded in the archive" and exits 0 without
+ *     downloading anything;
+ *   • the existing media file is moved aside (.superseded), otherwise
+ *     `--no-overwrites` skips the download the same way. The backup is
+ *     deleted when the new download succeeds and restored if it fails
+ *     permanently (see reconcile.ts).
+ * Throws when an existing file cannot be moved aside — the route then answers
+ * 500 instead of starting a download yt-dlp would silently skip.
+ */
+function retryJobById(id: string, config: Config): number {
+  const row = db.query("SELECT id, file_path FROM jobs WHERE id = ?").get(id) as {
+    id: string;
+    file_path: string | null;
+  } | null;
+  if (!row) return 0;
+  removeFromArchive(config.archiveFile, id);
+  // Move the previous file aside BEFORE the job becomes claimable: a worker
+  // that grabs it while the old file still exists would get a yt-dlp skip
+  // (`--no-overwrites`) instead of a real download. Throws when the file
+  // cannot be renamed — the route then answers 500 instead of starting a
+  // download that would silently no-op.
+  stashDownloadedFile(id, row.file_path);
   // Re-queue download AND any failed metadata/conversion work; preserve
   // conversion_status='not_needed'. Also clears a user pause and resets the
   // per-stage retry budgets so a manual retry always gets a fresh budget.
@@ -374,10 +414,14 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/jobs/:id/retry",
-    handler: ({ params }) => {
-      const changed = retryJobById(params.id);
-      if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
-      return Response.json({ ok: true });
+    handler: ({ params, config }) => {
+      try {
+        const changed = retryJobById(params.id, config);
+        if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+        return Response.json({ ok: true });
+      } catch (e: any) {
+        return Response.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
+      }
     },
   },
   {
@@ -448,6 +492,72 @@ const ROUTES: Route[] = [
     },
   },
   {
+    methods: ["POST"],
+    pattern: "/api/jobs/:id/sidecars",
+    handler: async ({ req, params }) => {
+      // Per-job sidecar toggles (subtitles / thumbnail / description) from the
+      // dashboard. Normally fixed at ingest time from the global config, but a
+      // downloaded job can still ask for its sidecars: flipping a flag on
+      // re-queues the metadata stage, which fetches against the existing media
+      // file. Flipping a flag off never deletes files that were already fetched.
+      const id = params.id;
+      const row = db
+        .query("SELECT id, download_status, metadata_status FROM jobs WHERE id = ?")
+        .get(id) as { id: string; download_status: string; metadata_status: string } | null;
+      if (!row) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+      const body = await req.json().catch(() => ({}));
+      const flags: { column: string; key: string }[] = [
+        { column: "want_subtitles", key: "subtitles" },
+        { column: "want_thumbnail", key: "thumbnail" },
+        { column: "want_description", key: "description" },
+      ];
+      const sets: string[] = [];
+      const values: (number | string)[] = [];
+      for (const f of flags) {
+        const v = (body as Record<string, unknown>)[f.key];
+        if (v === undefined) continue;
+        if (typeof v !== "boolean") {
+          return Response.json(
+            { ok: false, error: `${f.key} must be a boolean` },
+            { status: 400 },
+          );
+        }
+        sets.push(`${f.column} = ?`);
+        values.push(v ? 1 : 0);
+      }
+      if (sets.length === 0) {
+        return Response.json(
+          { ok: false, error: "Provide at least one of: subtitles, thumbnail, description" },
+          { status: 400 },
+        );
+      }
+      values.push(id);
+      db.run(`UPDATE jobs SET ${sets.join(", ")}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, values);
+      // Newly wanted sidecars for a finished download: re-open the metadata
+      // stage so the worker fetches them now (unless it is already running).
+      if (row.download_status === "downloaded" && !["pending", "in_progress"].includes(row.metadata_status)) {
+        db.run(
+          `UPDATE jobs SET metadata_status = CASE
+             WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0
+               THEN 'pending' ELSE metadata_status END,
+             metadata_retry_count = 0, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?`,
+          [id],
+        );
+      }
+      const fresh = db
+        .query("SELECT want_subtitles, want_thumbnail, want_description, metadata_status FROM jobs WHERE id = ?")
+        .get(id) as any;
+      return Response.json({
+        ok: true,
+        want_subtitles: !!fresh.want_subtitles,
+        want_thumbnail: !!fresh.want_thumbnail,
+        want_description: !!fresh.want_description,
+        metadata_status: fresh.metadata_status,
+      });
+    },
+  },
+  {
     methods: ["DELETE"],
     pattern: "/api/jobs/:id",
     handler: ({ params }) => {
@@ -492,10 +602,14 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/retry/:id",
-    handler: ({ params }) => {
-      const changed = retryJobById(params.id);
-      if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
-      return Response.json({ ok: true });
+    handler: ({ params, config }) => {
+      try {
+        const changed = retryJobById(params.id, config);
+        if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+        return Response.json({ ok: true });
+      } catch (e: any) {
+        return Response.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
+      }
     },
   },
   {

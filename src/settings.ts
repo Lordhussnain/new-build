@@ -155,6 +155,41 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     group: "media",
     help: "Comma-separated language codes kept when Multi-audio tracks is \"Selected languages only\" (e.g. en, ja, es). Empty = just the default track.",
   },
+  {
+    key: "downloadSubtitles",
+    label: "Download subtitles",
+    type: "boolean",
+    group: "media",
+    help: "Fetch subtitle sidecars for newly added videos. Already-downloaded videos can be toggled individually from their job detail panel.",
+  },
+  {
+    key: "subtitleLanguages",
+    label: "Subtitle languages",
+    type: "text",
+    group: "media",
+    help: "Which subtitle languages to fetch: comma-separated codes (en, es, ja — regexes like en.* work), or \"all\" for every available language including auto-generated ones.",
+  },
+  {
+    key: "writeThumbnail",
+    label: "Save thumbnails",
+    type: "boolean",
+    group: "media",
+    help: "Save a .jpg thumbnail sidecar next to each downloaded video.",
+  },
+  {
+    key: "writeDescription",
+    label: "Save descriptions",
+    type: "boolean",
+    group: "media",
+    help: "Save the video description as a .description sidecar file.",
+  },
+  {
+    key: "writeInfoJson",
+    label: "Save info.json",
+    type: "boolean",
+    group: "media",
+    help: "Save yt-dlp's full metadata dump as a .info.json sidecar file.",
+  },
   // --- concurrency ----------------------------------------------------------
   {
     key: "maxConcurrentDownloads",

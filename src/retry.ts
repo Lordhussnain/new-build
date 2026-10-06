@@ -82,6 +82,28 @@ export function isPermanentDownloadError(message: string | null | undefined): bo
   return PERMANENT_ERROR_PATTERNS.some((re) => re.test(message));
 }
 
+/**
+ * True when yt-dlp rejected the FORMAT SELECTOR rather than the video itself —
+ * the requested format ids do not (or no longer) exist for this video.
+ *
+ * This matters for multi-audio: the engine pins explicit audio format ids from
+ * an earlier `-J` probe into the selector, and YouTube renumbers formats over
+ * time. A stale probe then produces "Requested format is not available" — which
+ * `isPermanentDownloadError` also matches. Callers must check this FIRST and
+ * recover by clearing the stored audio tracks (forcing a fresh probe or a
+ * fallback to the classic single-track selector) instead of parking the job
+ * permanently: the video itself is perfectly downloadable.
+ */
+export function isFormatAvailabilityError(message: string | null | undefined): boolean {
+  if (!message) return false;
+  const m = message.toLowerCase();
+  return (
+    m.includes("requested format is not available") ||
+    m.includes("no matching formats") ||
+    m.includes("unable to find a video format")
+  );
+}
+
 export interface ProgressAwareRetryState {
   /** Number of no-progress failures in the current retry window. */
   retryCount: number;

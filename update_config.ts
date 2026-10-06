@@ -472,6 +472,12 @@ async function changeFeatureToggles(config: Config): Promise<Config> {
   console.log("🎛️  Feature Toggles\n");
 
   config.downloadSubtitles = await askYesNo("Download & embed subtitles?", config.downloadSubtitles);
+  if (config.downloadSubtitles) {
+    const langsAns = await ask(
+      `   Subtitle languages — comma-separated codes (e.g. en, es, ja), regexes like en.* work, or "all" for every language [current: ${config.subtitleLanguages}]: `,
+    );
+    if (langsAns.trim()) config.subtitleLanguages = langsAns.trim();
+  }
   config.embedMetadata = await askYesNo("Embed metadata, chapters & thumbnail?", config.embedMetadata);
   config.writeInfoJson = await askYesNo("Write .info.json sidecar files?", config.writeInfoJson);
   config.writeDescription = await askYesNo("Write .description sidecar files?", config.writeDescription);

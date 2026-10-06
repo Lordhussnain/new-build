@@ -68,6 +68,10 @@ export const ConfigSchema = z
     multiAudioMode: z.enum(["off", "all", "languages"]),
     audioTrackLanguages: z.array(z.string()),
     downloadSubtitles: z.boolean(),
+    // Which subtitle languages the metadata worker fetches: a comma-separated
+    // yt-dlp --sub-langs value (e.g. "en,es,ja" — regexes like "en.*" work),
+    // or "all" for every available language including auto-generated ones.
+    subtitleLanguages: z.string(),
     embedMetadata: z.boolean(),
     writeInfoJson: z.boolean(),
     writeDescription: z.boolean(),
@@ -160,6 +164,7 @@ export const DEFAULT_CONFIG: Config = {
   multiAudioMode: "off",
   audioTrackLanguages: [],
   downloadSubtitles: true,
+  subtitleLanguages: "all",
   embedMetadata: true,
   writeInfoJson: true,
   writeDescription: true,

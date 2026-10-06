@@ -17,6 +17,23 @@ import { notePipelineFailure, notePipelineSuccess } from "../resilience";
 import { logError } from "../logger";
 import type { Config } from "../config";
 
+/**
+ * The yt-dlp subtitle flags for one metadata pass (pure, unit-tested).
+ *
+ * `subtitleLanguages` is the operator's --sub-langs value: "all" (or blank)
+ * keeps the legacy behaviour of fetching every language including
+ * auto-generated captions (`all.*`); anything else is passed through as a
+ * comma-separated list of codes/regexes (e.g. "en,es,ja" or "en.*").
+ */
+export function subtitleArgs(config: {
+  subtitleLanguages: string;
+  subtitleFormat: string;
+}): string[] {
+  const langs = (config.subtitleLanguages || "").trim();
+  const selector = !langs || langs.toLowerCase() === "all" ? "all.*" : langs;
+  return ["--write-subs", "--write-auto-subs", "--sub-langs", selector, "--convert-subs", config.subtitleFormat || "srt"];
+}
+
 export async function metadataWorker(id: number, config: Config): Promise<void> {
   const workerId = `md-${id}`;
   while (!abortController.signal.aborted) {
@@ -70,9 +87,7 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
     "--newline",
     "--no-colors",
   ];
-  if (job.want_subtitles) {
-    args.push("--write-subs", "--write-auto-subs", "--sub-langs", "all.*", "--convert-subs", config.subtitleFormat || "srt");
-  }
+  if (job.want_subtitles) args.push(...subtitleArgs(config));
   if (job.want_thumbnail) args.push("--write-thumbnail", "--convert-thumbnails", "jpg");
   if (job.want_description) args.push("--write-description");
   if (config.writeInfoJson) args.push("--write-info-json");

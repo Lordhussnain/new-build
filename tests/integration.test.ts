@@ -1066,6 +1066,15 @@ describe("integration: multi-audio tracks", () => {
       expect(retryArgs).toContain("bv[height<=1080]+251-1/b[height<=1080]");
       expect(retryArgs).not.toContain("--audio-multistreams");
 
+      // 4b) The re-download really went through yt-dlp's archive gate: the id
+      //     was scrubbed on retry and recorded exactly once by the new
+      //     download, and the stashed backup of the old MKV is gone now that
+      //     the replacement succeeded.
+      const archiveText = await Bun.file(join(dir, "downloaded_videos.txt")).text();
+      expect(archiveText.split("\n").filter((l) => l.endsWith("mockvid001"))).toHaveLength(1);
+      const leftovers = (await readdir(folder)).filter((f) => f.endsWith(".superseded"));
+      expect(leftovers).toHaveLength(0);
+
       // 5) Resetting the selection returns the job to the global mode.
       const reset = await engine.api(`/api/jobs/${target.id}/audio-tracks`, {
         method: "POST",
@@ -1118,6 +1127,117 @@ describe("integration: multi-audio tracks", () => {
       for (const j of apiJobs) expect(j.audio_tracks).toEqual([]); // no probe ran
       const files = await readdir(folder);
       expect(files.filter((f) => f.endsWith(".mp4"))).toHaveLength(3);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("an unarchived retry of a downloaded job re-downloads and replaces the file", async () => {
+    // The regression this pins: with --download-archive a retry of an
+    // already-recorded video used to be silently skipped by yt-dlp (exit 0,
+    // no download), so per-job audio selections saved from the dashboard
+    // never reached disk. The engine must scrub the archive and move the old
+    // file aside so the re-download actually happens.
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 3997, BASE_CONFIG(3997));
+    const folder = join(dir, "downloads", "Mock Playlist");
+
+    try {
+      await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+      );
+      // The first download recorded the id in the archive file.
+      const archiveBefore = await Bun.file(join(dir, "downloaded_videos.txt")).text();
+      expect(archiveBefore).toContain("youtube mockvid001");
+
+      const retry = await engine.api("/api/retry/mockvid001", { method: "POST" });
+      expect(retry.ok).toBe(true);
+
+      // While the re-download is pending the previous file must be visible as
+      // a .superseded backup, and the job must not pretend to still have the
+      // old file.
+      await waitFor("backup recorded before the re-download starts", async () => {
+        const rows = await getJobs(engine);
+        const j = rows.find((r: any) => r.id === "mockvid001") as any;
+        const files = await readdir(folder).catch(() => [] as string[]);
+        return (
+          files.some((f) => f.endsWith(".superseded")) ||
+          j.download_status === "downloaded" // already replaced (fast mock)
+        );
+      });
+
+      await waitFor("job re-downloaded through the archive gate", async () => {
+        const rows = await getJobs(engine);
+        const j = rows.find((r: any) => r.id === "mockvid001") as any;
+        return j && j.download_status === "downloaded" && j.metadata_status === "done";
+      });
+
+      // The archive proves yt-dlp downloaded again instead of answering "has
+      // already been recorded in the archive": the retry scrubbed the id, and
+      // the fresh download recorded it exactly once.
+      const archive = await Bun.file(join(dir, "downloaded_videos.txt")).text();
+      expect(archive.split("\n").filter((l) => l.endsWith("mockvid001"))).toHaveLength(1);
+
+      const jobs = await getJobs(engine);
+      const j = jobs.find((r: any) => r.id === "mockvid001") as any;
+      expect(j.superseded_file).toBeFalsy(); // backup deleted on success
+      // file_path is stored relative to the engine's run dir.
+      const resolved = String(j.file_path).startsWith("/") ? j.file_path : join(dir, j.file_path);
+      expect(existsSync(resolved)).toBe(true);
+      expect(String(j.file_path).endsWith(".superseded")).toBe(false);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
+describe("integration: per-job sidecars from the Web UI", () => {
+  test("enabling subtitles on a finished download fetches them without re-downloading", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      4001,
+      BASE_CONFIG(4001, { downloadSubtitles: false, writeThumbnail: false, writeDescription: false, writeInfoJson: false }),
+    );
+    const folder = join(dir, "downloads", "Mock Playlist");
+
+    try {
+      // Nothing wanted → nothing to fetch: metadata settles at not_needed.
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "not_needed",
+      );
+      expect(jobs).toHaveLength(3);
+      expect((await readdir(folder)).filter((f) => f.endsWith(".vtt"))).toHaveLength(0);
+
+      // The dashboard flips the subtitle flag for one video only.
+      const save = await engine.api("/api/jobs/mockvid001/sidecars", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ subtitles: true }),
+      });
+      expect(save.ok).toBe(true);
+      expect(save.want_subtitles).toBe(true);
+      expect(save.metadata_status).toBe("pending");
+
+      // The metadata worker fetches the sidecar against the existing file —
+      // no new download attempt must happen for it.
+      await waitFor("subtitle sidecar fetched", async () => {
+        const rows = await getJobs(engine);
+        const j = rows.find((r: any) => r.id === "mockvid001") as any;
+        return j && j.metadata_status === "done" && j.download_status === "downloaded";
+      });
+      const rows = await getJobs(engine);
+      const j = rows.find((r: any) => r.id === "mockvid001") as any;
+      expect(j.metadata_files.some((f: string) => f.endsWith(".en.vtt"))).toBe(true);
+      const files = await readdir(folder);
+      expect(files.some((f) => f === "001 - First Mock Video.en.vtt")).toBe(true);
+      // The other two jobs kept their not_needed state.
+      for (const other of rows.filter((r: any) => r.id !== "mockvid001")) {
+        expect(other.metadata_status).toBe("not_needed");
+      }
     } finally {
       await engine.stop();
     }

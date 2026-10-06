@@ -5,6 +5,7 @@ import {
   computeBackoffMs,
   computeDownloadTimeoutMs,
   isDownloaderArgsError,
+  isFormatAvailabilityError,
   isPermanentDownloadError,
   isTransientDownloadError,
   progressAwareRetryState,
@@ -178,5 +179,29 @@ describe("isDownloaderArgsError", () => {
     expect(isDownloaderArgsError("unable to resume download, incomplete or corrupt data")).toBe(false);
     expect(isDownloaderArgsError("This video is private")).toBe(false);
     expect(isDownloaderArgsError(null)).toBe(false);
+  });
+});
+
+describe("isFormatAvailabilityError", () => {
+  test("matches selector-level format errors", () => {
+    expect(isFormatAvailabilityError("ERROR: Requested format is not available for use on this video")).toBe(true);
+    expect(isFormatAvailabilityError("no matching formats found")).toBe(true);
+    expect(isFormatAvailabilityError("Unable to find a video format matching the request")).toBe(true);
+  });
+
+  test("does not match unrelated errors", () => {
+    expect(isFormatAvailabilityError("Connection reset by peer")).toBe(false);
+    expect(isFormatAvailabilityError("Video unavailable. This video is private")).toBe(false);
+    expect(isFormatAvailabilityError("")).toBe(false);
+    expect(isFormatAvailabilityError(null)).toBe(false);
+  });
+
+  test("stale-format recovery must run before the permanent classification", () => {
+    // Both classifiers match the same yt-dlp message; the download worker is
+    // required to check isFormatAvailabilityError FIRST so a stale multi-audio
+    // probe re-probes instead of parking the job permanently.
+    const msg = "ERROR: Requested format is not available";
+    expect(isFormatAvailabilityError(msg)).toBe(true);
+    expect(isPermanentDownloadError(msg)).toBe(true);
   });
 });

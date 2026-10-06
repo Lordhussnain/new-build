@@ -1898,12 +1898,13 @@
       const modeNote = sel
         ? 'Per-video selection saved. It is applied on the next download attempt.'
         : 'Following the global multi-audio setting until you save a per-video selection.';
+      const downloaded = job.download_status === 'downloaded';
       return `<div class="audio-tracks-box">
           <div class="k" style="margin-bottom:6px;">Audio tracks (${tracks.length})</div>
           ${rows}
-          <div style="font-size:0.7rem; color: var(--text-secondary); margin:6px 0 8px;">${escapeHtml(modeNote)} Use <b>Retry job</b> to re-download with the saved tracks.</div>
+          <div style="font-size:0.7rem; color: var(--text-secondary); margin:6px 0 8px;">${escapeHtml(modeNote)}${downloaded ? ' This video is already downloaded — saving &amp; re-downloading replaces it (the previous file is kept until the new download succeeds).' : ''}</div>
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveAudioSelection('${job.id}')">💾 Save selection</button>
+            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveAudioSelection('${job.id}', ${downloaded})">💾 ${downloaded ? 'Save &amp; re-download' : 'Save selection'}</button>
             ${sel ? `<button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="resetAudioSelection('${job.id}')">↩️ Use global setting</button>` : ''}
             <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks('${job.id}')">🔄 Re-scan</button>
           </div>
@@ -1924,8 +1925,9 @@
       }
     }
 
-    async function saveAudioSelection(id) {
-      const boxes = document.querySelectorAll('.audio-track-check');
+    async function saveAudioSelection(id, andRedownload) {
+      // Scope to the drawer: only this job's checkboxes count.
+      const boxes = document.querySelectorAll('#drawerBody .audio-track-check');
       const tracks = [...boxes].filter(b => b.checked).map(b => b.dataset.lang);
       try {
         const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/audio-tracks`, {
@@ -1936,11 +1938,32 @@
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Save failed');
         const job = lastJobs.find(j => j.id === id);
-        if (job) { job.audio_selection = data.audio_selection; openJobDetail(job); }
-        showNotification(`🎧 Saved ${tracks.length} audio track(s) for the next download`, 'success');
+        if (job) { job.audio_selection = data.audio_selection; }
+        if (andRedownload) {
+          const retryRes = await fetch(`/api/jobs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
+          const retryData = await retryRes.json().catch(() => ({}));
+          if (!retryRes.ok || !retryData.ok) throw new Error(retryData.error || 'Re-download could not be queued');
+          showNotification(`🎧 Re-downloading with ${tracks.length} audio track(s) — the previous file is kept until it succeeds`, 'success');
+        } else {
+          showNotification(`🎧 Saved ${tracks.length} audio track(s) for the next download`, 'success');
+        }
+        const fresh = await fetchJob(id);
+        if (fresh) openJobDetail(fresh);
         refreshData();
       } catch (err) {
         showNotification(`❌ ${err.message}`, 'error');
+        refreshData();
+      }
+    }
+
+    async function fetchJob(id) {
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}`, { cache: 'no-store' });
+        if (!res.ok) return null;
+        const data = await res.json();
+        return data.ok && data.job ? data.job : null;
+      } catch {
+        return null;
       }
     }
 
@@ -1956,6 +1979,60 @@
         const job = lastJobs.find(j => j.id === id);
         if (job) { job.audio_selection = null; openJobDetail(job); }
         showNotification('🎧 Following the global multi-audio setting', 'success');
+        refreshData();
+      } catch (err) {
+        showNotification(`❌ ${err.message}`, 'error');
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Sidecar files — subtitles, thumbnail, description. Set per video at
+    // ingest time from the global config, editable here per job; enabling a
+    // flag on a finished download fetches the files right away.
+    // ------------------------------------------------------------------
+    function renderSidecarSection(job) {
+      const flags = [
+        ['subtitles', '📝 Subtitles', 'want_subtitles'],
+        ['thumbnail', '🖼️ Thumbnail', 'want_thumbnail'],
+        ['description', '📄 Description', 'want_description'],
+      ];
+      const rows = flags.map(([key, label, col]) =>
+        `<label style="display:flex; align-items:center; gap:8px; margin:4px 0; font-size:0.76rem; cursor:pointer;">
+           <input type="checkbox" class="sidecar-check" data-key="${key}" ${job[col] ? 'checked' : ''} />
+           <span>${label}</span>
+         </label>`).join('');
+      const sidecars = Array.isArray(job.metadata_files) && job.metadata_files.length
+        ? `<div style="font-size:0.7rem; color: var(--text-secondary); margin-top:6px;">Fetched so far: <span class="mono">${escapeHtml(job.metadata_files.join(', '))}</span></div>`
+        : '';
+      const note = job.download_status === 'downloaded'
+        ? 'Changes are fetched right away against the downloaded file.'
+        : 'Changes apply to the metadata pass after this video downloads.';
+      return `<div class="audio-tracks-box">
+          <div class="k" style="margin-bottom:6px;">Sidecar files</div>
+          ${rows}
+          ${sidecars}
+          <div style="font-size:0.7rem; color: var(--text-secondary); margin:6px 0 8px;">${note} Subtitle languages follow the “Subtitle languages” setting.</div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveSidecarSelection('${job.id}')">💾 Save${job.download_status === 'downloaded' ? ' &amp; fetch' : ''}</button>
+          </div>
+        </div>`;
+    }
+
+    async function saveSidecarSelection(id) {
+      const checks = document.querySelectorAll('#drawerBody .sidecar-check');
+      const body = {};
+      for (const c of checks) body[c.dataset.key] = c.checked;
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/sidecars`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Save failed');
+        showNotification(`📎 Sidecar settings saved${data.metadata_status === 'pending' ? ' — fetching now' : ''}`, 'success');
+        const fresh = await fetchJob(id);
+        if (fresh) openJobDetail(fresh);
         refreshData();
       } catch (err) {
         showNotification(`❌ ${err.message}`, 'error');
@@ -1990,6 +2067,8 @@
           ${detailRow('Last error', job.last_error)}
         </div>
         ${renderAudioTrackSection(job)}
+        ${renderSidecarSection(job)}
+        ${job.superseded_file ? `<div style="margin-top:12px; padding:8px 10px; border-radius:8px; background:rgba(59,130,246,0.10); font-size:0.73rem; color: var(--text-secondary);">🔁 Re-download in progress — the previous file is kept as <span class="mono">${escapeHtml(job.superseded_file)}</span> until the new download succeeds, and restored automatically if the re-download fails permanently.</div>` : ''}
         ${job.last_error ? `<div style="margin-top:14px; font-size:0.74rem; color: var(--text-secondary); line-height:1.4;">A kept partial means the next attempt resumes from it. Permanent failures (private / removed / age-gated / geo-blocked) are never retried automatically.</div>` : ''}
         <div style="margin-top:16px; display:flex; gap:8px; flex-wrap:wrap;">
           <button class="btn btn-success" style="padding:6px 12px; font-size:0.75rem;" onclick="retryJob('${job.id}'); closeJobDetail();">🔄 Retry job</button>
