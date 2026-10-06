@@ -31,6 +31,14 @@ export interface Job {
   conversion_retry_count: number;
   resume_count: number;
   best_progress: number;
+  /** High-water mark of the on-disk `.part` size in bytes (budget forgiveness). */
+  best_bytes: number;
+  /**
+   * UTC timestamp before which this job must not be claimed again. Transient
+   * failures set it to now+backoff instead of sleeping in the worker, so the
+   * worker moves on to the next video immediately. NULL = claimable now.
+   */
+  next_retry_at: string | null;
   last_error: string | null;
   /** JSON array of discovered AudioTracks (null = not probed yet). */
   audio_tracks: string | null;
@@ -66,7 +74,9 @@ function ensureColumn(table: string, column: string, ddl: string): void {
 export function initDatabase(path: string = "archive.db"): void {
   db = new Database(path);
   db.run("PRAGMA journal_mode = WAL;");
-  db.run("PRAGMA busy_timeout = 5000;");
+  // Three worker pools plus the web API and the sweeps all write here; a
+  // burst of progress updates must wait its turn rather than fail a claim.
+  db.run("PRAGMA busy_timeout = 15000;");
   db.run(
     `CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY,
@@ -130,6 +140,8 @@ export function initDatabase(path: string = "archive.db"): void {
   ensureColumn("jobs", "conversion_retry_count", "conversion_retry_count INTEGER DEFAULT 0");
   ensureColumn("jobs", "resume_count", "resume_count INTEGER DEFAULT 0");
   ensureColumn("jobs", "best_progress", "best_progress REAL DEFAULT 0");
+  ensureColumn("jobs", "best_bytes", "best_bytes INTEGER DEFAULT 0");
+  ensureColumn("jobs", "next_retry_at", "next_retry_at TEXT");
   ensureColumn("jobs", "duration", "duration REAL");
   // Multi-audio tracks (YouTube multi-language audio): what the video offers,
   // and which languages the user picked for this specific job.
@@ -159,7 +171,7 @@ export function initDatabase(path: string = "archive.db"): void {
   claimDownloadJob = db.transaction((workerId: string) => {
     const row = db
       .query(
-        `UPDATE jobs SET download_status = 'downloading', pause_reason = NULL, download_claimed_by = ?, download_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        `UPDATE jobs SET download_status = 'downloading', pause_reason = NULL, download_claimed_by = ?, download_claimed_at = CURRENT_TIMESTAMP, next_retry_at = NULL, updated_at = CURRENT_TIMESTAMP
          WHERE id = (
            SELECT id FROM jobs
            WHERE (download_status = 'pending'
@@ -171,6 +183,10 @@ export function initDatabase(path: string = "archive.db"): void {
              -- "file deleted before conversion finished".
              AND COALESCE(conversion_status, '') != 'in_progress'
              AND COALESCE(metadata_status, '') != 'in_progress'
+             -- Backoff without blocking a worker: a failed attempt stamps
+             -- next_retry_at instead of sleeping, so the pool keeps draining
+             -- other videos and this one becomes claimable when it is due.
+             AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
            ORDER BY created_at, rowid LIMIT 1
          )
          RETURNING *`,

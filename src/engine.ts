@@ -7,7 +7,7 @@
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { loadConfig } from "./config";
-import { aria2cPath, checkDependencies, validateCookies } from "./tools";
+import { aria2cPath, checkDependencies, refreshAria2cDiscovery, validateCookies } from "./tools";
 import { initDatabase } from "./db";
 import {
   cleanOrphanedFiles,
@@ -142,6 +142,12 @@ export async function main(): Promise<void> {
   setInterval(() => requeueFailedJobs(getConfig()), 60_000);
   // Cookies sweep: notice cookies.txt appearing / changing / vanishing mid-run.
   setInterval(() => cookiesWatch(getConfig()), 60_000);
+  // Missing-file sweep: files deleted behind the engine's back are re-fetched
+  // without waiting for a restart (a no-op pass is one cheap stat per file).
+  setInterval(() => reconcileMissingFiles(getConfig()), 30 * 60_000);
+  // aria2c discovery: an install that lands mid-run is picked up within a
+  // minute (a no-op when a binary is already known or discovery is disabled).
+  setInterval(() => void refreshAria2cDiscovery(getConfig()).catch(() => {}), 60_000);
   // Cheap new-upload watcher (no-op when rssEnabled=false or no channels).
   startRssPolling(config);
 

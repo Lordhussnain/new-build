@@ -448,7 +448,7 @@ async function changeReliabilitySettings(config: Config): Promise<Config> {
   console.log(
     `   • Stale claims reclaimed      every 60s — downloads ${STALE_CLAIM_THRESHOLDS.download.replace("-", "older than ")}, conversions ${STALE_CLAIM_THRESHOLDS.conversion.replace("-", "")}, metadata ${STALE_CLAIM_THRESHOLDS.metadata.replace("-", "")}`,
   );
-  console.log(`   • Deleted files re-fetched   on startup`);
+  console.log(`   • Deleted files re-fetched   on startup + every 30m`);
   console.log(
     `   • Failed jobs retried         every 60s after a ${config.requeueFailedAfterMinutes} min cooldown` +
       (config.requeueFailedAfterMinutes === 0 ? " (disabled)" : ""),

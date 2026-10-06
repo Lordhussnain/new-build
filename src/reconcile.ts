@@ -19,6 +19,7 @@ import { logError } from "./logger";
 import { detectCookiesChange, type CookiesChange } from "./tools";
 import { isPermanentDownloadError } from "./retry";
 import { jobBaseFilename } from "./download-args";
+import { activeProcs } from "./state";
 import type { Config } from "./config";
 
 /**
@@ -27,6 +28,10 @@ import type { Config } from "./config";
  * off via yt-dlp --continue). User-paused jobs stay held.
  */
 export function reconcileCrashedJobs(): void {
+  // Freeze each in-flight download's `.part` path BEFORE flipping statuses:
+  // recordPartialPaths only sees 'downloading' rows, and without this the
+  // re-queued job resumes with no recorded partial and restarts from scratch.
+  const recorded = recordPartialPaths();
   const stmt = db.run(
     `UPDATE jobs SET
        download_status = CASE WHEN download_status = 'downloading' THEN 'paused' ELSE download_status END,
@@ -35,6 +40,7 @@ export function reconcileCrashedJobs(): void {
        metadata_status = CASE WHEN metadata_status = 'in_progress' THEN 'pending' ELSE metadata_status END,
        download_claimed_by = NULL, download_claimed_at = NULL,
        conversion_claimed_by = NULL, conversion_claimed_at = NULL,
+       next_retry_at = NULL,
        updated_at = CURRENT_TIMESTAMP
      WHERE download_status = 'downloading'
         OR (download_status = 'paused' AND pause_reason IS NULL)
@@ -42,7 +48,9 @@ export function reconcileCrashedJobs(): void {
         OR metadata_status = 'in_progress'`,
   );
   if (stmt.changes > 0) {
-    console.log(`🔄 Reconciled ${stmt.changes} interrupted job(s) — paused/interrupted jobs will resume automatically.`);
+    console.log(
+      `🔄 Reconciled ${stmt.changes} interrupted job(s) — paused/interrupted jobs will resume automatically (${recorded} partial(s) marked resumable).`,
+    );
   }
 }
 
@@ -59,24 +67,57 @@ export const STALE_CLAIM_THRESHOLDS = {
 } as const;
 
 /**
- * Periodic safety net: if a worker process/thread dies mid-job the claim can
- * be left behind. Downloads have a duration-aware watchdog, so any claim older
- * than `STALE_CLAIM_THRESHOLDS.download` is definitely dead → mark
- * paused+interrupted for auto-resume. Conversion and metadata claims past their
- * thresholds are re-queued.
+ * True when the worker holding a download claim still has a live yt-dlp child.
+ * Claims look like `dl-<worker id>`; the id keys `activeProcs` while yt-dlp
+ * runs. Anything else (NULL, an unknown shape) means no live process.
  */
-export function reapStaleClaims(): void {
+function defaultHasLiveProc(claimedBy: string | null): boolean {
+  const m = claimedBy ? /^dl-(\d+)$/.exec(claimedBy) : null;
+  return !!m && activeProcs.has(Number(m[1]));
+}
+
+/**
+ * Periodic safety net: if a worker process/thread dies mid-job the claim can
+ * be left behind. Downloads whose claim went silent past
+ * `STALE_CLAIM_THRESHOLDS.download` are marked paused+interrupted for
+ * auto-resume; conversion and metadata claims past their thresholds are
+ * re-queued.
+ *
+ * Two guards keep the reaper from stealing LIVE work. The download worker
+ * heartbeats `download_claimed_at` on every progress update, so the threshold
+ * measures silence rather than age — and a claim whose owner still has a live
+ * yt-dlp child is skipped outright, however old it looks. Without that, any
+ * transfer outlasting the threshold would be re-queued while its yt-dlp was
+ * still writing, and a second worker would spawn a second yt-dlp onto the
+ * same `.part` file.
+ */
+export function reapStaleClaims(opts: { hasLiveProc?: (claimedBy: string | null) => boolean } = {}): void {
+  const hasLiveProc = opts.hasLiveProc ?? defaultHasLiveProc;
   try {
     // Freeze each in-flight download's `.part` path while the job is still
     // 'downloading' (that is this function's own filter) — otherwise the
     // reclaimed job resumes without a partial and restarts from scratch.
     const recorded = recordPartialPaths();
-    const dl = db.run(
-      `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
-         download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
-       WHERE download_status = 'downloading'
-         AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.download}'))`,
-    );
+    // Stale downloads are reaped selectively: only claims with no live yt-dlp
+    // behind them. Stale claims are rare, so the per-row guard costs nothing.
+    const staleDownloads = db
+      .query(
+        `SELECT id, download_claimed_by FROM jobs
+         WHERE download_status = 'downloading'
+           AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.download}'))`,
+      )
+      .all() as { id: string; download_claimed_by: string | null }[];
+    const deadIds = staleDownloads.filter((r) => !hasLiveProc(r.download_claimed_by)).map((r) => r.id);
+    let dlChanges = 0;
+    if (deadIds.length > 0) {
+      const placeholders = deadIds.map(() => "?").join(",");
+      dlChanges = db.run(
+        `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
+           download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE id IN (${placeholders})`,
+        deadIds,
+      ).changes;
+    }
     const cv = db.run(
       `UPDATE jobs SET conversion_status = 'pending', conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE conversion_status = 'in_progress'
@@ -86,12 +127,12 @@ export function reapStaleClaims(): void {
       `UPDATE jobs SET metadata_status = 'pending', updated_at = CURRENT_TIMESTAMP
        WHERE metadata_status = 'in_progress' AND updated_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.metadata}')`,
     );
-    const total = dl.changes + cv.changes + md.changes;
+    const total = dlChanges + cv.changes + md.changes;
     if (total > 0) {
       console.log(
-        `🧟 Reclaimed ${dl.changes} stale download(s) (${recorded} partial(s) marked resumable), ${cv.changes} conversion(s), ${md.changes} metadata job(s).`,
+        `🧟 Reclaimed ${dlChanges} stale download(s) (${recorded} partial(s) marked resumable), ${cv.changes} conversion(s), ${md.changes} metadata job(s).`,
       );
-      logError("reaper", `reclaimed stale claims: downloads=${dl.changes} conversions=${cv.changes} metadata=${md.changes}`);
+      logError("reaper", `reclaimed stale claims: downloads=${dlChanges} conversions=${cv.changes} metadata=${md.changes}`);
     }
   } catch (e: any) {
     logError("reaper", String(e?.message || e));
@@ -99,10 +140,11 @@ export function reapStaleClaims(): void {
 }
 
 /**
- * Startup reconciliation: the database says a video is downloaded, but the
- * file is not on disk any more (moved, renamed, or deleted by hand). Scrub the
- * id from the yt-dlp archive and re-queue the job so the next run fetches it
- * again — otherwise the archive entry would make yt-dlp skip it forever.
+ * Missing-file reconciliation (startup + every 30 minutes): the database says
+ * a video is downloaded, but the file is not on disk any more (moved,
+ * renamed, or deleted by hand). Scrub the id from the yt-dlp archive and
+ * re-queue the job so it is fetched again — otherwise the archive entry would
+ * make yt-dlp skip it forever.
  *
  * Jobs whose conversion is in progress are skipped: with
  * `deleteSourceAfterConvert` the converter legitimately has the media in
@@ -132,14 +174,15 @@ export function reconcileMissingFiles(config: Config): number {
       db.run(
         `UPDATE jobs SET
            download_status = 'pending', pause_reason = NULL,
-           retry_count = 0, resume_count = 0, best_progress = 0, progress = 0,
+           retry_count = 0, resume_count = 0, best_progress = 0, best_bytes = 0, progress = 0,
            file_path = NULL, file_size = 0, integrity = NULL, partial_file_path = NULL,
+           next_retry_at = NULL,
            conversion_status = CASE WHEN conversion_status = 'not_needed' THEN 'not_needed' ELSE 'pending' END,
            metadata_status = CASE
              WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
              ELSE metadata_status END,
            download_claimed_by = NULL, conversion_claimed_by = NULL,
-           last_error = 'file missing on startup — re-queued',
+           last_error = 'file missing — re-queued',
            updated_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
         [row.id],
@@ -242,7 +285,7 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
       if (isPermanentDownloadError(row.last_error)) continue;
       db.run(
         `UPDATE jobs SET download_status = 'pending', retry_count = retry_count + 1,
-           download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+           download_claimed_by = NULL, next_retry_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
         [row.id],
       );
       result.downloads++;

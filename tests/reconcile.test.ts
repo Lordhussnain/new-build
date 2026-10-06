@@ -18,6 +18,7 @@ import {
   findPartialFile,
   partialSidecars,
   removePartialFiles,
+  reconcileCrashedJobs,
   recordPartialPaths,
 } from "../src/reconcile";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
@@ -192,6 +193,39 @@ describe("recordPartialPaths", () => {
     );
     expect(recordPartialPaths()).toBe(0);
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("reconcileCrashedJobs", () => {
+  test("freezes the on-disk .part path before parking the job", () => {
+    // Otherwise the re-queued job resumes with no recorded partial and the
+    // next attempt restarts the video from scratch.
+    const dir = mkdtempSync(join(tmpdir(), "crash-"));
+    const part = join(dir, "001 - Crashed Video.f137.mp4.part");
+    writeFileSync(part, "bytes");
+    db.run(
+      `INSERT INTO jobs (id, url, title, "index", output_directory, download_status, partial_file_path)
+       VALUES ('c1', 'https://y', 'Crashed Video', 1, ?, 'downloading', NULL)`,
+      [dir],
+    );
+    reconcileCrashedJobs();
+    const row = db
+      .query("SELECT download_status, pause_reason, partial_file_path FROM jobs WHERE id = 'c1'")
+      .get() as any;
+    expect(row.download_status).toBe("paused");
+    expect(row.pause_reason).toBe("interrupted");
+    expect(row.partial_file_path).toBe(part);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("lifts backoff stamps so recovered jobs are immediately claimable", () => {
+    db.run(
+      `INSERT INTO jobs (id, url, title, download_status, next_retry_at)
+       VALUES ('c2', 'https://y', 'V', 'downloading', '2999-01-01 00:00:00')`,
+    );
+    reconcileCrashedJobs();
+    const row = db.query("SELECT next_retry_at FROM jobs WHERE id = 'c2'").get() as any;
+    expect(row.next_retry_at).toBeNull();
   });
 });
 

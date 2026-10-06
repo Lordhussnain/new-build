@@ -1,0 +1,3 @@
+# The integration-test mocks are shebang scripts executed directly on POSIX.
+# CRLF would break the shebang (`/usr/bin/env: 'bun\r'`), so they are always LF.
+tests/mocks/* text eol=lf

@@ -51,6 +51,37 @@ export function resolveDownloaderEngine(config: Config, aria2cAvailable: boolean
  */
 export const ARIA2C_MAX_CONNECTIONS_PER_SERVER = 16;
 
+/**
+ * What aria2c accepts for `--min-split-size`: a number with a K/M/G suffix
+ * (`512K`, `1M`, `1.5M`, `2G`). Mirrors the real binary — and the mock in
+ * `tests/mocks/aria2c`, which rejects anything else with exit 28.
+ */
+export const ARIA2C_SIZE_RE = /^\d+(\.\d+)?[KMG]$/i;
+
+/**
+ * Proactive validation of the aria2c tuning knobs.
+ *
+ * A rejected option makes aria2c exit 28 before transferring a byte, failing
+ * every download in the batch identically. Rather than discovering that from
+ * the first job's wreckage, the worker checks the settings before spawning
+ * yt-dlp and pauses the engine with an actionable reason when they cannot
+ * work — no attempt burned, no retry budget spent. The exit-28 classifier in
+ * `retry.ts` stays as the backstop for anything this cannot predict.
+ *
+ * Returns a human-readable problem, or null when the settings are safe.
+ */
+export function validateAria2cSettings(config: Config): string | null {
+  const n = Math.floor(Number(config.connectionsPerDownload));
+  if (!Number.isFinite(n) || n < 1 || n > 64) {
+    return `connectionsPerDownload must be between 1 and 64 (got ${String(config.connectionsPerDownload)})`;
+  }
+  const split = (config.minSplitSize || "").trim();
+  if (split && !ARIA2C_SIZE_RE.test(split)) {
+    return `minSplitSize ${JSON.stringify(split)} is not an aria2c size — use e.g. 512K, 1M or 2G`;
+  }
+  return null;
+}
+
 export function buildAria2cArgs(config: Config): string {
   const n = Math.max(1, Math.floor(config.connectionsPerDownload));
   const x = Math.min(n, ARIA2C_MAX_CONNECTIONS_PER_SERVER);

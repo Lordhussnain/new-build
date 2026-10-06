@@ -29,6 +29,7 @@ import {
   requeueFailedJobs,
 } from "../src/reconcile";
 import { removeFromArchive } from "../src/archive";
+import { activeProcs } from "../src/state";
 
 function testConfig(overrides: Partial<Config> = {}): Config {
   return { ...DEFAULT_CONFIG, ...overrides };
@@ -128,6 +129,8 @@ describe("schema & migrations", () => {
       expect(row.conversion_retry_count).toBe(0);
       expect(row.resume_count).toBe(0);
       expect(row.best_progress).toBe(0);
+      expect(row.best_bytes).toBe(0);
+      expect(row.next_retry_at).toBeNull();
       // A legacy row with want_subtitles=1 gets metadata_status backfilled.
       expect(row.metadata_status).toBe("pending");
     } finally {
@@ -170,6 +173,20 @@ describe("atomic claims", () => {
     const claims = [claimDownloadJob("w"), claimDownloadJob("w"), claimDownloadJob("w")];
     expect(claims.map((c) => c?.id)).toEqual(["first", "second", "third"]);
     expect(claimDownloadJob("w")).toBeNull();
+  });
+
+  test("holds jobs whose backoff has not elapsed, and clears the stamp on claim", () => {
+    insertJob("cooling", { download_status: "pending", next_retry_at: "2999-01-01 00:00:00" });
+    expect(claimDownloadJob("w")).toBeNull(); // backing off — the worker moves on
+    db.run(`UPDATE jobs SET next_retry_at = '2020-01-01 00:00:00' WHERE id = 'cooling'`);
+    const claimed = claimDownloadJob("w");
+    expect(claimed?.id).toBe("cooling");
+    expect(getJob("cooling").next_retry_at).toBeNull(); // claimed jobs carry no backoff
+  });
+
+  test("a NULL backoff stamp is claimable as before", () => {
+    insertJob("fresh", { download_status: "pending" });
+    expect(claimDownloadJob("w")?.id).toBe("fresh");
   });
 
   test("user-paused jobs are held; interrupted jobs auto-resume", () => {
@@ -237,6 +254,42 @@ describe("reapStaleClaims", () => {
     expect(getJob("stale-dl").pause_reason).toBe("interrupted");
     expect(getJob("fresh-dl").download_status).toBe("downloading"); // untouched
     expect(getJob("stale-cv").conversion_status).toBe("pending");
+  });
+
+  test("spares stale claims whose worker still has a live yt-dlp", () => {
+    // Without this guard any transfer outlasting the 20-minute threshold is
+    // re-queued while its yt-dlp is still writing, and a second worker spawns
+    // a second yt-dlp onto the same .part file.
+    insertJob("live-dl", {
+      download_status: "downloading",
+      download_claimed_by: "dl-9",
+      download_claimed_at: "2020-01-01 00:00:00",
+    });
+    insertJob("dead-dl", {
+      download_status: "downloading",
+      download_claimed_by: "dl-8",
+      download_claimed_at: "2020-01-01 00:00:00",
+    });
+    reapStaleClaims({ hasLiveProc: (owner) => owner === "dl-9" });
+    expect(getJob("live-dl").download_status).toBe("downloading");
+    expect(getJob("live-dl").download_claimed_by).toBe("dl-9");
+    expect(getJob("dead-dl").download_status).toBe("paused");
+    expect(getJob("dead-dl").pause_reason).toBe("interrupted");
+  });
+
+  test("the default guard reads the live child-process table", () => {
+    insertJob("live-dl", {
+      download_status: "downloading",
+      download_claimed_by: "dl-7",
+      download_claimed_at: "2020-01-01 00:00:00",
+    });
+    activeProcs.set(7, {} as any);
+    try {
+      reapStaleClaims();
+      expect(getJob("live-dl").download_status).toBe("downloading");
+    } finally {
+      activeProcs.delete(7);
+    }
   });
 });
 
@@ -315,6 +368,20 @@ describe("requeueFailedJobs", () => {
     expect(result.downloads).toBe(1);
     expect(getJob("flaky").download_status).toBe("pending");
     expect(getJob("flaky").retry_count).toBe(2);
+  });
+
+  test("lifts the backoff stamp when re-queueing", () => {
+    insertJob("flaky2", {
+      download_status: "failed",
+      retry_count: 1,
+      last_error: "The read operation timed out",
+      updated_at: "2020-01-01 00:00:00",
+      next_retry_at: "2999-01-01 00:00:00",
+    });
+    const config = testConfig({ requeueFailedAfterMinutes: 30, maxRetryAttempts: 3, maxFailuresPerVideo: 4 });
+    expect(requeueFailedJobs(config).downloads).toBe(1);
+    expect(getJob("flaky2").download_status).toBe("pending");
+    expect(getJob("flaky2").next_retry_at).toBeNull();
   });
 
   test("never re-queues permanent failures", () => {

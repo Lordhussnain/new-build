@@ -11,14 +11,14 @@ import { timingSafeEqual } from "node:crypto";
 import os from "node:os";
 import { db } from "./db";
 import { autoscaler, activeDlSlots } from "./autoscale";
-import { getConfig, getPauseReason, isPaused, workerStatuses } from "./state";
+import { activeProcs, getConfig, getPauseReason, isPaused, workerStatuses } from "./state";
 import { scanAndIngest } from "./scanner";
 import { parseSourceUrl, saveSource, type SourceUrl } from "./sources";
 import { diskUsage, triggerPause, triggerResume } from "./resilience";
 import { requeueFailedJobs, STALE_CLAIM_THRESHOLDS } from "./reconcile";
 import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
-import { aria2cPath } from "./tools";
+import { aria2cPath, aria2cUsable } from "./tools";
 import { applySettings, readSettings } from "./settings";
 import { resolveDownloaderEngine } from "./download-args";
 import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-tracks";
@@ -212,9 +212,12 @@ function retryJobById(id: string): number {
   // Re-queue download AND any failed metadata/conversion work; preserve
   // conversion_status='not_needed'. Also clears a user pause and resets the
   // per-stage retry budgets so a manual retry always gets a fresh budget.
+  // Progress watermarks go too: the retried attempt must be judged on its own
+  // progress, and any stamped backoff is lifted so it can start at once.
   return db.run(
     `UPDATE jobs SET
        download_status = 'pending', pause_reason = NULL, progress = 0, retry_count = 0,
+       resume_count = 0, best_progress = 0, best_bytes = 0, next_retry_at = NULL,
        conversion_status = CASE WHEN conversion_status = 'not_needed' THEN 'not_needed' ELSE 'pending' END,
        conversion_retry_count = 0,
        metadata_status = CASE
@@ -231,7 +234,7 @@ function retryJobById(id: string): number {
 function resetFailCounters(id: string): number {
   if (!id) return 0;
   return db.run(
-    `UPDATE jobs SET retry_count = 0, metadata_retry_count = 0, conversion_retry_count = 0, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    `UPDATE jobs SET retry_count = 0, metadata_retry_count = 0, conversion_retry_count = 0, next_retry_at = NULL, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
     [id],
   ).changes;
 }
@@ -748,20 +751,29 @@ function reliabilityHandler(config: Config): Response {
     )
     .get() as any;
   // What the stale-claim reaper would reclaim right now — same thresholds the
-  // sweep enforces (imported, so they cannot drift apart).
+  // sweep enforces (imported, so they cannot drift apart), and the same
+  // live-process guard: a stale-looking claim with a running yt-dlp behind it
+  // is not reclaimable.
   const t = STALE_CLAIM_THRESHOLDS;
+  const liveDlOwners = new Set([...activeProcs.keys()].map((n) => `dl-${n}`));
+  const staleDlOwners = db
+    .query(
+      `SELECT download_claimed_by AS owner FROM jobs WHERE download_status = 'downloading'
+       AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${t.download}'))`,
+    )
+    .all() as any[];
+  const staleDl = staleDlOwners.filter((r) => !liveDlOwners.has(r.owner)).length;
   const staleClaims = db
     .query(
       `SELECT
-         (SELECT COUNT(*) FROM jobs WHERE download_status = 'downloading'
-            AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${t.download}')))
-       + (SELECT COUNT(*) FROM jobs WHERE conversion_status = 'in_progress'
+         (SELECT COUNT(*) FROM jobs WHERE conversion_status = 'in_progress'
             AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', '${t.conversion}')))
        + (SELECT COUNT(*) FROM jobs WHERE metadata_status = 'in_progress'
             AND updated_at < datetime('now', '${t.metadata}'))
        AS count`,
     )
     .get() as any;
+  staleClaims.count += staleDl;
 
   // The four self-healing sweeps, with what each currently has in scope.
   // `pending: null` means "not counted here" — the missing-files sweep has to
@@ -784,7 +796,7 @@ function reliabilityHandler(config: Config): Response {
     {
       id: "missingFiles",
       label: "Deleted files re-fetched",
-      cadence: "startup",
+      cadence: "startup + every 30m",
       detail: "Files recorded as downloaded but no longer on disk are queued again.",
       pending: null,
     },
@@ -820,7 +832,7 @@ function reliabilityHandler(config: Config): Response {
       maxDownloadMinutes: config.maxDownloadMinutes,
     },
     downloader: {
-      engine: resolveDownloaderEngine(config, !!aria2cPath()),
+      engine: resolveDownloaderEngine(config, aria2cUsable()),
       path: aria2cPath(),
       connectionsPerDownload: config.connectionsPerDownload,
       concurrentFragments: config.concurrentFragments,

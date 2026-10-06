@@ -28,7 +28,15 @@ export async function metadataWorker(id: number, config: Config): Promise<void> 
       await Bun.sleep(2000);
       continue;
     }
-    const job = claimMetadataJob(workerId);
+    // Outside the job try-block: a SQLITE_BUSY throw must idle, not kill the loop.
+    let job;
+    try {
+      job = claimMetadataJob(workerId);
+    } catch (err: any) {
+      logError("metadata", `claim failed, idling: ${String(err?.message || err).slice(0, 200)}`);
+      await Bun.sleep(5000);
+      continue;
+    }
     if (!job) {
       await Bun.sleep(2000);
       continue;

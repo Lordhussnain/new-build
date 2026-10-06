@@ -31,7 +31,7 @@ export function triggerResume(): void {
     // Re-queue ALL paused jobs (global + user-paused) on an explicit Resume All.
     // In-flight jobs still holding a claim finish naturally in their worker.
     const stmt = db.run(
-      `UPDATE jobs SET download_status = 'pending', pause_reason = NULL, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
+      `UPDATE jobs SET download_status = 'pending', pause_reason = NULL, download_claimed_by = NULL, next_retry_at = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE download_status = 'paused' AND download_claimed_by IS NULL`,
     );
     if (stmt.changes > 0) console.log(`▶️ Re-queued ${stmt.changes} paused job(s).`);

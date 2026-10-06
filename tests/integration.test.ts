@@ -476,7 +476,7 @@ describe("integration: corrupt partials", () => {
 
 // ---------------------------------------------------------------------------
 describe("integration: permanent failures", () => {
-  test("parks as failed and is never auto-requeued", async () => {
+  test("fails fast without spending budget, discards the partial, and is never auto-requeued", async () => {
     const dir = await makeRunDir();
     const engine = await startEngine(
       dir,
@@ -494,9 +494,17 @@ describe("integration: permanent failures", () => {
       const jobs = await waitForAllJobs(engine, (j) => j.download_status === "failed");
       expect(jobs).toHaveLength(3);
       for (const job of jobs) {
-        expect(job.retry_count).toBeGreaterThanOrEqual(2); // budget spent
+        // Fail fast: a dead video is parked on the first attempt, not retried
+        // until the budget burns.
+        expect(job.retry_count).toBe(0);
         expect(job.last_error).toContain("Video unavailable");
+        expect(job.partial_file_path).toBeNull();
       }
+
+      // The dead partials were discarded with the jobs — nothing to resume, and
+      // no litter for the orphan sweep.
+      const files = await readdir(join(dir, "downloads", "Mock Playlist"));
+      expect(files.filter((f) => f.endsWith(".part"))).toHaveLength(0);
 
       // The failed tab lists them…
       const failed = await engine.api("/api/failed");
@@ -694,9 +702,11 @@ describe("integration: aria2c resume + self-healing", () => {
       );
       expect(jobs).toHaveLength(3);
 
-      // Every video was retried and completed.
+      // Every video was retried and completed — without spending retry budget:
+      // the failed attempt left resumable bytes on disk, so it was forgiven.
+      // (The resumed=yes evidence below proves a retry really happened.)
       for (const job of jobs) {
-        expect(job.retry_count).toBeGreaterThanOrEqual(1);
+        expect(job.retry_count).toBe(0);
         expect(job.file_path).toBeTruthy();
         expect(job.partial_file_path).toBeNull();
       }

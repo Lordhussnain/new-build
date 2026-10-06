@@ -13,6 +13,7 @@ import {
   computePerWorkerLimitKBps,
   jobBaseFilename,
   resolveDownloaderEngine,
+  validateAria2cSettings,
 } from "../src/download-args";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 
@@ -77,6 +78,34 @@ describe("buildAria2cArgs", () => {
     expect(buildAria2cArgs(cfg({ connectionsPerDownload: 64 }))).toBe("-x 16 -s 64 -j 64");
     expect(buildAria2cArgs(cfg({ connectionsPerDownload: 17 }))).toBe("-x 16 -s 17 -j 17");
     expect(buildAria2cArgs(cfg({ connectionsPerDownload: 16 }))).toBe("-x 16 -s 16 -j 16");
+  });
+});
+
+describe("validateAria2cSettings", () => {
+  test("accepts the defaults and an empty split size (yt-dlp's own default)", () => {
+    expect(validateAria2cSettings(cfg())).toBeNull();
+    expect(validateAria2cSettings(cfg({ minSplitSize: "" }))).toBeNull();
+    expect(validateAria2cSettings(cfg({ minSplitSize: "  " }))).toBeNull();
+  });
+
+  test("accepts real aria2c sizes", () => {
+    for (const size of ["512K", "1M", "1.5M", "2G", "20m"]) {
+      expect(validateAria2cSettings(cfg({ minSplitSize: size }))).toBeNull();
+    }
+  });
+
+  test("rejects sizes aria2c would exit 28 on, with an actionable message", () => {
+    const problem = validateAria2cSettings(cfg({ minSplitSize: "banana" }));
+    expect(problem).toContain("banana");
+    expect(problem).toContain("512K");
+    expect(validateAria2cSettings(cfg({ minSplitSize: "10X" }))).not.toBeNull();
+    expect(validateAria2cSettings(cfg({ minSplitSize: "M" }))).not.toBeNull();
+  });
+
+  test("rejects connection counts outside 1-64", () => {
+    expect(validateAria2cSettings(cfg({ connectionsPerDownload: 0 }))).toContain("1 and 64");
+    expect(validateAria2cSettings(cfg({ connectionsPerDownload: 65 }))).toContain("1 and 64");
+    expect(validateAria2cSettings(cfg({ connectionsPerDownload: 64 }))).toBeNull();
   });
 });
 

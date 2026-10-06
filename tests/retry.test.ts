@@ -7,6 +7,7 @@ import {
   isDownloaderArgsError,
   isPermanentDownloadError,
   isTransientDownloadError,
+  shouldForgiveRetry,
 } from "../src/retry";
 
 describe("computeBackoffMs", () => {
@@ -82,11 +83,22 @@ describe("isPermanentDownloadError", () => {
   test("flags unrecoverable errors", () => {
     expect(isPermanentDownloadError("ERROR: [youtube] abc: Video unavailable")).toBe(true);
     expect(isPermanentDownloadError("Private video. Sign in if you've been granted access")).toBe(true);
+    expect(isPermanentDownloadError("ERROR: [youtube] abc: Video unavailable. This video is private")).toBe(true);
     expect(isPermanentDownloadError("ERROR: members-only content")).toBe(true);
     expect(isPermanentDownloadError("Sign in to confirm your age")).toBe(true);
     expect(isPermanentDownloadError("HTTP Error 404: Not Found")).toBe(true);
     expect(isPermanentDownloadError("This video has been removed by the uploader")).toBe(true);
     expect(isPermanentDownloadError("The uploader has not made this video available in your country")).toBe(true);
+  });
+
+  test("flags the rest of YouTube's gone/gated vocabulary", () => {
+    expect(isPermanentDownloadError("ERROR: [youtube] abc: This video is private")).toBe(true);
+    expect(isPermanentDownloadError("This video has been deleted")).toBe(true);
+    expect(isPermanentDownloadError("This video is no longer available")).toBe(true);
+    expect(isPermanentDownloadError("removed for violating YouTube's Community Guidelines")).toBe(true);
+    expect(isPermanentDownloadError("removed for violating YouTube's Terms of Service")).toBe(true);
+    expect(isPermanentDownloadError("This video requires payment to watch")).toBe(true);
+    expect(isPermanentDownloadError("This channel does not exist")).toBe(true);
   });
 
   test("does not flag transient errors", () => {
@@ -96,6 +108,15 @@ describe("isPermanentDownloadError", () => {
     expect(isPermanentDownloadError(null)).toBe(false);
     expect(isPermanentDownloadError(undefined)).toBe(false);
     expect(isPermanentDownloadError("")).toBe(false);
+  });
+
+  test("keeps credential-shaped errors retryable (cookies can rescue them)", () => {
+    // Marking these permanent would break the cookies.txt mid-run rescue: the
+    // failed-job sweep skips permanent errors, so fresh cookies could never
+    // reach the videos they unblock.
+    expect(isPermanentDownloadError("Sign in to confirm you're not a bot")).toBe(false);
+    expect(isPermanentDownloadError("ERROR: login required")).toBe(false);
+    expect(isPermanentDownloadError("HTTP Error 403: Forbidden")).toBe(false);
   });
 });
 
@@ -127,10 +148,44 @@ describe("isDownloaderArgsError", () => {
     expect(isDownloaderArgsError("aria2c: unrecognized option '--splitt'")).toBe(true);
   });
 
+  test("flags aria2c's other option-validation failures", () => {
+    expect(isDownloaderArgsError("aria2c: bad option '--splitt'")).toBe(true);
+    expect(isDownloaderArgsError("aria2c: unknown option '--foo'")).toBe(true);
+    expect(isDownloaderArgsError("Bad number 'banana' for -k")).toBe(true);
+    expect(isDownloaderArgsError("unexpected option argument was given")).toBe(true);
+  });
+
   test("does not flag network, corrupt, or permanent failures", () => {
     expect(isDownloaderArgsError("Unable to download webpage: Connection reset by peer")).toBe(false);
     expect(isDownloaderArgsError("unable to resume download, incomplete or corrupt data")).toBe(false);
     expect(isDownloaderArgsError("This video is private")).toBe(false);
     expect(isDownloaderArgsError(null)).toBe(false);
+  });
+});
+
+describe("shouldForgiveRetry", () => {
+  const base = { progress: 0, bestProgress: 0, bytes: 0, bestBytes: 0 };
+
+  test("forgives when the percentage passed its claim-time best", () => {
+    expect(shouldForgiveRetry({ ...base, progress: 42, bestProgress: 10 })).toBe(true);
+  });
+
+  test("forgives when the partial grew even though the percentage did not", () => {
+    // Servers that hide the total never report a percentage — the partial
+    // growing on disk is still proof of forward progress.
+    expect(shouldForgiveRetry({ ...base, progress: 0, bestProgress: 0, bytes: 4096, bestBytes: 1024 })).toBe(true);
+  });
+
+  test("spends the budget when nothing moved", () => {
+    expect(shouldForgiveRetry({ ...base, progress: 42, bestProgress: 42 })).toBe(false);
+    expect(shouldForgiveRetry({ ...base, progress: 10, bestProgress: 42 })).toBe(false);
+    expect(
+      shouldForgiveRetry({ ...base, progress: 42, bestProgress: 42, bytes: 1024, bestBytes: 1024 }),
+    ).toBe(false);
+  });
+
+  test("is NaN-safe (missing counters never forgive)", () => {
+    expect(shouldForgiveRetry({ ...base, progress: NaN, bestProgress: NaN })).toBe(false);
+    expect(shouldForgiveRetry({ ...base, bytes: NaN, bestBytes: NaN })).toBe(false);
   });
 });

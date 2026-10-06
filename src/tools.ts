@@ -23,6 +23,50 @@ export function ffmpeg(): string {
 export function aria2cPath(): string | null {
   return resolvedTools.aria2cPath;
 }
+
+/**
+ * True when aria2c can actually be handed a transfer right now.
+ *
+ * A resolved filesystem path that vanished (uninstalled mid-run, unplugged
+ * drive) falls back to yt-dlp's native downloader instead of failing every
+ * download with "aria2c not found". A bare name already probed on PATH at
+ * startup is trusted — re-probing on every download would cost a spawn each.
+ */
+export function aria2cUsable(): boolean {
+  const p = resolvedTools.aria2cPath;
+  if (!p) return false;
+  if (p.includes("/") || p.includes("\\")) {
+    try {
+      return existsSync(p);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Re-run aria2c discovery when no binary is currently known.
+ *
+ * Operators install aria2c while the engine is already running; without this
+ * the engine would stay on the native downloader until the next restart. Only
+ * fills a gap — it never replaces or clears an existing resolution — honours
+ * the `"none"` opt-out, and returns true when a binary was newly found.
+ */
+export async function refreshAria2cDiscovery(config: {
+  aria2cPath?: string;
+  useAria2c?: boolean;
+}): Promise<boolean> {
+  if (resolvedTools.aria2cPath) return false;
+  if ((config.aria2cPath || "").trim().toLowerCase() === "none") return false;
+  const found = await resolveTool(config.aria2cPath || "", ["--version"], ["aria2c"], ["aria2c.exe"]);
+  if (!found) return false;
+  resolvedTools.aria2cPath = found.path;
+  console.log(
+    `  ✅ aria2c appeared mid-run: ${found.version || "ok"}  [${found.path}] — new downloads will use it`,
+  );
+  return true;
+}
 /** The executable yt-dlp should hand transfers to, or "native" for its own. */
 export function activeDownloader(): "aria2c" | "native" {
   return resolvedTools.aria2cPath ? "aria2c" : "native";

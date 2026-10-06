@@ -114,7 +114,7 @@ archive.ts, tools.ts, download-output.ts         │ (leaf modules, zero deps)
 audio-tracks.ts → config (types), tools          │ (pure parsing/selection + -J probe)
 db.ts → config                                  │
 resilience.ts → config, db, logger, state       │
-reconcile.ts → archive, config, db, logger, retry│
+reconcile.ts → archive, config, db, logger, retry, state│
 sources.ts → config, state                     │
 scanner.ts → config, db, state, tools, util     │
 autoscale.ts → db, state                        │
@@ -179,6 +179,8 @@ dependency-free — it is the module that breaks every import cycle.
 | `conversion_retry_count`, `metadata_retry_count` | per-stage attempt budgets |
 | `resume_count` | `--continue` resumes spent for this job |
 | `best_progress` | high-water mark of progress % (drives budget forgiveness) |
+| `best_bytes` | high-water mark of the on-disk `.part` size in bytes (forgiveness when % is unknown) |
+| `next_retry_at` | UTC timestamp before which the job is not claimable (non-blocking backoff; NULL = due now) |
 | `partial_file_path` | the `.part` file to resume from (NULL once complete); always absolute, so it resolves from any cwd |
 | `file_path`, `file_size`, `integrity` | final location + SHA-256 |
 | `progress`, `speed`, `eta` | live values for the dashboard |
@@ -234,6 +236,8 @@ while (!abortController.signal.aborted) {
   `--no-overwrites`, `--download-archive`, parses `PROGRESS:` lines from the
   progress template into the DB, and captures the final path from
   `--print after_move:FILEPATH:%(filepath)s` (validated before any filesystem call).
+  Failures stamp `next_retry_at` instead of sleeping, so the worker moves on;
+  progress writes heartbeat `download_claimed_at` for the stale-claim reaper.
 - **metadataWorker** — second yt-dlp pass with `--skip-download`, writes
   sidecars next to the media file using the same basename, records the file
   list in `metadata_files`.
@@ -262,22 +266,23 @@ re-queues a failed sidecar pass on an already-converted job.
 | --- | --- | --- |
 | Exponential backoff + jitter | `retry.ts computeBackoffMs()` | base × 2^attempt, capped, +0–30% jitter; RNG injectable for tests |
 | Download watchdog | `retry.ts computeDownloadTimeoutMs()` | 3× duration + 5 min, clamped to config min/max; unknown duration → min |
-| Transient vs permanent errors | `retry.ts isTransientDownloadError / isPermanentDownloadError` | permanent = private/removed/age-gated/geo-blocked/404/410/copyright |
-| Bad downloader arguments | `retry.ts isDownloaderArgsError` → pause in `workers/download.ts` | aria2c exit 28 + option help block; parks the job, pauses the engine (`BAD_DOWNLOADER_ARGS`) |
-| Retry-budget forgiveness | `workers/download.ts handleDownloadFailure()` | `retry_count` only increments when `progress <= best_progress` |
+| Transient vs permanent errors | `retry.ts isTransientDownloadError / isPermanentDownloadError` | permanent = private/removed/age-gated/geo-blocked/404/410/copyright + deleted/guidelines/paid variants; permanent fails fast (no budget, partial pair discarded, no circuit trip); credential-shaped errors stay retryable for the cookies rescue |
+| Bad downloader arguments | `download-args.ts validateAria2cSettings` (proactive) + `retry.ts isDownloaderArgsError` (exit-28 backstop) → pause in `workers/download.ts` | invalid tuning pauses the engine (`BAD_DOWNLOADER_ARGS`) before the first spawn; anything else aria2c rejects pauses it from the wreckage |
+| Retry-budget forgiveness | `retry.ts shouldForgiveRetry` ← `workers/download.ts handleDownloadFailure()` | the budget is forgiven when the attempt beats its claim-time % or byte watermarks; only a stalled video spends `retry_count` |
+| Non-blocking backoff | `db.ts` `next_retry_at` | failures stamp now+backoff on the job instead of sleeping in the worker; the claim filter holds the job while the pool drains others |
 | Resume budget | `workers/download.ts` corrupt branch | `.part` kept until `resume_count >= maxResumeAttempts`, then discarded |
 | Partial-file bookkeeping | `workers/download.ts` + `reconcile.ts findPartialFile()` | recorded on failure, cleared on success |
 | Partial-path freeze | `reconcile.ts recordJobPartial() / recordPartialPaths()` | records the on-disk `.part` before a job stops being `downloading`, so a paused/interrupted job really resumes instead of restarting |
 | Pause bookkeeping | `workers/download.ts parkPaused()` | parks an in-flight job as `paused` **and** freezes its partial path |
-| Circuit breaker | `resilience.ts notePipelineFailure()` | N consecutive failures per stage pauses the engine (`TOO_MANY_FAILURES`) |
-| Pause / resume | `resilience.ts triggerPause / triggerResume` | SIGINTs child yt-dlp; resume re-queues paused jobs |
+| Circuit breaker | `resilience.ts notePipelineFailure()` | N consecutive failures per stage pauses the engine (`TOO_MANY_FAILURES`); permanent failures never feed it (dead videos are not systemic) |
+| Pause / resume | `resilience.ts triggerPause / triggerResume` | SIGINTs child yt-dlp; resume re-queues paused jobs and lifts backoff stamps |
 | Network monitor | `resilience.ts networkMonitor()` | probes 3 hosts, pauses after 2 consecutive failures |
 | Cookies watcher | `reconcile.ts cookiesWatch()` + `tools.ts detectCookiesChange()` | 60s sweep: reports cookies.txt appearing / changing / vanishing mid-run and counts the credential-blocked jobs it may rescue (never auto-requeues them) |
 | Disk guard | `resilience.ts diskUsage()` → `checkDiskSpace()` | `diskUsage` is the **only** `statfs` caller: statfs → PowerShell `Get-PSDrive` fallback → `-1/-1` degraded mode (never bricks the engine, never 500s `/api/status`) |
-| Crash recovery | `reconcile.ts reconcileCrashedJobs()` | `downloading` → `paused + interrupted` (auto-claimable) |
-| Stale-claim reaper | `reconcile.ts reapStaleClaims()` | downloads >20 min, conversions >3 h, metadata >15 min; thresholds live in `STALE_CLAIM_THRESHOLDS` so the dashboard cannot drift from them |
-| Missing-file reconciliation | `reconcile.ts reconcileMissingFiles()` | scrubs the yt-dlp archive + re-queues |
-| Failed-job sweep | `reconcile.ts requeueFailedJobs()` | cooldown + per-video cap + permanent-error skip; `ignoreCooldown` for the UI button |
+| Crash recovery | `reconcile.ts reconcileCrashedJobs()` | records on-disk partials first, then `downloading` → `paused + interrupted` (auto-claimable, really resumable) |
+| Stale-claim reaper | `reconcile.ts reapStaleClaims()` | downloads silent >20 min (progress heartbeats `download_claimed_at`), conversions >3 h, metadata >15 min; claims with a live yt-dlp are never reaped; thresholds live in `STALE_CLAIM_THRESHOLDS` so the dashboard cannot drift from them |
+| Missing-file reconciliation | `reconcile.ts reconcileMissingFiles()` | startup + every 30 min; scrubs the yt-dlp archive + re-queues |
+| Failed-job sweep | `reconcile.ts requeueFailedJobs()` | cooldown + per-video cap + permanent-error skip + backoff-stamp lift; `ignoreCooldown` for the UI button |
 | Partial-file cleanup | `reconcile.ts cleanOrphanedFiles()` | keeps resume-able partials, deletes exhausted (>cap) and day-old orphans |
 | Archive scrubbing | `archive.ts removeFromArchive()` | needed whenever a file disappears, else yt-dlp skips it forever |
 | Signature self-heal | `workers/download.ts` | auto-runs `yt-dlp -U` and retries with a clean budget |
@@ -285,8 +290,8 @@ re-queues a failed sidecar pass on an already-converted job.
 
 **Adding a new failure class:** extend the classifiers in `retry.ts` (pure,
 unit-tested), then handle it in `workers/download.ts handleDownloadFailure()`
-in the right precedence order: signature → downloader-args → corrupt →
-archive-scrub → live → transient → permanent/budget.
+in the right precedence order: signature → downloader-args → permanent
+(fail fast) → corrupt → archive-scrub → live → transient → unknown/budget.
 
 The **downloader-args** class (`retry.ts isDownloaderArgsError`, aria2c exit 28
 + the option's help block) is a global misconfiguration, not a video problem:
@@ -361,6 +366,12 @@ Facts worth knowing before you touch it:
 - `aria2c` is discovered in `tools.ts` (`resolvedTools.aria2cPath`, `null` when
   absent) and is **optional** — a missing binary warns at startup and never
   exits. `checkDependencies` takes the aria2c keys as optional config fields.
+- Two availability refinements: the worker validates the tuning with
+  `validateAria2cSettings` before spawning (an invalid `minSplitSize` pauses
+  the engine with `BAD_DOWNLOADER_ARGS` without burning an attempt), and plans
+  consult `aria2cUsable()` — a binary installed mid-run is picked up by the
+  60s `refreshAria2cDiscovery` sweep, a binary uninstalled mid-run falls back
+  to the native downloader instead of failing every download.
 
 ### 7.2 Multi-audio tracks (YouTube multi-language audio)
 
@@ -473,7 +484,7 @@ bun run typecheck              # tsc --noEmit (tsconfig covers *.ts, src/**, tes
 bun run check                  # typecheck + full suite (what CI/the definition of done means)
 ```
 
-310 tests across 22 files. Tests share one process, so any file that touches the
+335 tests across 23 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -499,6 +510,7 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | `tests/logger.test.ts` | `errorLogPath()` routes test-run logs to the temp dir, never the operator's `error.log` |
 | `tests/disk.test.ts` | `diskUsage()` happy path, the `-1/-1` degraded path, and `checkDiskSpace`'s allow-through when free space is unknown |
 | `tests/web-routes.test.ts` | the `ROUTES` table: canonical per-job routes, the legacy aliases, the `{ok}` envelope, JSON 404 and 405 + `Allow`, trailing-slash collapse |
+| `tests/tools.test.ts` | `aria2cUsable` (vanished binary → native) and `refreshAria2cDiscovery` (mid-run install, `"none"` opt-out, never clobbers) |
 | `tests/settings.test.ts` | the dashboard settings allow-list, type coercion, Zod + cross-field validation, persistence, live-config propagation, and auth |
 | `tests/config-manager.test.ts` | every schema key is reachable from `update_config.ts`; the manager reads the sweep thresholds from `STALE_CLAIM_THRESHOLDS` and counts partials with the engine's predicate |
 | `tests/dashboard.test.ts` | `formatHeaderLine` counters, and the `Res:n` field appearing only when partials are held |
@@ -739,7 +751,7 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 
 ## 12. Definition of done
 
-- `bun run check` passes (strict typecheck + the full suite — 310 tests across 22 files).
+- `bun run check` passes (strict typecheck + the full suite — 335 tests across 23 files).
 - New pure logic has unit tests; new engine behavior has an integration scenario.
 - No new import cycles; `state.ts` stays dependency-free.
 - Config changes are backwards compatible (defaults merge + `ensureColumn`).

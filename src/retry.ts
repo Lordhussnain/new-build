@@ -41,16 +41,30 @@ export function computeDownloadTimeoutMs(
 }
 
 // Errors that will never succeed on retry — the video is gone, gated, or the
-// URL is wrong. Re-queueing these just burns time (and bandwidth), so the
-// failed-job sweep and the transient-retry path both skip them.
+// URL is wrong. The download worker fails these immediately (no budget spent),
+// and the failed-job sweep never re-queues them.
+//
+// Deliberately NOT here: credential-shaped errors ("login required", "sign in
+// to confirm you're not a bot", cookie errors) and HTTP 403/429. Those can heal
+// when cookies.txt appears mid-run or a throttle lifts, so they stay retryable
+// and the cookies watcher can point the operator at them.
 const PERMANENT_ERROR_PATTERNS: RegExp[] = [
   /video unavailable/i,
   /private video/i,
+  /video is private/i,
   /members[- ]only/i,
   /sign in to confirm your age/i,
   /age[- ]restricted/i,
   /inappropriate for some users/i,
   /removed by the uploader/i,
+  /video has been removed/i,
+  /has been deleted/i,
+  /no longer available/i,
+  /community guidelines/i,
+  /violating.*terms of service/i,
+  /requires payment/i,
+  /paid content/i,
+  /channel does not exist/i,
   /has been terminated/i,
   /account associated with this video has been terminated/i,
   /this video does not exist/i,
@@ -123,6 +137,45 @@ export function isDownloaderArgsError(message: string | null | undefined): boole
   return (
     m.includes("exited with code 28") ||
     m.includes("unrecognized option") ||
+    m.includes("unknown option") ||
+    m.includes("bad option") ||
+    m.includes("bad number") ||
+    m.includes("invalid option") ||
+    m.includes("unexpected option argument") ||
     m.includes("possible values:")
   );
+}
+
+/**
+ * The evidence one download attempt leaves about forward progress: the latest
+ * completion percentage plus the on-disk partial size, each against the best
+ * value known when the attempt STARTED (the claimed row's watermarks — not the
+ * live row, whose watermarks already include this attempt).
+ */
+export interface RetryProgressState {
+  /** Latest completion percentage reported this attempt. */
+  progress: number;
+  /** `best_progress` as it was when the attempt was claimed. */
+  bestProgress: number;
+  /** Current `.part` file size in bytes (0 when there is no partial). */
+  bytes: number;
+  /** `best_bytes` as it was when the attempt was claimed. */
+  bestBytes: number;
+}
+
+/**
+ * True when the attempt moved the video forward — by percentage OR by bytes.
+ *
+ * The retry budget only shrinks while a video makes no forward progress: a
+ * flaky connection that keeps advancing is forgiven, a video stuck at the same
+ * point eventually exhausts its budget. The byte comparison matters when the
+ * percentage is unknown (servers that hide the total) or never reported — the
+ * partial file growing on disk is still proof of progress.
+ */
+export function shouldForgiveRetry(s: RetryProgressState): boolean {
+  const pct = Number.isFinite(s.progress) ? s.progress : 0;
+  const bestPct = Number.isFinite(s.bestProgress) ? s.bestProgress : 0;
+  const bytes = Number.isFinite(s.bytes) ? s.bytes : 0;
+  const bestBytes = Number.isFinite(s.bestBytes) ? s.bestBytes : 0;
+  return pct > bestPct || bytes > bestBytes;
 }

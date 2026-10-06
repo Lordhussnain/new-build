@@ -10,12 +10,18 @@ import { stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { claimDownloadJob, db, perVideoCap, type Job } from "../db";
 import { activeDlSlots, autoscaler } from "../autoscale";
-import { aria2cPath, ytDlp } from "../tools";
+import { aria2cPath, aria2cUsable, ytDlp } from "../tools";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
 import { findPartialFile, recordJobPartial, removePartialFiles } from "../reconcile";
 import { removeFromArchive } from "../archive";
-import { computeBackoffMs, isDownloaderArgsError, isTransientDownloadError } from "../retry";
-import { buildDownloadPlan, jobBaseFilename } from "../download-args";
+import {
+  computeBackoffMs,
+  isDownloaderArgsError,
+  isPermanentDownloadError,
+  isTransientDownloadError,
+  shouldForgiveRetry,
+} from "../retry";
+import { buildDownloadPlan, jobBaseFilename, validateAria2cSettings } from "../download-args";
 import { parseDownloadPath, readProcessOutput } from "../download-output";
 import {
   parseSelectionJson,
@@ -51,14 +57,31 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
       continue;
     }
 
-    const disk = await checkDiskSpace(config.outputRoot, config.minFreeSpaceGB);
+    // The claim path runs outside the job try-block: a SQLITE_BUSY throw here
+    // must idle the worker, not kill the loop (nothing is claimed yet, so
+    // nothing is stranded).
+    let disk;
+    try {
+      disk = await checkDiskSpace(config.outputRoot, config.minFreeSpaceGB);
+    } catch (err: any) {
+      logError("download", `disk check failed, idling: ${String(err?.message || err).slice(0, 200)}`);
+      await Bun.sleep(5000);
+      continue;
+    }
     if (!disk.ok) {
       triggerPause(`LOW_DISK_SPACE (${disk.free.toFixed(1)}GB < ${config.minFreeSpaceGB}GB)`);
       await Bun.sleep(10000);
       continue;
     }
 
-    const job = claimDownloadJob(workerId);
+    let job;
+    try {
+      job = claimDownloadJob(workerId);
+    } catch (err: any) {
+      logError("download", `claim failed, idling: ${String(err?.message || err).slice(0, 200)}`);
+      await Bun.sleep(5000);
+      continue;
+    }
     if (!job) {
       await Bun.sleep(500);
       continue;
@@ -97,11 +120,27 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     job,
     config,
     activeSlots: activeDlSlots.size,
-    aria2cAvailable: !!aria2cPath(),
+    aria2cAvailable: aria2cUsable(),
     aria2cBinary: aria2cPath(),
     audioTracks,
   });
   const { baseFilename, timeoutMs } = plan;
+  // A downloader argument aria2c will reject is a global misconfiguration, not
+  // a video problem — pause before spawning anything rather than burning this
+  // attempt (and its retry budget) to discover it.
+  if (plan.engine === "aria2c") {
+    const problem = validateAria2cSettings(config);
+    if (problem) {
+      logError(
+        "download",
+        `${job.id} ${job.title}: invalid aria2c settings (${problem}) — engine paused, fix the downloader settings and resume`,
+      );
+      parkPaused(job);
+      triggerPause(`BAD_DOWNLOADER_ARGS (${problem})`);
+      updateWorkerLine(id, `⚙️ Bad downloader settings — paused | ${job.title}`, config);
+      return;
+    }
+  }
   const engineTag = plan.engine === "aria2c" ? `aria2c×${config.connectionsPerDownload}` : "native";
   const audioTag = audioTracks.length > 0 ? `, ${audioTracks.length} audio track(s)` : "";
 
@@ -131,10 +170,11 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
       if (!Number.isNaN(pctNum) && pctNum >= 0 && Date.now() - lastProgressUpdate > 500) {
         // Backfill file_size from progress so the global ETA has a total to work with.
         const totalBytes = Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : null;
-        // best_progress is the high-water mark of this job's attempts: it is
-        // what lets the retry budget forgive repeated failures at increasing
-        // completion percentages (see handleDownloadFailure).
-        updateJobProgress(job.id, pctNum, bps, parseFloat(parts[2]) || 0, totalBytes);
+        // best_progress/best_bytes are the high-water marks of this job's
+        // attempts: they let the retry budget forgive repeated failures at
+        // increasing completion (see handleDownloadFailure).
+        const dlBytes = Number.isFinite(dlNum) && dlNum > 0 ? dlNum : 0;
+        updateJobProgress(job.id, pctNum, bps, parseFloat(parts[2]) || 0, totalBytes, dlBytes);
         const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
         const etaNum = parseFloat(parts[2]);
         const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
@@ -199,14 +239,21 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
 
 /**
  * Central failure handler: classifies the error, decides whether the partial
- * file survives, and computes the next state. The guiding rules:
+ * file survives, and computes the next state. Precedence order:
+ * signature → downloader-args → permanent → corrupt → archive-scrub → live →
+ * transient → unknown/budget. The guiding rules:
  *
- *   • transient (network/timeout/5xx)  → requeue with exponential backoff
- *   • corrupt/incomplete               → delete the partial and resume (bounded
+ *   • transient (network/timeout/5xx)  → requeue with exponential backoff,
+ *                                        stamped as next_retry_at so the worker
+ *                                        moves on instead of sleeping
+ *   • corrupt/incomplete               → keep the partial and resume (bounded
  *                                        by maxResumeAttempts, then restart)
  *   • live stream in "wait for VOD"    → park as waiting_live
- *   • permanent (private/removed/…)    → fail fast, never auto-requeued
- *   • retry budget spent               → park as failed for the sweep
+ *   • permanent (private/removed/…)    → fail fast: no budget spent, the
+ *                                        partial pair is discarded, never
+ *                                        auto-requeued, no circuit trip
+ *   • unknown errors                   → spend the retry budget with backoff,
+ *                                        then park as failed for the sweep
  */
 async function handleDownloadFailure(id: number, job: Job, config: Config, err: any): Promise<void> {
   if (isPaused()) {
@@ -246,6 +293,36 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
     return;
   }
 
+  // Permanent failure: the video is gone or gated and no retry can ever fetch
+  // it. Fail fast — spending the retry budget (and the failed-job sweep's
+  // attention) on a dead video only delays the videos queued behind it. The
+  // partial pair is discarded with it: nothing will ever resume this download.
+  // This deliberately does NOT trip the circuit breaker — dead videos are
+  // per-video facts, not a systemic outage.
+  if (isPermanentDownloadError(errMsg)) {
+    const deadPartial =
+      job.partial_file_path && existsSync(job.partial_file_path)
+        ? job.partial_file_path
+        : await findPartialFile(job.output_directory, base);
+    if (deadPartial) {
+      const removal = await removePartialFiles(deadPartial);
+      if (removal.fatal) {
+        logError(
+          "download",
+          `${job.id} ${job.title}: could not discard dead partial (${removal.error}) — left for orphan cleanup`,
+        );
+      }
+    }
+    db.run(
+      `UPDATE jobs SET download_status = 'failed', partial_file_path = NULL, download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [errMsg.slice(0, 500), job.id],
+    );
+    stats.failed++;
+    logError("download", `${job.id} ${job.title}: permanent failure, not retrying: ${errMsg.slice(0, 500)}`);
+    updateWorkerLine(id, `⛔ Permanent failure (skipped) | ${job.title}`, config);
+    return;
+  }
+
   // Corrupt/incomplete partial: delete the .part file so yt-dlp restarts that
   // transfer — but only after the resume budget is spent. Until then we keep
   // the partial and let --continue resume from it.
@@ -267,13 +344,13 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
           // so keep both files, surface exactly what is blocking, and let a
           // later attempt retry once the handle is released.
           const msg = `partial file locked, cannot restart cleanly (${removal.error}). Close the program holding it — usually an orphaned aria2c/ffmpeg or antivirus scanning the download folder.`;
+          const lockBackoff = computeBackoffMs(2, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
           db.run(
-            `UPDATE jobs SET download_status = 'pending', download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            `UPDATE jobs SET download_status = 'pending', download_claimed_by = NULL, next_retry_at = ${retryAt(lockBackoff)}, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
             [msg.slice(0, 500), job.id],
           );
           logError("download", `${job.id} ${job.title}: ${msg}`);
           updateWorkerLine(id, `🔒 Partial locked — will retry | ${job.title}`, config);
-          await Bun.sleep(computeBackoffMs(2, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
           return;
         }
       }
@@ -281,13 +358,18 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
       updateWorkerLine(id, `🗑️ Restarting from scratch | ${job.title}`, config);
       return;
     }
-    // Keep the partial, count the resume attempt, and try again shortly.
+    // Keep the partial, count the resume attempt, and back off WITHOUT holding
+    // this worker: next_retry_at holds the job while the pool drains others.
+    const resumeBackoff = computeBackoffMs(resumeCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
     db.run(
-      `UPDATE jobs SET download_status = 'pending', resume_count = ?, download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      `UPDATE jobs SET download_status = 'pending', resume_count = ?, download_claimed_by = NULL, next_retry_at = ${retryAt(resumeBackoff)}, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [resumeCount, errMsg.slice(0, 500), job.id],
     );
-    updateWorkerLine(id, `⏳ Resuming (attempt ${resumeCount}/${config.maxResumeAttempts}) | ${job.title}`, config);
-    await Bun.sleep(computeBackoffMs(resumeCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
+    updateWorkerLine(
+      id,
+      `⏳ Resuming (attempt ${resumeCount}/${config.maxResumeAttempts}) in ${Math.round(resumeBackoff / 1000)}s | ${job.title}`,
+      config,
+    );
     return;
   }
 
@@ -317,38 +399,88 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
   // can resume from it, then requeue with exponential backoff.
   if (isTransientDownloadError(errMsg)) {
     const partial = await findPartialFile(job.output_directory, base);
+    // The retry budget only shrinks while the video makes no forward progress:
+    // this attempt's end state is judged against the watermarks from CLAIM time
+    // (the live row's watermarks already include this attempt, so comparing
+    // against them would never forgive). Bytes back up the percentage for
+    // servers that hide the total.
+    let partBytes = 0;
+    if (partial) {
+      try {
+        partBytes = (await stat(partial)).size;
+      } catch {
+        // The partial vanished mid-failure — no byte progress to forgive.
+      }
+    }
     const { retryCount, bestProgress, progress } = readProgressState(job.id);
-    // The retry budget only shrinks when the video makes no forward progress:
-    // a flaky connection that keeps advancing is forgiven, a video stuck at
-    // the same percentage eventually exhausts its budget.
-    const nextRetry = progress > bestProgress ? retryCount : retryCount + 1;
-    db.run(
-      `UPDATE jobs SET download_status = 'pending', retry_count = ?, best_progress = ?, partial_file_path = ?,
-         download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [nextRetry, Math.max(bestProgress, progress), partial || null, errMsg.slice(0, 500), job.id],
-    );
+    const forgiven = shouldForgiveRetry({
+      progress,
+      bestProgress: job.best_progress || 0,
+      bytes: partBytes,
+      bestBytes: job.best_bytes || 0,
+    });
+    const nextRetry = forgiven ? retryCount : retryCount + 1;
     const backoff = computeBackoffMs(nextRetry, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
+    db.run(
+      `UPDATE jobs SET download_status = 'pending', retry_count = ?, best_progress = ?, best_bytes = ?,
+         partial_file_path = ?, next_retry_at = ${retryAt(backoff)},
+         download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [
+        nextRetry,
+        Math.max(bestProgress, progress),
+        Math.max(job.best_bytes || 0, partBytes),
+        partial || null,
+        errMsg.slice(0, 500),
+        job.id,
+      ],
+    );
     updateWorkerLine(id, `🌐 Transient error, retrying in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
-    await Bun.sleep(backoff);
     return;
   }
 
-  // Permanent or unknown error: spend the retry budget, then park as failed
-  // for the periodic sweep (which skips permanent errors entirely).
+  // Unknown error: spend the retry budget with a backoff, then park as failed
+  // for the periodic sweep. (Permanent errors fail fast above and never reach
+  // the sweep at all.)
   const { retryCount } = readProgressState(job.id);
   const cap = perVideoCap(config);
   const newStatus = retryCount + 1 >= cap ? "failed" : "pending";
   const partial = newStatus === "failed" ? null : await findPartialFile(job.output_directory, base);
-  db.run(
-    `UPDATE jobs SET download_status = ?, retry_count = ?, partial_file_path = ?, download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [newStatus, retryCount + 1, partial, errMsg.slice(0, 500), job.id],
-  );
   if (newStatus === "failed") {
+    db.run(
+      `UPDATE jobs SET download_status = 'failed', retry_count = ?, partial_file_path = NULL,
+         download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [retryCount + 1, errMsg.slice(0, 500), job.id],
+    );
     stats.failed++;
     logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
     notePipelineFailure("dl", config);
+  } else {
+    // Unknown errors used to requeue with no backoff at all: the next claim
+    // retried instantly, burning the whole budget in seconds.
+    const unknownBackoff = computeBackoffMs(
+      retryCount + 1,
+      config.retryBackoffBaseSeconds,
+      config.retryBackoffMaxSeconds,
+    );
+    db.run(
+      `UPDATE jobs SET download_status = 'pending', retry_count = ?, partial_file_path = ?,
+         next_retry_at = ${retryAt(unknownBackoff)}, download_claimed_by = NULL, last_error = ?,
+         updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [retryCount + 1, partial || null, errMsg.slice(0, 500), job.id],
+    );
   }
   updateWorkerLine(id, `❌ Failed | ${job.title}`, config);
+}
+
+/**
+ * A `datetime('now', …)` expression scheduling a job's next attempt.
+ * Whole seconds — SQLite has no millisecond modifier. The integer is validated
+ * here, so the interpolated SQL can never carry user text (same rule as the
+ * sweep modifiers in `reconcile.ts`).
+ */
+function retryAt(backoffMs: number): string {
+  const delaySec = Math.max(1, Math.ceil(backoffMs / 1000));
+  return `datetime('now', '+${delaySec} seconds')`;
 }
 
 // --- small DB helpers --------------------------------------------------------
@@ -387,20 +519,26 @@ function baseNameOf(job: Job): string {
   return jobBaseFilename(job);
 }
 
-/** Record progress, keeping best_progress as the high-water mark. */
+/** Record progress, keeping the high-water marks — and heartbeat the claim. */
 function updateJobProgress(
   id: string,
   pct: number,
   bps: number,
   eta: number,
   totalBytes: number | null,
+  downloadedBytes: number,
 ): void {
   db.run(
     `UPDATE jobs SET progress = ?, speed = ?, eta = ?,
        best_progress = MAX(COALESCE(best_progress, 0), ?),
-       file_size = COALESCE(?, file_size)
+       best_bytes = MAX(COALESCE(best_bytes, 0), ?),
+       file_size = COALESCE(?, file_size),
+       -- Claim heartbeat, riding the already-throttled progress write: the
+       -- stale-claim reaper measures silence, not age, so a healthy long
+       -- download is never mistaken for a dead worker.
+       download_claimed_at = CURRENT_TIMESTAMP
      WHERE id = ?`,
-    [pct, bps, eta, pct, totalBytes, id],
+    [pct, bps, eta, pct, downloadedBytes, totalBytes, id],
   );
 }
 
@@ -428,15 +566,18 @@ function parkPaused(job: Job): void {
 
 function resetForRetry(id: string, opts: { incrementRetry?: boolean; clearPartial?: boolean } = {}): void {
   const clearPartial = opts.clearPartial ? 1 : 0;
+  // Restarting from scratch deletes the evidence the watermarks describe — the
+  // next attempt must be judged on its own progress, not the thrown-away past.
+  const watermarkReset = opts.clearPartial ? `, progress = 0, best_progress = 0, best_bytes = 0` : ``;
   if (opts.incrementRetry) {
     db.run(
-      `UPDATE jobs SET download_status = 'pending', retry_count = retry_count + 1, download_claimed_by = NULL,
+      `UPDATE jobs SET download_status = 'pending', retry_count = retry_count + 1, download_claimed_by = NULL, next_retry_at = NULL${watermarkReset},
          partial_file_path = CASE WHEN ? THEN NULL ELSE partial_file_path END, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [clearPartial, id],
     );
   } else {
     db.run(
-      `UPDATE jobs SET download_status = 'pending', retry_count = 0, download_claimed_by = NULL,
+      `UPDATE jobs SET download_status = 'pending', retry_count = 0, download_claimed_by = NULL, next_retry_at = NULL${watermarkReset},
          partial_file_path = CASE WHEN ? THEN NULL ELSE partial_file_path END, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [clearPartial, id],
     );
