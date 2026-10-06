@@ -40,7 +40,7 @@ bun install            # zod (+ dev: typescript, @types/bun)
 bun run start          # run the engine (reads ./config.json, creates it if absent)
 bun run config         # interactive config manager (TTY)
 bun run typecheck      # tsc --noEmit
-bun test               # full suite: unit + end-to-end (~45s, no network needed)
+bun test               # full suite: unit + end-to-end (mocked tools; no network needed)
 bun run check          # typecheck + tests
 bun run build:win      # cross-compile dist/youtube-archive.exe (Windows)
                          start-archive.bat runs it from dist\ first, then the
@@ -63,6 +63,17 @@ installed on the machine. Two more Windows facts the code already accounts for:
 some Bun builds for Windows do not implement `statfs` at all (see gotcha 22 —
 go through `diskUsage()`), and Windows does not reparent orphans, so the mocks'
 `process.ppid` watchdogs are inert there (see 9.3).
+
+### Local data, secrets, and generated files
+
+Runtime files are operator data, not source. Never stage or commit `config.json`
+(it can contain private source URLs and `webToken`), `cookies.txt` (account
+credentials), `archive.db` and its `-wal`/`-shm` files, `downloaded_videos.txt`,
+error/report logs, downloaded media, `.part`/`.aria2` partials, `dist/`, or
+`node_modules/`. Tests should use temporary working directories and the checked-in
+mock fixtures. When adding new runtime outputs, add appropriate `.gitignore`
+rules without hiding source or test fixtures; inspect `git status --short` before
+finishing a change.
 
 ---
 
@@ -167,7 +178,7 @@ dependency-free — it is the module that breaks every import cycle.
 | `url` | canonical `https://www.youtube.com/watch?v=<id>` |
 | `title`, `folder`, `index` | display name, output folder, `001`-style ordering |
 | `output_directory` | absolute-ish path where files land |
-| `target_format` | `mp4` or `mp3` |
+| `target_format` | `mp4` \| `mkv` \| `webm` \| `mp3` \| `m4a` |
 | `want_subtitles` / `want_thumbnail` / `want_description` | 0/1 sidecar flags |
 | `duration` | seconds from the listing (drives the watchdog) |
 | `download_status` | `pending` \| `downloading` \| `downloaded` \| `paused` \| `failed` \| `waiting_live` |
@@ -309,15 +320,17 @@ breaker trips.
   backwards compatible with existing `config.json` files.
 - Cross-field rules are enforced with `.refine()`: backoff max ≥ base,
   maxDownloadMinutes ≥ downloadTimeoutMinutes, minDownloadWorkers ≤ maxDownloadWorkers.
-- **Adding a key:** add to `ConfigSchema`, add to `DEFAULT_CONFIG`, add a prompt
-  to `update_config.ts` (menu 4 = download settings, menu 6 = reliability), and
-  add a test in `tests/config.test.ts`. `tests/config-manager.test.ts` asserts
-  every schema key is reachable from the manager, so an un-prompted key fails
-  the suite rather than becoming hand-edit-only.
-- `update_config.ts` prompts for the download root, cookies, and the Shorts
-  toggles, and its reliability screen reads live resume state from the archive
-  database (read-only, best-effort — a locked or absent DB must never stop the
-  manager) plus the sweep thresholds from `STALE_CLAIM_THRESHOLDS`.
+- **Adding a key:** add it to `ConfigSchema` and `DEFAULT_CONFIG`, add a prompt
+to the relevant `update_config.ts` menu (4 = download, 5 = feature toggles,
+6 = reliability), and add a test in `tests/config.test.ts`.
+`tests/config-manager.test.ts` asserts every schema key is reachable from the
+manager, so an un-prompted key fails the suite rather than becoming
+hand-edit-only.
+- The config manager prompts for the download root, cookies, and feature
+toggles. Its reliability menu should use `STALE_CLAIM_THRESHOLDS` for sweep
+values. If changing its resume-state display, ensure it opens `archive.db`:
+`config.archiveFile` is yt-dlp's plain-text history file, not the SQLite job
+database.
 
 Reliability keys: `maxResumeAttempts`, `retryBackoffBaseSeconds`,
 `retryBackoffMaxSeconds`, `requeueFailedAfterMinutes`, `verifyExistingFiles`,
@@ -511,15 +524,15 @@ re-extract the inline `<script>` and syntax-check it (see section 9.4).
 ### 9.1 Running
 
 ```bash
-bun test                       # everything (~160s — the integration scenarios dominate)
+bun test                       # everything (unit + end-to-end; uses mock tools)
 bun test tests/retry.test.ts   # one file
 bun run typecheck              # tsc --noEmit (tsconfig covers *.ts, src/**, tests/**)
 bun run check                  # typecheck + full suite (what CI/the definition of done means)
 ```
 
-361 tests across 25 files. Tests share one process, so any file that touches the
-database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
-`db` binding is replaced, which is exactly why it is a live ESM binding**.
+The suite is organized under `tests/` and covers both pure helpers and complete
+engine runs. Database tests initialize an isolated in-memory database in their
+setup; `db` is an exported live ESM binding because `initDatabase()` replaces it.
 
 ### 9.2 What is covered where
 
@@ -793,7 +806,7 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 
 ## 12. Definition of done
 
-- `bun run check` passes (strict typecheck + the full suite — 310 tests across 22 files).
+- `bun run check` passes (strict typecheck + the complete test suite under `tests/`).
 - New pure logic has unit tests; new engine behavior has an integration scenario.
 - No new import cycles; `state.ts` stays dependency-free.
 - Config changes are backwards compatible (defaults merge + `ensureColumn`).

@@ -60,8 +60,8 @@ retries, corrupt-partial resume, permanent failures, and restart reconciliation.
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/<repo-name>.git
-cd <repo-name>
+git clone https://github.com/Lordhussnain/new-build.git
+cd new-build
 bun install
 ```
 
@@ -85,6 +85,10 @@ For example (omitted keys use their defaults):
   "writeDescription": false
 }
 ```
+
+Keep `config.json` private: it can contain source URLs and a `webToken`.
+`cookies.txt` contains authentication credentials and must also stay local; do
+not commit either file.
 
 ### Adding sources from the Web UI
 
@@ -143,6 +147,18 @@ duplicate sources or duplicate jobs, even if all videos were already queued.
 | `maxDownloadMinutes` | Ceiling for the timeout. The effective timeout scales with the video's real duration (3× realtime + 5 min) between the two |
 
 Edit these interactively with `bun run config` → **Change Reliability & Resume**.
+
+### Video quality and output format
+
+| Key | Default | Options | What it controls |
+| --- | --- | --- | --- |
+| `videoQuality` | `"1080p"` | `highest`, `1080p`, `720p`, `480p`, `audio` | Selects the stream quality. `audio` downloads audio only and produces MP3 output. |
+| `targetFormat` | `"mp4"` | `mp4`, `mkv`, `webm`, `mp3`, `m4a` | Final media container for newly queued jobs. The selected value is stored on each job; changing it does not rewrite existing jobs or files. |
+
+Use `bun run config` → **Change Download Settings** to edit both values. The
+dashboard Settings editor exposes `targetFormat`, but not `videoQuality`.
+Multi-audio downloads with multiple tracks are kept as MKV so the tracks remain
+switchable.
 
 ### Download performance settings
 
@@ -207,13 +223,13 @@ media — no re-download; flipping one off never deletes files already fetched.
 
 ### Tuning from the dashboard
 
-The **⚙️ Settings** button opens an editor for the downloader, concurrency, and
-reliability knobs. Changes are validated against the same Zod schema the engine
-uses, written to , and applied to the running engine — the next
-download picks them up without a restart. The panel deliberately exposes only
-tuning keys: playlists, credentials, and the network binding are not editable
-from the browser, and a request naming anything outside the allow-list is
-rejected rather than silently ignored.
+The **⚙️ Settings** button opens an editor for the downloader, media format,
+concurrency, and reliability settings. Changes are validated against the same
+Zod schema the engine uses, atomically saved to `config.json`, and applied to the
+running engine; workers pick them up without a restart. The editor is limited to
+an explicit allow-list: source URLs, cookie credentials, the web token, and the
+network binding cannot be changed from the browser. Requests naming settings
+outside the allow-list are rejected rather than silently ignored.
 
 Click any job row for its detail view (file paths, sizes, duration, retry/resume
 counts, the kept partial and its aria2c control file, and the last error).
@@ -294,8 +310,9 @@ partial is unusable it deletes the `.part` **and** its control file: aria2c
 defaults to `--allow-overwrite=false`, under which a control file whose data is
 gone makes it neither resume nor restart, wedging the job permanently.
 
-Edit these interactively with `bun run config` → **Change Download Settings**.
-Settings**, or from the web dashboard's reliability panel.
+Edit downloader and media settings with `bun run config` → **Change Download
+Settings** or from the dashboard's **⚙️ Settings** editor. Reliability and resume
+settings are under **Change Reliability & Resume** in the terminal config manager.
 
 ## Usage
 
@@ -303,11 +320,10 @@ Settings**, or from the web dashboard's reliability panel.
 bun run start
 ```
 
-With CLI overrides:
-
-```bash
-bun run start --config ./my-config.json --format mkv
-```
+The engine reads `./config.json` from its working directory; it does not
+support command-line config or format overrides. Edit settings with the
+interactive `bun run config` manager or, while the engine is running, the
+allowed options in the dashboard Settings panel.
 
 The TUI shows live status for every video across all active workers. The web
 dashboard (`http://127.0.0.1:3000` by default) adds bulk actions, the failed-job
@@ -325,6 +341,10 @@ src/
   state.ts         shared mutable runtime state (pause, stats, workers)
   tools.ts         yt-dlp/ffmpeg/aria2c discovery + cookies helpers
   download-args.ts pure yt-dlp command construction (downloader engine, tuning)
+  download-output.ts bounded subprocess output parsing and final-path validation
+  audio-tracks.ts  multi-audio track discovery, selection, and format probing
+  settings.ts      allow-listed dashboard settings validation and live apply
+  sources.ts       source URL validation, canonicalization, and persistence
   retry.ts         pure retry policy: backoff, watchdogs, error classification
   resilience.ts    pause/resume, circuit breaker, network + disk guards
   reconcile.ts     self-healing sweeps (crashes, stale claims, missing files, failed jobs)
@@ -365,12 +385,21 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
 ## Security & operations
 
 - **Loopback-only Web UI by default** — `webBind` defaults to `127.0.0.1`, so the
-  dashboard (pause/purge/delete!) is not reachable from your LAN. Set
-  `"webBind": "0.0.0.0"` to expose it deliberately.
-- **Optional shared-secret token** — set `webToken` and every request (UI and
-  API) needs it, via cookie, `Authorization: Bearer`, `X-Web-Token`, or
-  `?token=`. The login page sets an `HttpOnly` cookie after the first
-  sign-in; comparisons are timing-safe.
+  dashboard (including pause, purge, and delete controls) is not reachable from
+  your LAN. Set `"webBind": "0.0.0.0"` only when you deliberately want network
+  access.
+- **Authentication is off by default** — an empty `webToken` means the UI and
+  API accept requests without a login. Before binding to `0.0.0.0`, set a strong,
+  private token; without one, anyone who can reach the port can control the
+  queue. With a token configured, requests must present it via the login cookie,
+  `Authorization: Bearer`, `X-Web-Token`, or `?token=`. The login page sets an
+  `HttpOnly` cookie after sign-in, and token comparisons are timing-safe.
+- **HTTP is not encrypted** — the built-in server does not provide TLS. Do not
+  expose it on an untrusted network; use a trusted LAN or put it behind a TLS
+  reverse proxy.
+- **Keep operational data private** — do not commit `config.json`, `cookies.txt`,
+  the SQLite database, download archive, logs, or downloaded media. In
+  particular, `cookies.txt` can grant access to your YouTube account.
 - **Real bandwidth cap** — `maxBandwidthKBps` maps to yt-dlp `--limit-rate`,
   split across the active download slots.
 - **Worker autoscaling** — with `autoscaleEnabled` the engine grows download
@@ -503,4 +532,5 @@ link and report it to Bun with the runtime version and reproduction steps.
 
 ## License
 
-MIT — replace with your preferred license.
+This repository does not currently include a `LICENSE` file, so no license is
+declared. Add a license before redistributing the project.
