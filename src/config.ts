@@ -4,7 +4,8 @@
 // (batch_playlist_downloader.ts) and the interactive config manager
 // (update_config.ts) can never drift apart again.
 
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { z } from "zod";
 
@@ -219,7 +220,7 @@ export async function loadConfig(configPath: string = CONFIG_PATH): Promise<Conf
   } catch (err: any) {
     if (err?.code === "ENOENT") {
       console.log("⚠️ config.json not found. Creating default...");
-      await writeFile(configPath, JSON.stringify(DEFAULT_CONFIG, null, 2));
+      await saveConfig(DEFAULT_CONFIG, configPath);
       return { ...DEFAULT_CONFIG };
     }
     console.error("❌ Failed to read config.json:", err?.message || err);
@@ -257,8 +258,27 @@ export async function loadConfigSafe(configPath: string = CONFIG_PATH): Promise<
   }
 }
 
-/** Validate and persist a config object. */
+// All live read/modify/write operations share this queue. In particular, a
+// source added while a settings request is saving must not be overwritten by
+// a stale config snapshot. Callers read getConfig() INSIDE their callback.
+let configWriteQueue: Promise<unknown> = Promise.resolve();
+export function withConfigWriteLock<T>(update: () => Promise<T>): Promise<T> {
+  const task = configWriteQueue.then(update);
+  // A failed write must not poison every later update.
+  configWriteQueue = task.then(() => {}, () => {});
+  return task;
+}
+
+/** Validate, then atomically replace the file (never truncate the live config). */
 export async function saveConfig(config: Config, configPath: string = CONFIG_PATH): Promise<void> {
   const validated = ConfigSchema.parse(config);
-  await writeFile(configPath, JSON.stringify(validated, null, 2));
+  // Same directory/volume so rename is atomic. A crash can leave a .tmp,
+  // but it cannot leave a half-written config.json and erase saved sources.
+  const tempPath = `${configPath}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tempPath, JSON.stringify(validated, null, 2), { flag: "wx", mode: 0o600 });
+    await rename(tempPath, configPath);
+  } finally {
+    await unlink(tempPath).catch(() => {});
+  }
 }

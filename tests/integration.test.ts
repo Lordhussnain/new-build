@@ -1147,3 +1147,142 @@ describe("integration: aria2c option validation", () => {
     }
   }, TEST_TIMEOUT);
 });
+
+// ---------------------------------------------------------------------------
+describe("integration: noisy downloader output", () => {
+  test("CR progress, oversized logs and a split Unicode after_move path do not break concurrent downloads", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      3999,
+      BASE_CONFIG(3999, { useAria2c: true, videoQuality: "audio" }),
+      { FAKE_OUTPUT_STRESS: "1" },
+    );
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done" && j.conversion_status === "done",
+      );
+      for (const job of jobs) {
+        expect(basename(job.file_path!)).toStartWith("final-");
+        expect(job.file_path!).toContain("数学 🧮");
+        expect(job.file_path!.endsWith(".mp3")).toBe(true);
+        expect(existsSync(resolve(dir, job.file_path!))).toBe(true);
+        expect(job.retry_count).toBe(0);
+        expect(job.partial_file_path).toBeNull();
+      }
+      expect(engine.proc.exitCode).toBeNull();
+      expect((await engine.api("/api/status")).isPaused).toBe(false);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("still recovers the expected media file when no after_move record is printed", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 4000, BASE_CONFIG(4000), { FAKE_OMIT_FINAL_PATH: "1" });
+    try {
+      const jobs = await waitForAllJobs(engine, (j) => j.download_status === "downloaded" && j.metadata_status === "done");
+      for (const job of jobs) {
+        expect(job.file_path!.endsWith(".mp4")).toBe(true);
+        expect(existsSync(resolve(dir, job.file_path!))).toBe(true);
+        expect(job.retry_count).toBe(0);
+      }
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
+describe("integration: Web UI source persistence", () => {
+  test("saves scanned sources once, preserves concurrent settings, and scans them again on restart", async () => {
+    const dir = await makeRunDir();
+    const port = 4001;
+    const playlist = "https://www.youtube.com/playlist?list=UI_ADDED";
+    const channel = "https://www.youtube.com/@UIAdded";
+    const channelPlaylists = channel + "/playlists";
+    const video = "https://www.youtube.com/watch?v=AbCdEf12345";
+    const scan = (engine: EngineHandle, url: string) => engine.api("/api/scan", {
+      method: "POST", body: JSON.stringify({ url }),
+    });
+    const engine = await startEngine(dir, port, BASE_CONFIG(port, { playlists: [], videoQuality: "audio" }));
+    let persisted: Record<string, unknown>;
+    try {
+      const added = await scan(engine, playlist);
+      expect(added).toMatchObject({ ok: true, saved: true, found: 3, added: 3, source: { key: "playlists", added: true } });
+      expect(added.message).toContain("Saved to config.json");
+      const duplicate = await scan(engine, "https://m.youtube.com/watch?v=AbCdEf12345&list=UI_ADDED&si=share");
+      expect(duplicate).toMatchObject({ ok: true, saved: true, added: 0, skipped: 3, source: { added: false } });
+
+      // The fixture returns the same three videos for each source. Sources must
+      // still be saved even when every video is already in archive.db.
+      const results = await Promise.all([
+        scan(engine, channel), scan(engine, channelPlaylists), scan(engine, "https://youtu.be/AbCdEf12345?si=share"),
+        engine.api("/api/settings", { method: "POST", body: JSON.stringify({ connectionsPerDownload: 8 }) }),
+      ]);
+      for (const result of results) expect(result.ok).toBe(true);
+      for (const result of results.slice(0, 3)) expect(result.added).toBe(0);
+      persisted = await Bun.file(join(dir, "config.json")).json();
+      expect(persisted.playlists).toEqual([playlist, video]);
+      expect(persisted.channels).toEqual([channel]);
+      expect(persisted.channelPlaylists).toEqual([channelPlaylists]);
+      expect(persisted.connectionsPerDownload).toBe(8);
+      expect(persisted.outputRoot).toBe("./downloads");
+      await waitForAllJobs(engine, (j) => j.download_status === "downloaded" && j.conversion_status === "done" && j.metadata_status === "done");
+    } finally {
+      await engine.stop();
+    }
+
+    // Restart from what the API really wrote, not from the original fixture.
+    const restarted = await startEngine(dir, port, persisted!);
+    try {
+      await waitFor("saved sources scanned at startup", async () =>
+        [playlist, video, channel, channelPlaylists].every((url) => restarted.stdout().includes(`📥 ${url} →`)),
+      );
+      const jobs = await getJobs(restarted);
+      expect(jobs).toHaveLength(3); // no duplicate jobs or re-downloads
+      expect(jobs.every((job) => job.download_status === "downloaded")).toBe(true);
+    } finally {
+      await restarted.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("daemon rescans include playlists added after starting with no sources", async () => {
+    const dir = await makeRunDir();
+    const logPath = join(dir, "scans.log");
+    const playlist = "https://www.youtube.com/playlist?list=UI_WATCHED";
+    const engine = await startEngine(
+      dir, 4002,
+      BASE_CONFIG(4002, { playlists: [], daemonMode: true, rescanIntervalHours: 0.0002 }),
+      { FAKE_SCAN_LOG: logPath },
+    );
+    try {
+      await waitFor("empty engine started", async () => engine.stdout().includes("Engine started"));
+      const response = await engine.api("/api/scan", { method: "POST", body: JSON.stringify({ url: playlist }) });
+      expect(response.saved).toBe(true);
+      await waitFor("a later daemon scan of the new playlist", async () => {
+        const scans = await Bun.file(logPath).text().catch(() => "");
+        return scans.split("\n").filter((line) => line === playlist).length >= 2;
+      });
+      expect(await getJobs(engine)).toHaveLength(3);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("an empty source is saved for future scans rather than silently forgotten", async () => {
+    const dir = await makeRunDir();
+    const channel = "https://www.youtube.com/@EmptyForNow";
+    const engine = await startEngine(dir, 4003, BASE_CONFIG(4003, { playlists: [] }), { FAKE_EMPTY_SCAN: "1" });
+    try {
+      const response = await engine.api("/api/scan", { method: "POST", body: JSON.stringify({ url: channel }) });
+      expect(response).toMatchObject({ ok: true, saved: true, found: 0, added: 0 });
+      expect(response.message).toContain("No videos found");
+      expect((await Bun.file(join(dir, "config.json")).json()).channels).toEqual([channel]);
+      expect(await getJobs(engine)).toEqual([]);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});

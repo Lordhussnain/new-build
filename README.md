@@ -67,26 +67,52 @@ bun install
 
 ## Configuration
 
-Define your batch in `config.json`:
+Your saved sources and settings live in **`config.json` in the app's working
+folder**, next to `archive.db`. `src/config.ts` only defines the schema and
+shipped defaults; the Web UI does not edit TypeScript source files.
+
+For example (omitted keys use their defaults):
 
 ```json
 {
-  "output_directory": "D:/Downloads/YT",
-  "target_format": "mp4",
-  "download": {
-    "subtitles": true,
-    "thumbnail": true,
-    "description": false
-  },
-  "links": [
-    "https://www.youtube.com/playlist?list=...",
-    "https://www.youtube.com/watch?v=..."
-  ]
+  "playlists": ["https://www.youtube.com/playlist?list=..."],
+  "channels": ["https://www.youtube.com/@SomeChannel"],
+  "channelPlaylists": ["https://www.youtube.com/@SomeChannel/playlists"],
+  "outputRoot": "D:/Downloads/YT",
+  "targetFormat": "mp4",
+  "downloadSubtitles": true,
+  "writeThumbnail": true,
+  "writeDescription": false
 }
 ```
 
-Per-link overrides (format, output folder, subtitle/thumbnail flags) are
-supported alongside these global defaults.
+### Adding sources from the Web UI
+
+**Save & Scan** saves the pasted URL to the appropriate list in `config.json`
+**before** scanning/queuing videos in `archive.db`. Playlist links go in
+`playlists`, channel links in `channels`, and a channel's `/playlists` tab in
+`channelPlaylists`. Single-video links also use the existing `playlists` list.
+Share/tracking parameters are removed; a watch link with `list=` keeps the
+playlist, not just the currently selected video. Repeated scans do not append
+duplicate sources or duplicate jobs, even if all videos were already queued.
+
+- The response confirms **Saved to config.json**; a failed write is shown as
+  an error and does not start a scan. Writes replace the file atomically, and
+  concurrent source/settings updates cannot overwrite each other.
+- An empty/temporarily unavailable source stays saved for future scans. If
+  scanning fails after saving, the UI says the source was saved separately
+  from the scan failure.
+- Saved sources are scanned again at startup. With `daemonMode: true` and
+  `rescanIntervalHours > 0`, full rescans include **all three lists**, including
+  playlists added while running. Enabled RSS polling also picks up new channel
+  entries without a restart, even if the engine started with no channels.
+- The optional folder override is for **this scan**; it is recorded on the
+  queued jobs, not stored as a source-level override in the config.
+- Links submitted with an older version were one-off scans. Paste those source
+  links once more to save them; you do **not** need to delete existing jobs or
+  downloads. To remove saved sources, stop the engine, edit the lists through
+  `bun run config` or `config.json`, then restart. Purging the queue does not
+  remove sources from future scans.
 
 ### Reliability settings
 
@@ -220,7 +246,7 @@ Bearer`, `X-Web-Token`, or `?token=`).
 | `DELETE /api/jobs/:id` | Delete one job row. |
 | `POST /api/jobs/pause` | Bulk user-pause `{ "ids": [...] }`. |
 | `DELETE /api/jobs` | Bulk delete `{ "ids": [...] }` (alias: `POST /api/jobs/delete`). |
-| `POST /api/scan` | Scan/add a playlist or channel `{ "url", "folder?" }`. |
+| `POST /api/scan` | `{ "url", "folder?" }` → save the source to `config.json`, then scan/add jobs. Returns `saved`, `source: {url, key, added}`, and `found`/`added`/`skipped`. |
 | `POST /api/queue/purge` | Delete all pending/paused/waiting/failed jobs. |
 | `POST /api/pause` · `POST /api/resume` | Pause/resume the whole engine. |
 | `GET /api/failed` · `POST /api/failed/requeue` | Failed jobs; requeue all eligible (ignores cooldown). |
@@ -405,6 +431,44 @@ powershell -ExecutionPolicy Bypass -File .\install-task.ps1 -Uninstall
 - If `statfs` is unavailable, free space falls back to PowerShell
   (`Get-PSDrive`); if that also fails the engine runs in degraded mode
   instead of pausing forever
+
+### Bun crashes with `panic: index out of bounds` on Windows
+
+This is a native Bun runtime crash, not a normal yt-dlp/aria2c download error;
+JavaScript `try/catch` and worker supervision cannot recover inside that process.
+A reported Bun 1.3.14 trace points to `existsSync` → `toWPathMaybeDir` (Windows
+path conversion). The old downloader treated arbitrary stdout as possible paths;
+aria2c's carriage-return progress updates could accumulate into a huge string.
+
+The downloader now uses an explicit `FILEPATH:` after-move record, rejects
+oversized/control-character paths **before** filesystem calls, handles CR/LF
+and split UTF-8 safely, and bounds both stdout/stderr diagnostics. If the final
+record is absent, it still looks for the expected media file in the job folder.
+
+**Recovery:**
+
+1. Stop any remaining yt-dlp/aria2c/ffmpeg processes belonging to the crashed
+   run before restarting (a hard crash can leave child processes alive).
+2. Update this checkout to include the output-parser fix, then update Bun and
+   restart **from the same app folder**:
+
+   ```powershell
+   bun upgrade
+   bun --version
+   bun run start
+   ```
+
+   If you use a standalone exe, rebuild/replace it too: upgrading the system
+   Bun does not update the runtime embedded in an already compiled exe, and
+   `start-archive.bat` prefers that exe over the source checkout.
+3. Keep `archive.db` (including any `-wal`/`-shm` files), the download archive,
+   and the downloads folder. Do **not** delete `.part` or `.part.aria2` files:
+   startup reconciliation re-queues interrupted jobs and resumes available
+   partials. There is no need to reset the queue or lower the connection count
+   for this parser fix.
+
+If it still crashes on an updated runtime and checkout, save the new crash-report
+link and report it to Bun with the runtime version and reproduction steps.
 
 ## License
 

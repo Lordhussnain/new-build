@@ -76,16 +76,18 @@ config.json                    user config (created from defaults on first run)
 archive.db                     SQLite job store (+ -wal/-shm while running)
 error.log                      rotating error log
 src/
-  config.ts      Zod schema, DEFAULT_CONFIG, load/loadSafe/save, QUALITY_FORMATS
+  config.ts      Zod schema, DEFAULT_CONFIG, load/loadSafe/save (atomic), live-write lock, QUALITY_FORMATS
   db.ts          SQLite schema, migrations, atomic claim transactions, helpers
   state.ts       shared mutable runtime state (leaf module — imports nothing)
   tools.ts       yt-dlp/ffmpeg/aria2c discovery, cookiesArgs, validateCookies
   download-args.ts PURE yt-dlp command construction (downloader engine, tuning)
+  download-output.ts bounded pipe decoding + validated FILEPATH records (no fs calls)
   audio-tracks.ts PURE multi-audio track parsing/selection + the yt-dlp -J probe
   settings.ts    dashboard-editable config allow-list + validate/persist/apply
   retry.ts       PURE retry policy: backoff, watchdog, error classification
   resilience.ts  pause/resume, circuit breaker, network + disk guards (diskUsage = the only statfs caller)
   reconcile.ts   self-healing sweeps (crashes, stale claims, missing files, failed jobs) + partial-file housekeeping
+  sources.ts     Web UI URL validation/canonicalization + durable source-list additions
   scanner.ts     playlist/channel listing + deduplicated ingestion
   autoscale.ts   dynamic download-slot management
   workers/
@@ -108,22 +110,23 @@ tests/           bun test suite (see section 9)
 ```
 state.ts ──────────────────────────────────────┐ (imports only config types)
 config.ts, util.ts, logger.ts, retry.ts,
-archive.ts, tools.ts                             │ (leaf modules, zero deps)
+archive.ts, tools.ts, download-output.ts         │ (leaf modules, zero deps)
 audio-tracks.ts → config (types), tools          │ (pure parsing/selection + -J probe)
 db.ts → config                                  │
 resilience.ts → config, db, logger, state       │
 reconcile.ts → archive, config, db, logger, retry│
+sources.ts → config, state                     │
 scanner.ts → config, db, state, tools, util     │
 autoscale.ts → db, state                        │
 dashboard.ts → autoscale, config, db, state, util│
 report.ts → autoscale, db, state, util          │
-download-args.ts → audio-tracks, config, db (types), retry, tools, util    │ (pure)
-web.ts → audio-tracks, autoscale, config, db, download-args, logger, reconcile, report, resilience, retry, scanner, state, tools, util
-rss.ts → config, logger, scanner, tools         │
-polling.ts → config, logger, scanner            │
+download-args.ts → audio-tracks, config, db (types), download-output, retry, tools, util    │ (pure)
+web.ts → audio-tracks, autoscale, config, db, download-args, logger, reconcile, report, resilience, retry, scanner, sources, state, tools, util
+rss.ts → config, logger, scanner, state, tools   │
+polling.ts → config, logger, scanner, state     │
 history.ts → db, logger, state                  │
 lifecycle.ts → dashboard, db, history, logger, resilience, state
-workers/* → config, dashboard, db, download-args, logger, resilience, retry, state, tools, util (+ autoscale/archive/reconcile; download.ts also audio-tracks)
+workers/* → config, dashboard, db, download-args, download-output, logger, resilience, retry, state, tools, util (+ autoscale/archive/reconcile; download.ts also audio-tracks)
 engine.ts → everything (composition root)
 ```
 
@@ -230,7 +233,7 @@ while (!abortController.signal.aborted) {
   `checkDiskSpace()` before claiming. Spawns yt-dlp with `--continue`,
   `--no-overwrites`, `--download-archive`, parses `PROGRESS:` lines from the
   progress template into the DB, and captures the final path from
-  `--print after_move:%(filepath)s`.
+  `--print after_move:FILEPATH:%(filepath)s` (validated before any filesystem call).
 - **metadataWorker** — second yt-dlp pass with `--skip-download`, writes
   sidecars next to the media file using the same basename, records the file
   list in `metadata_files`.
@@ -435,7 +438,7 @@ segment as an id (gotcha 21).
 | GET | `/api/status` | stats, speed, ETA, disk, live worker lines, pause state, `runtime`; `diskSpace.free` reads `"unknown"` when no disk probe could answer |
 | GET | `/api/jobs` | up to 500 jobs with status/retry/progress fields, plus parsed `audio_tracks` / `audio_selection` |
 | GET | `/api/jobs/:id` | one job, read fresh from the DB — the detail drawer fetches this instead of trusting a poll-cycle-old list row |
-| POST | `/api/scan` | `{url, folder?}` → scan & ingest |
+| POST | `/api/scan` | `{url, folder?}` → validate/canonicalize → save source to `config.json` → scan & ingest; returns `saved`, `source: {url, key, added}`, and counts. Save failure starts no scan; scan failure keeps the saved source. Folder override applies only to this scan |
 | POST | `/api/queue/purge` | delete every pending / paused / waiting_live / failed job; returns `{ok, deleted}` |
 | POST | `/api/pause` · `/api/resume` | global pause / resume-all |
 | POST | `/api/jobs/:id/retry` | re-queue one job (all stages, budgets reset); 404 for an unknown id |
@@ -464,13 +467,13 @@ re-extract the inline `<script>` and syntax-check it (see section 9.4).
 ### 9.1 Running
 
 ```bash
-bun test                       # everything (~130s — the integration scenarios dominate)
+bun test                       # everything (~160s — the integration scenarios dominate)
 bun test tests/retry.test.ts   # one file
 bun run typecheck              # tsc --noEmit (tsconfig covers *.ts, src/**, tests/**)
 bun run check                  # typecheck + full suite (what CI/the definition of done means)
 ```
 
-279 tests across 20 files. Tests share one process, so any file that touches the
+310 tests across 22 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -480,13 +483,15 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | --- | --- |
 | `tests/retry.test.ts` | backoff math, watchdog scaling, error classification |
 | `tests/util.test.ts` | formatters, Windows filename hardening, `fitBaseFilename`, hashing |
-| `tests/config.test.ts` | defaults, validation, cross-field refinements, load/save |
+| `tests/config.test.ts` | defaults, validation, cross-field refinements, atomic load/save |
+| `tests/sources.test.ts` | URL classification, canonicalization, persisted source lists, dedup, concurrent saves/settings, validation/auth/write failures |
 | `tests/db.test.ts` | schema + legacy migration, atomic claims, the pipeline claim exclusions, all reconcile/requeue sweeps, ingestion dedupe |
 | `tests/cookies.test.ts` | `cookiesArgs`/`cookiesState` on a missing/empty/present file, the appeared/updated/disappeared transitions, and `cookiesWatch`'s credential-blocked count |
-| `tests/rss.test.ts` | `parseRssFeed` against a realistic feed (CDATA, missing duration) |
+| `tests/rss.test.ts` | `parseRssFeed` against a realistic feed (CDATA, missing duration); timer picks up live-added channels after an empty startup |
 | `tests/webauth.test.ts` | token extraction, timing-safe compare, authorization |
 | `tests/report.test.ts` | run report contents |
 | `tests/download-args.test.ts` | downloader-engine selection, aria2c args, bandwidth split, fragment/chunk/buffer flags, watchdog scaling, multi-audio selector/multistream flags |
+| `tests/download-output.test.ts` | bounded CR/LF pipe parsing, split UTF-8, oversized-record discard, validated final-path markers |
 | `tests/audio-tracks.test.ts` | track parsing (variant collapse, drc drop, ordering), selection policy incl. per-job override, selector splicing, JSON column round-trips |
 | `tests/autoscale.test.ts` | slot ramp step, backlog/ceiling clamps, idle collapse, disabled mode |
 | `tests/reconcile.test.ts` | `removePartialFiles` (control-file-first order and its `fatal` result), `partialSidecars`, `findPartialFile`, and `cleanOrphanedFiles` control-file handling |
@@ -564,6 +569,10 @@ Mock controls (environment variables):
 | `FAKE_FAIL_TIMES=N` | fail the first N download attempts, leaving a `.part` file behind |
 | `FAKE_FAIL_MODE` | `transient` \| `permanent` \| `corrupt` (which error message to emit) |
 | `FAKE_DELAY_MS` | artificial per-attempt delay |
+| `FAKE_OUTPUT_STRESS=1` | CR-only progress + oversized stdout/stderr, renamed Unicode final file with split UTF-8 and no trailing newline |
+| `FAKE_OMIT_FINAL_PATH=1` | no after_move output, so the engine must find the expected media in the job folder |
+| `FAKE_SCAN_LOG=path` | append every scanned URL, proving live daemon rescans and persisted startup sources |
+| `FAKE_EMPTY_SCAN=1` | a valid source with no videos, proving source persistence does not depend on jobs added |
 | `FAKE_HANG=1` | never exit (watchdog testing) |
 | `FAKE_ARIA2C_BIN` | absolute path of the sibling aria2c mock (set by the integration harness so that hop never depends on PATH) |
 | `FAKE_ARIA2C_FAIL_TIMES=N` | fail the first N attempts *inside* aria2c, leaving the `.part` + `.part.aria2` pair |
@@ -695,6 +704,22 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     found" on a machine where the engine just probed the binary successfully.
     `buildDownloadPlan` emits `--downloader <aria2cBinary>`; the mock yt-dlp
     matches the basename, so keep that regex if you change the flag.
+26. **Never pass arbitrary subprocess output to filesystem APIs.** Bun 1.3.14
+    on Windows can panic in `existsSync` → `toWPathMaybeDir` on an oversized
+    string (native panic, not catchable JS). `download-output.ts` splits CR as
+    well as LF, drops oversized records in full, preserves split UTF-8, and
+    retains only bounded diagnostic tails. Only explicit `FILEPATH:` records
+    passing its length/control-character checks may be probed; directory
+    fallback still recovers the expected media if the marker is missing.
+27. **Source lists are runtime data in `config.json`, not TypeScript defaults.**
+    `/api/scan` validates and saves the source via `sources.ts saveSource()`
+    BEFORE scanning; an empty scan or zero new jobs must not lose the URL.
+    Source saves and `/api/settings` share `withConfigWriteLock()`; read the
+    latest `getConfig()` INSIDE that lock and publish only after a successful
+    atomic save. Never hold the lock over the slow yt-dlp scan. RSS/daemon
+    timers read live sources each tick and start even with empty lists; full
+    rescans include `playlists` as well as both channel lists. Optional scan
+    folder overrides remain per-job/per-scan, not source-level configuration.
 
 ---
 
@@ -709,12 +734,12 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 | Change claim semantics | `src/db.ts` claim transactions + `tests/db.test.ts` atomicity tests |
 | Add a sweep | `src/reconcile.ts` (pure-ish, take `Config`) → register interval in `src/engine.ts` |
 | Add a worker | `src/workers/<name>.ts` → claim fn in `db.ts` → `supervise()` in `engine.ts` → TUI line in `dashboard.ts` |
-| Support a new site/URL shape | `src/scanner.ts normalizeVideoUrl()` (canonicalization + dedupe) |
+| Support a new site/URL shape | `src/sources.ts parseSourceUrl()` (Web UI validation/source identity) + `src/scanner.ts normalizeVideoUrl()` (job URL canonicalization) |
 | Probe the OS (disk space, …) | `src/resilience.ts diskUsage()` — statfs + PowerShell fallback + degraded mode in one place; never call `statfs` directly (gotcha 22) |
 
 ## 12. Definition of done
 
-- `bun run check` passes (strict typecheck + the full suite — 279 tests across 20 files).
+- `bun run check` passes (strict typecheck + the full suite — 310 tests across 22 files).
 - New pure logic has unit tests; new engine behavior has an integration scenario.
 - No new import cycles; `state.ts` stays dependency-free.
 - Config changes are backwards compatible (defaults merge + `ensureColumn`).

@@ -7,22 +7,33 @@
 
 import { scanAndIngest } from "./scanner";
 import { logError } from "./logger";
+import { getConfig } from "./state";
 import type { Config } from "./config";
 
 export function startAutonomousPolling(config: Config): void {
-  if (config.rescanIntervalHours > 0 && (config.channels.length > 0 || config.channelPlaylists.length > 0)) {
-    const intervalMs = config.rescanIntervalHours * 60 * 60 * 1000;
-    console.log(`🤖 Daemon mode: full rescan every ${config.rescanIntervalHours}h.`);
-    setInterval(async () => {
-      console.log("🔄 [Daemon] Running full channel rescan...");
-      for (const url of [...config.channels, ...config.channelPlaylists]) {
+  if (!config.daemonMode || config.rescanIntervalHours <= 0) return;
+  const intervalMs = config.rescanIntervalHours * 60 * 60 * 1000;
+  console.log(`🤖 Daemon mode: full rescan every ${config.rescanIntervalHours}h.`);
+  let inFlight = false;
+  // Start even with no sources: the Web UI can add the first one later.
+  setInterval(async () => {
+    const current = getConfig();
+    if (inFlight || !current.daemonMode || current.rescanIntervalHours <= 0) return;
+    const urls = [...new Set([...current.playlists, ...current.channels, ...current.channelPlaylists])];
+    if (urls.length === 0) return;
+    inFlight = true;
+    try {
+      console.log("🔄 [Daemon] Running full source rescan...");
+      for (const url of urls) {
         try {
-          await scanAndIngest(url, config);
+          await scanAndIngest(url, current);
         } catch (e: any) {
           logError("rescan", `${url}: ${e?.message || e}`);
           console.error(`❌ Rescan failed for ${url}:`, e?.message || e);
         }
       }
-    }, intervalMs);
-  }
+    } finally {
+      inFlight = false;
+    }
+  }, intervalMs);
 }

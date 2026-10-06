@@ -723,10 +723,11 @@
   <div class="workers-strip" id="workersStrip" title="Live worker status — download (DL), metadata (MD) and conversion (CV) workers"></div>
   
   <div class="add-url-section">
-    <h3 style="margin-bottom: 10px;">➕ Add New Playlist/Channel</h3>
-    <input type="text" id="newUrlInput" placeholder="Paste YouTube playlist or channel URL here..." />
-    <input type="text" id="folderOverride" placeholder="Optional: Custom folder name" />
-    <button class="btn btn-primary" onclick="scanUrl()">📡 Scan & Add to Queue</button>
+    <h3 style="margin-bottom: 10px;">➕ Save a Playlist, Channel or Video</h3>
+    <input type="text" id="newUrlInput" placeholder="Paste a full YouTube playlist, channel or video URL..." />
+    <input type="text" id="folderOverride" placeholder="Optional: Custom folder for this scan" />
+    <button class="btn btn-primary" id="scanUrlButton" onclick="scanUrl()">📡 Save &amp; Scan</button>
+    <p class="stat-sub" style="margin-top: 8px;">Sources are saved to config.json for future runs. Re-scanning skips videos already in the archive.</p>
   </div>
   
   <div class="reliability-panel">
@@ -1425,6 +1426,10 @@
         return;
       }
       
+      const button = document.getElementById('scanUrlButton');
+      if (button.disabled) return;
+      button.disabled = true;
+      button.textContent = '⏳ Saving & scanning...';
       try {
         const res = await fetch('/api/scan', {
           method: 'POST',
@@ -1433,16 +1438,24 @@
         });
         const data = await res.json();
 
-        if (data.ok) {
-          showNotification(`✅ ${data.message || 'URL scanned and added to queue'}`, 'success');
-          document.getElementById('newUrlInput').value = '';
-          document.getElementById('folderOverride').value = '';
+        if (res.ok && data.ok) {
+          showNotification(`✅ ${data.message || 'Source saved to config.json and scanned'}`, 'success');
+          // A scan may take a while; don't erase a new URL typed meanwhile.
+          if (document.getElementById('newUrlInput').value.trim() === url) {
+            document.getElementById('newUrlInput').value = '';
+            if (document.getElementById('folderOverride').value.trim() === folder) {
+              document.getElementById('folderOverride').value = '';
+            }
+          }
           refreshData();
         } else {
           showNotification(`❌ ${data.error}`, 'error');
         }
       } catch (err) {
-        showNotification('❌ Failed to scan URL', 'error');
+        showNotification('❌ Save/scan request failed. Check the connection and try again; duplicate sources are skipped.', 'error');
+      } finally {
+        button.disabled = false;
+        button.textContent = '📡 Save & Scan';
       }
     }
     

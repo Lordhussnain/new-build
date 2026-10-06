@@ -9,6 +9,7 @@
 import { cookiesArgs, ytDlp } from "./tools";
 import { ingestItems, type ListingItem } from "./scanner";
 import { logError } from "./logger";
+import { getConfig } from "./state";
 import type { Config } from "./config";
 
 const channelIdCache = new Map<string, string>();
@@ -82,7 +83,8 @@ export async function pollChannelRss(channelUrl: string, config: Config): Promis
 }
 
 export function startRssPolling(config: Config): void {
-  if (!config.rssEnabled || config.channels.length === 0) return;
+  // Start even without channels; a later Web UI save can add the first one.
+  if (!config.rssEnabled) return;
   const intervalMs = Math.max(1, config.rssPollIntervalMinutes) * 60_000;
   console.log(`RSS polling enabled: ${config.channels.length} channel(s), every ${config.rssPollIntervalMinutes} min.`);
   // First pass shortly after startup (ingest dedup makes it harmless), then
@@ -90,12 +92,13 @@ export function startRssPolling(config: Config): void {
   // network, stuck yt-dlp) from overlapping with the next tick.
   let inFlight = false;
   const tick = async () => {
-    if (inFlight) return;
+    const current = getConfig();
+    if (inFlight || !current.rssEnabled) return;
     inFlight = true;
     try {
-      for (const channel of config.channels) {
+      for (const channel of current.channels) {
         try {
-          const added = await pollChannelRss(channel, config);
+          const added = await pollChannelRss(channel, current);
           if (added > 0) console.log(`RSS: ${added} new video(s) from ${channel}`);
         } catch (e: any) {
           logError("rss", `${channel}: ${e?.message || e}`);

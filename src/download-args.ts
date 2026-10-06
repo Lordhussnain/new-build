@@ -19,6 +19,7 @@
 
 import { join } from "node:path";
 import { cookiesArgs } from "./tools";
+import { DOWNLOAD_PATH_PREFIX } from "./download-output";
 import { fitBaseFilename, sanitizeFileName } from "./util";
 import { computeDownloadTimeoutMs } from "./retry";
 import { QUALITY_FORMATS, type Config } from "./config";
@@ -153,10 +154,11 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
     "--no-colors",
     "--progress-template",
     "download:PROGRESS:%(progress.percent).1f|%(progress.speed)f|%(progress.eta)f|%(progress.total_bytes)s|%(progress.downloaded_bytes)s",
-    // Print the final path after all post-processing so we can record it.
+    // Mark the final path explicitly: other stdout (including aria2c progress)
+    // must never be probed as a filesystem path.
     // --print implies --simulate, so --no-simulate is required to actually write files.
     "--print",
-    "after_move:%(filepath)s",
+    `after_move:${DOWNLOAD_PATH_PREFIX}%(filepath)s`,
     "--no-simulate",
     "--socket-timeout",
     "15",

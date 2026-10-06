@@ -13,6 +13,7 @@ import { db } from "./db";
 import { autoscaler, activeDlSlots } from "./autoscale";
 import { getConfig, getPauseReason, isPaused, workerStatuses } from "./state";
 import { scanAndIngest } from "./scanner";
+import { parseSourceUrl, saveSource, type SourceUrl } from "./sources";
 import { diskUsage, triggerPause, triggerResume } from "./resilience";
 import { requeueFailedJobs, STALE_CLAIM_THRESHOLDS } from "./reconcile";
 import { buildRunReport } from "./report";
@@ -23,7 +24,7 @@ import { resolveDownloaderEngine } from "./download-args";
 import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-tracks";
 import { formatBytesPerSec, formatDuration } from "./util";
 import { errorLogPath, logError } from "./logger";
-import type { Config } from "./config";
+import { withConfigWriteLock, type Config } from "./config";
 
 // --- Web UI auth (optional shared-secret token) ------------------------------
 // When webToken is set, every request must present it — as a cookie (set after
@@ -506,20 +507,41 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/scan",
-    handler: async ({ req, config }) => {
-      const body = await req.json().catch(() => ({}));
-      const { url: scanUrl, folder } = body || {};
-      if (!scanUrl) return Response.json({ ok: false, error: "URL required" }, { status: 400 });
+    handler: async ({ req }) => {
+      const body = await req.json().catch(() => null);
+      let source: SourceUrl;
       try {
-        const result = await scanAndIngest(scanUrl, getConfig(), folder);
-        const message =
-          result.found === 0
-            ? `No videos found at ${scanUrl} (check the URL, network, or cookies)`
-            : `Scanned ${result.found} video(s): ${result.added} added, ${result.skipped} skipped`;
-        return Response.json({ ok: true, message, ...result });
+        source = parseSourceUrl(body?.url);
+        if (body.folder !== undefined && typeof body.folder !== "string") throw new Error("Folder must be a string");
       } catch (e: any) {
-        logError("scan", `${scanUrl}: ${e?.message || e}`);
-        return Response.json({ ok: false, error: e.message || "Scan failed" }, { status: 500 });
+        return Response.json({ ok: false, saved: false, error: e.message }, { status: 400 });
+      }
+
+      let savedSource: SourceUrl & { added: boolean };
+      try {
+        // Save first: a failed config write must not silently start a one-off
+        // download, and a slow/failed scan must not lose the user's source.
+        savedSource = await saveSource(source.url);
+      } catch (e: any) {
+        logError("config", `Saving source ${source.url}: ${e?.message || e}`);
+        return Response.json({
+          ok: false, saved: false,
+          error: `Could not save URL to config.json; no scan was started. ${e?.message || e}`,
+        }, { status: 500 });
+      }
+      try {
+        const result = await scanAndIngest(source.url, getConfig(), body.folder?.trim() || undefined);
+        const summary = result.found === 0
+          ? `No videos found at ${source.url} (check the URL, network, or cookies)`
+          : `Scanned ${result.found} video(s): ${result.added} added, ${result.skipped} skipped`;
+        const message = `Saved to config.json (${savedSource.key}). ${summary}`;
+        return Response.json({ ok: true, saved: true, source: savedSource, message, ...result });
+      } catch (e: any) {
+        logError("scan", `${source.url}: ${e?.message || e}`);
+        return Response.json({
+          ok: false, saved: true, source: savedSource,
+          error: `URL saved to config.json, but the scan failed: ${e?.message || e}`,
+        }, { status: 500 });
       }
     },
   },
@@ -581,14 +603,14 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/settings",
-    handler: async ({ req, config }) => {
+    handler: async ({ req }) => {
       let patch: unknown;
       try {
         patch = await req.json();
       } catch {
         return Response.json({ ok: false, error: "Expected a JSON body" }, { status: 400 });
       }
-      const result = await applySettings(config, patch as Record<string, unknown>);
+      const result = await withConfigWriteLock(() => applySettings(getConfig(), patch as Record<string, unknown>));
       if (!result.ok) {
         return Response.json({ ok: false, error: result.error }, { status: 400 });
       }
@@ -597,7 +619,7 @@ const ROUTES: Route[] = [
       return Response.json({
         ok: true,
         changed: result.changed,
-        ...readSettings(result.config ?? config),
+        ...readSettings(result.config ?? getConfig()),
       });
     },
   },
