@@ -9,6 +9,10 @@ import { createInterface } from "node:readline/promises";
 import { existsSync } from "node:fs";
 import { Database } from "bun:sqlite";
 import { CONFIG_PATH, loadConfigSafe, saveConfig, type Config } from "./src/config";
+import { associateExistingJobsWithSource, db, initDatabase, pruneJobsForUnconfiguredSources } from "./src/db";
+import { getPlaylistItems } from "./src/scanner";
+import { resolvedTools } from "./src/tools";
+import { SOURCE_KEYS, sourceIdentity } from "./src/sources";
 import { STALE_CLAIM_THRESHOLDS } from "./src/reconcile";
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -496,6 +500,10 @@ async function viewConfig(config: Config) {
 // ---- Main Menu -------------------------------------------------------------
 async function mainMenu() {
   let config = await loadConfigSafe(CONFIG_PATH);
+  const originalSources = new Map<string, string>();
+  for (const key of SOURCE_KEYS) {
+    for (const url of config[key]) originalSources.set(sourceIdentity(url), url);
+  }
 
   while (true) {
     console.clear();
@@ -537,11 +545,44 @@ async function mainMenu() {
         await viewConfig(config);
         break;
       case "8":
+        let saved = false;
         try {
           await saveConfig(config, CONFIG_PATH);
+          saved = true;
           console.log("\n✅ Configuration saved to " + CONFIG_PATH);
         } catch (e: any) {
           console.error("\n❌ Failed to save config:", e.message);
+        }
+        if (saved && existsSync("archive.db")) {
+          try {
+            initDatabase("archive.db");
+            const activeSources = new Set(
+              SOURCE_KEYS.flatMap((key) => config[key].map((url) => sourceIdentity(url))),
+            );
+            for (const [identity, sourceUrl] of originalSources) {
+              if (activeSources.has(identity)) continue;
+              const tracked = db
+                .query("SELECT COUNT(*) AS count FROM job_sources WHERE source_url = ?")
+                .get(identity) as { count: number };
+              if ((tracked?.count || 0) > 0) continue;
+              try {
+                if (config.ytDlpPath.trim()) resolvedTools.ytDlp = config.ytDlpPath.trim();
+                const items = await getPlaylistItems(sourceUrl, config);
+                associateExistingJobsWithSource(identity, items.map((item) => item.id));
+              } catch (e: any) {
+                console.warn(`⚠️ Could not backfill old jobs for ${sourceUrl}: ${e?.message || e}`);
+              }
+            }
+            const cleanup = pruneJobsForUnconfiguredSources(activeSources);
+            console.log(
+              `🗑️ Removed ${cleanup.deletedJobs} database job(s) for sources no longer configured.` +
+                (cleanup.retainedJobs ? ` Kept ${cleanup.retainedJobs} shared job(s).` : ""),
+            );
+          } catch (e: any) {
+            console.error("\n⚠️ Config saved, but database cleanup failed:", e?.message || e);
+          } finally {
+            try { db?.close(); } catch { /* unopened/already closed */ }
+          }
         }
         rl.close();
         return;

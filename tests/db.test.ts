@@ -93,6 +93,7 @@ describe("schema & migrations", () => {
       .all()
       .map((r: any) => r.name);
     expect(tables).toContain("jobs");
+    expect(tables).toContain("job_sources");
     expect(tables).toContain("playlist_state");
     expect(tables).toContain("run_history");
   });

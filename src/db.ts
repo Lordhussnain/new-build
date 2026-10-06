@@ -67,6 +67,7 @@ export function initDatabase(path: string = "archive.db"): void {
   db = new Database(path);
   db.run("PRAGMA journal_mode = WAL;");
   db.run("PRAGMA busy_timeout = 5000;");
+  db.run("PRAGMA foreign_keys = ON;");
   db.run(
     `CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY,
@@ -102,6 +103,18 @@ export function initDatabase(path: string = "archive.db"): void {
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     )`,
   );
+  // Track which configured source discovered each video. Jobs are globally
+  // deduplicated by video id, so this many-to-many table lets source removal
+  // delete jobs that belong only to that source while preserving shared videos.
+  db.run(
+    `CREATE TABLE IF NOT EXISTS job_sources (
+       source_url TEXT NOT NULL,
+       job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+       PRIMARY KEY (source_url, job_id)
+     )`,
+  );
+  db.run(`CREATE INDEX IF NOT EXISTS idx_job_sources_job ON job_sources(job_id)`);
   db.run(
     `CREATE TABLE IF NOT EXISTS playlist_state (
        folder TEXT PRIMARY KEY,
@@ -227,6 +240,94 @@ export function perVideoCap(config: Config): number {
 
 export function isVideoInDb(videoId: string): boolean {
   return !!db.query("SELECT id FROM jobs WHERE id = ?").get(videoId);
+}
+
+/** Backfill legacy jobs from a source listing before that source is removed. */
+export function associateExistingJobsWithSource(sourceUrl: string, videoIds: Iterable<string>): number {
+  const ids = [...new Set([...videoIds].filter(Boolean))];
+  if (ids.length === 0) return 0;
+  const associate = db.transaction((batch: string[]) => {
+    const stmt = db.prepare(
+      `INSERT OR IGNORE INTO job_sources (source_url, job_id)
+       SELECT ?, id FROM jobs WHERE id = ?`,
+    );
+    let associated = 0;
+    for (const id of batch) associated += stmt.run(sourceUrl, id).changes;
+    return associated;
+  });
+  return associate(ids);
+}
+
+export interface SourceJobCleanup {
+  /** Jobs that had a recorded association with the removed/stale source. */
+  affectedJobs: number;
+  /** Jobs deleted because no remaining configured source needs them. */
+  deletedJobs: number;
+  /** Shared jobs retained for another configured source. */
+  retainedJobs: number;
+}
+
+/**
+ * Remove a source's ownership links and delete its now-unowned jobs. A video
+ * still referenced by another configured source remains in the queue.
+ */
+export function removeSourceJobsFromDatabase(
+  sourceUrl: string,
+  activeSourceUrls: Iterable<string>,
+): SourceJobCleanup {
+  const activeSources = new Set(activeSourceUrls);
+  const cleanup = db.transaction(() => {
+    const rows = db
+      .query("SELECT job_id FROM job_sources WHERE source_url = ?")
+      .all(sourceUrl) as { job_id: string }[];
+    db.run("DELETE FROM job_sources WHERE source_url = ?", [sourceUrl]);
+    return cleanupUnownedSourceJobs(new Set(rows.map((row) => row.job_id)), activeSources);
+  });
+  return cleanup();
+}
+
+/**
+ * Startup safety net for sources removed by editing config.json directly.
+ * Only jobs that were previously source-tracked are candidates; legacy/manual
+ * jobs without ownership metadata are left alone rather than guessed at.
+ */
+export function pruneJobsForUnconfiguredSources(activeSourceUrls: Iterable<string>): SourceJobCleanup {
+  const activeSources = new Set(activeSourceUrls);
+  const cleanup = db.transaction(() => {
+    const links = db.query("SELECT source_url, job_id FROM job_sources").all() as {
+      source_url: string;
+      job_id: string;
+    }[];
+    const staleLinks = links.filter((link) => !activeSources.has(link.source_url));
+    const affected = new Set(staleLinks.map((link) => link.job_id));
+    for (const link of staleLinks) {
+      db.run("DELETE FROM job_sources WHERE source_url = ? AND job_id = ?", [link.source_url, link.job_id]);
+    }
+    return cleanupUnownedSourceJobs(affected, activeSources);
+  });
+  return cleanup();
+}
+
+/** Must be called from inside a transaction. */
+function cleanupUnownedSourceJobs(jobIds: Set<string>, activeSources: Set<string>): SourceJobCleanup {
+  let deletedJobs = 0;
+  let retainedJobs = 0;
+  for (const jobId of jobIds) {
+    const links = db.query("SELECT source_url FROM job_sources WHERE job_id = ?").all(jobId) as {
+      source_url: string;
+    }[];
+    // Drop stale links too, so a missing/manual config entry cannot keep a
+    // deleted source's job alive indefinitely.
+    for (const link of links) {
+      if (!activeSources.has(link.source_url)) {
+        db.run("DELETE FROM job_sources WHERE source_url = ? AND job_id = ?", [link.source_url, jobId]);
+      }
+    }
+    const stillNeeded = db.query("SELECT 1 FROM job_sources WHERE job_id = ? LIMIT 1").get(jobId);
+    if (stillNeeded) retainedJobs++;
+    else deletedJobs += db.run("DELETE FROM jobs WHERE id = ?", [jobId]).changes;
+  }
+  return { affectedJobs: jobIds.size, deletedJobs, retainedJobs };
 }
 
 export function getNextIndex(folder: string): number {

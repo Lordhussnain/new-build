@@ -5,8 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG, loadConfig, saveConfig, type Config } from "../src/config";
 import { getConfig, setConfig } from "../src/state";
-import { db, initDatabase } from "../src/db";
-import { parseSourceUrl, saveSource } from "../src/sources";
+import { associateExistingJobsWithSource, db, initDatabase, pruneJobsForUnconfiguredSources } from "../src/db";
+import { ingestItems } from "../src/scanner";
+import { parseSourceUrl, removeSource, saveSource } from "../src/sources";
 import { handleRequest } from "../src/web";
 
 const dirs: string[] = [];
@@ -155,6 +156,156 @@ describe("saveSource", () => {
     } finally {
       process.chdir(cwd);
     }
+  });
+});
+
+describe("removeSource", () => {
+  test("removes the config entry and only deletes jobs exclusive to that source", async () => {
+    const dir = await makeDir();
+    const path = join(dir, "config.json");
+    const config = baseConfig({ playlists: [playlist], channels: [channel], outputRoot: join(dir, "out") });
+    setConfig(config);
+    await saveConfig(config, path);
+
+    await ingestItems(
+      [
+        { id: "owned01", title: "Owned", playlist: "Playlist", duration: 120 },
+        { id: "shared01", title: "Shared", playlist: "Playlist", duration: 120 },
+      ],
+      config,
+      undefined,
+      playlist,
+    );
+    await ingestItems(
+      [{ id: "shared01", title: "Shared", playlist: "Channel", duration: 120 }],
+      config,
+      undefined,
+      channel,
+    );
+
+    const result = await removeSource(playlist, path);
+    expect(result).toMatchObject({ removed: true, removedConfigEntries: 1, affectedJobs: 2, deletedJobs: 1, retainedJobs: 1 });
+    expect(getConfig().playlists).toEqual([]);
+    expect(getConfig().channels).toEqual([channel]);
+    expect(await loadConfig(path)).toEqual({ ...config, playlists: [] });
+    expect(db.query("SELECT id FROM jobs WHERE id = 'owned01'").get()).toBeNull();
+    expect(db.query("SELECT id FROM jobs WHERE id = 'shared01'").get()).toEqual({ id: "shared01" });
+    expect(db.query("SELECT COUNT(*) AS n FROM job_sources WHERE source_url = ?").get(playlist)).toEqual({ n: 0 });
+    expect(db.query("SELECT COUNT(*) AS n FROM job_sources WHERE source_url = ?").get(channel)).toEqual({ n: 1 });
+    const staleScan = await ingestItems(
+      [{ id: "stale02", title: "Should not return", playlist: "Playlist", duration: 120 }],
+      config,
+      undefined,
+      playlist,
+    );
+    expect(staleScan.added).toBe(0);
+    expect(db.query("SELECT id FROM jobs WHERE id = 'stale02'").get()).toBeNull();
+  });
+
+  test("legacy jobs can be associated before a source is removed", async () => {
+    const dir = await makeDir();
+    const path = join(dir, "config.json");
+    const config = baseConfig({ playlists: [playlist], outputRoot: join(dir, "out") });
+    setConfig(config);
+    await saveConfig(config, path);
+    db.run(
+      `INSERT INTO jobs (id, url, title, output_directory, target_format, folder)
+       VALUES ('legacy02', 'https://www.youtube.com/watch?v=legacy02', 'Legacy', ?, 'mp4', 'Playlist')`,
+      [join(dir, "out")],
+    );
+
+    expect(associateExistingJobsWithSource(playlist, ["legacy02", "missing02"])).toBe(1);
+    const result = await removeSource(playlist, path);
+    expect(result.deletedJobs).toBe(1);
+    expect(db.query("SELECT id FROM jobs WHERE id = 'legacy02'").get()).toBeNull();
+  });
+
+  test("a failed config write leaves live config and database jobs untouched", async () => {
+    const dir = await makeDir();
+    const config = baseConfig({ playlists: [playlist], outputRoot: join(dir, "out") });
+    setConfig(config);
+    await ingestItems(
+      [{ id: "keep001", title: "Keep", playlist: "Playlist", duration: 120 }],
+      config,
+      undefined,
+      playlist,
+    );
+
+    await expect(removeSource(playlist, join(dir, "missing", "config.json"))).rejects.toThrow();
+    expect(getConfig()).toBe(config);
+    expect(db.query("SELECT id FROM jobs WHERE id = 'keep001'").get()).toEqual({ id: "keep001" });
+  });
+
+  test("startup pruning catches config.json removals for tracked sources", async () => {
+    const dir = await makeDir();
+    const config = baseConfig({ playlists: [playlist], channels: [channel], outputRoot: join(dir, "out") });
+    setConfig(config);
+    await ingestItems(
+      [
+        { id: "stale01", title: "Stale", playlist: "Playlist", duration: 120 },
+        { id: "keep002", title: "Shared", playlist: "Playlist", duration: 120 },
+      ],
+      config,
+      undefined,
+      playlist,
+    );
+    await ingestItems(
+      [{ id: "keep002", title: "Shared", playlist: "Channel", duration: 120 }],
+      config,
+      undefined,
+      channel,
+    );
+
+    const result = pruneJobsForUnconfiguredSources([channel]);
+    expect(result).toEqual({ affectedJobs: 2, deletedJobs: 1, retainedJobs: 1 });
+    expect(db.query("SELECT id FROM jobs WHERE id = 'stale01'").get()).toBeNull();
+    expect(db.query("SELECT id FROM jobs WHERE id = 'keep002'").get()).toEqual({ id: "keep002" });
+  });
+});
+
+describe("GET/DELETE /api/sources", () => {
+  test("lists configured sources and removes a source from config and the database", async () => {
+    const dir = await makeDir();
+    const cwd = process.cwd();
+    process.chdir(dir);
+    try {
+      const config = baseConfig({ playlists: [playlist], outputRoot: join(dir, "out") });
+      setConfig(config);
+      await saveConfig(config);
+      await ingestItems(
+        [{ id: "api001", title: "API video", playlist: "Playlist", duration: 120 }],
+        config,
+        undefined,
+        playlist,
+      );
+
+      const listed = await handleRequest(new Request("http://x/api/sources"), getConfig());
+      expect((await listed.json()).sources).toEqual([{ key: "playlists", url: playlist, trackedJobs: 1 }]);
+
+      const removed = await handleRequest(new Request("http://x/api/sources", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: playlist }),
+      }), getConfig());
+      expect(removed.status).toBe(200);
+      expect(await removed.json()).toMatchObject({ ok: true, deletedJobs: 1, retainedJobs: 0 });
+      expect((await loadConfig()).playlists).toEqual([]);
+      expect(db.query("SELECT id FROM jobs WHERE id = 'api001'").get()).toBeNull();
+    } finally {
+      process.chdir(cwd);
+    }
+  });
+
+  test("rejects malformed and non-configured source deletions", async () => {
+    const invalid = await handleRequest(new Request("http://x/api/sources", {
+      method: "DELETE", body: JSON.stringify({ url: "https://example.com" }),
+    }), getConfig());
+    expect(invalid.status).toBe(400);
+
+    const missing = await handleRequest(new Request("http://x/api/sources", {
+      method: "DELETE", body: JSON.stringify({ url: playlist }),
+    }), getConfig());
+    expect(missing.status).toBe(404);
   });
 });
 

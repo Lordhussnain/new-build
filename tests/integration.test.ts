@@ -273,6 +273,7 @@ interface JobRow {
   metadata_status: string;
   retry_count: number;
   resume_count: number;
+  best_progress: number;
   last_error: string | null;
   file_path: string | null;
   partial_file_path: string | null;

@@ -110,9 +110,14 @@ duplicate sources or duplicate jobs, even if all videos were already queued.
   queued jobs, not stored as a source-level override in the config.
 - Links submitted with an older version were one-off scans. Paste those source
   links once more to save them; you do **not** need to delete existing jobs or
-  downloads. To remove saved sources, stop the engine, edit the lists through
-  `bun run config` or `config.json`, then restart. Purging the queue does not
-  remove sources from future scans.
+  downloads. To completely remove a saved source, use **Saved sources → Remove**
+  in the dashboard. It removes the URL from `config.json` and deletes its
+  source-owned job rows from `archive.db`; jobs still referenced by another
+  configured source are retained. Already-downloaded media files and the
+  yt-dlp download-history file are not deleted. The `bun run config` manager
+  performs the same cleanup when saving removed sources (stop the engine before
+  using the terminal manager). Purging the queue alone does not remove sources
+  from future scans.
 
 ### Reliability settings
 
@@ -246,6 +251,8 @@ Bearer`, `X-Web-Token`, or `?token=`).
 | `DELETE /api/jobs/:id` | Delete one job row. |
 | `POST /api/jobs/pause` | Bulk user-pause `{ "ids": [...] }`. |
 | `DELETE /api/jobs` | Bulk delete `{ "ids": [...] }` (alias: `POST /api/jobs/delete`). |
+| `GET /api/sources` | List configured source URLs and their tracked database-job counts. |
+| `DELETE /api/sources` | `{ "url" }` → remove the source from `config.json` and delete jobs owned only by it; jobs shared with other configured sources remain. |
 | `POST /api/scan` | `{ "url", "folder?" }` → save the source to `config.json`, then scan/add jobs. Returns `saved`, `source: {url, key, added}`, and `found`/`added`/`skipped`. |
 | `POST /api/queue/purge` | Delete all pending/paused/waiting/failed jobs. |
 | `POST /api/pause` · `POST /api/resume` | Pause/resume the whole engine. |

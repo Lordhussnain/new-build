@@ -312,6 +312,39 @@
       outline: none;
       border-color: var(--accent);
     }
+
+    .source-manager {
+      background: var(--bg-card);
+      padding: 18px 20px;
+      border-radius: 12px;
+      margin-bottom: 20px;
+      border: 1px solid var(--border);
+    }
+    .source-manager-heading {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .source-manager-heading h3 { font-size: 0.95rem; }
+    .source-list { display: grid; gap: 8px; margin-top: 12px; }
+    .source-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-width: 0;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-secondary);
+    }
+    .source-info { min-width: 0; }
+    .source-url { overflow-wrap: anywhere; font-size: 0.82rem; }
+    .source-kind { color: var(--text-secondary); font-size: 0.72rem; margin-top: 2px; }
+    .source-empty { color: var(--text-secondary); font-size: 0.82rem; padding: 10px 0; }
+    .source-remove { flex: 0 0 auto; padding: 6px 10px; font-size: 0.75rem; }
     
     .log-viewer {
       background: var(--bg-secondary);
@@ -728,6 +761,15 @@
     <input type="text" id="folderOverride" placeholder="Optional: Custom folder for this scan" />
     <button class="btn btn-primary" id="scanUrlButton" onclick="scanUrl()">📡 Save &amp; Scan</button>
     <p class="stat-sub" style="margin-top: 8px;">Sources are saved to config.json for future runs. Re-scanning skips videos already in the archive.</p>
+  </div>
+
+  <div class="source-manager">
+    <div class="source-manager-heading">
+      <h3>📚 Saved sources</h3>
+      <button class="btn btn-secondary" style="padding: 5px 10px; font-size: 0.75rem;" onclick="loadSources()">🔄 Refresh</button>
+    </div>
+    <p class="stat-sub">Removing a source deletes it from config.json and removes its exclusively owned jobs from the database. Jobs also used by another saved source stay queued. Already-downloaded files are not deleted.</p>
+    <div id="savedSources" class="source-list"><div class="source-empty">Loading sources...</div></div>
   </div>
   
   <div class="reliability-panel">
@@ -1417,6 +1459,63 @@
       // fetchStatus() keeps the button in sync with the server from here on.
     }
     
+    async function loadSources() {
+      const container = document.getElementById('savedSources');
+      if (!container) return;
+      container.innerHTML = '<div class="source-empty">Loading sources...</div>';
+      try {
+        const res = await fetch('/api/sources', { cache: 'no-store' });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Unable to load saved sources');
+        const sources = data.sources || [];
+        if (!sources.length) {
+          container.innerHTML = '<div class="source-empty">No saved sources. Add one above to keep it in config.json.</div>';
+          return;
+        }
+        const labels = { playlists: 'Playlist / single video', channels: 'Channel', channelPlaylists: 'Channel playlists' };
+        container.innerHTML = sources.map(source => `
+          <div class="source-row">
+            <div class="source-info">
+              <div class="source-url" title="${escapeHtml(source.url)}">${escapeHtml(source.url)}</div>
+              <div class="source-kind">${escapeHtml(labels[source.key] || source.key)} · ${Number(source.trackedJobs) || 0} tracked database job(s)</div>
+            </div>
+            <button class="btn btn-danger source-remove" data-remove-source data-source-url="${escapeHtml(source.url)}">🗑️ Remove</button>
+          </div>
+        `).join('');
+        container.querySelectorAll('[data-remove-source]').forEach(button => {
+          button.addEventListener('click', () => removeSavedSource(button.dataset.sourceUrl, button));
+        });
+      } catch (error) {
+        container.innerHTML = `<div class="source-empty">Could not load saved sources: ${escapeHtml(error.message || error)}</div>`;
+      }
+    }
+
+    async function removeSavedSource(sourceUrl, button) {
+      if (!sourceUrl) return;
+      if (!confirm(`Remove this saved source from config.json and delete its unshared database jobs?\n\n${sourceUrl}\n\nAlready-downloaded files will remain on disk.`)) return;
+      if (button) button.disabled = true;
+      try {
+        const res = await fetch('/api/sources', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: sourceUrl })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          showNotification(`❌ ${data.error || 'Could not remove source'}`, 'error');
+          return;
+        }
+        const retained = data.retainedJobs ? ` ${data.retainedJobs} shared job(s) remain because another saved source uses them.` : '';
+        showNotification(`✅ Source removed; ${data.deletedJobs || 0} database job(s) deleted.${retained}`, 'success');
+        await loadSources();
+        await fetchStatus();
+      } catch (error) {
+        showNotification('❌ Failed to remove source. Check the connection and try again.', 'error');
+      } finally {
+        if (button) button.disabled = false;
+      }
+    }
+
     async function scanUrl() {
       const url = document.getElementById('newUrlInput').value.trim();
       const folder = document.getElementById('folderOverride').value.trim();
@@ -1448,6 +1547,7 @@
             }
           }
           refreshData();
+          loadSources();
         } else {
           showNotification(`❌ ${data.error}`, 'error');
         }
@@ -1944,6 +2044,7 @@
     // skips the fetch entirely (browsers throttle its timers anyway) and
     // refreshes once the moment it becomes visible again.
     refreshData();
+    loadSources();
     setInterval(() => { if (!document.hidden) fetchStatus(); }, 5000);
     document.addEventListener('visibilitychange', () => { if (!document.hidden) fetchStatus(); });
   </script>

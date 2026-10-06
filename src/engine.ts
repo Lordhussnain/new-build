@@ -8,7 +8,8 @@ import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { loadConfig } from "./config";
 import { aria2cPath, checkDependencies, validateCookies } from "./tools";
-import { initDatabase } from "./db";
+import { initDatabase, pruneJobsForUnconfiguredSources } from "./db";
+import { SOURCE_KEYS, sourceIdentity } from "./sources";
 import {
   cleanOrphanedFiles,
   cookiesWatch,
@@ -87,6 +88,16 @@ export async function main(): Promise<void> {
       process.exit(1);
     }
     throw err;
+  }
+
+  // The source manager deletes jobs immediately; this also catches a playlist
+  // removed by directly editing config.json while the engine was stopped.
+  const activeSourceUrls = new Set(
+    SOURCE_KEYS.flatMap((key) => config[key].map((url) => sourceIdentity(url))),
+  );
+  const staleSourceJobs = pruneJobsForUnconfiguredSources(activeSourceUrls);
+  if (staleSourceJobs.deletedJobs > 0) {
+    console.log(`🗑️ Removed ${staleSourceJobs.deletedJobs} job(s) for sources no longer in config.json.`);
   }
 
   reconcileCrashedJobs();

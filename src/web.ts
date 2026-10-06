@@ -9,11 +9,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import os from "node:os";
-import { db } from "./db";
+import { associateExistingJobsWithSource, db } from "./db";
 import { autoscaler, activeDlSlots } from "./autoscale";
 import { activeDownloadJobs, getConfig, getPauseReason, isPaused, workerStatuses } from "./state";
-import { scanAndIngest } from "./scanner";
-import { parseSourceUrl, saveSource, type SourceUrl } from "./sources";
+import { getPlaylistItems, scanAndIngest } from "./scanner";
+import { parseSourceUrl, removeSource, saveSource, SOURCE_KEYS, sourceIdentity, type SourceUrl } from "./sources";
 import { diskUsage, triggerPause, triggerResume } from "./resilience";
 import { requeueFailedJobs, STALE_CLAIM_THRESHOLDS } from "./reconcile";
 import { buildRunReport } from "./report";
@@ -504,6 +504,80 @@ const ROUTES: Route[] = [
     handler: ({ params }) => {
       resetFailCounters(params.id);
       return Response.json({ ok: true });
+    },
+  },
+  {
+    methods: ["GET", "DELETE"],
+    pattern: "/api/sources",
+    handler: async ({ req, config }) => {
+      if (req.method === "GET") {
+        const seen = new Set<string>();
+        const sources = SOURCE_KEYS.flatMap((key) =>
+          config[key].flatMap((sourceUrl) => {
+            const identity = sourceIdentity(sourceUrl);
+            if (seen.has(identity)) return [];
+            seen.add(identity);
+            const row = db
+              .query("SELECT COUNT(*) AS count FROM job_sources WHERE source_url = ?")
+              .get(identity) as { count: number };
+            return [{ key, url: sourceUrl, trackedJobs: row?.count || 0 }];
+          }),
+        );
+        return Response.json({ ok: true, sources });
+      }
+
+      const body = await req.json().catch(() => null);
+      if (!body || typeof body.url !== "string") {
+        return Response.json({ ok: false, error: "A source URL is required" }, { status: 400 });
+      }
+      let source: SourceUrl;
+      try {
+        source = parseSourceUrl(body.url);
+      } catch (error: any) {
+        return Response.json({ ok: false, error: error?.message || "Invalid source URL" }, { status: 400 });
+      }
+      const identity = sourceIdentity(source.url);
+      const configured = SOURCE_KEYS.some((key) => config[key].some((url) => sourceIdentity(url) === identity));
+      if (!configured) {
+        return Response.json({ ok: false, error: "Saved source not found" }, { status: 404 });
+      }
+      let legacyJobsLinked = 0;
+      const tracked = db
+        .query("SELECT COUNT(*) AS count FROM job_sources WHERE source_url = ?")
+        .get(identity) as { count: number };
+      // Older databases have jobs but no ownership table entries. When there
+      // are no known links, list the source once and backfill matching job ids
+      // so this first removal also cleans pre-upgrade queue rows.
+      if ((tracked?.count || 0) === 0) {
+        try {
+          const items = await getPlaylistItems(source.url, config);
+          legacyJobsLinked = associateExistingJobsWithSource(identity, items.map((item) => item.id));
+        } catch (error: any) {
+          logError("source-delete", `Legacy job lookup for ${source.url}: ${error?.message || error}`);
+        }
+      }
+      try {
+        const result = await removeSource(source.url);
+        if (!result.removed) {
+          return Response.json({ ok: false, error: "Saved source not found" }, { status: 404 });
+        }
+        return Response.json({
+          ok: true,
+          source: { url: result.url, key: result.key },
+          removedConfigEntries: result.removedConfigEntries,
+          affectedJobs: result.affectedJobs,
+          legacyJobsLinked,
+          deletedJobs: result.deletedJobs,
+          retainedJobs: result.retainedJobs,
+          message: `Removed source from config.json and deleted ${result.deletedJobs} job(s).`,
+        });
+      } catch (error: any) {
+        logError("config", `Removing source ${source.url}: ${error?.message || error}`);
+        return Response.json({
+          ok: false,
+          error: `Could not completely remove this source: ${error?.message || error}`,
+        }, { status: 500 });
+      }
     },
   },
   {

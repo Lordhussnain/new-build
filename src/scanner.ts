@@ -8,6 +8,7 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { db, getNextIndex, isVideoInDb } from "./db";
+import { isSourceBlocked, sourceIdentity } from "./sources";
 import { cookiesArgs, ytDlp } from "./tools";
 import { sanitizeFolderName } from "./util";
 import { stats } from "./state";
@@ -79,11 +80,17 @@ export async function ingestItems(
   items: ListingItem[],
   config: Config,
   overrideFolderName?: string,
+  sourceUrl?: string,
 ): Promise<{ found: number; added: number; skipped: number }> {
   if (items.length === 0) return { found: 0, added: 0, skipped: 0 };
+  const sourceKey = sourceUrl ? sourceIdentity(sourceUrl) : null;
   const folder = sanitizeFolderName(overrideFolderName || items[0].playlist || "Single Videos");
   const outputDir = join(config.outputRoot, folder);
   await mkdir(outputDir, { recursive: true });
+  // A delete may have landed while this scan was awaiting the directory I/O.
+  if (sourceKey && isSourceBlocked(sourceKey)) {
+    return { found: items.length, added: 0, skipped: items.length };
+  }
   const targetFormat = config.videoQuality === "audio" ? "mp3" : (config.targetFormat || "mp4");
   const wantSubs = config.downloadSubtitles ? 1 : 0;
   const wantThumb = config.writeThumbnail ? 1 : 0;
@@ -101,19 +108,10 @@ export async function ingestItems(
          (id, url, title, output_directory, target_format, want_subtitles, want_thumbnail, want_description, folder, "index", duration, download_status, conversion_status, metadata_status)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
     );
+    const sourceStmt = sourceKey
+      ? db.prepare("INSERT OR IGNORE INTO job_sources (source_url, job_id) VALUES (?, ?)")
+      : null;
     for (const item of batch) {
-      if (isVideoInDb(item.id)) {
-        // A job parked as waiting_live (stream was live at download time) may
-        // have ended by now — any fresh listing that still contains it requeues
-        // it; the !is_live filter drops it again if it is somehow still live.
-        db.run(
-          `UPDATE jobs SET download_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND download_status = 'waiting_live'`,
-          [item.id],
-        );
-        skipped++;
-        stats.skipped++;
-        continue;
-      }
       if (
         config.skipShorts &&
         !config.downloadShorts &&
@@ -121,6 +119,21 @@ export async function ingestItems(
         item.duration > 0 &&
         item.duration < 60
       ) {
+        skipped++;
+        stats.skipped++;
+        continue;
+      }
+      if (isVideoInDb(item.id)) {
+        // Record additional source ownership even though the video job itself
+        // is deduplicated globally.
+        if (sourceKey) sourceStmt?.run(sourceKey, item.id);
+        // A job parked as waiting_live (stream was live at download time) may
+        // have ended by now — any fresh listing that still contains it requeues
+        // it; the !is_live filter drops it again if it is somehow still live.
+        db.run(
+          `UPDATE jobs SET download_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND download_status = 'waiting_live'`,
+          [item.id],
+        );
         skipped++;
         stats.skipped++;
         continue;
@@ -141,6 +154,7 @@ export async function ingestItems(
         conversionStatus,
         metadataStatus,
       );
+      if (sourceKey) sourceStmt?.run(sourceKey, item.id);
       added++;
       stats.totalQueued++;
     }
@@ -155,6 +169,7 @@ export async function scanAndIngest(
   config: Config,
   overrideFolderName?: string,
 ): Promise<{ found: number; added: number; skipped: number }> {
+  if (isSourceBlocked(url)) return { found: 0, added: 0, skipped: 0 };
   const items = await getPlaylistItems(url, config);
-  return ingestItems(items, config, overrideFolderName);
+  return ingestItems(items, config, overrideFolderName, url);
 }

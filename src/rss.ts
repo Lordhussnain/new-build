@@ -78,7 +78,7 @@ export async function pollChannelRss(channelUrl: string, config: Config): Promis
   if (!res.ok) throw new Error(`RSS HTTP ${res.status} for ${channelUrl}`);
   const xml = await res.text();
   const { items } = parseRssFeed(xml);
-  const result = await ingestItems(items, config);
+  const result = await ingestItems(items, config, undefined, channelUrl);
   return result.added;
 }
 
