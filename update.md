@@ -106,16 +106,19 @@ claim with nothing able to kill it.
 **Fix:** `AbortController` + 120 s timeout, drain both pipes, register in `activeProcs`
 under a reserved key so `killActiveChildren()` reaches it.
 
-### 1.5 Per-job user pause is silently discarded
+### 1.5 Per-job user pause is silently discarded — RESOLVED
 
-`web.ts:468` sets `download_status='paused', pause_reason='user'`, but
-`handleDownloadFailure` checks only the **global** `isPaused()` (`download.ts:223`) — a
-paused job that errors falls into the transient branch and is written back to `pending`;
-one that succeeds goes to `downloaded` via `recordSuccess`.
+The download handlers now read the persisted pause reason when processing a result
+(rather than trusting the possibly stale `Job` snapshot). A failed attempt keeps a
+`pause_reason='user'` row paused and records its partial; a successful file is recorded
+without advancing the download status or pipeline. The success update is atomic, so a
+concurrent pause cannot be overwritten. The route-level active-claim guard from 1.2
+remains in force; these worker checks protect a user pause already persisted when a
+completion/failure handler runs.
 
-**Fix:** `recordSuccess` and `handleDownloadFailure` (and the converter) honour
-`job.pause_reason === 'user'` by parking instead of advancing. Same for
-`metadata.ts:115` writing `done` unconditionally after a re-queue.
+**Tests** (`tests/download-pause.test.ts`): cover a failure with a stale worker snapshot
+and a successful file result; both preserve `download_status='paused'` and
+`pause_reason='user'`.
 
 ### 1.6 Silent swallows that hide real failures
 

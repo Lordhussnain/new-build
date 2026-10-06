@@ -517,7 +517,7 @@ bun run typecheck              # tsc --noEmit (tsconfig covers *.ts, src/**, tes
 bun run check                  # typecheck + full suite (what CI/the definition of done means)
 ```
 
-358 tests across 24 files. Tests share one process, so any file that touches the
+361 tests across 25 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -537,6 +537,7 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | `tests/download-args.test.ts` | downloader-engine selection, aria2c args, bandwidth split, fragment/chunk/buffer flags, watchdog scaling, multi-audio selector/multistream flags |
 | `tests/download-output.test.ts` | bounded CR/LF pipe parsing, split UTF-8, oversized-record discard, validated final-path markers |
 | `tests/download-process.test.ts` | a progress-callback failure kills/reaps the downloader and clears active process tracking |
+| `tests/download-pause.test.ts` | user pause state survives download failure and successful file recording |
 | `tests/audio-tracks.test.ts` | track parsing (variant collapse, drc drop, ordering), selection policy incl. per-job override, selector splicing, JSON column round-trips |
 | `tests/metadata.test.ts` | `subtitleArgs` — `all`/blank keep fetch-everything, explicit language lists pass through verbatim |
 | `tests/autoscale.test.ts` | slot ramp step, backlog/ceiling clamps, idle collapse, disabled mode |

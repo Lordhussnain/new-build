@@ -177,7 +177,7 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
   }
   const [stdoutText, stderrText, code] = output;
 
-  if (isPaused()) {
+  if (isPaused() && !isUserPaused(job.id)) {
     parkPaused(job);
     updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
     return;
@@ -193,7 +193,10 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
       throw new Error("Download finished but output file could not be located");
     }
     const fileSize = (await stat(filePath)).size;
-    recordSuccess(job.id, filePath, fileSize);
+    if (recordSuccess(job.id, filePath, fileSize)) {
+      updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
+      return;
+    }
     // This attempt replaces a previously downloaded file (dashboard retry):
     // the new file is in place, so the stashed backup can finally go. Until
     // this moment the engine never deletes work that has already been done.
@@ -279,7 +282,12 @@ export async function cleanupDownloadProcess(
  *   • permanent (private/removed/…)    → fail fast, never auto-requeued
  *   • retry budget spent               → park as failed for the sweep
  */
-async function handleDownloadFailure(id: number, job: Job, config: Config, err: any): Promise<void> {
+export async function handleDownloadFailure(id: number, job: Job, config: Config, err: any): Promise<void> {
+  if (isUserPaused(job.id)) {
+    parkUserPaused(job);
+    updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
+    return;
+  }
   if (isPaused()) {
     parkPaused(job);
     updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
@@ -620,6 +628,22 @@ function readProgressState(id: string): { retryCount: number; bestProgress: numb
   };
 }
 
+// `job` is the claim-time snapshot; the DB is authoritative for a later pause request.
+function isUserPaused(id: string): boolean {
+  const row = db.query("SELECT pause_reason FROM jobs WHERE id = ?").get(id) as { pause_reason: string | null } | null;
+  return row?.pause_reason === "user";
+}
+
+function parkUserPaused(job: Job): void {
+  const result = db.run(
+    `UPDATE jobs SET download_status = 'paused', pause_reason = 'user',
+       download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND pause_reason = 'user'`,
+    [job.id],
+  );
+  if (result.changes > 0) recordJobPartial(job);
+}
+
 function parkPaused(job: Job): void {
   db.run(
     `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
@@ -642,13 +666,20 @@ function resetForRetry(id: string): void {
   );
 }
 
-function recordSuccess(id: string, filePath: string, fileSize: number): void {
-  db.run(
-    `UPDATE jobs SET download_status = 'downloaded', file_path = ?, file_size = ?, partial_file_path = NULL,
-       progress = 100, best_progress = 100, last_error = NULL,
-       download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [filePath, fileSize, id],
-  );
+export function recordSuccess(id: string, filePath: string, fileSize: number): boolean {
+  const row = db
+    .query(
+      `UPDATE jobs SET
+         download_status = CASE WHEN pause_reason = 'user' THEN 'paused' ELSE 'downloaded' END,
+         pause_reason = CASE WHEN pause_reason = 'user' THEN 'user' ELSE NULL END,
+         file_path = ?, file_size = ?, partial_file_path = NULL,
+         progress = 100, best_progress = 100, last_error = NULL,
+         download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?
+       RETURNING pause_reason`,
+    )
+    .get(filePath, fileSize, id) as { pause_reason: string | null } | null;
+  return row?.pause_reason === "user";
 }
 
 function updateWorkerLine(id: number, text: string, _config: Config): void {

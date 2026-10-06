@@ -272,6 +272,26 @@ describe("job mutations reject active pipeline claims", () => {
     expect(getJob("pause-idle")).toMatchObject({ download_status: "pending" });
   });
 
+  test("single-job pause refuses a currently downloading row and leaves it unchanged", async () => {
+    insertJob("pause-downloading", {
+      download_status: "downloading",
+      download_claimed_by: "dl-1",
+      pause_reason: null,
+    });
+
+    const response = await api("/api/jobs/pause", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: ["pause-downloading"] }),
+    });
+    await expectInProgress(response);
+    expect(getJob("pause-downloading")).toMatchObject({
+      download_status: "downloading",
+      pause_reason: null,
+      download_claimed_by: "dl-1",
+    });
+  });
+
   test("purge refuses a paused row that still holds a download claim", async () => {
     insertJob("purge-active", {
       download_status: "paused",
