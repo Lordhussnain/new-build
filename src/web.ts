@@ -220,6 +220,35 @@ function mapJobRow(r: any) {
   };
 }
 
+const ACTIVE_JOB_PREDICATE = `
+  COALESCE(download_status, '') = 'downloading'
+  OR download_claimed_by IS NOT NULL
+  OR COALESCE(conversion_status, '') = 'in_progress'
+  OR conversion_claimed_by IS NOT NULL
+  OR COALESCE(metadata_status, '') = 'in_progress'
+`;
+
+const PURGE_QUEUE_PREDICATE = "download_status IN ('pending', 'paused', 'waiting_live', 'failed')";
+
+type IdleJobResult<T> = { ok: true; value: T } | { ok: false };
+
+/** Run a synchronous job mutation only while none of its rows has a live stage claim. */
+function withIdleJobs<T>(ids: string[], operation: () => T): IdleJobResult<T> {
+  const placeholders = ids.map(() => "?").join(",");
+  const transaction = db.transaction(() => {
+    const active = db
+      .query(`SELECT id FROM jobs WHERE id IN (${placeholders}) AND (${ACTIVE_JOB_PREDICATE}) LIMIT 1`)
+      .get(...ids);
+    if (active) return { ok: false as const };
+    return { ok: true as const, value: operation() };
+  });
+  return transaction.immediate();
+}
+
+function jobInProgressResponse(): Response {
+  return Response.json({ ok: false, error: "job is in progress" }, { status: 409 });
+}
+
 /**
  * Re-queue a job with fresh budgets (download + any failed side stages).
  *
@@ -233,40 +262,43 @@ function mapJobRow(r: any) {
  *     `--no-overwrites` skips the download the same way. The backup is
  *     deleted when the new download succeeds and restored if it fails
  *     permanently (see reconcile.ts).
- * Throws when an existing file cannot be moved aside — the route then answers
- * 500 instead of starting a download yt-dlp would silently skip.
+ * Active download, conversion, and metadata claims return "in-progress" before
+ * the archive or any media file is touched.
  */
-function retryJobById(id: string, config: Config): number {
-  const row = db.query("SELECT id, file_path FROM jobs WHERE id = ?").get(id) as {
-    id: string;
-    file_path: string | null;
-  } | null;
-  if (!row) return 0;
-  removeFromArchive(config.archiveFile, id);
-  // Move the previous file aside BEFORE the job becomes claimable: a worker
-  // that grabs it while the old file still exists would get a yt-dlp skip
-  // (`--no-overwrites`) instead of a real download. Throws when the file
-  // cannot be renamed — the route then answers 500 instead of starting a
-  // download that would silently no-op.
-  stashDownloadedFile(id, row.file_path);
-  // Re-queue download AND any failed metadata/conversion work; preserve
-  // conversion_status='not_needed'. Also clears a user pause and resets the
-  // per-stage retry budgets so a manual retry always gets a fresh budget.
-  return db.run(
-    `UPDATE jobs SET
-       download_status = 'pending', pause_reason = NULL, progress = 0, retry_count = 0,
-       best_progress = 0, resume_count = 0, speed = 0, eta = 0,
-       conversion_status = CASE WHEN conversion_status = 'not_needed' THEN 'not_needed' ELSE 'pending' END,
-       conversion_retry_count = 0,
-       metadata_status = CASE
-         WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
-         ELSE metadata_status END,
-       metadata_retry_count = 0,
-       last_error = NULL, download_claimed_by = NULL, download_claimed_at = NULL,
-       conversion_claimed_by = NULL, conversion_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
-     WHERE id = ?`,
-    [id],
-  ).changes;
+function retryJobById(id: string, config: Config): number | "in-progress" {
+  const result = withIdleJobs([id], () => {
+    const row = db.query("SELECT id, file_path FROM jobs WHERE id = ?").get(id) as {
+      id: string;
+      file_path: string | null;
+    } | null;
+    if (!row) return 0;
+    removeFromArchive(config.archiveFile, id);
+    // Move the previous file aside BEFORE the job becomes claimable: a worker
+    // that grabs it while the old file still exists would get a yt-dlp skip
+    // (`--no-overwrites`) instead of a real download. Throws when the file
+    // cannot be renamed — the route then answers 500 instead of starting a
+    // download that would silently no-op.
+    stashDownloadedFile(id, row.file_path);
+    // Re-queue download AND any failed metadata/conversion work; preserve
+    // conversion_status='not_needed'. Also clears a user pause and resets the
+    // per-stage retry budgets so a manual retry always gets a fresh budget.
+    return db.run(
+      `UPDATE jobs SET
+         download_status = 'pending', pause_reason = NULL, progress = 0, retry_count = 0,
+         best_progress = 0, resume_count = 0, speed = 0, eta = 0,
+         conversion_status = CASE WHEN conversion_status = 'not_needed' THEN 'not_needed' ELSE 'pending' END,
+         conversion_retry_count = 0,
+         metadata_status = CASE
+           WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
+           ELSE metadata_status END,
+         metadata_retry_count = 0,
+         last_error = NULL, download_claimed_by = NULL, download_claimed_at = NULL,
+         conversion_claimed_by = NULL, conversion_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND NOT (${ACTIVE_JOB_PREDICATE})`,
+      [id],
+    ).changes;
+  });
+  return result.ok ? result.value : "in-progress";
 }
 
 /** Clear every per-stage failure counter for one job. */
@@ -286,8 +318,9 @@ async function deleteJobsBulk(req: Request): Promise<Response> {
     : [];
   if (ids.length === 0) return Response.json({ ok: false, error: "No job ids provided" }, { status: 400 });
   const placeholders = ids.map(() => "?").join(",");
-  const result = db.run(`DELETE FROM jobs WHERE id IN (${placeholders})`, ids);
-  return Response.json({ ok: true, deleted: result.changes });
+  const result = withIdleJobs(ids, () => db.run(`DELETE FROM jobs WHERE id IN (${placeholders})`, ids).changes);
+  if (!result.ok) return jobInProgressResponse();
+  return Response.json({ ok: true, deleted: result.value });
 }
 
 const ROUTES: Route[] = [
@@ -417,6 +450,7 @@ const ROUTES: Route[] = [
     handler: ({ params, config }) => {
       try {
         const changed = retryJobById(params.id, config);
+        if (changed === "in-progress") return jobInProgressResponse();
         if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
         return Response.json({ ok: true });
       } catch (e: any) {
@@ -561,9 +595,10 @@ const ROUTES: Route[] = [
     methods: ["DELETE"],
     pattern: "/api/jobs/:id",
     handler: ({ params }) => {
-      const result = db.run(`DELETE FROM jobs WHERE id = ?`, [params.id]);
-      if (result.changes === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
-      return Response.json({ ok: true, deleted: result.changes });
+      const result = withIdleJobs([params.id], () => db.run(`DELETE FROM jobs WHERE id = ?`, [params.id]).changes);
+      if (!result.ok) return jobInProgressResponse();
+      if (result.value === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+      return Response.json({ ok: true, deleted: result.value });
     },
   },
   // Static action paths must be listed before the :id routes so GET on them
@@ -578,14 +613,17 @@ const ROUTES: Route[] = [
         : [];
       if (ids.length === 0) return Response.json({ ok: false, error: "No job ids provided" }, { status: 400 });
       const placeholders = ids.map(() => "?").join(",");
-      const result = db.run(
-        `UPDATE jobs SET download_status = 'paused', pause_reason = 'user',
-           download_claimed_by = CASE WHEN download_status = 'downloading' THEN download_claimed_by ELSE NULL END,
-           updated_at = CURRENT_TIMESTAMP
-         WHERE id IN (${placeholders}) AND download_status IN ('pending', 'downloading', 'paused')`,
-        ids,
+      const result = withIdleJobs(ids, () =>
+        db.run(
+          `UPDATE jobs SET download_status = 'paused', pause_reason = 'user',
+             download_claimed_by = CASE WHEN download_status = 'downloading' THEN download_claimed_by ELSE NULL END,
+             updated_at = CURRENT_TIMESTAMP
+           WHERE id IN (${placeholders}) AND download_status IN ('pending', 'downloading', 'paused')`,
+          ids,
+        ).changes,
       );
-      return Response.json({ ok: true, paused: result.changes });
+      if (!result.ok) return jobInProgressResponse();
+      return Response.json({ ok: true, paused: result.value });
     },
   },
   {
@@ -605,6 +643,7 @@ const ROUTES: Route[] = [
     handler: ({ params, config }) => {
       try {
         const changed = retryJobById(params.id, config);
+        if (changed === "in-progress") return jobInProgressResponse();
         if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
         return Response.json({ ok: true });
       } catch (e: any) {
@@ -739,8 +778,22 @@ const ROUTES: Route[] = [
     methods: ["POST"],
     pattern: "/api/queue/purge",
     handler: () => {
-      const result = db.run("DELETE FROM jobs WHERE download_status IN ('pending', 'paused', 'waiting_live', 'failed')");
-      return Response.json({ ok: true, deleted: result.changes });
+      const transaction = db.transaction(() => {
+        const active = db
+          .query(`SELECT id FROM jobs WHERE ${PURGE_QUEUE_PREDICATE} AND (${ACTIVE_JOB_PREDICATE}) LIMIT 1`)
+          .get();
+        if (active) return { ok: false as const };
+        const result = db.run(
+          `DELETE FROM jobs WHERE ${PURGE_QUEUE_PREDICATE}
+             AND download_claimed_by IS NULL AND conversion_claimed_by IS NULL
+             AND COALESCE(conversion_status, '') != 'in_progress'
+             AND COALESCE(metadata_status, '') != 'in_progress'`,
+        );
+        return { ok: true as const, deleted: result.changes };
+      });
+      const result = transaction.immediate();
+      if (!result.ok) return jobInProgressResponse();
+      return Response.json({ ok: true, deleted: result.deleted });
     },
   },
   {
@@ -938,7 +991,7 @@ function reliabilityHandler(config: Config): Response {
     .get() as any;
   // What the stale-claim reaper would reclaim right now — same thresholds and
   // active-download protection as the sweep itself, so the panel cannot drift.
-  const t = STALE_CLAIM_THRESHOLDS;
+  const t = STALE_CLAIM_THRESHOLDS(config);
   const activeJobIds = Array.from(activeDownloadJobs.values());
   const activeJobFilter = activeJobIds.length
     ? `AND id NOT IN (${activeJobIds.map(() => "?").join(", ")})`

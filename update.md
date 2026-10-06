@@ -39,50 +39,44 @@ and stays readable in history. Sign out of Google/YouTube in that browser profil
 
 Six verified bugs. Each is a small diff with a concrete failure mode.
 
-### 1.1 The stale-claim reaper steals live downloads — HIGHEST
+### 1.1 Stale-claim timeout does not follow long download watchdogs — RESOLVED
 
-`src/reconcile.ts:56` reaps downloads at `-20 minutes`. `download_claimed_at` is set once
-at claim (`src/db.ts:162`) and **never refreshed**. But `maxDownloadMinutes` defaults to
-**180** (schema max 2880), and `computeDownloadTimeoutMs` (`src/retry.ts:32-41`)
-legitimises a run that long.
+The original audit description that `download_claimed_at` was never refreshed did not
+match this checkout: `updateJobProgress` already heartbeats it in the existing
+500 ms-throttled progress `UPDATE`, and `reapStaleClaims` already excludes jobs owned by
+live download workers. Those protections prevent an active in-process transfer from
+being re-queued while yt-dlp writes.
 
-Result: any transfer taking >20 min is re-queued as `paused/interrupted` **while its
-yt-dlp is still writing**. A second worker claims it and spawns a second yt-dlp on the
-same `outTemplate`; whichever finishes first clobbers `file_path`
-(`src/workers/download.ts:195`).
+The remaining gap was the fixed `-20 minutes` stale threshold, which was shorter than
+the configured download watchdog (180 minutes by default). The reaper now takes the
+current `Config` and uses `-${Math.max(20, config.maxDownloadMinutes)} minutes`; the
+shared `STALE_CLAIM_THRESHOLDS(config)` function keeps the dashboard and config manager
+in sync. Progress heartbeats and the live-worker exclusion remain in place.
 
-**Fix — both halves:**
+**Tests** (`tests/db.test.ts`, `tests/settings.test.ts`): verify that a claim within a
+configured 60-minute window survives, a claim beyond it is reclaimed, the 20-minute
+minimum is retained for smaller configured timeouts, and the dashboard reports the same
+window.
 
-1. *Heartbeat the claim on progress.* In `updateJobProgress`
-   (`src/workers/download.ts`, ~line 400) add `download_claimed_at = CURRENT_TIMESTAMP`
-   to the existing 500 ms-throttled `UPDATE` — same round-trip, no extra write. The
-   reaper then measures *no progress* rather than *claim age*.
-2. *Make the floor config-aware.* `reapStaleClaims` takes a `Config`; the download
-   threshold becomes `-${max(20, maxDownloadMinutes)} minutes` so it can never undercut
-   the watchdog. `STALE_CLAIM_THRESHOLDS` becomes a function; keep the exported name so
-   `web.ts:731` and `update_config.ts` cannot drift (AGENTS.md §6 invariant).
+### 1.2 Job mutation routes bypass active-stage exclusions — RESOLVED
 
-**Test** (`tests/reconcile.test.ts`): a 25-min-old claim with a fresh `download_claimed_at`
-survives; the same claim with a stale one is reaped; the threshold never drops below
-`maxDownloadMinutes`.
+Retry, single/bulk delete, queue purge, and per-job bulk pause previously mutated rows
+without checking whether a download, conversion, or metadata worker still owned the
+media/sidecars. In particular, retry cleared stage claims and purge could delete paused
+rows that still held a download claim.
 
-### 1.2 Routes bypass the three claim exclusions
+These routes now use `withIdleJobs()` and an immediate SQLite transaction to reject
+active downloads, conversions, metadata work, and lingering download/conversion claims
+with HTTP 409 `{ok:false, error:"job is in progress"}` before changing files or rows.
+Bulk operations are all-or-nothing; purge also explicitly deletes only rows with
+`download_claimed_by IS NULL` and no active side-stage claim. Both retry route aliases
+share the same guard. Startup reconciliation clears orphaned claims from legacy
+user-paused rows without changing their held status.
 
-`retryJobById` (`src/web.ts:214-224`) flips `conversion_status` `'in_progress' →
-'pending'` and nulls the claim. The download guard at `src/db.ts:172` then passes, so
-yt-dlp writes over the exact file ffmpeg is reading. Same hole in
-`DELETE /api/jobs/:id` (`web.ts:451`), bulk delete (`:239`), `/api/queue/purge`
-(`:530` — which deletes `paused` rows *holding live claims*), and the per-job bulk pause
-(`:472`).
-
-**Fix:**
-- `retryJobById` gains `AND conversion_status != 'in_progress' AND metadata_status != 'in_progress'`
-- **409 `{ok:false, error:"job is in progress"}`** when any stage is live, on retry,
-  delete, bulk delete, pause, and purge
-- Purge additionally requires `download_claimed_by IS NULL`
-
-**Test** (`tests/web-routes.test.ts`): retry / delete / pause / purge against an in-flight
-job → 409, and every status column unchanged.
+**Tests** (`tests/web-routes.test.ts`, `tests/db.test.ts`): active conversion retry leaves
+its archive/file untouched; single delete, mixed bulk delete, bulk pause, and purge
+return 409 without mutating active or idle rows. Startup recovery releases an orphaned
+user-pause claim while preserving the user pause.
 
 ### 1.3 `runDownload` leaks a live yt-dlp on any throw
 

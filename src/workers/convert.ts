@@ -86,8 +86,8 @@ export async function converterWorker(id: number, config: Config): Promise<void>
  * True when this worker still owns the job's conversion claim.
  *
  * Claims can be lost mid-flight: the stale-claim reaper re-queues conversions
- * after STALE_CLAIM_THRESHOLDS.conversion, and (before the web-port
- * single-instance gate) a second engine instance could reset them at startup.
+ * after its three-hour timeout, and (before the web-port single-instance gate)
+ * a second engine instance could reset them at startup.
  * A converter that kept working would then race a second converter on the same
  * files — the loser's source gets deleted under it, which on Windows either
  * fails silently (locked handle) or corrupts the winner's output. Every

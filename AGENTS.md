@@ -277,8 +277,8 @@ re-queues a failed sidecar pass on an already-converted job.
 | Network monitor | `resilience.ts networkMonitor()` | probes 3 hosts, pauses after 2 consecutive failures |
 | Cookies watcher | `reconcile.ts cookiesWatch()` + `tools.ts detectCookiesChange()` | 60s sweep: reports cookies.txt appearing / changing / vanishing mid-run and counts the credential-blocked jobs it may rescue (never auto-requeues them) |
 | Disk guard | `resilience.ts diskUsage()` → `checkDiskSpace()` | `diskUsage` is the **only** `statfs` caller: statfs → PowerShell `Get-PSDrive` fallback → `-1/-1` degraded mode (never bricks the engine, never 500s `/api/status`) |
-| Crash recovery | `reconcile.ts reconcileCrashedJobs()` | `downloading` → `paused + interrupted` (auto-claimable) |
-| Stale-claim reaper | `reconcile.ts reapStaleClaims()` | downloads idle >20 min (actively owned jobs are protected and progress heartbeats the claim), conversions >3 h, metadata >15 min; thresholds live in `STALE_CLAIM_THRESHOLDS` so the dashboard cannot drift from them |
+| Crash recovery | `reconcile.ts reconcileCrashedJobs()` | `downloading` → `paused + interrupted` (auto-claimable); also clears orphan claims from legacy user-paused downloads while keeping them held |
+| Stale-claim reaper | `reconcile.ts reapStaleClaims(config)` | downloads idle >`max(20 min, maxDownloadMinutes)` (actively owned jobs are protected and progress heartbeats the claim), conversions >3 h, metadata >15 min; thresholds come from `STALE_CLAIM_THRESHOLDS(config)` so the dashboard cannot drift from them |
 | Missing-file reconciliation | `reconcile.ts reconcileMissingFiles()` | scrubs the yt-dlp archive + re-queues |
 | Failed-job sweep | `reconcile.ts requeueFailedJobs()` | after cooldown, non-permanent failures start a fresh per-video retry window; permanent download errors are skipped; `ignoreCooldown` for the UI button |
 | Partial-file cleanup | `reconcile.ts cleanOrphanedFiles()` | keeps resume-able partials, including retryable failures waiting for cooldown; deletes exhausted partials when auto-requeue is disabled and day-old orphans |
@@ -467,6 +467,12 @@ slashes collapse (`/api/jobs/` is `/api/jobs`). Static action paths are listed
 *before* `:param` routes so a wrong method answers 405 instead of binding the
 segment as an id (gotcha 21).
 
+Job retry, delete, queue purge, and per-job pause mutations must check all
+pipeline stages and claims inside an immediate SQLite transaction (`withIdleJobs()`
+for id-based operations). If any targeted row is downloading, converting, fetching
+metadata, or still holds a download/conversion claim, return HTTP 409 with
+`{ok:false, error:"job is in progress"}` and make no partial bulk changes.
+
 | Method | Route | Purpose |
 | --- | --- | --- |
 | GET | `/` | dashboard (login page when a token is required) |
@@ -476,16 +482,16 @@ segment as an id (gotcha 21).
 | GET | `/api/jobs` | up to 500 jobs with status/retry/progress fields, plus parsed `audio_tracks` / `audio_selection` / `metadata_files` and boolean `want_*` sidecar flags |
 | GET | `/api/jobs/:id` | one job, read fresh from the DB — the detail drawer fetches this instead of trusting a poll-cycle-old list row |
 | POST | `/api/scan` | `{url, folder?}` → validate/canonicalize → save source to `config.json` → scan & ingest; returns `saved`, `source: {url, key, added}`, and counts. Save failure starts no scan; scan failure keeps the saved source. Folder override applies only to this scan |
-| POST | `/api/queue/purge` | delete every pending / paused / waiting_live / failed job; returns `{ok, deleted}` |
+| POST | `/api/queue/purge` | delete every idle pending / paused / waiting_live / failed job; returns `{ok, deleted}` or 409 if any candidate still holds an active claim |
 | POST | `/api/pause` · `/api/resume` | global pause / resume-all |
-| POST | `/api/jobs/:id/retry` | re-queue one job (all stages, budgets reset); 404 for an unknown id. For a downloaded job this is a deliberate re-download: the id is scrubbed from the yt-dlp archive and the existing file stashed as `.superseded` first (§7.2). 500 when the previous file cannot be moved aside |
+| POST | `/api/jobs/:id/retry` | re-queue one idle job (all stages, budgets reset); 404 for an unknown id, 409 while any pipeline stage/claim is active. For a downloaded job this is a deliberate re-download: the id is scrubbed from the yt-dlp archive and the existing file stashed as `.superseded` first (§7.2). 500 when the previous file cannot be moved aside |
 | POST | `/api/jobs/:id/reset-failures` | zero the per-stage retry counters; 404 for an unknown id |
 | POST | `/api/jobs/:id/sidecars` | per-job sidecar toggles: `{subtitles?, thumbnail?, description?}` (booleans). Flipping a flag on for a finished download re-opens the metadata stage so the worker fetches the files against the existing media; flipping off never deletes fetched files. 400 for an empty/non-boolean body |
-| POST | `/api/jobs/pause` | bulk user-pause by `{ids: []}` |
-| DELETE | `/api/jobs` | bulk delete by `{ids: []}` |
+| POST | `/api/jobs/pause` | bulk user-pause by `{ids: []}`; 409 and no changes if any requested job has an active stage/claim |
+| DELETE | `/api/jobs` | bulk delete by `{ids: []}`; 409 and no changes if any requested job has an active stage/claim |
 | POST | `/api/jobs/:id/audio-tracks` | per-job audio-track selection: `{tracks:["es",…]}` saves it, `{tracks:null}` returns the job to the global mode |
 | POST | `/api/jobs/:id/audio-probe` | runs the yt-dlp `-J` probe for one job, stores + returns its audio tracks |
-| DELETE | `/api/jobs/:id` | delete one job |
+| DELETE | `/api/jobs/:id` | delete one idle job; 409 while any pipeline stage/claim is active |
 | POST | `/api/retry/:id` · `/api/failcount/reset/:id` · `/api/jobs/delete` | **legacy aliases** of the canonical routes above — kept on purpose for older dashboards and scripts |
 | GET | `/api/failed` | failed jobs |
 | POST | `/api/failed/requeue` | force-requeue eligible failed jobs (cooldown ignored, permanent errors still skipped) |
@@ -537,7 +543,7 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | `tests/convert.test.ts` | `findConvertedOutput` crash-window adoption: adopts a finished mp3/mp4, never the source itself, empty for unrelated sidecars |
 | `tests/logger.test.ts` | `errorLogPath()` routes test-run logs to the temp dir, never the operator's `error.log` |
 | `tests/disk.test.ts` | `diskUsage()` happy path, the `-1/-1` degraded path, and `checkDiskSpace`'s allow-through when free space is unknown |
-| `tests/web-routes.test.ts` | the `ROUTES` table: canonical per-job routes, the legacy aliases, the `{ok}` envelope, JSON 404 and 405 + `Allow`, trailing-slash collapse, retry-as-re-download (archive scrub + `.superseded` stash), and the per-job sidecars endpoint |
+| `tests/web-routes.test.ts` | the `ROUTES` table: canonical per-job routes, the legacy aliases, JSON 404/405 + `Allow`, trailing-slash collapse, active-stage 409 guards across retry/delete/pause/purge, retry-as-re-download (archive scrub + `.superseded` stash), and per-job sidecars |
 | `tests/settings.test.ts` | the dashboard settings allow-list, type coercion, Zod + cross-field validation, persistence, live-config propagation, and auth |
 | `tests/config-manager.test.ts` | every schema key is reachable from `update_config.ts`; the manager reads the sweep thresholds from `STALE_CLAIM_THRESHOLDS` and counts partials with the engine's predicate |
 | `tests/dashboard.test.ts` | `formatHeaderLine` counters, and the `Res:n` field appearing only when partials are held |

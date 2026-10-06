@@ -57,6 +57,10 @@ function getJob(id: string): any {
   return db.query("SELECT * FROM jobs WHERE id = ?").get(id);
 }
 
+function minutesAgo(minutes: number): string {
+  return (db.query("SELECT datetime('now', ?) AS timestamp").get(`-${minutes} minutes`) as any).timestamp;
+}
+
 beforeEach(() => {
   initDatabase(":memory:");
 });
@@ -202,13 +206,20 @@ describe("atomic claims", () => {
 describe("reconcileCrashedJobs", () => {
   test("interrupted downloads become auto-resumable; user pauses survive", () => {
     insertJob("inflight", { download_status: "downloading" });
-    insertJob("userpaused", { download_status: "paused", pause_reason: "user" });
+    insertJob("userpaused", {
+      download_status: "paused",
+      pause_reason: "user",
+      download_claimed_by: "dl-stale",
+      download_claimed_at: "2020-01-01 00:00:00",
+    });
     insertJob("conv", { download_status: "downloaded", conversion_status: "in_progress" });
     insertJob("meta", { download_status: "downloaded", metadata_status: "in_progress" });
     reconcileCrashedJobs();
     expect(getJob("inflight").download_status).toBe("paused");
     expect(getJob("inflight").pause_reason).toBe("interrupted");
     expect(getJob("userpaused").pause_reason).toBe("user");
+    expect(getJob("userpaused").download_claimed_by).toBeNull();
+    expect(getJob("userpaused").download_claimed_at).toBeNull();
     expect(getJob("conv").conversion_status).toBe("pending");
     expect(getJob("meta").metadata_status).toBe("pending");
     // ...and the interrupted job is immediately claimable again
@@ -225,7 +236,7 @@ describe("reapStaleClaims", () => {
     });
     activeDownloadJobs.set(7, "long-download");
     try {
-      reapStaleClaims();
+      reapStaleClaims(testConfig());
       expect(getJob("long-download").download_status).toBe("downloading");
     } finally {
       activeDownloadJobs.delete(7);
@@ -249,11 +260,47 @@ describe("reapStaleClaims", () => {
       conversion_claimed_by: "cv-1",
       conversion_claimed_at: "2020-01-01 00:00:00",
     });
-    reapStaleClaims();
+    reapStaleClaims(testConfig());
     expect(getJob("stale-dl").download_status).toBe("paused");
     expect(getJob("stale-dl").pause_reason).toBe("interrupted");
     expect(getJob("fresh-dl").download_status).toBe("downloading"); // untouched
     expect(getJob("stale-cv").conversion_status).toBe("pending");
+  });
+
+  test("uses the configured maximum download time as the stale-claim floor", () => {
+    insertJob("within-download-window", {
+      download_status: "downloading",
+      download_claimed_by: "dl-1",
+      download_claimed_at: minutesAgo(25),
+    });
+    insertJob("past-download-window", {
+      download_status: "downloading",
+      download_claimed_by: "dl-2",
+      download_claimed_at: minutesAgo(61),
+    });
+
+    reapStaleClaims(testConfig({ maxDownloadMinutes: 60 }));
+
+    expect(getJob("within-download-window").download_status).toBe("downloading");
+    expect(getJob("past-download-window").download_status).toBe("paused");
+  });
+
+  test("keeps the 20-minute minimum when maxDownloadMinutes is lower", () => {
+    insertJob("inside-minimum", {
+      download_status: "downloading",
+      download_claimed_by: "dl-1",
+      download_claimed_at: minutesAgo(19),
+    });
+    insertJob("outside-minimum", {
+      download_status: "downloading",
+      download_claimed_by: "dl-2",
+      download_claimed_at: minutesAgo(21),
+    });
+
+    reapStaleClaims(testConfig({ downloadTimeoutMinutes: 5, maxDownloadMinutes: 10 }));
+
+    expect(getJob("inside-minimum").download_status).toBe("downloading");
+    expect(getJob("outside-minimum").download_status).toBe("paused");
   });
 });
 

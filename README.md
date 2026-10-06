@@ -233,10 +233,11 @@ not a static list of settings:
   `.aria2` control file.
 - **Interrupted** — jobs parked as `paused` + `interrupted`, i.e. the ones the
   crashed-jobs sweep will re-claim and continue rather than restart.
-- **Stale claims** — what the reaper would reclaim right now: claims older than
-  the thresholds in `STALE_CLAIM_THRESHOLDS` (20 min download / 3 h conversion /
-  15 min metadata). The panel imports those constants, so it cannot advertise a
-  timeout the sweep does not enforce.
+- **Stale claims** — what the reaper would reclaim right now: download claims
+  idle longer than `max(20 min, maxDownloadMinutes)`, conversion claims idle over
+  3 h, and metadata claims idle over 15 min. The panel and reaper share
+  `STALE_CLAIM_THRESHOLDS(config)`, so the displayed timeout follows the live
+  watchdog setting and cannot drift from the sweep.
 - **Self-healing sweeps** — the four sweeps with their cadence and a pending
   count. Deleted-files is `startup`-only and stats every recorded file, so its
   count is reported as unknown rather than guessed.

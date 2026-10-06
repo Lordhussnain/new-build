@@ -38,6 +38,11 @@ function getJob(id: string): any {
 const req = (path: string, init?: RequestInit) => new Request(`http://localhost${path}`, init);
 const api = (path: string, init?: RequestInit) => handleRequest(req(path, init), baseConfig());
 
+async function expectInProgress(response: Response): Promise<void> {
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({ ok: false, error: "job is in progress" });
+}
+
 beforeEach(() => {
   initDatabase(":memory:");
   setConfig(baseConfig());
@@ -178,6 +183,110 @@ describe("the route table", () => {
     expect(data.stats.total).toBe(0);
     expect(data.runtime.platform).toBe(process.platform);
     expect(Array.isArray(data.workers)).toBe(true);
+  });
+});
+
+describe("job mutations reject active pipeline claims", () => {
+  test("retry refuses a live conversion before touching the archive or media file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-active-retry-"));
+    const archive = join(dir, "archive.txt");
+    const media = join(dir, "video.mp4");
+    await writeFile(archive, "youtube busyretry\n");
+    await writeFile(media, "existing media");
+    insertJob("busyretry", {
+      download_status: "downloaded",
+      conversion_status: "in_progress",
+      conversion_claimed_by: "cv-1",
+      metadata_status: "done",
+      file_path: media,
+      superseded_file: null,
+      retry_count: 4,
+    });
+
+    const response = await apiWith("/api/jobs/busyretry/retry", cfgWith({ archiveFile: archive }), {
+      method: "POST",
+    });
+    await expectInProgress(response);
+
+    const job = getJob("busyretry");
+    expect(job).toMatchObject({
+      download_status: "downloaded",
+      conversion_status: "in_progress",
+      conversion_claimed_by: "cv-1",
+      retry_count: 4,
+      file_path: media,
+      superseded_file: null,
+    });
+    expect(existsSync(media)).toBe(true);
+    expect(existsSync(`${media}.superseded`)).toBe(false);
+    expect(await readFile(archive, "utf-8")).toBe("youtube busyretry\n");
+  });
+
+  test("single delete refuses an active metadata stage", async () => {
+    insertJob("busydelete", { download_status: "downloaded", metadata_status: "in_progress" });
+
+    const response = await api("/api/jobs/busydelete", { method: "DELETE" });
+    await expectInProgress(response);
+    expect(getJob("busydelete")).toMatchObject({
+      download_status: "downloaded",
+      metadata_status: "in_progress",
+    });
+  });
+
+  test("bulk delete is all-or-nothing when one requested job is downloading", async () => {
+    insertJob("bulk-active", {
+      download_status: "downloading",
+      download_claimed_by: "dl-1",
+    });
+    insertJob("bulk-idle", { download_status: "pending" });
+
+    const response = await api("/api/jobs", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: ["bulk-active", "bulk-idle"] }),
+    });
+    await expectInProgress(response);
+    expect(getJob("bulk-active")).toMatchObject({ download_status: "downloading", download_claimed_by: "dl-1" });
+    expect(getJob("bulk-idle")).toMatchObject({ download_status: "pending" });
+  });
+
+  test("bulk pause leaves every requested row unchanged if one stage is active", async () => {
+    insertJob("pause-active", {
+      download_status: "downloaded",
+      conversion_status: "in_progress",
+      conversion_claimed_by: "cv-2",
+    });
+    insertJob("pause-idle", { download_status: "pending" });
+
+    const response = await api("/api/jobs/pause", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: ["pause-active", "pause-idle"] }),
+    });
+    await expectInProgress(response);
+    expect(getJob("pause-active")).toMatchObject({
+      download_status: "downloaded",
+      conversion_status: "in_progress",
+      conversion_claimed_by: "cv-2",
+    });
+    expect(getJob("pause-idle")).toMatchObject({ download_status: "pending" });
+  });
+
+  test("purge refuses a paused row that still holds a download claim", async () => {
+    insertJob("purge-active", {
+      download_status: "paused",
+      pause_reason: "user",
+      download_claimed_by: "dl-3",
+    });
+    insertJob("purge-idle", { download_status: "pending" });
+
+    const response = await api("/api/queue/purge", { method: "POST" });
+    await expectInProgress(response);
+    expect(getJob("purge-active")).toMatchObject({
+      download_status: "paused",
+      download_claimed_by: "dl-3",
+    });
+    expect(getJob("purge-idle")).toMatchObject({ download_status: "pending" });
   });
 });
 

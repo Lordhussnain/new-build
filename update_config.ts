@@ -453,8 +453,9 @@ async function changeReliabilitySettings(config: Config): Promise<Config> {
 
   console.log("\n— Self-healing sweeps (run by the engine, not configurable here) —");
   console.log(`   • Crashed jobs resume        on startup`);
+  const staleClaimThresholds = STALE_CLAIM_THRESHOLDS(config);
   console.log(
-    `   • Stale claims reclaimed      every 60s — inactive downloads ${STALE_CLAIM_THRESHOLDS.download.replace("-", "idle longer than ")}, conversions ${STALE_CLAIM_THRESHOLDS.conversion.replace("-", "")}, metadata ${STALE_CLAIM_THRESHOLDS.metadata.replace("-", "")}`,
+    `   • Stale claims reclaimed      every 60s — inactive downloads ${staleClaimThresholds.download.replace("-", "idle longer than ")}, conversions ${staleClaimThresholds.conversion.replace("-", "")}, metadata ${staleClaimThresholds.metadata.replace("-", "")}`,
   );
   console.log(`   • Deleted files re-fetched   on startup`);
   console.log(

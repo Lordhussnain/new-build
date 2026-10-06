@@ -25,7 +25,8 @@ import type { Config } from "./config";
 /**
  * Interrupted mid-download jobs become 'paused' + 'interrupted' so they are
  * visible as paused AND automatically re-claimed (resuming where they left
- * off via yt-dlp --continue). User-paused jobs stay held.
+ * off via yt-dlp --continue). User-paused jobs stay held; orphan claims left
+ * by older per-job pause requests are cleared without resuming those jobs.
  */
 export function reconcileCrashedJobs(): void {
   // Persist the on-disk resume point before flipping the status. This is also
@@ -43,36 +44,41 @@ export function reconcileCrashedJobs(): void {
        updated_at = CURRENT_TIMESTAMP
      WHERE download_status = 'downloading'
         OR (download_status = 'paused' AND pause_reason IS NULL)
+        OR (download_status = 'paused' AND pause_reason = 'user' AND download_claimed_by IS NOT NULL)
         OR conversion_status = 'in_progress'
         OR metadata_status = 'in_progress'`,
   );
   if (stmt.changes > 0) {
     console.log(
-      `🔄 Reconciled ${stmt.changes} interrupted job(s) (${recorded} partial(s) recorded) — paused/interrupted jobs will resume automatically.`,
+      `🔄 Reconciled ${stmt.changes} interrupted/stale-claim job(s) (${recorded} partial(s) recorded) — interrupted jobs will resume automatically.`,
     );
   }
 }
 
 /**
  * How long a claim may sit untouched before `reapStaleClaims` treats its owner
- * as dead and re-queues the job. Exported so the dashboard's sweep status
- * reports exactly the same thresholds the sweep itself enforces — if these
- * drift, the UI would promise recovery the engine never performs.
+ * as dead and re-queues the job. The download window is never shorter than
+ * either the 20-minute baseline or the configured maximum download timeout.
+ * Exported so the dashboard and config manager report the exact thresholds
+ * enforced by the sweep.
  */
-export const STALE_CLAIM_THRESHOLDS = {
-  download: "-20 minutes",
-  conversion: "-3 hours",
-  metadata: "-15 minutes",
-} as const;
+export function STALE_CLAIM_THRESHOLDS(config: Pick<Config, "maxDownloadMinutes">) {
+  return {
+    download: `-${Math.max(20, config.maxDownloadMinutes)} minutes`,
+    conversion: "-3 hours",
+    metadata: "-15 minutes",
+  };
+}
 
 /**
  * Periodic safety net: if a worker process/thread dies mid-job the claim can
- * be left behind. A download claim past `STALE_CLAIM_THRESHOLDS.download` is
+ * be left behind. A download claim past the config-aware stale threshold is
  * reclaimed only when no worker still owns that job; progress events heartbeat
  * the claim timestamp. Conversion and metadata claims past their thresholds
  * are re-queued.
  */
-export function reapStaleClaims(): void {
+export function reapStaleClaims(config: Config): void {
+  const thresholds = STALE_CLAIM_THRESHOLDS(config);
   try {
     // Freeze each in-flight download's `.part` path while the job is still
     // 'downloading' (that is this function's own filter) — otherwise the
@@ -86,17 +92,19 @@ export function reapStaleClaims(): void {
       `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
          download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE download_status = 'downloading'
-         AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.download}')) ${activeJobFilter}`;
-    const dl = activeJobIds.length ? db.run(dlQuery, activeJobIds) : db.run(dlQuery);
+         AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', ?)) ${activeJobFilter}`;
+    const dl = db.run(dlQuery, [thresholds.download, ...activeJobIds]);
     const cv = db.run(
       `UPDATE jobs SET conversion_status = 'pending', conversion_claimed_by = NULL,
          conversion_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE conversion_status = 'in_progress'
-         AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.conversion}'))`,
+         AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', ?))`,
+      [thresholds.conversion],
     );
     const md = db.run(
       `UPDATE jobs SET metadata_status = 'pending', updated_at = CURRENT_TIMESTAMP
-       WHERE metadata_status = 'in_progress' AND updated_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.metadata}')`,
+       WHERE metadata_status = 'in_progress' AND updated_at < datetime('now', ?)`,
+      [thresholds.metadata],
     );
     const total = dl.changes + cv.changes + md.changes;
     if (total > 0) {
@@ -451,7 +459,8 @@ export function findPartialFileSync(dir: string, baseFilename: string): string {
 
 /**
  * Remember where each in-flight download's `.part` lives before the job stops
- * being "downloading".
+ * being "downloading", including legacy user-paused rows that still hold a
+ * download claim.
  *
  * Without this, a graceful shutdown or a reaped stale claim leaves the job
  * paused+interrupted with `partial_file_path = NULL` even though the partial is
@@ -464,7 +473,9 @@ export function recordPartialPaths(): number {
   const rows = db
     .query(
       `SELECT id, "index", title, output_directory, partial_file_path FROM jobs
-       WHERE download_status = 'downloading' AND partial_file_path IS NULL`,
+       WHERE (download_status = 'downloading'
+          OR (download_status = 'paused' AND pause_reason = 'user' AND download_claimed_by IS NOT NULL))
+         AND partial_file_path IS NULL`,
     )
     .all() as any[];
   let recorded = 0;

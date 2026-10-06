@@ -284,6 +284,11 @@ describe("GET /api/reliability — resume + self-healing state", () => {
       download_claimed_by: "dl-2",
       download_claimed_at: "2000-01-01 00:00:00",
     });
+    insertJob("within-configured-window", {
+      download_status: "downloading",
+      download_claimed_by: "dl-4",
+      download_claimed_at: (db.query("SELECT datetime('now', '-25 minutes') AS timestamp").get() as any).timestamp,
+    });
     insertJob("active-but-old", {
       download_status: "downloading",
       download_claimed_by: "dl-3",
@@ -292,7 +297,10 @@ describe("GET /api/reliability — resume + self-healing state", () => {
     activeDownloadJobs.set(3, "active-but-old");
 
     try {
-      const res = await handleRequest(new Request("http://x/api/reliability"), getConfig());
+      const res = await handleRequest(
+        new Request("http://x/api/reliability"),
+        baseConfig({ maxDownloadMinutes: 60 }),
+      );
       const body = await res.json();
       expect(body.resume.staleClaims).toBe(1);
     } finally {
@@ -319,9 +327,14 @@ describe("GET /api/reliability — resume + self-healing state", () => {
 
   test("the sweep thresholds match the ones the reaper enforces", async () => {
     // Guards against the dashboard promising recovery the engine never performs.
-    expect(STALE_CLAIM_THRESHOLDS.download).toBe("-20 minutes");
-    expect(STALE_CLAIM_THRESHOLDS.conversion).toBe("-3 hours");
-    expect(STALE_CLAIM_THRESHOLDS.metadata).toBe("-15 minutes");
+    const defaults = STALE_CLAIM_THRESHOLDS(baseConfig());
+    expect(defaults.download).toBe("-180 minutes");
+    expect(defaults.conversion).toBe("-3 hours");
+    expect(defaults.metadata).toBe("-15 minutes");
+    expect(STALE_CLAIM_THRESHOLDS(baseConfig({ maxDownloadMinutes: 45 })).download).toBe("-45 minutes");
+    expect(
+      STALE_CLAIM_THRESHOLDS(baseConfig({ downloadTimeoutMinutes: 5, maxDownloadMinutes: 10 })).download,
+    ).toBe("-20 minutes");
   });
 });
 
