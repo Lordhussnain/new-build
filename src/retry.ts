@@ -202,21 +202,37 @@ export function isTransientDownloadError(message: string): boolean {
  * can never be finished, so ONLY discarding it (together with its aria2c
  * control file, via `removePartialFiles`) lets the video download again.
  *
- * Two verified shapes, both of which repeat byte-for-byte on every attempt:
+ * Upstream reference: yt-dlp#8313 ("Unable to download video data: HTTP Error
+ * 416: Requested range not satisfiable"), closed as config/site behaviour with
+ * the maintainer's diagnosis: the error happens when the partial yt-dlp found
+ * is "the same size or larger than that of the file on youtube's servers".
+ * yt-dlp deliberately does not automate the recovery, so this engine owns it.
  *
- *   • `ERROR: unable to download video data: HTTP Error 416: Requested range
- *     not satisfiable` — the resume asked the CDN for
- *     `Range: bytes=<size of the .part>-` and the answer was "that range does
- *     not exist": the remote stream shrank (YouTube re-encodes / re-slices a
- *     format mid-flight) or the partial already sits at/past the server's
- *     Content-Length. This is how a video strands at 99.0% forever: progress
- *     can never beat `best_progress`, so every retry charges the no-progress
- *     budget and the job ends up `failed` — while the next retry resumes from
- *     the same partial and fails the same way.
- *   • aria2c's refusal to touch the saved state: `File <name> exists, but a
- *     control file(*.aria2) does not exist. Download was canceled ...` (its
- *     default `--allow-overwrite=false`). Nothing is resume-able and starting
- *     over on top of the existing file is refused, so the pair has to go.
+ * Three ways to reach that state, all fixed by the same discard:
+ *
+ *   • YouTube re-encodes / re-slices the format mid-flight (a DASH `f137` /
+ *     `f399` stream getting shorter while the transfer is paused), so
+ *     `Range: bytes=<size of the .part>-` now starts past the end of the file.
+ *   • The same signed URL answers a different Content-Length because the CDN
+ *     switched the content for this IP (proxy/geo change) — the shape that got
+ *     #8313 labelled `geo-blocked`.
+ *   • A pre-existing FINAL file is mistaken for a partial. That is the exact
+ *     cause in #8313 (`nopart: True` plus one fixed output template) and it is
+ *     structurally impossible here: the plan never passes `--no-part`, and
+ *     every job's template is `<index> - <title>` fitted with `[videoId]`, so
+ *     no two videos can share a name.
+ *
+ * Why it must be handled instead of retried: with `--continue` the failure
+ * repeats byte-for-byte, and because progress can never beat `best_progress`
+ * every attempt is a no-progress failure — the video strands at 99.0% until the
+ * budget parks it as `failed`, after which the cooldown sweep re-queues it into
+ * the same loop.
+ *
+ * The same reasoning covers aria2c's refusal to touch the saved state: `File
+ * <name> exists, but a control file(*.aria2) does not exist. Download was
+ * canceled ...` (its default `--allow-overwrite=false`) — nothing is
+ * resume-able and starting over on top of the existing file is refused, so the
+ * pair has to go.
  *
  * Deliberately NOT matched: aria2c's "cannot continue download: downloading is
  * not supported by remote server" (a server without `Accept-Ranges`). There the

@@ -542,6 +542,16 @@ serve for that format — YouTube re-encoded or re-sliced it mid-download — so
 range the resume asks for does not exist. No retry, backoff, re-probe or cookie
 refresh can fix that: only throwing the partial away can.
 
+That is yt-dlp's documented behaviour, not something it will recover from for
+you: in [yt-dlp#8313][i416] a maintainer describes precisely this — the error
+fires when "the partial download that yt-dlp detects has a filesize that is
+either the same size or larger than that of the file on youtube's servers" — and
+closes it as a caller problem (there, `nopart` made an already-*complete* file
+look resumable). This engine always keeps `.part` naming and names every video
+`<index> - <title> [videoId]`, so a mismatch can only mean the remote stream
+changed; a fresh transfer is the whole remedy, and the engine now starts one by
+itself.
+
 Current builds do this themselves: a 416 discards the `.part` together with its
 aria2c control file, zeroes the progress and the high-water mark (which would
 otherwise mark every later attempt "no progress"), and re-queues the video for a
@@ -594,6 +604,8 @@ record is absent, it still looks for the expected media file in the job folder.
    startup reconciliation re-queues interrupted jobs and resumes available
    partials. There is no need to reset the queue or lower the connection count
    for this parser fix.
+
+[i416]: https://github.com/yt-dlp/yt-dlp/issues/8313
 
 If it still crashes on an updated runtime and checkout, save the new crash-report
 link and report it to Bun with the runtime version and reproduction steps.

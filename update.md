@@ -398,6 +398,16 @@ its control file (never one without the other — gotcha 14/19), `progress`/`bes
 are zeroed so the fresh transfer is not pre-judged "no progress", and the job is re-queued.
 A locked pair is still parked with the reason instead of being forced (gotcha 19).
 
+Cross-checked against upstream [yt-dlp#8313](https://github.com/yt-dlp/yt-dlp/issues/8313), which is the same
+message and was closed as caller-side behaviour: the maintainer's diagnosis is that the resume is attempted from
+a file whose "filesize … is either the same size or larger than that of the file on youtube's servers", and in
+that report it came from `nopart: True` plus one fixed output template — an already *complete* file being
+mistaken for a partial. Neither variant of that cause is reachable here (the plan never passes `--no-part`, and
+every job's template carries its video id), so the size mismatch is the only shape that matters and discarding
+is the correct remedy. Recorded in `isUnrecoverableResumeError`'s docstring so this class is not "fixed" later
+with a yt-dlp self-update or a `--no-continue` probe; unlike the signature-challenge class, an upgrade changes
+nothing about it.
+
 **Tests:** `tests/retry.test.ts` (classification + "never permanent"), new
 `tests/download-resume-416.test.ts` (7 handler cases), and an integration scenario in
 `tests/integration.test.ts` backed by a new mock-aria2c mode (`FAKE_ARIA2C_FAIL_MODE=range416`,
