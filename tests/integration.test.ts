@@ -19,7 +19,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { copyFile, mkdir, mkdtemp, readdir, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import type { Subprocess } from "bun";
 import { existsSync } from "node:fs";
@@ -1644,8 +1644,12 @@ describe("integration: secondary-storage move", () => {
       expect(sidecarsLeft).toHaveLength(0);
 
       // file_path points into secondary storage, and the media is really there.
+      // `isAbsolute`, not `startsWith("/")`: a Windows path starts with a drive
+      // letter, and joining it onto the run dir would mangle it into nonsense.
       const job = (await getJobs(engine)).find((j) => j.id === "mockvid001") as any;
-      const resolved = String(job.file_path).startsWith("/") ? job.file_path : join(dir, job.file_path);
+      const resolved = isAbsolute(String(job.file_path))
+        ? String(job.file_path)
+        : join(dir, String(job.file_path));
       expect(resolved.startsWith(nas)).toBe(true);
       expect(existsSync(resolved)).toBe(true);
     } finally {

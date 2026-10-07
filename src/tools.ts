@@ -174,7 +174,16 @@ export interface ToolSearchEnv {
   /** Stand-in for the folder holding the running executable. */
   exeDir?: string;
   platform?: NodeJS.Platform;
-  /** Environment for the probe's child process (PATH included). */
+  /**
+   * Environment for the probe's child process (PATH included).
+   *
+   * When set, this environment IS the search space: with no PATH in it, the
+   * bare-name candidates are skipped instead of spawned. Bun/Windows resolves a
+   * bare name through the *invoking* process's PATH (CreateProcess semantics),
+   * so an injected empty environment would otherwise still "find" a binary that
+   * is installed on the machine — and the "nothing is installed" case this
+   * switch exists for would be untestable there.
+   */
   env?: Record<string, string | undefined>;
   /** Existence gate for absolute candidates. */
   exists?: (path: string) => boolean;
@@ -211,6 +220,20 @@ async function probeBinary(
   }
 }
 
+/**
+ * Can a bare-name candidate still be resolved through PATH?
+ *
+ * Production passes no `env`, so the child inherits the real PATH and the
+ * answer is always yes. An injected `env`, though, has to be able to mean
+ * "there is no PATH here" — see `ToolSearchEnv.env` for why the OS alone cannot
+ * be trusted to enforce that on Windows.
+ */
+function pathLookupAvailable(search: ToolSearchEnv): boolean {
+  if (!search.env) return true;
+  const pathKey = Object.keys(search.env).find((k) => k.toLowerCase() === "path");
+  return !!pathKey && !!(search.env[pathKey] ?? "").trim();
+}
+
 // Candidate search order: explicit config path → PATH → app folder → folder of
 // the compiled exe → common Windows package-manager shims.
 function toolCandidates(
@@ -223,8 +246,9 @@ function toolCandidates(
   if (cfgPath && cfgPath.trim()) cands.push(cfgPath.trim());
   const cwd = search.cwd ?? process.cwd();
   const exeDir = search.exeDir ?? dirname(process.execPath);
+  const bareNameWorks = pathLookupAvailable(search);
   for (const n of posixNames) {
-    cands.push(n); // bare name → PATH lookup
+    if (bareNameWorks) cands.push(n); // bare name → PATH lookup
     cands.push(join(cwd, n)); // next to config.json / working dir
     cands.push(join(exeDir, n)); // next to the compiled archive.exe
   }

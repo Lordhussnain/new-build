@@ -269,10 +269,25 @@ export async function moveToSecondaryStorage(
   const srcBase = basename(finalPath).replace(/\.[^.]+$/, "");
   // Move matching sidecar files (subs/thumbs/description/info.json) with
   // the media so everything stays together in the final location.
+  //
+  // The order is pinned, because `readdir` is not: NTFS hands back names in
+  // sorted order, ext4/APFS in hash order, so the same folder walks these
+  // destructive steps differently on different machines — and a move that is
+  // stopped mid-sequence (ownership lost) must stop at the same place
+  // everywhere. The video's OWN sidecars (`<base><suffix>`, e.g.
+  // `.info.json`) go first in a fixed suffix order — with an identical base,
+  // name order IS suffix order — followed by the language-tagged derivatives
+  // (`<base>.<lang>.vtt`) in name order.
   const entries = await readdir(srcDir).catch(() => [] as string[]);
-  for (const f of entries) {
-    if (!f.startsWith(srcBase + ".")) continue;
-    if (!SIDECAR_SUFFIXES.some((sfx) => f.endsWith(sfx))) continue;
+  const isOwnSidecar = (f: string) => SIDECAR_SUFFIXES.some((sfx) => f === srcBase + sfx);
+  const sidecars = entries
+    .filter((f) => f.startsWith(srcBase + ".") && SIDECAR_SUFFIXES.some((sfx) => f.endsWith(sfx)))
+    .sort((a, b) => {
+      const [ownA, ownB] = [isOwnSidecar(a), isOwnSidecar(b)];
+      if (ownA !== ownB) return ownA ? -1 : 1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+  for (const f of sidecars) {
     if (!canContinue()) return { path: finalPath, stopped: true };
     await moveFile(join(srcDir, f), join(destDir, f), job);
   }

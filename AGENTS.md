@@ -62,10 +62,17 @@ shebangs nor spawns extensionless files, so the integration harness compiles
 them into real executables with `bun build --compile` (cached per run, a few
 seconds once) and pins every tool path in the engine's config to the mocks —
 bare-name PATH discovery could otherwise pick up real yt-dlp/ffmpeg/aria2c
-installed on the machine. Two more Windows facts the code already accounts for:
+installed on the machine. Three more Windows facts the code already accounts for:
 some Bun builds for Windows do not implement `statfs` at all (see gotcha 22 —
 go through `diskUsage()`), and Windows does not reparent orphans, so the mocks'
-`process.ppid` watchdogs are inert there (see 9.3).
+`process.ppid` watchdogs are inert there (see 9.3). A third one matters for the
+unit tests: a bare executable name is resolved by the OS through the *invoking*
+process's PATH, so spawning `["aria2c"]` with an injected `env` that has no PATH
+still finds an installed aria2c. `resolveTool` therefore treats an injected
+`ToolSearchEnv.env` as the whole search space and skips the bare-name candidates
+when it carries no PATH — that is what makes "nothing is installed" testable on
+Windows (`tests/tools.test.ts`), instead of passing only on a machine that
+happens not to have the binary.
 
 ### Local data, secrets, and generated files
 
@@ -854,7 +861,12 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     unlink-after-a-swallowed-error: a failed copy keeps BOTH copies (a
     duplicate is recoverable, a lost file is not) and a media move that cannot
     complete throws so the job retries instead of being marked done against a
-    path that does not exist.
+    path that does not exist. The sidecar order inside that move is PINNED
+    (the video's own `<base><suffix>` files first, then the language-tagged
+    derivatives): `readdir` order is filesystem-defined (NTFS sorts names,
+    ext4 hashes them), and a stopped move must stop at the same step on every
+    machine — `tests/convert-storage.test.ts` asserts exactly which file moved
+    before ownership was lost.
 21. **API routes live in the `ROUTES` table in `web.ts`.** Static action paths
     (`/api/jobs/pause`) must be listed before `:param` routes so a wrong
     method answers 405 instead of binding the segment as an id. Legacy aliases
@@ -871,7 +883,12 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     (that is how `/api/status` used to blank the dashboard). `diskUsage()`
     catches the synchronous throw, falls back to PowerShell `Get-PSDrive` on
     win32, and returns `-1/-1` + an `error` string so callers degrade instead
-    of failing. `tests/disk.test.ts` is the guard.
+    of failing. `tests/disk.test.ts` is the guard. A related rule: `driveLetterOf`
+    answers only for an explicit `X:` prefix and must never `resolve()` first —
+    on Windows that would turn every relative path (and every POSIX-style
+    `/tmp/...`) into the current drive's letter, i.e. a guessed volume reported
+    as a measured one. `windowsDiskUsage` resolves a drive-less path against the
+    run directory itself when it needs the letter.
 23. **The mocks' orphan watchdogs do not work on Windows** (`process.ppid`
     never changes there). See 9.3 — crash-recovery scenarios that depend on an
     orphan abandoning its transfer are POSIX-only until the harness kills the

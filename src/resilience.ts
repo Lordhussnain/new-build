@@ -329,17 +329,21 @@ const POWERSHELL_MEMO_TTL_MS = 15000;
 const driveMemo = new Map<string, { at: number; usage: DiskUsage }>();
 
 /**
- * The drive letter a path lives on, or "" when it has none.
+ * The drive letter a path explicitly names (`D:\…`, `c:/…`), or "" when it
+ * names none.
  *
- * `X:…` is recognised before `resolve()` so the helper is testable off Windows
- * (where resolving a `D:\…` string against a POSIX cwd would mangle it); on
- * win32 `resolve()` returns the drive path unchanged, so behaviour is
- * identical there.
+ * The test is deliberately syntactic: only a `X:` prefix answers. Resolving
+ * first would make the answer depend on the HOST rather than on the path — on
+ * win32 `resolve("/tmp/videos")` and `resolve("./downloads")` both land on the
+ * current directory's drive, so every relative path (and every POSIX-style
+ * absolute one) would come back as "C". That is a guessed volume, and "no
+ * drive, nothing to measure" is exactly what the PowerShell fallback needs to
+ * be able to say. Callers that do know their run directory resolve the path
+ * before asking — see `windowsDiskUsage`.
  */
 export function driveLetterOf(path: string): string {
-  const root = /^[A-Za-z]:/.test(path) ? path : resolve(path); // e.g. D:\Downloads\YT
-  const drive = root.slice(0, 1);
-  return /^[A-Za-z]$/.test(drive) ? drive : "";
+  const drive = /^([A-Za-z]):/.exec(path.trim());
+  return drive ? drive[1] : "";
 }
 
 /** Get-PSDrive probe for win32; null when it cannot answer. */
@@ -353,7 +357,11 @@ async function windowsDiskUsage(path: string, opts: DiskProbeOptions = {}): Prom
     // Cheaper than the spawn too, which matters: no statfs means every probe
     // here costs a PowerShell start.
     if (!exists(path)) return null;
-    const drive = driveLetterOf(path);
+    // A relative output root ("downloads", or the default "./downloads") is
+    // still on a drive, and `driveLetterOf` only answers for an explicit `X:`
+    // prefix — so resolve such a path against the run directory instead of
+    // declaring the volume unknown.
+    const drive = driveLetterOf(path) || driveLetterOf(resolve(path));
     if (!drive) return null;
     const key = drive.toUpperCase();
     const memo = driveMemo.get(key);

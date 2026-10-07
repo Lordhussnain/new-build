@@ -39,6 +39,20 @@ import { DEFAULT_CONFIG, type Config } from "../src/config";
 const FIXTURE = join(import.meta.dir, "fixtures", "claim-worker.ts");
 const tmpDirs: string[] = [];
 
+/**
+ * Budget for the out-of-process tests.
+ *
+ * The default 5 s is a stopwatch on *spawning*, not on correctness: each test
+ * starts two or three real `bun run` processes, and the drain test has them
+ * write to one SQLite file several hundred times (three workers × 400 claim
+ * attempts over 40 jobs). That costs ~0.7 s here and well over 5 s on a Windows
+ * box whose write path runs through a virus scanner — where the drain test used
+ * to report a bare "timed out after 5000ms" with none of its own assertions
+ * having run. Atomicity is what these tests are for, so give the processes room
+ * instead of trimming the work.
+ */
+const TEST_TIMEOUT = 60_000;
+
 afterAll(async () => {
   while (tmpDirs.length) {
     const d = tmpDirs.pop();
@@ -208,7 +222,7 @@ describe("claims across separate processes", () => {
     const winners = claims.filter((c) => c.id === "contested");
     expect(winners).toHaveLength(1);
     expect(jobRow("contested").download_claim_token).toBe(winners[0].token);
-  });
+  }, TEST_TIMEOUT);
 
   test("three processes draining a queue never claim the same job twice", async () => {
     const path = (db as unknown as { filename: string }).filename;
@@ -237,7 +251,7 @@ describe("claims across separate processes", () => {
       expect(row.download_claim_token).toBe(claim.token);
     }
     expect(claimDownloadJob("late")).toBeNull();
-  });
+  }, TEST_TIMEOUT);
 
   test("a crashed owner is reclaimed only after its claim lease expires", async () => {
     const path = (db as unknown as { filename: string }).filename;
@@ -267,7 +281,7 @@ describe("claims across separate processes", () => {
     expect(row.download_claim_token).toBeNull();
     // And the job is immediately claimable again.
     expect(claimDownloadJob("dl-next")?.id).toBe("crashed");
-  });
+  }, TEST_TIMEOUT);
 
   test("a stale worker cannot update progress or release after its claim was taken", async () => {
     const path = (db as unknown as { filename: string }).filename;
@@ -299,7 +313,7 @@ describe("claims across separate processes", () => {
     expect(row.download_claimed_by).toBe("dl-fresh");
     expect(row.download_claim_token).toBe(freshToken);
     expect(row.progress).toBe(0);
-  });
+  }, TEST_TIMEOUT);
 
   test("a long-running, heartbeating conversion is never reaped", async () => {
     const path = (db as unknown as { filename: string }).filename;
@@ -336,7 +350,7 @@ describe("claims across separate processes", () => {
     row = jobRow("long-convert");
     expect(row.conversion_status).toBe("pending");
     expect(row.conversion_claim_token).toBeNull();
-  });
+  }, TEST_TIMEOUT);
 
   test("metadata is reaped on its heartbeat, not on updated_at", async () => {
     insertJob("meta-heartbeat", {
@@ -359,7 +373,7 @@ describe("claims across separate processes", () => {
     expect(row.metadata_status).toBe("pending");
     expect(row.metadata_claim_token).toBeNull();
     expect(row.metadata_claimed_at).toBeNull();
-  });
+  }, TEST_TIMEOUT);
 
   test("two reapers racing the same expired claim: the first CAS wins", async () => {
     const path = (db as unknown as { filename: string }).filename;
@@ -381,7 +395,7 @@ describe("claims across separate processes", () => {
     expect(row.download_status).toBe("paused");
     expect(row.pause_reason).toBe("interrupted");
     expect(row.download_claim_token).toBeNull();
-  });
+  }, TEST_TIMEOUT);
 
   test("a second reaper's CAS is refused after the claim was re-claimed", async () => {
     const path = (db as unknown as { filename: string }).filename;
@@ -401,5 +415,5 @@ describe("claims across separate processes", () => {
     expect(row.download_status).toBe("downloading");
     expect(row.download_claimed_by).toBe("dl-new");
     expect(row.download_claim_token).toBe(lines.find((l) => l.startsWith("CLAIMED "))!.split(" ")[2]);
-  });
+  }, TEST_TIMEOUT);
 });
