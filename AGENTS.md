@@ -153,9 +153,13 @@ dependency-free — it is the module that breaks every import cycle.
 4. `startWebServer()` — **before any sweep: the web port is the single-instance
    lock**. A second instance (autostart task + a manual start) dies here with an
    actionable error instead of re-queueing a live instance's in-flight work.
-5. `reconcileCrashedJobs()` → `reconcileMissingFiles()` (the latter skips jobs
-   with a conversion in progress — the converter legitimately has those files
-   in mid-transition under `deleteSourceAfterConvert`)
+5. `reconcileCrashedJobs()` → `reconcileSupersededFiles()` →
+   `reconcileMissingFiles()` (the superseded sweep MUST run before the
+   missing-file sweep: an interrupted `.superseded` stash looks like a deleted
+   file to it, and the video would be re-queued over a backup that is sitting
+   right there; the missing-file sweep itself skips jobs with a conversion in
+   progress — the converter legitimately has those files in mid-transition
+   under `deleteSourceAfterConvert`)
 6. `startRunHistory()` + heartbeat interval
 7. `mkdir(outputRoot)` → `cleanOrphanedFiles()` → `autoscaler.init()`
 8. cookie validation (if enabled)
@@ -290,10 +294,11 @@ re-queues a failed sidecar pass on an already-converted job.
 | Cookies watcher | `reconcile.ts cookiesWatch()` + `tools.ts detectCookiesChange()` | 60s sweep: reports cookies.txt appearing / changing / vanishing mid-run and counts the credential-blocked jobs it may rescue (never auto-requeues them) |
 | Disk guard | `resilience.ts diskUsage()` → `checkDiskSpace()` | `diskUsage` is the **only** `statfs` caller: statfs → PowerShell `Get-PSDrive` fallback → `-1/-1` degraded mode (never bricks the engine, never 500s `/api/status`) |
 | Crash recovery | `reconcile.ts reconcileCrashedJobs()` | `downloading` → `paused + interrupted` (auto-claimable); also clears orphan claims from legacy user-paused downloads while keeping them held |
-| Stale-claim reaper | `reconcile.ts reapStaleClaims(config)` | downloads idle >`max(20 min, maxDownloadMinutes)` (actively owned jobs are protected and progress heartbeats the claim), conversions >3 h, metadata >15 min; thresholds come from `STALE_CLAIM_THRESHOLDS(config)` so the dashboard cannot drift from them |
+| Stale-claim reaper | `reconcile.ts reapStaleClaims(config)` | downloads idle >`max(20 min, maxDownloadMinutes)` (actively owned jobs are protected and progress heartbeats the claim), conversions >3 h, metadata >15 min; thresholds come from `STALE_CLAIM_THRESHOLDS(config)` so the dashboard cannot drift from them. Also sweeps the stranded `.aria2` control files of the jobs it reclaims (a dead worker's pair whose data file is gone would wedge the next attempt) through the same `removePartialFiles` contract: a locked control file is reported and retried on the next tick, never forced |
 | Missing-file reconciliation | `reconcile.ts reconcileMissingFiles()` | scrubs the yt-dlp archive + re-queues |
 | Failed-job sweep | `reconcile.ts requeueFailedJobs()` | after cooldown, non-permanent failures start a fresh per-video retry window; permanent download errors are skipped; `ignoreCooldown` for the UI button |
-| Partial-file cleanup | `reconcile.ts cleanOrphanedFiles()` | keeps resume-able partials, including retryable failures waiting for cooldown; deletes exhausted partials when auto-requeue is disabled and day-old orphans |
+| Partial-file cleanup | `reconcile.ts cleanOrphanedFiles()` | keeps every resume-able partial — `pending`/`downloading`/`paused`/`waiting_live` owners and retryable failures waiting for cooldown are **never** aged out; deletes exhausted partials when auto-requeue is disabled, partials nothing will resume once they are a week old (`PARTIAL_MAX_AGE_MS`), day-old orphans (`ORPHAN_PARTIAL_MAX_AGE_MS`) and unowned `.superseded` backups. Recorded paths and walked paths are compared through `pathKey()` (absolute + case-folded), because the DB stores absolute paths while the walk is relative to `outputRoot`. Returns `{removed, locked}`: a partial whose control file is locked keeps BOTH files, is counted as `locked`, logged, and retried by a later sweep — never counted as removed |
+| Superseded-file recovery | `reconcile.ts reconcileSupersededFiles()` | startup heal of the deliberate-re-download hand-off: rolls back a stash whose rename never ran (`file_path` not yet recorded), restores a backup whose retry never became claimable, drops a backup whose re-download already finished, and adopts a legacy rename-first backup instead of letting the missing-file sweep re-queue the video |
 | Archive scrubbing | `archive.ts removeFromArchive()` | needed whenever a file disappears, else yt-dlp skips it forever |
 | Signature self-heal | `workers/download.ts` | auto-runs `yt-dlp -U` and retries with a clean budget |
 | WAL checkpoint | `lifecycle.ts handleShutdown()` | keeps `archive.db` self-contained after exit |
@@ -423,16 +428,27 @@ must get past two yt-dlp gates, and the engine does both in `retryJobById`
 1. `removeFromArchive()` scrubs the id from the archive file, otherwise yt-dlp
    answers *"has already been recorded in the archive"* and exits 0 without
    downloading anything (the old silent no-op bug).
-2. `stashDownloadedFile()` (reconcile.ts) renames the existing media file to
+2. `stashDownloadedFile()` (reconcile.ts) moves the existing media file to
    `<file>.superseded`, because `--no-overwrites` skips a download whose
    target file still exists. The job's `file_path` is cleared and the backup
-   path recorded in `superseded_file`.
+   path recorded in `superseded_file` — **the row is written before the
+   rename**, so a crash between the two steps leaves recoverable state instead
+   of a file nothing points at. If the rename itself fails the row is put back
+   and the retry aborts with a 500 instead of starting a download yt-dlp would
+   skip.
 
 The backup is the safety net: the download worker deletes it on success
 (`dropSupersededFile`) and — if the re-download fails permanently — restores
 it and marks the job downloaded again (`restoreSupersededFile`), so a failed
-re-fetch never destroys the previously archived file. A rename failure aborts
-the retry with a 500 instead of starting a download yt-dlp would skip.
+re-fetch never destroys the previously archived file. Every crash window of
+the hand-off is healed by `reconcileSupersededFiles()` at the next startup:
+an interrupted rename is rolled back (the file never moved, so the row
+re-claims it), a backup whose retry never became claimable is restored, a
+backup whose replacement already succeeded is deleted, and a legacy
+rename-first backup (`file_path` gone, `<file_path>.superseded` present, no
+pointer recorded) is adopted back into place — otherwise
+`reconcileMissingFiles` would re-queue the video and the old file would stay
+unmanaged.
 
 #### Stale audio formats recover instead of parking the job
 
@@ -556,15 +572,17 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/download-output.test.ts` | bounded CR/LF pipe parsing, split UTF-8, oversized-record discard, validated final-path markers |
 | `tests/download-process.test.ts` | a progress-callback failure kills/reaps the downloader and clears active process tracking |
 | `tests/download-pause.test.ts` | user pause state survives download failure and successful file recording |
-| `tests/audio-tracks.test.ts` | track parsing (variant collapse, drc drop, ordering), selection policy incl. per-job override, selector splicing, JSON column round-trips |
+| `tests/audio-tracks.test.ts` | track parsing (variant collapse, drc drop, ordering), selection policy incl. per-job override, selector splicing, JSON column round-trips, and `probeAudioTracks` failures against a real child process (non-zero exit, unparsable JSON, and the abort at the timeout — every path the worker's single-audio fallback depends on) |
 | `tests/metadata.test.ts` | `subtitleArgs` — `all`/blank keep fetch-everything, explicit language lists pass through verbatim |
 | `tests/autoscale.test.ts` | slot ramp step, backlog/ceiling clamps, idle collapse, disabled mode |
-| `tests/reconcile.test.ts` | `removePartialFiles` (control-file-first order and its `fatal` result), `partialSidecars`, `findPartialFile`, `cleanOrphanedFiles` control-file handling, and the superseded-file lifecycle (`stash`/`drop`/`restore` for deliberate re-downloads) |
+| `tests/reconcile.test.ts` | `removePartialFiles` (control-file-first order, its `fatal` result, and `.ytdl` fragment DIRECTORY removal), `partialSidecars`, `findPartialFile`, the reaper's stranded-control-file sweep (swept, live pair kept, non-reclaimed job untouched, locked retry), `cleanOrphanedFiles` control-file handling and honest `{removed, locked}` counting plus the durable-work guarantees (relative `outputRoot` vs absolute recorded path via `pathKey`, resumable statuses never aged out, terminal partials and unowned `.superseded` backups swept, the fitted base name `recordPartialPaths` must search), and the superseded-file lifecycle (`stash`/`drop`/`restore` + every `reconcileSupersededFiles` crash state) |
 | `tests/convert.test.ts` | `findConvertedOutput` crash-window adoption: adopts a finished mp3/mp4, never the source itself, empty for unrelated sidecars |
+| `tests/convert-storage.test.ts` | `moveToSecondaryStorage` safety: media + sidecars land in `secondaryStoragePath/<folder>/` and the sources go with them, a sidecar that cannot be copied keeps its source, an impossible media move throws and leaves the only copy in place, ownership loss stops the sequence at the next destructive step, and the cross-device copy path (EXDEV) deletes the source only after the copy lands |
+| `tests/tools.test.ts` | `resolveTool` discovery against a real injected search space: NOTHING installed answers null (the native-downloader fallback), PATH discovery finds a shim, an explicit config path wins, a stale config path does not hide a PATH candidate, and a binary whose version probe fails is not usable |
 | `tests/logger.test.ts` | `errorLogPath()` routes test-run logs to the temp dir, never the operator's `error.log` |
-| `tests/disk.test.ts` | `diskUsage()` happy path, the `-1/-1` degraded path, and `checkDiskSpace`'s allow-through when free space is unknown |
+| `tests/disk.test.ts` | `diskUsage()` happy path, the `-1/-1` degraded path, and `checkDiskSpace`'s allow-through when free space is unknown — plus the forced fallback chain through `DiskProbeOptions` (a build without statfs, the win32 PowerShell probe, a hung shell timing out, an unusable shell answer, and the no-spawn rule for a path that is not on disk), with `driveLetterOf`/`parsePSDriveOutput` pinned directly |
 | `tests/web-routes.test.ts` | the `ROUTES` table: canonical per-job routes, the legacy aliases, JSON 404/405 + `Allow`, trailing-slash collapse, active-stage 409 guards across retry/delete/pause/purge, retry-as-re-download (archive scrub + `.superseded` stash), per-job format/quality/audio overrides, and sidecars |
-| `tests/settings.test.ts` | the dashboard settings allow-list, type coercion, Zod + cross-field validation, persistence, live-config propagation, and auth |
+| `tests/settings.test.ts` | the dashboard settings allow-list, type coercion (including every accepted boolean spelling and the rejection of `"maybe"`/empty — an invalid value must never coerce to `false`), Zod + cross-field validation, persistence, live-config propagation, and auth |
 | `tests/config-manager.test.ts` | every schema key is reachable from `update_config.ts`; the manager reads the sweep thresholds from `STALE_CLAIM_THRESHOLDS` and counts partials with the engine's predicate |
 | `tests/dashboard.test.ts` | `formatHeaderLine` counters, and the `Res:n` field appearing only when partials are held |
 | `tests/integration.test.ts` | **end-to-end engine runs** (see 9.3) |
@@ -584,14 +602,31 @@ and spawns the real `batch_playlist_downloader.ts`, then drives it over HTTP
 Scenarios: happy path (scan → download → metadata → convert), transient-failure
 retries with backoff, corrupt-partial resume, permanent failures (never
 requeued), restart reconciliation after deleting files, aria2c multi-connection
-downloads (args + cap verified), the native fallback when aria2c is missing,
+downloads (args + cap verified), the native fallback when aria2c is missing in
+TWO ways — the documented `aria2cPath: "none"` switch, and (POSIX) a real
+dependency probe over a PATH that holds nothing but the mock yt-dlp, proving
+discovery itself answers "not installed" instead of failing the run — the
+multi-audio probe falling back to a single-audio download both when `-J` fails
+and when it hangs (the timeout is shortened with
+`YTA_AUDIO_PROBE_TIMEOUT_MS`, a test-only override read by
+`src/audio-tracks.ts`), the secondary-storage hand-off (media + sidecars land
+under `<secondaryStoragePath>/<folder>/` and `file_path` records the new
+location; a move whose destination is blocked keeps the only copy in the
+download folder, fails the conversion, and stores the move error in
+`last_error`),
 aria2c option validation (`-x` above the 16 cap is clamped; a malformed
 `--min-split-size` pauses the engine with `BAD_DOWNLOADER_ARGS` instead of
 failing the batch), and
 four aria2c resume/self-healing scenarios: resume from the control file,
 discarding a partial *with* its control file when the resume budget runs out, a
 hard kill mid-transfer followed by a resume on restart, and deleted files being
-re-fetched.
+re-fetched. Two more scenarios pin the durable-work guarantees end to end: a
+paused job's ABSOLUTE `partial_file_path` survives the startup sweep while
+`outputRoot` is the default RELATIVE `./downloads` (the counterexample that
+used to delete a day-old "orphan" that was the job's only resume state), and a
+crashed rename-first stash (`file_path` gone, `<file_path>.superseded` present)
+is adopted back on startup — the media's marker bytes prove it was restored,
+not re-downloaded.
 
 The mock aria2c reproduces the real control-file lifecycle (interrupted →
 `.part` + `.aria2`; resume → `resumed=yes`; success → control file removed) and
@@ -646,6 +681,8 @@ Mock controls (environment variables):
 | `FAKE_SCAN_LOG=path` | append every scanned URL, proving live daemon rescans and persisted startup sources |
 | `FAKE_EMPTY_SCAN=1` | a valid source with no videos, proving source persistence does not depend on jobs added |
 | `FAKE_HANG=1` | never exit (watchdog testing) |
+| `FAKE_PROBE_FAIL=1` \| `=json` | make the `-J` audio-track probe fail (HTTP error / unparsable output) so the single-audio fallback runs end to end |
+| `FAKE_PROBE_HANG=1` | make `-J` never answer, so the probe watchdog fires (pair with `YTA_AUDIO_PROBE_TIMEOUT_MS` to keep the test short) |
 | `FAKE_ARIA2C_BIN` | absolute path of the sibling aria2c mock (set by the integration harness so that hop never depends on PATH) |
 | `FAKE_ARIA2C_FAIL_TIMES=N` | fail the first N attempts *inside* aria2c, leaving the `.part` + `.part.aria2` pair |
 | `FAKE_ARIA2C_FAIL_MODE` | `transient` \| `corrupt` (which aria2c-side error message to emit) |
@@ -737,20 +774,35 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     reports a `fatal` result when it is locked** (orphaned aria2c, antivirus).
     Never delete the `.part` after a fatal — that strands the control file and
     wedges aria2c. "Restart from scratch" paths must check `.fatal` and retry
-    later instead.
+    later instead: that is EVERY cleanup path, not just the corrupt-partial
+    handler. `cleanOrphanedFiles` counts only real removals (`{removed, locked}`
+    — a locked pair must never be reported as cleaned while it is still on
+    disk) and `reapStaleClaims` sweeps the stranded control files of reclaimed
+    downloads through the same function, reporting locks for the next tick.
+    Also note a `.ytdl` resume point is a *directory* of fragments: a bare
+    `unlink` fails on it (EISDIR), so removal recurses and reports honestly.
 20. **The converter guards every destructive step with
-    `stillOwnsConversion`** (source delete, secondary-storage move, the final
-    done-update) and updates `file_path` to the converted output BEFORE
-    unlinking the source. Deleting first is what made a crash in the
-    finalize window look like "file deleted before conversion finished" and
-    triggered a full re-download on the next startup sweep.
+    `stillOwnsConversion`** (source delete, EACH move inside
+    `moveToSecondaryStorage`, the final done-update) and updates `file_path`
+    to the converted output BEFORE unlinking the source. Deleting first is what
+    made a crash in the finalize window look like "file deleted before
+    conversion finished" and triggered a full re-download on the next startup
+    sweep. The secondary-storage move is copy-then-unlink, never
+    unlink-after-a-swallowed-error: a failed copy keeps BOTH copies (a
+    duplicate is recoverable, a lost file is not) and a media move that cannot
+    complete throws so the job retries instead of being marked done against a
+    path that does not exist.
 21. **API routes live in the `ROUTES` table in `web.ts`.** Static action paths
     (`/api/jobs/pause`) must be listed before `:param` routes so a wrong
     method answers 405 instead of binding the segment as an id. Legacy aliases
     (`/api/retry/:id`, `/api/failcount/reset/:id`, `POST /api/jobs/delete`)
     are kept on purpose — older dashboards and scripts bookmark them.
 22. **Never call `statfs` directly — go through `resilience.ts diskUsage()`.**
-    Some Bun builds for Windows do not implement it, so the import is
+    The statfs-missing / PowerShell / `-1/-1` chain is testable through the
+    `DiskProbeOptions` argument (`statfs: null`, `platform`, `pathExists`,
+    `runPowerShell`, `timeoutMs`) — do not remove it, or the degraded branches
+    become unreachable off a broken Windows box. Some Bun builds for Windows do
+    not implement statfs, so the import is
     `undefined` and *calling* it throws a `TypeError` **synchronously** — a
     `.catch()` chained on the call cannot see it, and the whole request 500s
     (that is how `/api/status` used to blank the dashboard). `diskUsage()`
@@ -792,6 +844,26 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     timers read live sources each tick and start even with empty lists; full
     rescans include `playlists` as well as both channel lists. Optional scan
     folder overrides remain per-job/per-scan, not source-level configuration.
+28. **Compare on-disk paths with `reconcile.ts pathKey()`, never with `===`.**
+    The DB stores `partial_file_path`/`superseded_file` as absolute `resolve()`d
+    paths, while `cleanOrphanedFiles` builds its paths from
+    `readdir(outputRoot)` — relative whenever `outputRoot` is the default
+    `./downloads`. A raw string compare silently misses, and a tracked partial
+    gets deleted as a day-old "orphan". `pathKey` resolves and case-folds on
+    Windows; build the walk paths with `resolve(rootDir, file)` too.
+29. **A partial is only aged out when nothing will resume it.** The day/week
+    thresholds (`ORPHAN_PARTIAL_MAX_AGE_MS`/`PARTIAL_MAX_AGE_MS`) must skip
+    `pending`/`downloading`/`paused`/`waiting_live` owners and cooldown-waiting
+    failures — the sweep exists to clear litter, not to throw away hours of
+    transfer because an operator paused a job for a month.
+30. **`stashDownloadedFile` writes the DB row BEFORE the rename.** Never
+    restore the old rename-first order: a crash in that window leaves the media
+    at `<file>.superseded` with no row pointing at it, and
+    `reconcileSupersededFiles()` (startup, right before
+    `reconcileMissingFiles`) can then only recover it through the legacy
+    sibling probe. Any lookup for a job's file on disk must also use
+    `jobFittedBaseFilename()` — `fitBaseFilename` truncation means the raw
+    title is not the name on disk.
 
 ---
 

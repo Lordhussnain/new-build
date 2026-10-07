@@ -107,9 +107,39 @@ export async function validateCookies(cookiesFile: string): Promise<boolean> {
   return code === 0 && !stderr.toLowerCase().includes("login required");
 }
 
-async function probeBinary(bin: string, args: string[]): Promise<{ ok: boolean; version: string }> {
+/**
+ * Injectable view of the machine, for the discovery search below.
+ *
+ * The search itself is the thing that decides "aria2c is not installed", and
+ * that decision is unreachable in a test on a box that has aria2c (the bare
+ * name resolves through the real PATH, and on Windows the package-manager shim
+ * folders are probed whether or not PATH has it). Production passes nothing;
+ * tests pin the search space so a genuinely missing binary can be discovered
+ * deterministically — the fallback the engine promises.
+ */
+export interface ToolSearchEnv {
+  /** Stand-in for the app folder (`process.cwd()`). */
+  cwd?: string;
+  /** Stand-in for the folder holding the running executable. */
+  exeDir?: string;
+  platform?: NodeJS.Platform;
+  /** Environment for the probe's child process (PATH included). */
+  env?: Record<string, string | undefined>;
+  /** Existence gate for absolute candidates. */
+  exists?: (path: string) => boolean;
+}
+
+async function probeBinary(
+  bin: string,
+  args: string[],
+  search: ToolSearchEnv = {},
+): Promise<{ ok: boolean; version: string }> {
   try {
-    const proc = Bun.spawn([bin, ...args], { stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn([bin, ...args], {
+      stdout: "pipe",
+      stderr: "pipe",
+      ...(search.env ? { env: search.env } : {}),
+    });
     const [out, err, code] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
@@ -127,20 +157,26 @@ async function probeBinary(bin: string, args: string[]): Promise<{ ok: boolean; 
 
 // Candidate search order: explicit config path → PATH → app folder → folder of
 // the compiled exe → common Windows package-manager shims.
-function toolCandidates(cfgPath: string, posixNames: string[], winNames: string[]): string[] {
+function toolCandidates(
+  cfgPath: string,
+  posixNames: string[],
+  winNames: string[],
+  search: ToolSearchEnv = {},
+): string[] {
   const cands: string[] = [];
   if (cfgPath && cfgPath.trim()) cands.push(cfgPath.trim());
-  const cwd = process.cwd();
-  const exeDir = dirname(process.execPath);
+  const cwd = search.cwd ?? process.cwd();
+  const exeDir = search.exeDir ?? dirname(process.execPath);
   for (const n of posixNames) {
     cands.push(n); // bare name → PATH lookup
     cands.push(join(cwd, n)); // next to config.json / working dir
     cands.push(join(exeDir, n)); // next to the compiled archive.exe
   }
-  if (process.platform === "win32") {
+  if ((search.platform ?? process.platform) === "win32") {
     const home = os.homedir();
-    const progData = process.env.ProgramData || "C:\\ProgramData";
-    const localAppData = process.env.LOCALAPPDATA || join(home, "AppData", "Local");
+    const env = search.env ?? process.env;
+    const progData = env.ProgramData || "C:\\ProgramData";
+    const localAppData = env.LOCALAPPDATA || join(home, "AppData", "Local");
     for (const n of winNames) {
       cands.push(
         join(cwd, n),
@@ -159,27 +195,39 @@ function toolCandidates(cfgPath: string, posixNames: string[], winNames: string[
   });
 }
 
-async function resolveTool(
+/**
+ * Walk the candidate list and return the first one that runs, or null.
+ *
+ * Exported (with `search`) so the "no candidate works" outcome — the one that
+ * turns aria2c into yt-dlp's native downloader — can be tested against a real,
+ * empty search space instead of being simulated with the `"none"` switch.
+ */
+export async function resolveTool(
   cfgPath: string,
   versionArgs: string[],
   posixNames: string[],
   winNames: string[],
+  search: ToolSearchEnv = {},
 ): Promise<{ path: string; version: string } | null> {
-  for (const cand of toolCandidates(cfgPath, posixNames, winNames)) {
+  const exists = search.exists ?? existsSync;
+  for (const cand of toolCandidates(cfgPath, posixNames, winNames, search)) {
     const isBare = !cand.includes("/") && !cand.includes("\\");
-    if (!isBare && !existsSync(cand)) continue;
-    const probe = await probeBinary(cand, versionArgs);
+    if (!isBare && !exists(cand)) continue;
+    const probe = await probeBinary(cand, versionArgs, search);
     if (probe.ok) return { path: cand, version: probe.version };
   }
   return null;
 }
 
-export async function checkDependencies(config: {
-  ytDlpPath: string;
-  ffmpegPath: string;
-  aria2cPath?: string;
-  useAria2c?: boolean;
-}): Promise<void> {
+export async function checkDependencies(
+  config: {
+    ytDlpPath: string;
+    ffmpegPath: string;
+    aria2cPath?: string;
+    useAria2c?: boolean;
+  },
+  search: ToolSearchEnv = {},
+): Promise<void> {
   console.log("🔎 Checking dependencies...");
   const missing: string[] = [];
   // The special value "none" skips aria2c discovery entirely — an operator
@@ -187,13 +235,13 @@ export async function checkDependencies(config: {
   // real aria2c is installed on this machine.
   const aria2Disabled = (config.aria2cPath || "").trim().toLowerCase() === "none";
   const [ytdlp, ffm, aria2] = await Promise.all([
-    resolveTool(config.ytDlpPath, ["--version"], ["yt-dlp"], ["yt-dlp.exe"]),
-    resolveTool(config.ffmpegPath, ["-version"], ["ffmpeg"], ["ffmpeg.exe"]),
+    resolveTool(config.ytDlpPath, ["--version"], ["yt-dlp"], ["yt-dlp.exe"], search),
+    resolveTool(config.ffmpegPath, ["-version"], ["ffmpeg"], ["ffmpeg.exe"], search),
     // aria2c is probed regardless of the flag so the status line can report
     // why it is (not) being used; a missing binary is never fatal.
     aria2Disabled
       ? Promise.resolve(null)
-      : resolveTool(config.aria2cPath || "", ["--version"], ["aria2c"], ["aria2c.exe"]),
+      : resolveTool(config.aria2cPath || "", ["--version"], ["aria2c"], ["aria2c.exe"], search),
   ]);
 
   if (ytdlp) {

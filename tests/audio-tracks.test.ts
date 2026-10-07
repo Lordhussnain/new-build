@@ -6,7 +6,12 @@
 // per-job override) must behave exactly as the download worker and the
 // dashboard's picker expect.
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { probeAudioTracks } from "../src/audio-tracks";
+import { resolvedTools } from "../src/tools";
 import {
   extractAudioTracks,
   multiAudioFormatSelector,
@@ -134,5 +139,54 @@ describe("JSON column round-trips", () => {
     expect(parseSelectionJson(JSON.stringify(["en", "hi"]))).toEqual(["en", "hi"]);
     expect(parseSelectionJson(null)).toBeNull();
     expect(parseSelectionJson("nope")).toBeNull();
+  });
+});
+
+describe.skipIf(process.platform === "win32")("probeAudioTracks failures (the single-audio fallback)", () => {
+  // The download worker catches ALL of these and continues with the classic
+  // single-track plan. Each stub is a real child process so the probe's own
+  // spawn/timeout/parse handling is exercised, not a mocked return value.
+  const original = resolvedTools.ytDlp;
+  const stubDirs: string[] = [];
+
+  async function probeStub(name: string, body: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), `yta-probe-${name}-`));
+    stubDirs.push(dir);
+    const file = join(dir, "yt-dlp");
+    // Absolute interpreter: the stub must not need a working PATH.
+    await writeFile(file, `#!${process.execPath}\n${body}\n`);
+    await chmod(file, 0o755);
+    return file;
+  }
+
+  afterAll(async () => {
+    resolvedTools.ytDlp = original;
+    for (const dir of stubDirs.splice(0)) await rm(dir, { recursive: true, force: true });
+  });
+
+  test("a failed -J call throws so the worker can fall back to single audio", async () => {
+    resolvedTools.ytDlp = await probeStub(
+      "fail",
+      'console.error("ERROR: Unable to download webpage: HTTP Error 503: Service Unavailable");\nprocess.exit(1);',
+    );
+    await expect(
+      probeAudioTracks("https://www.youtube.com/watch?v=mockvid001", { cookiesFile: "" }),
+    ).rejects.toThrow(/503|exited with code/i);
+  });
+
+  test("unparsable -J output throws instead of silently reporting zero tracks", async () => {
+    resolvedTools.ytDlp = await probeStub("badjson", 'console.log("not-json-at-all");');
+    await expect(
+      probeAudioTracks("https://www.youtube.com/watch?v=mockvid001", { cookiesFile: "" }),
+    ).rejects.toThrow(/invalid JSON/i);
+  });
+
+  test("a hung probe is aborted at the timeout, not left hanging", async () => {
+    resolvedTools.ytDlp = await probeStub("hang", "await new Promise(() => {});");
+    const started = Date.now();
+    await expect(
+      probeAudioTracks("https://www.youtube.com/watch?v=mockvid001", { cookiesFile: "" }, { timeoutMs: 250 }),
+    ).rejects.toThrow(/timed out/i);
+    expect(Date.now() - started).toBeLessThan(10_000);
   });
 });

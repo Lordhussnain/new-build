@@ -15,6 +15,7 @@ import {
   cookiesWatch,
   reconcileCrashedJobs,
   reconcileMissingFiles,
+  reconcileSupersededFiles,
   reapStaleClaims,
   requeueFailedJobs,
 } from "./reconcile";
@@ -101,6 +102,11 @@ export async function main(): Promise<void> {
   }
 
   reconcileCrashedJobs();
+  // Heal the `.superseded` hand-off before the missing-file sweep: an
+  // interrupted stash looks like "downloaded file vanished" to
+  // reconcileMissingFiles, which would re-queue a download over a file that is
+  // sitting right there as a `.superseded` backup.
+  reconcileSupersededFiles();
   reconcileMissingFiles(config);
   // Run history: row created now, heartbeated so hard kills still leave data.
   startRunHistory();
@@ -146,7 +152,12 @@ export async function main(): Promise<void> {
   );
 
   networkMonitor();
-  setInterval(() => reapStaleClaims(getConfig()), 60_000);
+  setInterval(() => {
+    // Fire-and-forget: the tick must never overlap itself, and a failure is
+    // already reported by the reaper. The void + catch keeps the interval from
+    // surfacing an unhandled rejection if the DB is mid-shutdown.
+    void reapStaleClaims(getConfig()).catch(() => {});
+  }, 60_000);
   // Dynamic download-slot autoscaling (no-op when autoscaleEnabled=false).
   setInterval(autoscaleTick, 15_000);
   // Failed-job sweep: re-queue transient failures after their cooldown.

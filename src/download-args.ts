@@ -95,6 +95,24 @@ export function jobBaseFilename(job: Pick<Job, "index" | "title" | "id">): strin
   return `${String(job.index).padStart(3, "0")} - ${sanitizeFileName(job.title)}`;
 }
 
+/**
+ * The base name a download ACTUALLY writes: `jobBaseFilename` fitted to the
+ * output directory's path budget (see `fitBaseFilename`).
+ *
+ * Every lookup that hunts for one of a job's files on disk — the partial-path
+ * freeze in reconcile.ts, the worker's fallback scans, the recovery sweeps —
+ * must use this, not the raw `jobBaseFilename`: for a long title (or a deep
+ * output directory) the two differ, and a lookup with the unfitted name
+ * silently finds nothing. That mismatch is how a long-titled video's recorded
+ * `.part` kept its `partial_file_path` empty and its resume state was later
+ * swept as an orphan.
+ */
+export function jobFittedBaseFilename(
+  job: Pick<Job, "id" | "index" | "title" | "output_directory">,
+): string {
+  return fitBaseFilename(job.output_directory, jobBaseFilename(job), job.id);
+}
+
 export interface DownloadPlan {
   engine: DownloaderEngine;
   /** Full argv for the yt-dlp process. */
@@ -148,11 +166,7 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
   const audioTracks = videoQuality === "audio" ? [] : opts.audioTracks ?? [];
   const effectiveFormat =
     audioTracks.length > 0 ? multiAudioFormatSelector(format, audioTracks) : format;
-  const baseFilename = fitBaseFilename(
-    job.output_directory,
-    jobBaseFilename(job),
-    job.id,
-  );
+  const baseFilename = jobFittedBaseFilename(job);
   const outTemplate = join(job.output_directory, `${baseFilename}.%(ext)s`);
 
   const args: string[] = [

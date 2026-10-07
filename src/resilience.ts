@@ -124,6 +124,26 @@ export interface DiskUsage {
 }
 
 /**
+ * Injection points for the disk-probe fallback chain. Production callers pass
+ * nothing; the tests use them to force each step of the chain (a build with no
+ * `statfs`, a Windows host, a shell that hangs or answers nonsense) on any
+ * machine — the unsupported-`statfs` and PowerShell branches are otherwise
+ * unreachable off a broken Windows box.
+ */
+export interface DiskProbeOptions {
+  /** statfs implementation. `null` = this Bun build has none (calling it throws). */
+  statfs?: typeof statfs | null;
+  /** Platform gate for the PowerShell fallback. */
+  platform?: NodeJS.Platform;
+  /** Existence gate for the fallback's "nothing on disk to measure" rule. */
+  pathExists?: (path: string) => boolean;
+  /** The bounded PowerShell round-trip; resolves to the shell's stdout, or null. */
+  runPowerShell?: (drive: string) => Promise<string | null>;
+  /** Ceiling for the PowerShell round-trip. */
+  timeoutMs?: number;
+}
+
+/**
  * Free + total bytes for the volume holding `path`.
  *
  * statfs first (one syscall, no child process). Some Bun builds on Windows do
@@ -139,12 +159,16 @@ export interface DiskUsage {
  * here, on every platform: the shell fallback deliberately refuses to answer
  * for a drive when there is nothing on it to measure.
  */
-export async function diskUsage(path: string): Promise<DiskUsage> {
+export async function diskUsage(path: string, opts: DiskProbeOptions = {}): Promise<DiskUsage> {
+  const statfsFn = opts.statfs === undefined ? statfs : opts.statfs;
   try {
-    const stats = await statfs(path);
+    // Exactly what an unimplemented Bun build does: the call itself throws a
+    // TypeError, before any promise exists to catch.
+    if (!statfsFn) throw new TypeError("statfs is not a function");
+    const stats = await statfsFn(path);
     return { freeBytes: stats.bavail * stats.bsize, totalBytes: stats.blocks * stats.bsize };
   } catch (e: any) {
-    const fallback = await windowsDiskUsage(path);
+    const fallback = await windowsDiskUsage(path, opts);
     if (fallback) return fallback;
     return { freeBytes: -1, totalBytes: -1, error: String(e?.code || e?.message || e) };
   }
@@ -156,23 +180,37 @@ const POWERSHELL_TIMEOUT_MS = 8000;
 const POWERSHELL_MEMO_TTL_MS = 15000;
 const driveMemo = new Map<string, { at: number; usage: DiskUsage }>();
 
+/**
+ * The drive letter a path lives on, or "" when it has none.
+ *
+ * `X:…` is recognised before `resolve()` so the helper is testable off Windows
+ * (where resolving a `D:\…` string against a POSIX cwd would mangle it); on
+ * win32 `resolve()` returns the drive path unchanged, so behaviour is
+ * identical there.
+ */
+export function driveLetterOf(path: string): string {
+  const root = /^[A-Za-z]:/.test(path) ? path : resolve(path); // e.g. D:\Downloads\YT
+  const drive = root.slice(0, 1);
+  return /^[A-Za-z]$/.test(drive) ? drive : "";
+}
+
 /** Get-PSDrive probe for win32; null when it cannot answer. */
-async function windowsDiskUsage(path: string): Promise<DiskUsage | null> {
+async function windowsDiskUsage(path: string, opts: DiskProbeOptions = {}): Promise<DiskUsage | null> {
   try {
-    if (process.platform !== "win32") return null;
-    const root = resolve(path); // e.g. D:\Downloads\YT
+    if ((opts.platform ?? process.platform) !== "win32") return null;
+    const exists = opts.pathExists ?? existsSync;
     // A path that is not on disk has no volume to measure, and the shell would
     // happily answer for the *drive* it sits under — which would silently mask
     // the "unknown" state the dashboard and the low-disk guard exist to surface.
     // Cheaper than the spawn too, which matters: no statfs means every probe
     // here costs a PowerShell start.
-    if (!existsSync(root)) return null;
-    const drive = root.slice(0, 1); // "D"
-    if (!/^[A-Za-z]$/.test(drive)) return null;
+    if (!exists(path)) return null;
+    const drive = driveLetterOf(path);
+    if (!drive) return null;
     const key = drive.toUpperCase();
     const memo = driveMemo.get(key);
     if (memo && Date.now() - memo.at < POWERSHELL_MEMO_TTL_MS) return memo.usage;
-    const usage = await getPSDriveFreeSpace(drive);
+    const usage = await getPSDriveFreeSpace(drive, opts);
     // Only successful answers are memoized; a failure must stay retryable.
     if (usage) driveMemo.set(key, { at: Date.now(), usage });
     return usage;
@@ -182,7 +220,44 @@ async function windowsDiskUsage(path: string): Promise<DiskUsage | null> {
 }
 
 /** One bounded Get-PSDrive round-trip; null on any failure. */
-async function getPSDriveFreeSpace(drive: string): Promise<DiskUsage | null> {
+async function getPSDriveFreeSpace(drive: string, opts: DiskProbeOptions = {}): Promise<DiskUsage | null> {
+  const timeoutMs = opts.timeoutMs ?? POWERSHELL_TIMEOUT_MS;
+  // The outer race bounds the *injected* probe too (and any implementation
+  // that ignores its signal), so a hung shell can never stall a caller even if
+  // the child-process timeout below is bypassed.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutGuard = new Promise<null>((resolveTimeout) => {
+    timer = setTimeout(() => resolveTimeout(null), timeoutMs);
+  });
+  try {
+    const work = opts.runPowerShell ? opts.runPowerShell(drive) : runPSDriveProbe(drive, timeoutMs);
+    const out = await Promise.race<string | null>([work, timeoutGuard]);
+    if (out === null) return null;
+    return parsePSDriveOutput(out);
+  } catch {
+    return null;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * Parse Get-PSDrive's `"<free> <used>"` line. Exported for tests: the shell's
+ * output shapes (bytes, an error banner, an empty string) are the part that
+ * decides degraded vs measured, and they are impossible to produce on demand
+ * from a real shell.
+ */
+export function parsePSDriveOutput(out: string): DiskUsage | null {
+  const [free, used] = out.trim().split(/\s+/).map((n) => parseFloat(n));
+  if (!Number.isFinite(free)) return null;
+  return {
+    freeBytes: free,
+    totalBytes: Number.isFinite(used) ? free + used : -1,
+  };
+}
+
+/** Spawn `powershell … Get-PSDrive`, hard-killed at `timeoutMs`; stdout or null. */
+async function runPSDriveProbe(drive: string, timeoutMs: number): Promise<string | null> {
   const proc = Bun.spawn(
     [
       "powershell",
@@ -201,19 +276,13 @@ async function getPSDriveFreeSpace(drive: string): Promise<DiskUsage | null> {
           proc.kill("SIGKILL");
         } catch {}
         resolveTimeout(null);
-      }, POWERSHELL_TIMEOUT_MS);
+      }, timeoutMs);
     });
     const reading = Promise.all([new Response(proc.stdout).text(), proc.exited]);
     const result = await Promise.race<[string, number] | null>([reading, timedOut]);
     if (!result) return null; // shell never answered
     const [out, code] = result;
-    if (code !== 0) return null;
-    const [free, used] = out.trim().split(/\s+/).map((n) => parseFloat(n));
-    if (!Number.isFinite(free)) return null;
-    return {
-      freeBytes: free,
-      totalBytes: Number.isFinite(used) ? free + used : -1,
-    };
+    return code === 0 ? out : null;
   } catch {
     return null;
   } finally {
@@ -224,8 +293,9 @@ async function getPSDriveFreeSpace(drive: string): Promise<DiskUsage | null> {
 export async function checkDiskSpace(
   path: string,
   minGB: number,
+  opts: DiskProbeOptions = {},
 ): Promise<{ free: number; ok: boolean }> {
-  const usage = await diskUsage(path);
+  const usage = await diskUsage(path, opts);
   if (usage.freeBytes < 0) {
     // Degraded mode: never permanently brick the engine over a failed probe —
     // log once and allow (yt-dlp will still surface a real disk-full error).

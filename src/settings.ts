@@ -329,6 +329,31 @@ export interface ApplySettingsResult {
 }
 
 /**
+ * Parse a boolean the dashboard may send: a real boolean, or one of the
+ * unambiguous string forms a form control can produce (`"true"/"false"`,
+ * `"1"/"0"`, `"yes"/"no"`, `"on"/"off"`, case- and whitespace-insensitive).
+ * Anything else — `"maybe"`, `""`, `null`, `2` — is null, which the caller
+ * rejects.
+ *
+ * The old rule mapped every unrecognised value to `false`, so
+ * `{"useAria2c": "maybe"}` reported `ok: true` and a changed key: an invalid
+ * value silently switched a setting off.
+ */
+export function coerceBoolean(raw: unknown): boolean | null {
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "number") {
+    if (raw === 1) return true;
+    if (raw === 0) return false;
+    return null;
+  }
+  if (typeof raw !== "string") return null;
+  const v = raw.trim().toLowerCase();
+  if (["true", "1", "yes", "on"].includes(v)) return true;
+  if (["false", "0", "no", "off"].includes(v)) return false;
+  return null;
+}
+
+/**
  * Apply a partial settings patch: validate the merged config, persist it, and
  * make it live for the running engine.
  *
@@ -357,20 +382,31 @@ export async function applySettings(
   }
 
   // Coerce to the field's declared type before validating, so "16" from a text
-  // input and 16 from JSON both work.
+  // input and 16 from JSON both work. A value that is not a usable
+  // representation of the declared type is REJECTED — never coerced to some
+  // default: "maybe" is not false, and silently turning it into a change would
+  // contradict the all-or-nothing rule the rest of this function enforces.
   const coerced: Record<string, unknown> = {};
   for (const field of EDITABLE_SETTINGS) {
     if (!(field.key in patch)) continue;
     const raw = patch[field.key];
     if (field.type === "number") {
       const n = typeof raw === "number" ? raw : Number(String(raw).trim());
+      // `Number("")` is 0 and `Number(" ")` is 0: an empty text input is not a
+      // number, it is a missing value.
+      if (typeof raw !== "number" && !String(raw ?? "").trim()) {
+        return { ok: false, error: `${field.label} must be a number`, changed: [] };
+      }
       if (!Number.isFinite(n)) {
         return { ok: false, error: `${field.label} must be a number`, changed: [] };
       }
       coerced[field.key] = n;
     } else if (field.type === "boolean") {
-      coerced[field.key] =
-        typeof raw === "boolean" ? raw : ["true", "1", "yes", "on"].includes(String(raw).toLowerCase());
+      const parsed = coerceBoolean(raw);
+      if (parsed === null) {
+        return { ok: false, error: `${field.label} must be true or false`, changed: [] };
+      }
+      coerced[field.key] = parsed;
     } else if (field.type === "list") {
       // A string of comma-separated values ("en, ja") or a real array both
       // normalize to a clean string array.

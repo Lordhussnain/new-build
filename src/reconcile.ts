@@ -11,14 +11,14 @@
 //                            permanent errors (private/removed videos) skipped
 
 import { existsSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
-import { readdir, stat, unlink } from "node:fs/promises";
+import { readdir, rm, stat, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { db, perVideoCap, type Job } from "./db";
 import { removeFromArchive } from "./archive";
 import { logError } from "./logger";
 import { detectCookiesChange, type CookiesChange } from "./tools";
 import { isPermanentDownloadError } from "./retry";
-import { jobBaseFilename } from "./download-args";
+import { jobFittedBaseFilename } from "./download-args";
 import { activeDownloadJobs } from "./state";
 import type { Config } from "./config";
 
@@ -77,8 +77,19 @@ export function STALE_CLAIM_THRESHOLDS(config: Pick<Config, "maxDownloadMinutes"
  * the claim timestamp. Conversion and metadata claims past their thresholds
  * are re-queued.
  */
-export function reapStaleClaims(config: Config): void {
+export interface ReapSummary {
+  downloads: number;
+  conversions: number;
+  metadata: number;
+  /** Stranded control files left by dead download workers, swept this tick. */
+  stranded: number;
+  /** Stranded control files that could not be swept (locked) — retried later. */
+  locked: number;
+}
+
+export async function reapStaleClaims(config: Config): Promise<ReapSummary> {
   const thresholds = STALE_CLAIM_THRESHOLDS(config);
+  const reaped: ReapSummary = { downloads: 0, conversions: 0, metadata: 0, stranded: 0, locked: 0 };
   try {
     // Freeze each in-flight download's `.part` path while the job is still
     // 'downloading' (that is this function's own filter) — otherwise the
@@ -88,6 +99,15 @@ export function reapStaleClaims(config: Config): void {
     const activeJobFilter = activeJobIds.length
       ? `AND id NOT IN (${activeJobIds.map(() => "?").join(", ")})`
       : "";
+    // Snapshot what is about to be reclaimed so the resume state of EXACTLY
+    // those jobs can be checked below, before the status update loses them.
+    const staleRows = db
+      .query(
+        `SELECT id, "index", title, output_directory FROM jobs
+          WHERE download_status = 'downloading'
+            AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', ?)) ${activeJobFilter}`,
+      )
+      .all(thresholds.download, ...activeJobIds) as { id: string; index: number; title: string; output_directory: string }[];
     const dlQuery =
       `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
          download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
@@ -106,16 +126,84 @@ export function reapStaleClaims(config: Config): void {
        WHERE metadata_status = 'in_progress' AND updated_at < datetime('now', ?)`,
       [thresholds.metadata],
     );
+    // A reclaimed download whose worker died can leave half a resume pair: the
+    // `.aria2` control file with no data file beside it. The next attempt hands
+    // that control file to aria2c, which can neither resume (the data is gone)
+    // nor start over — the job wedges. The startup sweep clears these, but only
+    // after a day and only for jobs it sees; the reaper owns them from now on.
+    // A locked control file is reported and left alone, exactly like the
+    // corrupt-partial path: retry on the next tick rather than risk stranding.
+    let stranded = 0;
+    let locked = 0;
+    for (const row of staleRows) {
+      const found = await sweepStrandedControlFiles(row);
+      stranded += found.removed;
+      locked += found.locked;
+    }
+    // Report what the UPDATEs actually changed, not just the stranded sweep:
+    // a caller (the dashboard/test) can now tell "nothing to do" from "wrote".
     const total = dl.changes + cv.changes + md.changes;
-    if (total > 0) {
+    if (total > 0 || stranded > 0) {
       console.log(
-        `🧟 Reclaimed ${dl.changes} stale download(s) (${recorded} partial path(s) recorded), ${cv.changes} conversion(s), ${md.changes} metadata job(s).`,
+        `🧟 Reclaimed ${dl.changes} stale download(s) (${recorded} partial path(s) recorded, ${stranded} stranded control file(s) swept), ${cv.changes} conversion(s), ${md.changes} metadata job(s).`,
       );
       logError("reaper", `reclaimed stale claims: downloads=${dl.changes} conversions=${cv.changes} metadata=${md.changes}`);
     }
+    if (locked > 0) {
+      logError(
+        "reaper",
+        `${locked} stranded aria2c control file(s) are locked — kept both files; the next sweep retries`,
+      );
+    }
+    reaped.downloads = dl.changes;
+    reaped.conversions = cv.changes;
+    reaped.metadata = md.changes;
+    reaped.stranded = stranded;
+    reaped.locked = locked;
   } catch (e: any) {
     logError("reaper", String(e?.message || e));
   }
+  return reaped;
+}
+
+/**
+ * Sweep the stranded half of a reclaimed job's resume pair: an `.aria2` control
+ * file whose data file is gone. Returns what happened, so the caller can report
+ * a lock and retry later instead of pretending it cleaned something.
+ *
+ * Never touches a job whose pair is intact — that is live resume state.
+ */
+export async function sweepStrandedControlFiles(
+  job: Pick<Job, "id" | "index" | "title" | "output_directory">,
+): Promise<{ removed: number; locked: number }> {
+  const result = { removed: 0, locked: 0 };
+  const dir = job.output_directory || ".";
+  const base = jobFittedBaseFilename(job);
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return result;
+  }
+  for (const f of entries) {
+    if (!f.endsWith(ARIA2_CONTROL_SUFFIX)) continue;
+    if (!f.startsWith(base + ".")) continue;
+    const controlPath = join(dir, f);
+    const dataPath = controlPath.slice(0, -ARIA2_CONTROL_SUFFIX.length);
+    if (existsSync(dataPath)) continue; // the pair is intact: resumable state
+    // Control file first, data file (already gone) after — the pairing rule.
+    const removal = await removePartialFiles(dataPath);
+    if (removal.fatal) {
+      result.locked++;
+      logError(
+        "reaper",
+        `stranded control file ${controlPath} is locked (${removal.error || "not removable"}) — kept for now, will retry`,
+      );
+      continue;
+    }
+    if (removal.controlRemoved) result.removed++;
+  }
+  return result;
 }
 
 /**
@@ -372,30 +460,51 @@ export interface PartialRemovalResult {
  */
 export async function removePartialFiles(partialPath: string): Promise<PartialRemovalResult> {
   const controlPath = `${partialPath}${ARIA2_CONTROL_SUFFIX}`;
-  let controlRemoved = false;
+  const control = await removeOne(controlPath, { strict: true });
+  if (!control.ok) {
+    // Locked or otherwise undeletable — do NOT touch the data file.
+    return { controlRemoved: false, dataRemoved: false, fatal: true, error: control.error };
+  }
+  const data = await removeOne(partialPath);
+  // Data file locked (or a fragment directory that would not budge) but the
+  // control file gone: the next attempt restarts from scratch — annoying, not
+  // fatal. The `removed` flag is what tells the caller whether the file is
+  // really gone, so a partial that survived is never reported as cleaned.
+  return { controlRemoved: control.removed, dataRemoved: data.removed, fatal: false };
+}
+
+/**
+ * Delete one path, reporting whether anything was actually removed.
+ *
+ * The control file is removed strictly: it is always a plain file, so any
+ * failure to unlink it (EISDIR included) is treated as "locked" and aborts the
+ * whole removal, leaving the pair intact for a later retry.
+ *
+ * The data path is handled more tolerantly, because `.ytdl` resume points are
+ * *fragment directories*: `unlink()` refuses them on every platform
+ * (EISDIR/EPERM), so a caller that only ever unlinked would silently keep them
+ * — and would report the partial as cleaned while the stale fragments were
+ * still there for the next attempt to pick up.
+ */
+async function removeOne(path: string, opts: { strict?: boolean } = {}): Promise<{ removed: boolean; ok: boolean; error?: string }> {
   try {
-    await unlink(controlPath);
-    controlRemoved = true;
+    await unlink(path);
+    return { removed: true, ok: true };
   } catch (e: any) {
-    if (e?.code !== "ENOENT") {
-      // Locked or otherwise undeletable — do NOT touch the data file.
-      return {
-        controlRemoved,
-        dataRemoved: false,
-        fatal: true,
-        error: `${controlPath}: ${e?.code || e?.message || e}`,
-      };
+    if (e?.code === "ENOENT") return { removed: false, ok: true }; // already gone
+    if (!opts.strict) {
+      try {
+        const s = await stat(path);
+        if (s.isDirectory()) {
+          await rm(path, { recursive: true, force: true });
+          return { removed: true, ok: true };
+        }
+      } catch {
+        return { removed: false, ok: true }; // vanished between unlink and stat
+      }
     }
+    return { removed: false, ok: false, error: `${path}: ${e?.code || e?.message || e}` };
   }
-  let dataRemoved = false;
-  try {
-    await unlink(partialPath);
-    dataRemoved = true;
-  } catch {
-    // Data file locked but control gone: the next attempt restarts from
-    // scratch — annoying, not fatal.
-  }
-  return { controlRemoved, dataRemoved, fatal: false };
 }
 
 /**
@@ -496,7 +605,11 @@ export function recordPartialPaths(): number {
 export function recordJobPartial(
   job: Pick<Job, "id" | "index" | "title" | "output_directory">,
 ): string {
-  const partial = findPartialFileSync(job.output_directory || ".", jobBaseFilename(job));
+  // The fitted name, not the raw title: that is the file yt-dlp actually wrote
+  // (see jobFittedBaseFilename). Searching with the unfitted name finds
+  // nothing for a long title, so no partial path is recorded and the on-disk
+  // resume state later looks like an orphan to the sweep.
+  const partial = findPartialFileSync(job.output_directory || ".", jobFittedBaseFilename(job));
   if (partial) {
     db.run(`UPDATE jobs SET partial_file_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [
       partial,
@@ -507,12 +620,53 @@ export function recordJobPartial(
 }
 
 /**
+ * Key for comparing a recorded path against a path built from a directory
+ * walk.
+ *
+ * The two sides come from different places and are not textually equal even
+ * when they name the same file: `findPartialFile(Sync)` stores an absolute,
+ * `resolve()`d path, while `cleanOrphanedFiles` builds its paths by joining the
+ * configured `outputRoot` (`./downloads` by default — relative) with the
+ * entries of a recursive `readdir`. Resolving both sides to an absolute path
+ * kills that mismatch, and case-folding on Windows (a case-insensitive
+ * filesystem) keeps a recorded `C:\Downloads` matching a walked
+ * `c:\downloads`.
+ */
+export function pathKey(p: string): string {
+  const abs = resolve(p);
+  return process.platform === "win32" ? abs.toLowerCase() : abs;
+}
+
+/** Age after which an unowned orphan partial is swept, and the same for `.superseded` backups. */
+export const ORPHAN_PARTIAL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Age after which a partial nothing will ever resume is considered litter.
+ * Only ever applied to non-resumable owners: a partial belonging to a job that
+ * is going to be claimed again is never aged out (see the sweep below).
+ */
+export const PARTIAL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Statuses whose partial the pipeline will still resume, so the sweep must
+ * keep it no matter how old it is:
+ *   • `pending` / `downloading` — the next claim continues from it
+ *   • `paused`                  — the operator holds the job; resuming later
+ *     must continue where it stopped, even after weeks
+ *   • `waiting_live`            — parked until the stream becomes a VOD
+ */
+const RESUMABLE_PARTIAL_STATUSES = new Set(["pending", "downloading", "paused", "waiting_live"]);
+
+/**
  * Housekeeping for leftover partial downloads at startup:
  *   • a .part belonging to a FAILED job whose immediate retry window is spent
- *     is deleted when cooldown requeue is disabled; any partial older than a
- *     week is deleted
+ *     is deleted when cooldown requeue is disabled; a partial no job will
+ *     resume (terminal failure, forgotten row) is deleted once it is a week old
  *   • orphan .part files with no matching job (DB reset, manual cleanup) are
  *     deleted once they are a day old
+ *   • orphan `.superseded` backups with no matching job are deleted once they
+ *     are a day old — a backup the DB does not reference can never be restored,
+ *     so it is a stale duplicate next to a job that re-downloaded over it
  *   • everything else — including in-flight downloads from a previous run and
  *     resume-able partials of failed jobs waiting for cooldown — is kept so
  *     `--continue` can pick up exactly where the download stopped
@@ -521,7 +675,11 @@ export function recordJobPartial(
  * whose data file is gone are swept on their own — a stranded `.aria2` makes
  * aria2c refuse to restart the transfer (see `removePartialFiles`).
  */
-export async function cleanOrphanedFiles(rootDir: string, config?: Config): Promise<void> {
+export async function cleanOrphanedFiles(
+  rootDir: string,
+  config?: Config,
+): Promise<{ removed: number; locked: number }> {
+  const summary = { removed: 0, locked: 0 };
   try {
     const cap = config ? perVideoCap(config) : 0;
     const rows = db
@@ -530,23 +688,53 @@ export async function cleanOrphanedFiles(rootDir: string, config?: Config): Prom
     const owners = new Map<string, { status: string; retries: number; lastError: string | null }>();
     for (const r of rows) {
       if (r.partial_file_path) {
-        owners.set(r.partial_file_path, {
+        // Absolute + case-folded: the walk below yields paths relative to a
+        // possibly-relative outputRoot, and a raw string compare would miss.
+        owners.set(pathKey(r.partial_file_path), {
           status: r.download_status,
           retries: r.retry_count || 0,
           lastError: r.last_error || null,
         });
       }
     }
+    // Backups some job still owns (including in-flight re-downloads). The
+    // sibling form covers legacy rows only: an older build renamed the file
+    // aside before recording the backup, so the sole association left is
+    // `<file_path>.superseded` — and only while that `file_path` is itself
+    // missing. A sibling next to a live output file is a leftover from a
+    // completed re-download and may be swept.
+    const supersededOwners = new Set<string>();
+    const supersededRows = db
+      .query("SELECT superseded_file, file_path FROM jobs WHERE superseded_file IS NOT NULL OR file_path IS NOT NULL")
+      .all() as any[];
+    for (const r of supersededRows) {
+      if (r.superseded_file) supersededOwners.add(pathKey(r.superseded_file));
+      if (r.file_path && !existsSync(r.file_path)) {
+        supersededOwners.add(pathKey(`${r.file_path}${SUPERSEDED_SUFFIX}`));
+      }
+    }
 
     const files = await readdir(rootDir, { recursive: true });
     let removed = 0;
     for (const file of files) {
-      if (!file.endsWith(".part") && !file.endsWith(".ytdl")) continue;
-      const fullPath = join(rootDir, file);
+      const isPartial = file.endsWith(".part") || file.endsWith(".ytdl");
+      const isSuperseded = file.endsWith(SUPERSEDED_SUFFIX);
+      if (!isPartial && !isSuperseded) continue;
+      // `resolve`, not `join`: recursive readdir entries are relative to
+      // rootDir, so joining a relative root yields a relative path that never
+      // matches the absolute path recorded in the database.
+      const fullPath = resolve(rootDir, file);
       const s = await stat(fullPath).catch(() => null);
       if (!s) continue;
       const ageMs = Date.now() - s.mtimeMs;
-      const owner = owners.get(fullPath);
+      if (isSuperseded) {
+        if (!supersededOwners.has(pathKey(fullPath)) && ageMs > ORPHAN_PARTIAL_MAX_AGE_MS) {
+          await unlink(fullPath).catch(() => {});
+          removed++;
+        }
+        continue;
+      }
+      const owner = owners.get(pathKey(fullPath));
       if (owner) {
         const waitingForCooldownRetry =
           owner.status === "failed" &&
@@ -554,16 +742,19 @@ export async function cleanOrphanedFiles(rootDir: string, config?: Config): Prom
           config.requeueFailedAfterMinutes > 0 &&
           !isPermanentDownloadError(owner.lastError);
         const exhausted = owner.status === "failed" && cap > 0 && owner.retries >= cap && !waitingForCooldownRetry;
-        const ancient = ageMs > 7 * 24 * 60 * 60 * 1000;
+        // Only partials no attempt will ever resume are aged out. A paused or
+        // pending job's resume state must survive indefinitely — deleting it
+        // because a week passed silently throws away the download progress the
+        // job exists to continue from.
+        const abandoned = !RESUMABLE_PARTIAL_STATUSES.has(owner.status) && !waitingForCooldownRetry;
+        const ancient = abandoned && ageMs > PARTIAL_MAX_AGE_MS;
         if (exhausted || ancient) {
           // Take the aria2c control file with it, or the next attempt wedges.
-          await removePartialFiles(fullPath);
-          removed++;
+          if (await removePartialAndReport(fullPath, summary)) removed++;
         }
-      } else if (ageMs > 24 * 60 * 60 * 1000) {
+      } else if (ageMs > ORPHAN_PARTIAL_MAX_AGE_MS) {
         // Orphan: no job claims it — safe to clean once it is clearly stale.
-        await removePartialFiles(fullPath);
-        removed++;
+        if (await removePartialAndReport(fullPath, summary)) removed++;
       }
     }
 
@@ -575,19 +766,76 @@ export async function cleanOrphanedFiles(rootDir: string, config?: Config): Prom
     // --allow-overwrite=false will not start over.
     for (const file of files) {
       if (!file.endsWith(ARIA2_CONTROL_SUFFIX)) continue;
-      const fullPath = join(rootDir, file);
+      const fullPath = resolve(rootDir, file);
       const s2 = await stat(fullPath).catch(() => null);
       if (!s2) continue;
       // Young enough that a download may just have started writing it.
-      if (Date.now() - s2.mtimeMs < 24 * 60 * 60 * 1000) continue;
+      if (Date.now() - s2.mtimeMs < ORPHAN_PARTIAL_MAX_AGE_MS) continue;
       // Its data file is still there — this is live resume state, keep it.
       if (existsSync(fullPath.slice(0, -ARIA2_CONTROL_SUFFIX.length))) continue;
-      await unlink(fullPath).catch(() => {});
-      removed++;
+      try {
+        await unlink(fullPath);
+        removed++;
+      } catch (e: any) {
+        if (e?.code !== "ENOENT") {
+          // Locked (an orphaned aria2c, an antivirus scan). Litter that will
+          // not move is not a failure of the engine, but it must not be
+          // reported as removed either — the next startup sweep retries it.
+          summary.locked++;
+          logError(
+            "reconcile",
+            `stranded control file ${fullPath} is locked (${e?.code || e?.message || e}) — left in place, will retry on the next sweep`,
+          );
+        }
+      }
     }
 
-    if (removed > 0) console.log(`🧹 Cleaned ${removed} stale partial file(s).`);
-  } catch {}
+    summary.removed = removed;
+    if (removed > 0 || summary.locked > 0) {
+      console.log(
+        `🧹 Cleaned ${removed} stale partial/backup file(s).` +
+          (summary.locked > 0 ? ` ${summary.locked} locked file(s) left for a later sweep.` : ""),
+      );
+    }
+  } catch (e: any) {
+    logError("reconcile", String(e?.message || e));
+  }
+  return summary;
+}
+
+/**
+ * Remove a stale partial and say whether the DATA file is really gone.
+ *
+ * `removePartialFiles` refuses to touch the data file while the control file
+ * cannot be removed (that pairing is what keeps aria2c restartable), and it
+ * reports that refusal as `.fatal`. Counting it as a removal anyway is how the
+ * sweep's "🧹 Cleaned N stale partial file(s)" line lied about locked files
+ * that were still on disk — and how a wedged aria2c could go unnoticed. A
+ * locked pair keeps BOTH files and is retried by the next sweep (the startup
+ * sweep for a manual lock, the reaper for a stranded control file).
+ */
+async function removePartialAndReport(
+  partialPath: string,
+  summary: { removed: number; locked: number },
+): Promise<boolean> {
+  const result = await removePartialFiles(partialPath);
+  if (result.fatal) {
+    summary.locked++;
+    logError(
+      "reconcile",
+      `partial ${partialPath} is locked (${result.error || "control file not removable"}) — kept both files, will retry later`,
+    );
+    return false;
+  }
+  if (!result.dataRemoved) {
+    // Control gone, data still there (locked file, or a directory that would
+    // not budge). aria2c can restart now — that was the point of the deletion —
+    // but the file itself is still on disk, so it is not "cleaned".
+    summary.locked++;
+    logError("reconcile", `partial ${partialPath} could not be deleted — the next attempt restarts instead of resuming`);
+    return false;
+  }
+  return true;
 }
 
 // --- Superseded media files (deliberate re-downloads) ------------------------
@@ -601,20 +849,40 @@ export async function cleanOrphanedFiles(rootDir: string, config?: Config): Prom
 // caller. The new download deletes the backup on success
 // (`dropSupersededFile`); a permanent re-download failure restores it
 // (`restoreSupersededFile`).
+//
+// The hand-off is ordered so a crash at ANY point is recoverable: the DB row
+// is rewritten first (backup recorded, `file_path` cleared) and only then is
+// the file renamed. The in-between state — a recorded backup whose file was
+// never moved — is rolled back by `reconcileSupersededFiles()` at the next
+// startup, so the media can never end up sitting at `<path>.superseded` with
+// no row that knows about it.
 
 export const SUPERSEDED_SUFFIX = ".superseded";
 
 /**
  * Move a downloaded job's media file aside so a re-download gets a free
  * output path. Clears `file_path` (it no longer exists) and records the
- * backup in `superseded_file`. Returns the backup path, or null when the job
- * had no file on disk to protect. Throws when an existing file cannot be
- * renamed — the caller should refuse the retry rather than start a download
- * that yt-dlp will skip against the still-present file.
+ * backup in `superseded_file` BEFORE the rename, so the database and the
+ * filesystem can never disagree about where the file went. Returns the backup
+ * path, or null when the job had no file on disk to protect. Throws when an
+ * existing file cannot be renamed — the caller should refuse the retry rather
+ * than start a download that yt-dlp will skip against the still-present file,
+ * and the row is put back so the job still looks downloaded.
  */
 export function stashDownloadedFile(jobId: string, filePath: string | null): string | null {
   if (!filePath) return null;
+  const backup = `${filePath}${SUPERSEDED_SUFFIX}`;
   if (!existsSync(filePath)) {
+    // The original is already gone. If a backup for the same path survives
+    // (a previous stash whose caller never got to record it — see
+    // reconcileSupersededFiles), adopt it: the file is still worth protecting.
+    if (existsSync(backup)) {
+      db.run(
+        `UPDATE jobs SET file_path = NULL, file_size = 0, superseded_file = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [backup, jobId],
+      );
+      return backup;
+    }
     // DB says downloaded but the file is already gone — nothing to protect.
     db.run(
       `UPDATE jobs SET file_path = NULL, file_size = 0, superseded_file = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
@@ -622,16 +890,32 @@ export function stashDownloadedFile(jobId: string, filePath: string | null): str
     );
     return null;
   }
-  const backup = `${filePath}${SUPERSEDED_SUFFIX}`;
+  let size = 0;
   try {
-    renameSync(filePath, backup);
-  } catch (err: any) {
-    throw new Error(`could not move the previous file aside (${filePath}): ${err?.message || err}`);
-  }
+    size = statSync(filePath).size;
+  } catch {}
+  // Record the intent BEFORE the filesystem rename. If the process dies
+  // between the two steps the database still knows where the file went, and
+  // `reconcileSupersededFiles` completes or rolls back the hand-off at the
+  // next startup. The reverse order (rename first, record after) is the bug
+  // this replaces: a crash in that window left the media at
+  // `<path>.superseded` with no row pointing at it, so the re-queue looked
+  // exactly like a deleted download and the backup was never managed again.
   db.run(
     `UPDATE jobs SET file_path = NULL, file_size = 0, superseded_file = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
     [backup, jobId],
   );
+  try {
+    renameSync(filePath, backup);
+  } catch (err: any) {
+    // Put the row back exactly as it was: the caller aborts the retry (500),
+    // so the job must still look downloaded with its file in place.
+    db.run(
+      `UPDATE jobs SET file_path = ?, file_size = ?, superseded_file = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [filePath, size, jobId],
+    );
+    throw new Error(`could not move the previous file aside (${filePath}): ${err?.message || err}`);
+  }
   return backup;
 }
 
@@ -695,5 +979,161 @@ export function restoreSupersededFile(jobId: string, reason: string): boolean {
        last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
     [original, size, row.wants, reason, jobId],
   );
+  return true;
+}
+
+/** What `reconcileSupersededFiles` did at startup. */
+export interface SupersededReconcileResult {
+  /** Interrupted stashes rolled back: the media is back at its output path. */
+  restored: number;
+  /** Backups deleted because the re-download they guarded already finished. */
+  dropped: number;
+  /** Stale `superseded_file` pointers forgotten (nothing left to protect). */
+  cleared: number;
+}
+
+/**
+ * Startup recovery for the `.superseded` hand-off.
+ *
+ * `stashDownloadedFile` records the backup in the DB before it renames the
+ * file, so a crash can leave exactly one recoverable in-between state:
+ *
+ *   • `superseded_file` set, backup NOT on disk, original still in place —
+ *     the rename never ran (or a `renameSync` rollback raced a crash). The row
+ *     is put back to "downloaded with its file", so the job is never re-queued
+ *     against a file that vanished from the DB's point of view and the old
+ *     media is not left unmanaged.
+ *
+ * Two further states are healed so no backup is ever stranded:
+ *
+ *   • `superseded_file` set, backup on disk, but the backup belongs to a job
+ *     that is still "downloaded" and has no current file — the retry never
+ *     became claimable (the crash landed between the stash and the status
+ *     update). Rolling the file back restores the exact pre-click state; the
+ *     operator can retry again, and nothing re-downloads behind their back.
+ *   • `superseded_file` set, backup on disk, and `file_path` already points at
+ *     an existing file — the re-download succeeded but the crash hit between
+ *     `recordSuccess()` and `dropSupersededFile()`. The new file is the
+ *     archive's copy; the backup is deleted.
+ *
+ * The older, rename-first ordering could also leave the opposite signature —
+ * no `superseded_file` recorded, `file_path` pointing at a file that is not
+ * there, sitting next to its `.superseded` sibling. Those rows are adopted:
+ * the backup is put back where `file_path` says it belongs, so a previous
+ * build's crash window cannot turn into a pointless re-download (or a file
+ * that is never managed again).
+ *
+ * Runs before `reconcileMissingFiles`, which would otherwise read the missing
+ * `file_path` as "deleted by hand" and re-queue the video.
+ */
+export function reconcileSupersededFiles(): SupersededReconcileResult {
+  const result: SupersededReconcileResult = { restored: 0, dropped: 0, cleared: 0 };
+  try {
+    const rows = db
+      .query(
+        `SELECT id, file_path, superseded_file, download_status FROM jobs
+          WHERE superseded_file IS NOT NULL OR file_path IS NOT NULL`,
+      )
+      .all() as any[];
+    for (const row of rows) {
+      const backup: string | null = row.superseded_file || null;
+      const currentFile: string | null = row.file_path && existsSync(row.file_path) ? row.file_path : null;
+
+      if (backup && backup.endsWith(SUPERSEDED_SUFFIX)) {
+        const original = backup.slice(0, -SUPERSEDED_SUFFIX.length);
+        if (existsSync(backup)) {
+          if (currentFile) {
+            // The re-download finished; only the backup's deletion was lost.
+            db.run(`UPDATE jobs SET superseded_file = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [row.id]);
+            try {
+              unlinkSync(backup);
+            } catch {}
+            result.dropped++;
+          } else if (row.download_status === "downloaded") {
+            // The retry was never queued: the job still claims to be finished
+            // but its file is the backup. Put it back — the pre-click state.
+            if (restoreStashedMedia(row.id, backup, original)) result.restored++;
+          }
+          // Otherwise the queued/in-flight re-download owns the backup: keep.
+          continue;
+        }
+        if (!currentFile && existsSync(original)) {
+          // The intent was recorded but the rename never ran (or a
+          // renameSync rollback raced the crash): the file is exactly where
+          // the pre-stash row expects it. Put the row back — no filesystem
+          // work, nothing to rename.
+          rollBackStash(row.id, original);
+          result.restored++;
+          continue;
+        }
+        // Nothing on disk to protect any more (backup deleted by hand, or the
+        // whole file is gone) — forget the pointer; `reconcileMissingFiles`
+        // and the sweep own the rest.
+        db.run(`UPDATE jobs SET superseded_file = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [row.id]);
+        result.cleared++;
+        continue;
+      }
+
+      // Legacy rename-first crash window: no pointer was recorded, the DB's
+      // file_path names a file that is not there, and the `.superseded` sibling
+      // is what the interrupted retry left behind.
+      if (!backup && row.file_path && !currentFile) {
+        const legacyBackup = `${row.file_path}${SUPERSEDED_SUFFIX}`;
+        if (existsSync(legacyBackup) && row.download_status === "downloaded") {
+          if (restoreStashedMedia(row.id, legacyBackup, row.file_path)) result.restored++;
+        }
+      }
+    }
+    if (result.restored + result.dropped + result.cleared > 0) {
+      console.log(
+        `🧷 Superseded-file recovery: ${result.restored} restored, ${result.dropped} backup(s) dropped, ${result.cleared} stale pointer(s) cleared.`,
+      );
+    }
+  } catch (e: any) {
+    logError("reconcile", `superseded recovery: ${e?.message || e}`);
+  }
+  return result;
+}
+
+/**
+ * Forget the interrupted stash in the database only: the media never left its
+ * output path, so re-point `file_path` at it and drop the backup pointer.
+ */
+function rollBackStash(jobId: string, original: string): void {
+  let size = 0;
+  try {
+    size = statSync(original).size;
+  } catch {}
+  db.run(
+    `UPDATE jobs SET file_path = ?, file_size = ?, superseded_file = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [original, size, jobId],
+  );
+}
+
+/**
+ * Move a `.superseded` backup back to `original` and make the job row describe
+ * it again (downloaded, file present, no backup). Used when a re-download
+ * never got off the ground, so the archive keeps exactly what it had. Returns
+ * false (and logs) when the rename fails — the backup is then left for the
+ * next startup and the orphan sweep will not touch it, because the row still
+ * references it.
+ */
+function restoreStashedMedia(jobId: string, backup: string, original: string): boolean {
+  // Never clobber a file that appeared at the output path in the meantime.
+  if (existsSync(original)) {
+    db.run(`UPDATE jobs SET superseded_file = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [jobId]);
+    logError(
+      "reconcile",
+      `${jobId}: both ${original} and its backup ${backup} exist — keeping the output file and forgetting the backup`,
+    );
+    return false;
+  }
+  try {
+    renameSync(backup, original);
+  } catch (err: any) {
+    logError("reconcile", `${jobId} could not restore ${backup}: ${err?.message || err}`);
+    return false;
+  }
+  rollBackStash(jobId, original);
   return true;
 }

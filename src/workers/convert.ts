@@ -162,29 +162,16 @@ async function finalizeConversion(
     return;
   }
   if (config.secondaryStoragePath) {
-    const destDir = join(config.secondaryStoragePath, job.folder);
-    await mkdir(destDir, { recursive: true });
-    const srcDir = dirname(finalPath);
-    const srcBase = basename(finalPath).replace(/\.[^.]+$/, "");
-    // Move matching sidecar files (subs/thumbs/description/info.json) with
-    // the media so everything stays together in the final location.
-    const entries = await readdir(srcDir).catch(() => [] as string[]);
-    for (const f of entries) {
-      if (!f.startsWith(srcBase + ".")) continue;
-      if (!SIDECAR_SUFFIXES.some((sfx) => f.endsWith(sfx))) continue;
-      const sideSrc = join(srcDir, f);
-      const sideDest = join(destDir, f);
-      await rename(sideSrc, sideDest).catch(async () => {
-        await cp(sideSrc, sideDest, { force: true }).catch(() => {});
-        await unlink(sideSrc).catch(() => {});
-      });
+    const moved = await moveToSecondaryStorage(job, config.secondaryStoragePath, finalPath, () =>
+      stillOwnsConversion(job, workerId),
+    );
+    if (moved.stopped) {
+      // Ownership is gone: the thief owns these files now, so nothing else is
+      // touched (not even the DB row, whose WHERE clause would refuse it).
+      logError("conversion", `${job.id} ${job.title}: conversion claim lost mid-move — files left where they are`);
+      return;
     }
-    const destPath = join(destDir, basename(finalPath));
-    await rename(finalPath, destPath).catch(async () => {
-      await cp(finalPath, destPath, { force: true });
-      await unlink(finalPath);
-    });
-    finalPath = destPath;
+    finalPath = moved.path;
   }
   let integrity: string | null = null;
   if (config.verifyIntegrity) {
@@ -205,6 +192,110 @@ async function finalizeConversion(
   stats.converted++;
   notePipelineSuccess("post");
   updateConvertWorkerLine(id, `✅ Done | ${job.title}`, config);
+}
+
+/**
+ * Move a finished conversion — media plus matching sidecars — into secondary
+ * storage, preserving the folder layout. Returns the media's new path.
+ *
+ * Every destructive step re-checks ownership through `canContinue`: the claim
+ * can be stolen at any await in this sequence, and after that the files belong
+ * to the new claim (AGENTS.md invariant 20). A stopped move reports back so the
+ * caller can bail out; a sidecar that cannot move is a warning, while the media
+ * itself is `required` — if it cannot land in secondary storage the job must
+ * fail and retry rather than be marked done against the wrong path. The source
+ * is only ever deleted after a copy that reported success (see `moveFile`).
+ *
+ * Exported for the tests: the failure modes here are exactly the ones that must
+ * never lose data, and they are impossible to trigger through the full engine
+ * without contriving a broken secondary disk.
+ */
+export async function moveToSecondaryStorage(
+  job: Pick<Job, "id" | "title" | "folder">,
+  secondaryStoragePath: string,
+  finalPath: string,
+  canContinue: () => boolean = () => true,
+): Promise<{ path: string; stopped: boolean }> {
+  const destDir = join(secondaryStoragePath, job.folder);
+  await mkdir(destDir, { recursive: true });
+  const srcDir = dirname(finalPath);
+  const srcBase = basename(finalPath).replace(/\.[^.]+$/, "");
+  // Move matching sidecar files (subs/thumbs/description/info.json) with
+  // the media so everything stays together in the final location.
+  const entries = await readdir(srcDir).catch(() => [] as string[]);
+  for (const f of entries) {
+    if (!f.startsWith(srcBase + ".")) continue;
+    if (!SIDECAR_SUFFIXES.some((sfx) => f.endsWith(sfx))) continue;
+    if (!canContinue()) return { path: finalPath, stopped: true };
+    await moveFile(join(srcDir, f), join(destDir, f), job);
+  }
+  if (!canContinue()) return { path: finalPath, stopped: true };
+  const destPath = join(destDir, basename(finalPath));
+  await moveFile(finalPath, destPath, job, { required: true });
+  return { path: destPath, stopped: false };
+}
+
+/**
+ * Move one file to secondary storage without ever destroying the only copy.
+ *
+ * `rename` is tried first (same volume: atomic, and the source is gone the
+ * moment it succeeds). Across volumes it fails with EXDEV and the copy is the
+ * only option — and THAT is where the old code was dangerous: it swallowed a
+ * copy failure and then unlinked the source anyway, so a full secondary disk
+ * silently deleted a sidecar that had nowhere else to live. Now the source is
+ * removed only after a copy that reported success; a failed copy keeps BOTH
+ * files and is logged loudly (a duplicate is recoverable, a lost file is not).
+ *
+ * Returns false when the move did not happen. `required` turns that into a
+ * thrown error — the media itself must land in secondary storage or the job
+ * must stay retryable, while a sidecar is worth only a warning.
+ */
+async function moveFile(
+  src: string,
+  dest: string,
+  job: Pick<Job, "id" | "title">,
+  opts: { required?: boolean } = {},
+): Promise<boolean> {
+  try {
+    await rename(src, dest);
+    return true;
+  } catch {
+    // EXDEV when secondary storage is another volume (the expected case);
+    // anything else (a locked destination) has no better answer than the
+    // checked copy below, which keeps the source on failure.
+    return moveFileCopy(src, dest, job, opts);
+  }
+}
+
+async function moveFileCopy(
+  src: string,
+  dest: string,
+  job: Pick<Job, "id" | "title">,
+  opts: { required?: boolean },
+): Promise<boolean> {
+  try {
+    // `force` overwrites a half-written destination from an earlier crash.
+    await cp(src, dest, { force: true });
+  } catch (e: any) {
+    logError(
+      "conversion",
+      `${job.id} ${job.title}: could not move ${src} to secondary storage (${e?.code || e?.message || e}) — keeping BOTH copies`,
+    );
+    if (opts.required) {
+      throw new Error(`secondary-storage move failed for ${src}: ${e?.code || e?.message || e}`);
+    }
+    return false;
+  }
+  // Only now is the source redundant.
+  try {
+    await unlink(src);
+  } catch (e: any) {
+    logError(
+      "conversion",
+      `${job.id} ${job.title}: moved ${src} to secondary storage but could not remove the source (${e?.code || e?.message || e}) — duplicate left in place`,
+    );
+  }
+  return true;
 }
 
 async function convertJob(job: Job, config: Config, id: number): Promise<void> {

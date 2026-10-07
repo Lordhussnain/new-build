@@ -17,7 +17,7 @@
 //                              on the aria2c path
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { copyFile, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
@@ -231,6 +231,23 @@ async function startEngine(
   }
   await handle.stop();
   throw new Error(`engine did not start within 30s\nSTDOUT:\n${out}\nSTDERR:\n${err}`);
+}
+
+/**
+ * The engine's error log, wherever the child process wrote it: `error.log` in
+ * the run directory, or the temp-dir file `logError` uses under `bun test`.
+ * The worker's fallback messages land here, not on stderr.
+ */
+async function engineErrorLog(dir: string): Promise<string> {
+  let text = "";
+  for (const path of [join(dir, "error.log"), join(tmpdir(), "yta-test-error.log")]) {
+    try {
+      text += await Bun.file(path).text();
+    } catch {
+      // not written (or already rotated) — try the other location
+    }
+  }
+  return text;
 }
 
 async function waitFor(label: string, predicate: () => Promise<boolean>, timeoutMs = 60_000): Promise<void> {
@@ -1002,6 +1019,115 @@ describe("integration: aria2c resume + self-healing", () => {
 });
 
 // ---------------------------------------------------------------------------
+describe("integration: durable partial and superseded recovery", () => {
+  test("a paused job's absolute partial survives the startup sweep under the relative output root", async () => {
+    // The sweep walks `outputRoot` (default './downloads' — relative) while
+    // recorded partial paths are absolute. Comparing them as raw strings made
+    // the partial look like an orphan and deleted it after a day, silently
+    // turning "resumes where it stopped" into "starts over".
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 4004, BASE_CONFIG(4004));
+    const folder = join(dir, "downloads", "Mock Playlist");
+    let targetId = "";
+    let partialAbs = "";
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+      );
+      targetId = jobs[0].id;
+      const mediaAbs = resolve(dir, jobs[0].file_path!);
+      partialAbs = mediaAbs.replace(/\.mp4$/, ".f137.mp4.part");
+      // A real resume point: the media is gone, the .part is what is left.
+      await rename(mediaAbs, partialAbs);
+      await writeFile(partialAbs, "partial-bytes");
+      const ancient = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+      await utimes(partialAbs, ancient, ancient);
+
+      // Park the job the way the engine's own pause path does — with the
+      // ABSOLUTE path in the database (findPartialFileSync resolves it).
+      const db = new Database(join(dir, "archive.db"));
+      db.run(
+        `UPDATE jobs SET download_status = 'paused', pause_reason = 'user',
+           file_path = NULL, file_size = 0, progress = 40, best_progress = 40,
+           partial_file_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [partialAbs, targetId],
+      );
+      db.close();
+    } finally {
+      await engine.stop();
+    }
+
+    // Restart: startup reconciliation must keep the resume state. Before the
+    // path normalization it swept it as an orphan (8 days > the day-old orphan
+    // threshold) and the job would restart from zero.
+    const engine2 = await startEngine(dir, 4005, BASE_CONFIG(4005));
+    try {
+      await Bun.sleep(1500); // the sweeps run right after the port is claimed
+      expect(existsSync(partialAbs)).toBe(true);
+      const row = (await getJobs(engine2)).find((j) => j.id === targetId)!;
+      expect(row.download_status).toBe("paused");
+      expect(row.partial_file_path).toBe(partialAbs);
+    } finally {
+      await engine2.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("a crashed rename-first stash is adopted on startup instead of re-queued", async () => {
+    // The old `.superseded` hand-off renamed the media first and recorded the
+    // backup afterwards. A crash in that window left the row claiming a file
+    // that was gone while the only copy sat at `<file_path>.superseded` — the
+    // missing-file sweep then re-queued the video and the backup stayed
+    // unmanaged forever. Startup recovery must put the file back instead.
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 4006, BASE_CONFIG(4006));
+    const folder = join(dir, "downloads", "Mock Playlist");
+    let targetId = "";
+    let mediaAbs = "";
+    let backupAbs = "";
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+      );
+      targetId = jobs[0].id;
+      mediaAbs = resolve(dir, jobs[0].file_path!);
+      backupAbs = `${mediaAbs}.superseded`;
+      await rename(mediaAbs, backupAbs);
+      // Marker bytes prove afterwards that the ORIGINAL file was put back and
+      // not overwritten by a re-download.
+      await writeFile(backupAbs, "previous-archive-copy");
+      // No DB write: this is the crash state exactly — file_path still names
+      // the media, superseded_file was never recorded.
+    } finally {
+      await engine.stop();
+    }
+
+    const engine2 = await startEngine(dir, 4007, BASE_CONFIG(4007));
+    try {
+      await waitFor("the stashed media to be put back", async () => {
+        return existsSync(mediaAbs) && (await Bun.file(mediaAbs).text()) === "previous-archive-copy";
+      });
+      expect(existsSync(backupAbs)).toBe(false);
+
+      const row = (await getJobs(engine2)).find((j) => j.id === targetId)!;
+      expect(row.download_status).toBe("downloaded");
+      expect(row.file_path).toBeTruthy();
+      expect(resolve(dir, row.file_path!)).toBe(mediaAbs);
+
+      // The video was not re-downloaded: three original media files, no
+      // leftover backup, no partial litter.
+      const files = await readdir(folder);
+      expect(files.filter((f) => f.endsWith(".mp4"))).toHaveLength(3);
+      expect(files.filter((f) => f.endsWith(".superseded"))).toHaveLength(0);
+      expect(files.filter((f) => f.endsWith(".part"))).toHaveLength(0);
+    } finally {
+      await engine2.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
 describe("integration: multi-audio tracks", () => {
   test("all mode muxes every audio track into one MKV and keeps it through conversion", async () => {
     const dir = await makeRunDir();
@@ -1186,6 +1312,202 @@ describe("integration: multi-audio tracks", () => {
       const resolved = String(j.file_path).startsWith("/") ? j.file_path : join(dir, j.file_path);
       expect(existsSync(resolved)).toBe(true);
       expect(String(j.file_path).endsWith(".superseded")).toBe(false);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
+describe("integration: degradation paths (missing tool, failed audio probe)", () => {
+  test.skipIf(WIN)("discovers that aria2c is genuinely absent and downloads natively", async () => {
+    // The difference from the `aria2cPath: "none"` test above: discovery runs
+    // for real and finds nothing. The engine must not treat the optional tool
+    // as fatal, and the whole batch must still complete on yt-dlp's native
+    // downloader. A PATH holding only the mock yt-dlp (plus the interpreter
+    // its shebang needs) and a mocks dir without aria2c make "nothing is
+    // installed" true on any machine — including dev boxes with a real aria2c.
+    //
+    // Windows is skipped on purpose: its candidate list probes the
+    // chocolatey/scoop/winget shim directories directly, so a genuinely
+    // missing binary cannot be forced there (its `aria2cPath: "none"` switch
+    // stays the way to pin this behaviour).
+    const dir = await makeRunDir();
+    const soloMocks = await mkdtemp(join(tmpdir(), "yta-mocks-noaria-"));
+    tmpDirs.push(soloMocks);
+    for (const name of ["yt-dlp", "ffmpeg"]) {
+      await copyFile(join(MOCKS, name), join(soloMocks, name));
+    }
+    const cleanPath = await mkdtemp(join(tmpdir(), "yta-clean-path-"));
+    tmpDirs.push(cleanPath);
+    // `env bun` in the mock shebangs must resolve, and nothing else may.
+    await symlink(process.execPath, join(cleanPath, "bun"));
+
+    const engine = await startEngine(dir, 4008, BASE_CONFIG(4008, { videoQuality: "audio" }), { PATH: cleanPath }, soloMocks);
+    const folder = join(dir, "downloads", "Mock Playlist");
+
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done" && j.conversion_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+
+      // The engine reported the missing tool without dying...
+      expect(engine.stdout()).toContain("aria2c: not found");
+      // ...and the pipeline used the native downloader.
+      const files = await readdir(folder);
+      expect(files.filter((f) => f.endsWith(".aria2-args"))).toHaveLength(0);
+      const reliability = await engine.api("/api/reliability");
+      expect(reliability.downloader.engine).toBe("native");
+      expect(reliability.downloader.path).toBeNull();
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("a failed multi-audio probe falls back to a single-audio download", async () => {
+    // multiAudioMode "all" would mux three tracks — but the probe call fails
+    // (HTTP 503 in the mock). The download must not be lost over it: the job
+    // proceeds with the classic single-audio plan and settles as done.
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 4009, BASE_CONFIG(4009, { multiAudioMode: "all" }), {
+      FAKE_PROBE_FAIL: "1",
+    });
+    const folder = join(dir, "downloads", "Mock Playlist");
+
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+
+      const args = await Bun.file(join(folder, "001 - First Mock Video.ytdlp-args")).text();
+      expect(args).toContain("--format bv[height<=1080]+ba/b[height<=1080]");
+      expect(args).not.toContain("--audio-multistreams");
+      for (const j of (await getJobs(engine)) as any[]) {
+        expect(j.audio_tracks).toEqual([]); // the probe stored nothing
+      }
+      expect(await engineErrorLog(dir)).toContain("audio-track probe failed (falling back to single audio)");
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("a multi-audio probe that never answers times out and falls back", async () => {
+    // Same promise, watchdog branch: the -J call hangs forever, so the probe's
+    // own timeout must abort it (the env override shortens the 90 s cap) and
+    // the download must continue single-audio.
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 4010, BASE_CONFIG(4010, { multiAudioMode: "all" }), {
+      FAKE_PROBE_HANG: "1",
+      YTA_AUDIO_PROBE_TIMEOUT_MS: "500",
+    });
+    const folder = join(dir, "downloads", "Mock Playlist");
+
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+      const args = await Bun.file(join(folder, "001 - First Mock Video.ytdlp-args")).text();
+      expect(args).not.toContain("--audio-multistreams");
+      expect(await engineErrorLog(dir)).toContain("audio-track probe timed out");
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
+describe("integration: secondary-storage move", () => {
+  test("moves finished media (and sidecars) to secondary storage and records the new path", async () => {
+    // The whole hand-off in one engine run: remux to mkv, then move the media
+    // and its sidecars into <secondary>/Mock Playlist/ and record THAT path.
+    const dir = await makeRunDir();
+    const nas = join(dir, "nas");
+    const engine = await startEngine(
+      dir,
+      4011,
+      BASE_CONFIG(4011, { targetFormat: "mkv", secondaryStoragePath: nas }),
+    );
+    const folder = join(dir, "downloads", "Mock Playlist");
+    const nasFolder = join(nas, "Mock Playlist");
+
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done" && j.conversion_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+
+      const nasFiles = await readdir(nasFolder);
+      expect(nasFiles.filter((f) => f.endsWith(".mkv"))).toHaveLength(3);
+      const leftBehind = (await readdir(folder)).filter((f) => f.endsWith(".mkv"));
+      expect(leftBehind).toHaveLength(0);
+
+      // Every sidecar the metadata pass wrote travelled with its media.
+      const sidecars = nasFiles.filter((f) => f.includes("001 - First Mock Video.") && f.endsWith(".info.json"));
+      expect(sidecars.length).toBeGreaterThanOrEqual(1);
+      const sidecarsLeft = (await readdir(folder)).filter(
+        (f) => f.startsWith("001 - First Mock Video.") && f.endsWith(".info.json"),
+      );
+      expect(sidecarsLeft).toHaveLength(0);
+
+      // file_path points into secondary storage, and the media is really there.
+      const job = (await getJobs(engine)).find((j) => j.id === "mockvid001") as any;
+      const resolved = String(job.file_path).startsWith("/") ? job.file_path : join(dir, job.file_path);
+      expect(resolved.startsWith(nas)).toBe(true);
+      expect(existsSync(resolved)).toBe(true);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("a move that cannot complete keeps the media in the download folder and the job retryable", async () => {
+    // The media's destination is unwritable (a non-empty directory squats on
+    // exactly the file name the move needs), so the move itself fails. The only
+    // copy must stay in the download folder and the job must NOT be recorded as
+    // done against a path that does not exist — this is the engine-level
+    // counterpart of the copy-failure unit test.
+    const dir = await makeRunDir();
+    const nas = join(dir, "nas");
+    await mkdir(join(nas, "Mock Playlist", "001 - First Mock Video.mkv"), { recursive: true });
+    await writeFile(join(nas, "Mock Playlist", "001 - First Mock Video.mkv", "keep"), "occupied");
+    const engine = await startEngine(
+      dir,
+      4012,
+      BASE_CONFIG(4012, {
+        targetFormat: "mkv",
+        secondaryStoragePath: nas,
+        maxRetryAttempts: 1,
+        maxFailuresPerVideo: 1,
+        maxFailures: 100, // keep the circuit breaker out of the way
+      }),
+    );
+    const folder = join(dir, "downloads", "Mock Playlist");
+
+    try {
+      await waitFor(
+        "the conversion to fail its single attempt",
+        async () => {
+          const j = (await getJobs(engine)).find((r) => r.id === "mockvid001");
+          return !!j && j.conversion_status === "failed";
+        },
+        60_000,
+      );
+
+      const job = (await getJobs(engine)).find((j) => j.id === "mockvid001")!;
+      expect(String(job.file_path || "").includes("nas")).toBe(false);
+      expect(String(job.last_error || "")).toContain("secondary-storage move failed");
+      // The remuxed media is exactly where it was produced: nothing was lost,
+      // and the destination still holds the squatter, not the media.
+      const files = await readdir(folder);
+      expect(files).toContain("001 - First Mock Video.mkv");
+      const blocked = join(nas, "Mock Playlist", "001 - First Mock Video.mkv");
+      expect(existsSync(join(blocked, "keep"))).toBe(true);
     } finally {
       await engine.stop();
     }

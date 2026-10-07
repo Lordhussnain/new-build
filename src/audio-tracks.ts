@@ -179,16 +179,30 @@ export function multiAudioFormatSelector(
  *
  * Hard-capped at `PROBE_TIMEOUT_MS`: this runs inside the download worker (one
  * slot blocked) and behind the dashboard's probe button, so a wedged network
- * call must surface as a probe error, not a hang.
+ * call must surface as a probe error, not a hang. The cap is overridable so
+ * the timeout path can be exercised without a 90-second test.
  */
 export const PROBE_TIMEOUT_MS = 90_000;
+
+/**
+ * The watchdog actually used: `PROBE_TIMEOUT_MS`, unless the environment
+ * overrides it. The override exists so the worker's timeout → single-audio
+ * fallback can be exercised end to end without a 90-second test; production
+ * never sets it.
+ */
+function probeTimeoutMs(): number {
+  const override = Number(process.env.YTA_AUDIO_PROBE_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : PROBE_TIMEOUT_MS;
+}
 
 export async function probeAudioTracks(
   url: string,
   config: { cookiesFile: string },
+  opts: { timeoutMs?: number } = {},
 ): Promise<AudioTrack[]> {
+  const timeoutMs = opts.timeoutMs ?? probeTimeoutMs();
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT_MS);
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
   let out = "";
   let stderr = "";
   let code = -1;

@@ -21,6 +21,9 @@
 //   FAKE_OMIT_FINAL_PATH=1  exercise directory-based final-path recovery
 //   FAKE_SCAN_LOG=path      append every scanned URL (source persistence tests)
 //   FAKE_EMPTY_SCAN=1       a valid source with no videos yet
+//   FAKE_PROBE_FAIL=1|json  make the -J audio-track probe fail (non-zero exit /
+//                           unparsable JSON) so the single-audio fallback runs
+//   FAKE_PROBE_HANG=1       make -J hang forever (probe timeout tests)
 
 import { appendFile, rename } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -55,6 +58,19 @@ if (flag("-U")) {
 // (original + two dubs), each in two quality variants plus a -drc duplicate
 // the engine must ignore.
 if (flag("--dump-single-json")) {
+  // Probe-failure injection: a real -J call fails on network errors, and the
+  // engine's promise is that the download still proceeds single-audio.
+  if (process.env.FAKE_PROBE_FAIL === "1") {
+    console.error("ERROR: Unable to download webpage: HTTP Error 503: Service Unavailable");
+    process.exit(1);
+  }
+  if (process.env.FAKE_PROBE_FAIL === "json") {
+    console.log("not-json-at-all");
+    process.exit(0);
+  }
+  if (process.env.FAKE_PROBE_HANG === "1") {
+    await new Promise(() => {}); // never answers: the probe's watchdog must fire
+  }
   console.log(
     JSON.stringify({
       id: "mockvid001",

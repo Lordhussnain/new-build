@@ -28,7 +28,7 @@ import {
   isTransientDownloadError,
   progressAwareRetryState,
 } from "../retry";
-import { buildDownloadPlan, effectiveVideoQuality, jobBaseFilename } from "../download-args";
+import { buildDownloadPlan, effectiveVideoQuality, jobFittedBaseFilename } from "../download-args";
 import { parseDownloadPath, readProcessOutput } from "../download-output";
 import {
   parseSelectionJson,
@@ -591,9 +591,13 @@ async function resolveJobAudioTracks(job: Job, config: Config): Promise<AudioTra
   }
 }
 
-/** The on-disk base name used for a job's files (no extension). */
+/**
+ * The on-disk base name used for a job's files (no extension) — fitted exactly
+ * like `buildDownloadPlan` does, or a lookup for a long title's `.part` misses
+ * the file yt-dlp wrote (see `jobFittedBaseFilename`).
+ */
 function baseNameOf(job: Job): string {
-  return jobBaseFilename(job);
+  return jobFittedBaseFilename(job);
 }
 
 /** Record progress, keeping best_progress as the high-water mark. */

@@ -229,7 +229,7 @@ describe("reconcileCrashedJobs", () => {
 });
 
 describe("reapStaleClaims", () => {
-  test("does not reclaim a stale-looking download while a worker still owns its claim", () => {
+  test("does not reclaim a stale-looking download while a worker still owns its claim", async () => {
     insertJob("long-download", {
       download_status: "downloading",
       download_claimed_by: "dl-7",
@@ -237,14 +237,14 @@ describe("reapStaleClaims", () => {
     });
     activeDownloadJobs.set(7, "long-download");
     try {
-      reapStaleClaims(testConfig());
+      await reapStaleClaims(testConfig());
       expect(getJob("long-download").download_status).toBe("downloading");
     } finally {
       activeDownloadJobs.delete(7);
     }
   });
 
-  test("re-queues claims older than the watchdog windows", () => {
+  test("re-queues claims older than the watchdog windows", async () => {
     insertJob("stale-dl", {
       download_status: "downloading",
       download_claimed_by: "dl-1",
@@ -261,14 +261,14 @@ describe("reapStaleClaims", () => {
       conversion_claimed_by: "cv-1",
       conversion_claimed_at: "2020-01-01 00:00:00",
     });
-    reapStaleClaims(testConfig());
+    await reapStaleClaims(testConfig());
     expect(getJob("stale-dl").download_status).toBe("paused");
     expect(getJob("stale-dl").pause_reason).toBe("interrupted");
     expect(getJob("fresh-dl").download_status).toBe("downloading"); // untouched
     expect(getJob("stale-cv").conversion_status).toBe("pending");
   });
 
-  test("uses the configured maximum download time as the stale-claim floor", () => {
+  test("uses the configured maximum download time as the stale-claim floor", async () => {
     insertJob("within-download-window", {
       download_status: "downloading",
       download_claimed_by: "dl-1",
@@ -280,13 +280,13 @@ describe("reapStaleClaims", () => {
       download_claimed_at: minutesAgo(61),
     });
 
-    reapStaleClaims(testConfig({ maxDownloadMinutes: 60 }));
+    await reapStaleClaims(testConfig({ maxDownloadMinutes: 60 }));
 
     expect(getJob("within-download-window").download_status).toBe("downloading");
     expect(getJob("past-download-window").download_status).toBe("paused");
   });
 
-  test("keeps the 20-minute minimum when maxDownloadMinutes is lower", () => {
+  test("keeps the 20-minute minimum when maxDownloadMinutes is lower", async () => {
     insertJob("inside-minimum", {
       download_status: "downloading",
       download_claimed_by: "dl-1",
@@ -298,7 +298,7 @@ describe("reapStaleClaims", () => {
       download_claimed_at: minutesAgo(21),
     });
 
-    reapStaleClaims(testConfig({ downloadTimeoutMinutes: 5, maxDownloadMinutes: 10 }));
+    await reapStaleClaims(testConfig({ downloadTimeoutMinutes: 5, maxDownloadMinutes: 10 }));
 
     expect(getJob("inside-minimum").download_status).toBe("downloading");
     expect(getJob("outside-minimum").download_status).toBe("paused");

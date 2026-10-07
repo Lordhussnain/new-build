@@ -7,6 +7,7 @@
 // all-or-nothing behaviour when a patch is invalid.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -122,6 +123,53 @@ describe("applySettings", () => {
     const result = await applySettings(baseConfig(), { useAria2c: "false" }, join(dir, "config.json"));
     expect(result.ok).toBe(true);
     expect(getConfig().useAria2c).toBe(false);
+    // Every unambiguous spelling a form control can produce is accepted.
+    for (const [raw, expected] of [
+      ["TRUE", true],
+      ["1", true],
+      ["yes", true],
+      [" on ", true],
+      ["0", false],
+      ["no", false],
+      ["off", false],
+      [true, true],
+    ] as [unknown, boolean][]) {
+      const ok = await applySettings(baseConfig(), { useAria2c: raw }, join(dir, "config.json"));
+      expect(ok.ok).toBe(true);
+      expect(getConfig().useAria2c).toBe(expected);
+    }
+  });
+
+  test("rejects an invalid boolean instead of coercing it to false", async () => {
+    // "maybe" is not false. The old coercion mapped any unrecognised string to
+    // false and reported success — an invalid value silently switched a
+    // setting off, which is exactly what "invalid key/value rejects, change
+    // nothing" promises never happens.
+    const dir = await makeConfigDir();
+    const cfgPath = join(dir, "config.json");
+    const before = baseConfig({ useAria2c: true });
+
+    for (const raw of ["maybe", "", "  ", null, 2, {}, ["true"]]) {
+      const result = await applySettings(before, { useAria2c: raw }, cfgPath);
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("true or false");
+      expect(result.changed).toEqual([]);
+      // Nothing was written and nothing went live.
+      expect(existsSync(cfgPath)).toBe(false);
+      expect(getConfig().useAria2c).toBe(true);
+    }
+  });
+
+  test("rejects an empty or non-numeric number instead of coercing it to 0", async () => {
+    const dir = await makeConfigDir();
+    const cfgPath = join(dir, "config.json");
+    for (const raw of ["", "   ", "many", null]) {
+      const result = await applySettings(baseConfig(), { maxBandwidthKBps: raw }, cfgPath);
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("must be a number");
+      expect(result.changed).toEqual([]);
+      expect(existsSync(cfgPath)).toBe(false);
+    }
   });
 
   test("coerces list fields from comma-separated strings and arrays", async () => {

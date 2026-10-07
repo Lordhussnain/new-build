@@ -15,7 +15,8 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Automatic retries** with exponential backoff + jitter on transient failures (network drops, throttling, timeouts)
 - **Permanent-failure detection** — private / removed / age-gated / geo-blocked videos fail fast and are never auto-requeued
 - **Self-healing sweeps** — crashed jobs resume, stale claims are reclaimed, deleted downloads are re-fetched, and failed jobs are retried after a cooldown. With aria2c these sweeps resume from the download's `.aria2` control file, and a discarded partial always takes its control file with it
-- **Single-instance safety** — the web port acts as a lock: starting a second engine against the same `archive.db` refuses to start (with an actionable message) instead of re-queueing the running instance's in-flight work. If a restart-from-scratch hits a partial file locked by another program (orphaned aria2c/ffmpeg, antivirus), the video is retried later with that exact reason in `last_error` instead of being wedged
+- **Resume state is protected, not aged away** — the startup sweep only deletes a `.part` once nothing will resume it: a `pending`, `paused`, or `waiting_live` job keeps its partial as long as the job exists, and a crash in the deliberate-re-download hand-off (`.superseded`) is rolled back or finished at the next start instead of leaving the old file unmanaged
+- **Single-instance safety** — the web port acts as a lock: starting a second engine against the same `archive.db` refuses to start (with an actionable message) instead of re-queueing the running instance's in-flight work. If a restart-from-scratch hits a partial file locked by another program (orphaned aria2c/ffmpeg, antivirus), the video is retried later with that exact reason in `last_error` instead of being wedged. The same rule holds for every sweep: a locked resume pair is kept intact and reported, never counted as cleaned, and a stranded `.aria2` control file left by a dead worker is swept before the reclaimed job retries — a control file whose data is gone makes aria2c neither resume nor restart
 - **Duration-aware watchdog** — long videos are not killed by a flat 15-minute timeout
 - **Disk space precheck** before starting a batch
 - **Graceful shutdown** — safely stops in-flight downloads on exit
@@ -204,7 +205,10 @@ engine scrubs the video from the yt-dlp download archive, moves the old file
 aside (`.superseded`), and downloads again with the new tracks. The previous
 file is kept until the new download succeeds and is restored automatically if
 the re-download fails permanently — a retry never destroys what is already
-archived. If YouTube renumbers its formats after a probe, the engine detects
+archived. The hand-off is crash-safe: the backup is recorded in the database
+before the file is moved, and if the engine dies mid-retry the next startup
+either finishes the move or puts the file back — it never re-queues the video
+while the old file sits unmanaged. If YouTube renumbers its formats after a probe, the engine detects
 the stale format ids, re-probes, and retries instead of parking the job.
 
 ### Subtitles & sidecar files
@@ -365,8 +369,9 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
 ## How It Works
 
 1. **Startup** — load config, verify dependencies, open/migrate the database,
-   then self-heal: reconcile crashed jobs, re-queue jobs whose files vanished,
-   clean up unusable partials
+   then self-heal: reconcile crashed jobs, recover interrupted `.superseded`
+   hand-offs, re-queue jobs whose files vanished, clean up unusable partials
+   and stale backups
 2. **Scan** — every configured playlist/channel is listed (yt-dlp flat scan or
    cheap RSS polling) and deduplicated into the jobs table by video id
 3. **Download workers** — pull videos into the configured output directory
@@ -378,7 +383,10 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
    stay parked).
 4. **Metadata workers** — fetch subtitles, thumbnails, and descriptions per video, based on config flags
 5. **Converter workers** — convert completed downloads into the target format,
-   optionally moving them (with sidecars) to a secondary storage path
+   optionally moving them (with sidecars) to a secondary storage path. The move
+   is copy-then-remove: if the destination copy fails (full disk, unwritable
+   share, cross-volume copy error) both copies are kept and the job is retried,
+   so a broken secondary store can never delete the only copy
 6. **Sweeps** — every minute: reclaim stale claims, re-queue cooled-down
    transient failures, heartbeat the run history
 
