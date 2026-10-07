@@ -13,7 +13,17 @@
 //
 // Failure injection via environment variables:
 //   FAKE_FAIL_TIMES=2        fail the first N download attempts (leaves a .part)
-//   FAKE_FAIL_MODE=transient|permanent|corrupt   what the failure looks like
+//   FAKE_FAIL_MODE=transient|permanent|corrupt|private|unavailable|format
+//                            what the failure looks like ("private"/"unavailable"
+//                            are the wordings YouTube actually emits, which the
+//                            engine must skip terminally; "format" is yt-dlp's
+//                            selector failure that triggers the quality ladder)
+//   FAKE_FAIL_MESSAGE=…      override the failure text (unique markers let a
+//                            test assert where the message did and did not land)
+//   FAKE_FORMAT_FAILS_SELECTOR='height<=1080'
+//                            fail with "Requested format is not available" only
+//                            while --format contains the substring, so the
+//                            quality-ladder fallback is observable
 //   FAKE_FAIL_PROGRESS_SEQUENCE=20,40 emit progress before failed attempts
 //   FAKE_HANG=1             hang forever (watchdog test)
 //   FAKE_DELAY_MS=250       per-attempt delay (progress parsing)
@@ -236,13 +246,39 @@ if (failTimes > 0 && attempts <= failTimes) {
     console.log(`PROGRESS:${progressPct.toFixed(1)}|1.0MiB|12|10485760|${downloaded}`);
   }
   await Bun.sleep(delayMs);
+  // FAKE_FAIL_MESSAGE wins so a scenario can stamp a unique marker into the
+  // text and prove exactly where it was (and was not) recorded.
   const msg =
-    failMode === "permanent"
+    process.env.FAKE_FAIL_MESSAGE ||
+    (failMode === "permanent"
       ? "ERROR: [youtube] mockvid001: Video unavailable. This video is private"
-      : failMode === "corrupt"
-        ? "ERROR: unable to resume download, incomplete or corrupt data"
-        : "ERROR: Unable to download webpage: Connection reset by peer (transient mock failure)";
+      : failMode === "private"
+        ? "ERROR: [youtube] mockvid001: This video is private"
+        : failMode === "unavailable"
+          ? "ERROR: [youtube] mockvid001: This video is unavailable"
+          : failMode === "format"
+            ? "ERROR: [youtube] mockvid001: Requested format is not available"
+            : failMode === "corrupt"
+              ? "ERROR: unable to resume download, incomplete or corrupt data"
+              : "ERROR: Unable to download webpage: Connection reset by peer (transient mock failure)");
   console.error(msg);
+  process.exit(1);
+}
+
+// Selector-scoped failure injection: a real yt-dlp answers "Requested format is
+// not available" when the requested selector matches nothing. Failing only for
+// selectors containing FAKE_FORMAT_FAILS_SELECTOR lets a test watch the engine
+// step its quality ladder down (every rung uses a different selector) and then
+// download successfully with the fallback one.
+// The sentinel "all" fails every selector (including yt-dlp's most permissive
+// default): the shape of a video with no usable formats at all, which must end
+// the quality ladder instead of looping.
+const failsSelector = process.env.FAKE_FORMAT_FAILS_SELECTOR || "";
+const selectorFails =
+  failsSelector === "all" || (!!failsSelector && (flagValue("--format") || "").includes(failsSelector));
+if (selectorFails) {
+  await Bun.sleep(delayMs);
+  console.error("ERROR: [youtube] mockvid001: Requested format is not available");
   process.exit(1);
 }
 

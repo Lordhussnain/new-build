@@ -14,7 +14,8 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Resilient by design** — interrupted downloads keep their `.part` file and resume exactly where they stopped; the retry budget only shrinks while a video makes no forward progress
 - **A resume that can never finish is discarded, not retried** — when the saved partial no longer matches what the server will serve (`HTTP Error 416: Requested range not satisfiable`, or aria2c refusing a file whose control state is gone), resuming repeats the failure forever and the video sits at 99.0%. The engine deletes the `.part` **and** its `.aria2` control file, resets progress, and restarts that video from zero
 - **Automatic retries** with exponential backoff + jitter on transient failures (network drops, throttling, timeouts)
-- **Permanent-failure detection** — private / removed / age-gated / geo-blocked videos fail fast and are never auto-requeued
+- **Unavailable videos are skipped, not retried** — private, deleted, members-only, age-gated, paid or geo-blocked videos are attempted **once**, classified with a plain-language reason (`Private video`, `Video unavailable`, `Not available in your region`, …), and parked as a terminal skip: no retry budget, no cooldown requeue, no `error.log` line per dead video, and no circuit-breaker trip for a whole playlist of them. The rest of the playlist keeps downloading, and the reason stays readable in the dashboard, the Failed tab, `/api/failed` and the run report
+- **An unavailable format is switched, not retried** — when yt-dlp answers `Requested format is not available`, the engine steps the quality down one rung (`4k → 1440p → 1080p → 720p → 480p → highest`), persists it as that job's quality override, and says so: `🎚️ Format 1080p not available — switched to 720p`. The ladder only ever moves down, so it cannot loop, and a stale multi-audio probe is cleared and re-probed first. Only a job that fails at every rung — a video with no usable formats — is parked, with `No format available` recorded as its reason
 - **Self-healing sweeps** — crashed jobs resume, stale claims are reclaimed, deleted downloads are re-fetched, and failed jobs are retried after a cooldown. With aria2c these sweeps resume from the download's `.aria2` control file, and a discarded partial always takes its control file with it
 - **Resume state is protected, not aged away** — the startup sweep only deletes a `.part` once nothing will resume it: a `pending`, `paused`, or `waiting_live` job keeps its partial as long as the job exists, and a crash in the deliberate-re-download hand-off (`.superseded`) is rolled back or finished at the next start instead of leaving the old file unmanaged
 - **Single-instance safety: one engine per `archive.db`** — a database-level engine lease (owner token + expiring heartbeat + monotonic fencing number) is taken before the startup sweeps, so a second engine pointed at the same database refuses to start with an actionable message even if it uses a different `webPort` — it can never re-queue the running instance's in-flight work. The lease is renewed while the engine runs, released on a clean exit, taken over automatically after a crash, and shown on the reliability panel
@@ -397,8 +398,12 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
    downloader. Failures keep the `.part` file and retry with exponential
    backoff; the retry budget only shrinks while the video makes no forward
    progress. If a retry window is exhausted, a later cooldown sweep opens a
-   fresh window and continues from the retained partial (permanent video errors
-   stay parked).
+   fresh window and continues from the retained partial. Two classes are
+   deliberately exempt from that loop: a video that will never download
+   (private / deleted / members-only / region-locked) is skipped after one
+   attempt with its reason recorded, and a selector that matches nothing steps
+   the quality down the fallback ladder instead of re-running the same command
+   — both are described in `jobs.last_error` and never auto-requeued.
 4. **Metadata workers** — fetch subtitles, thumbnails, and descriptions per video, based on config flags
 5. **Converter workers** — convert completed downloads into the target format,
    optionally moving them (with sidecars) to a secondary storage path. The move
@@ -476,6 +481,9 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
 - [x] Resume interrupted downloads from exactly where they left off
       (`.part` files kept, `--continue`, bounded resume budget)
 - [x] Fully independent, parallel metadata and conversion pipelines
+- [x] Unavailable videos skipped after one attempt (reason recorded, never
+      auto-requeued) and unavailable formats switched automatically down the
+      quality ladder instead of retried
 - [x] Modular architecture with a unit + end-to-end test suite
 - [ ] Deduplicate identical videos across playlists by content hash
 - [ ] Per-link quality/format overrides in the web dashboard

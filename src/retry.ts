@@ -45,8 +45,15 @@ export function computeDownloadTimeoutMs(
 // failed-job sweep and the transient-retry path both skip them.
 const PERMANENT_ERROR_PATTERNS: RegExp[] = [
   /video unavailable/i,
+  /video is unavailable/i,
+  /video (?:is )?no longer available/i,
+  /content is (?:not|no longer) available/i,
+  /video (?:has been|was) (?:deleted|removed)/i,
   /video (?:is )?not available\b/i,
+  /video is private/i,
   /private video/i,
+  /premium members/i,
+  /requires payment/i,
   /members[- ]only/i,
   /sign in to confirm your age/i,
   /age[- ]restricted/i,
@@ -101,10 +108,20 @@ export function isNChallengeError(message: string | null | undefined): boolean {
  * retrying is pointless.
  */
 export function isPermanentDownloadError(message: string | null | undefined): boolean {
+  // Our own durable record wins over everything (including the n-challenge
+  // guard below): the terminal path is the ONLY writer of the marker, and it
+  // never writes it for an n-challenge failure.
+  if (isTerminalErrorMessage(message)) return true;
   if (!message) return false;
   // n-challenge failures are environmental; the format-missing text they leave
-  // behind must not park the job forever.
+  // behind must not park the job forever. This check comes BEFORE the reason
+  // table: that table's format rules match the same stderr tail, and a video
+  // is still downloadable once a JS runtime / updated solver is in place.
   if (isNChallengeError(message)) return false;
+  // Belt and braces: the pattern list below is the historical source of truth,
+  // the rule table is what labels the reason. A message either knows how to
+  // describe itself or the generic patterns still park it.
+  if (classifyTerminalDownloadError(message)) return true;
   return PERMANENT_ERROR_PATTERNS.some((re) => re.test(message));
 }
 
@@ -128,6 +145,200 @@ export function isFormatAvailabilityError(message: string | null | undefined): b
     m.includes("no matching formats") ||
     m.includes("unable to find a video format")
   );
+}
+
+// --- Terminal (skip-and-move-on) failures -----------------------------------
+//
+// A playlist is full of videos nobody can download: private uploads, deleted
+// ones, members-only content, region locks, livestreams that never became VOD.
+// They are EXPECTED in archival, not incidents, so the engine must:
+//
+//   1. classify them once, precisely (what is the reason, in operator words),
+//   2. park the job as terminal — the cooldown sweep and every requeue path
+//      must keep their hands off it, and
+//   3. keep the rest of the playlist moving without spending retry budget,
+//      without tripping the circuit breaker, and without an error.log line per
+//      dead video (error.log is for things an operator must act on).
+//
+// The classification is durable, not re-derived: the worker stores the marker
+// below in `jobs.last_error`, and `isPermanentDownloadError` trusts the marker
+// even if the raw tail was truncated. `requeueFailedJobs`, `/api/failed/requeue`
+// and `/api/reliability` all read the same predicate, so a skipped video can
+// never be resurrected by a sweep or counted as retryable.
+
+/** Marker prefixing every `jobs.last_error` written by the terminal path. */
+export const TERMINAL_ERROR_MARKER = "[terminal]";
+
+export type TerminalErrorCode =
+  | "private"
+  | "members_only"
+  | "age_restricted"
+  | "payment_required"
+  | "copyright"
+  | "terminated"
+  | "removed"
+  | "geo_blocked"
+  | "not_found"
+  | "format_unavailable"
+  | "no_formats"
+  | "unavailable"
+  | "other";
+
+export interface TerminalErrorInfo {
+  code: TerminalErrorCode;
+  /** Short operator-facing reason, e.g. "Private video". */
+  label: string;
+}
+
+/** Used when a message is permanent but no rule knows how to describe it. */
+export const GENERIC_TERMINAL_INFO: TerminalErrorInfo = {
+  code: "other",
+  label: "Video not downloadable",
+};
+
+/**
+ * Reason table, most specific first — order is behaviour.
+ *
+ * "This video is not available in your country" matches both the geo rule and
+ * the generic unavailable rule; geo must win, or a VPN/cookies fix would never
+ * look like the answer. Private/members/age come before the generic
+ * "unavailable" wording for the same reason.
+ */
+const TERMINAL_ERROR_RULES: ReadonlyArray<{ code: TerminalErrorCode; label: string; pattern: RegExp }> = [
+  { code: "private", label: "Private video", pattern: /private video|video is private|video is set to private/i },
+  {
+    code: "members_only",
+    label: "Members-only video",
+    pattern: /members[- ]only|member[- ]only|premium members|only available to .*\bmembers?\b/i,
+  },
+  {
+    code: "age_restricted",
+    label: "Age-restricted video",
+    pattern: /sign in to confirm your age|age[- ]restricted|age verification required|inappropriate for some users/i,
+  },
+  {
+    code: "payment_required",
+    label: "Paid video",
+    pattern: /requires payment|payment required|available for rent or purchase|rent or buy/i,
+  },
+  { code: "copyright", label: "Blocked by a copyright claim", pattern: /copyright/i },
+  {
+    code: "terminated",
+    label: "Channel terminated",
+    pattern: /has been terminated|terminated the account/i,
+  },
+  {
+    code: "removed",
+    label: "Removed by the uploader",
+    pattern: /removed by the uploader|video has been removed|been removed for violating|community guidelines|video (?:has been|was) deleted/i,
+  },
+  {
+    code: "geo_blocked",
+    label: "Not available in your region",
+    pattern:
+      /blocked (?:it )?(?:in|from) your (?:country|region|location)|not available (?:in|from) your (?:country|region|location)|unavailable (?:in|from) your (?:country|region|location)|not made this video available in your (?:country|region|location)|geo[- ]?restrict(?:ed|ion)?|geo[- ]?blocked/i,
+  },
+  {
+    code: "not_found",
+    label: "Video not found",
+    pattern: /http error 404|http error 410|does not exist|is not a valid url|unsupported url/i,
+  },
+  {
+    code: "format_unavailable",
+    label: "Requested format not available",
+    pattern: /requested format is not available|no matching formats|unable to find a video format/i,
+  },
+  { code: "no_formats", label: "No downloadable formats", pattern: /no video formats|no formats found/i },
+  {
+    code: "unavailable",
+    label: "Video unavailable",
+    pattern:
+      /video unavailable|video is unavailable|video (?:is )?(?:not available|no longer available)|no longer available|content is (?:not|no longer) available|this video does not exist/i,
+  },
+];
+
+/** Classify a raw yt-dlp error tail into a terminal reason, or null. */
+export function classifyTerminalDownloadError(message: string | null | undefined): TerminalErrorInfo | null {
+  if (!message) return null;
+  for (const rule of TERMINAL_ERROR_RULES) {
+    if (rule.pattern.test(message)) return { code: rule.code, label: rule.label };
+  }
+  return null;
+}
+
+/** True when `message` is a `jobs.last_error` written by the terminal path. */
+export function isTerminalErrorMessage(message: string | null | undefined): boolean {
+  if (typeof message !== "string") return false;
+  return message.trimStart().toLowerCase().startsWith(TERMINAL_ERROR_MARKER);
+}
+
+/**
+ * Build the durable `jobs.last_error` value for a terminal failure.
+ *
+ * The raw tail is kept (trimmed and length-capped) so an operator who wonders
+ * *why* a video was skipped still sees yt-dlp's own words; the marker and the
+ * label in front are what the sweep, the API and the dashboard read.
+ */
+export function formatTerminalErrorMessage(info: TerminalErrorInfo, raw: string | null | undefined): string {
+  const detail = String(raw ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 300);
+  return `${TERMINAL_ERROR_MARKER} ${info.label} — skipped, it will not be retried automatically.${detail ? ` yt-dlp: ${detail}` : ""}`;
+}
+
+/** Split a stored terminal message back into label + detail (for reports/UI). */
+export function parseStoredTerminalError(
+  message: string | null | undefined,
+): { label: string; detail: string } | null {
+  if (!isTerminalErrorMessage(message)) return null;
+  const rest = String(message).trimStart().slice(TERMINAL_ERROR_MARKER.length).trim();
+  const [label, ...detail] = rest.split(" — ");
+  return { label: label.trim(), detail: detail.join(" — ").trim() };
+}
+
+// --- Format fallback ladder --------------------------------------------------
+//
+// "Requested format is not available" is a SELECTOR problem, not a dead video:
+// the preset the plan asked for has no matching stream. Instead of letting the
+// failure burn the retry budget and park the video (the old behaviour) the
+// download worker steps the quality override DOWN one rung and immediately
+// retries with the new selector.
+//
+// The ladder is monotonic — every step persists a strictly lower per-job
+// `video_quality` override, and nothing ever moves back up — so a job can
+// descend it at most once and the recovery needs no retry budget to be bounded.
+// The last rung is `highest` (`bv+ba/b`): it accepts any stream the extractor
+// found, so a failure there means the video really has no usable formats.
+export const FORMAT_FALLBACK_LADDER: readonly string[] = ["4k", "1440p", "1080p", "720p", "480p", "highest"];
+
+/**
+ * The next lower quality preset for `current`, or null when there is none.
+ *
+ * `audio` never falls back to a video preset (that would silently download a
+ * video stream for an audio-only request) and an unknown key has no defined
+ * position on the ladder — both end the recovery, which the worker records as a
+ * terminal format failure.
+ */
+export function nextFormatFallback(current: string | null | undefined): string | null {
+  const key = String(current ?? "")
+    .trim()
+    .toLowerCase();
+  if (!key || key === "audio") return null;
+  const index = FORMAT_FALLBACK_LADDER.indexOf(key);
+  return index >= 0 && index + 1 < FORMAT_FALLBACK_LADDER.length ? FORMAT_FALLBACK_LADDER[index + 1] : null;
+}
+
+/**
+ * The message stored on a job whose selector was stepped down.
+ *
+ * Deliberately NOT a permanent-error shape: the job keeps running, and if it
+ * later fails for a real reason every failure path overwrites `last_error`. The
+ * wording also avoids the classifier phrases on purpose — a switch note left on
+ * a row must never be mistaken for a dead video by the cooldown sweep.
+ */
+export function formatSwitchMessage(from: string, to: string): string {
+  return `Requested quality ${from} is not available for this video — switched to ${to} automatically.`;
 }
 
 export interface ProgressAwareRetryState {

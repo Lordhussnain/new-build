@@ -32,14 +32,20 @@ import {
 } from "../reconcile";
 import { removeFromArchive } from "../archive";
 import {
+  classifyTerminalDownloadError,
   computeBackoffMs,
+  formatSwitchMessage,
+  formatTerminalErrorMessage,
+  GENERIC_TERMINAL_INFO,
   isDownloaderArgsError,
   isFormatAvailabilityError,
   isNChallengeError,
   isPermanentDownloadError,
   isTransientDownloadError,
   isUnrecoverableResumeError,
+  nextFormatFallback,
   progressAwareRetryState,
+  type TerminalErrorInfo,
 } from "../retry";
 import { buildDownloadPlan, effectiveVideoQuality, jobFittedBaseFilename } from "../download-args";
 import { parseAria2cReadout, parseDownloadPath, readProcessOutput } from "../download-output";
@@ -349,6 +355,14 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
 const DOWNLOAD_PROCESS_CLEANUP_GRACE_MS = 2_000;
 
 /**
+ * How long the dashboard keeps showing "Format X not available — switched to Y".
+ *
+ * The fallback itself is instant; this pause exists purely so the one message
+ * that explains a silent-looking quality downgrade is actually readable.
+ */
+const FORMAT_SWITCH_NOTICE_MS = 1_500;
+
+/**
  * Stop and reap a spawned downloader on every exit path. SIGINT gives yt-dlp a
  * chance to stop its external downloader (aria2c) cleanly; SIGKILL is the
  * bounded fallback if it does not exit. Tracking is removed even if waiting
@@ -409,8 +423,14 @@ export async function cleanupDownloadProcess(
  *                                        resume asks for no longer exist
  *   • corrupt/incomplete               → delete the partial and resume (bounded
  *                                        by maxResumeAttempts, then restart)
- *   • live stream in "wait for VOD"    → park as waiting_live
- *   • permanent (private/removed/…)    → fail fast, never auto-requeued
+ *   • live / not-yet-premiered stream  → park as waiting_live (a rescan picks
+ *                                        it up once a VOD exists)
+ *   • format not available             → clear stale pinned audio ids, else
+ *                                        step DOWN the quality ladder and retry
+ *                                        with the new selector; a bottomed-out
+ *                                        ladder is terminal
+ *   • permanent (private/removed/…)    → terminal skip: one attempt, no error.log
+ *                                        line, never auto-requeued
  *   • n-challenge / missing JS runtime → retryable (not a dead video)
  *   • retry budget spent               → park as failed for the sweep
  *   • transient (network/timeout/5xx)  → requeue with exponential backoff
@@ -458,16 +478,27 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
     return;
   }
 
-  // Stale multi-audio probe: the selector carried explicit audio format ids
-  // from an earlier -J probe, and YouTube renumbers formats over time, so
-  // yt-dlp answers "Requested format is not available". That is a selector
-  // problem, not a video problem — forget the stored tracks (the next attempt
-  // re-probes, and the per-job language selection survives the reset) instead
-  // of parking the job permanently. Must run before the permanent-error check,
-  // which matches the same message. Still bounded by the no-progress budget.
-  // Skip when the same tail is an n-challenge failure: missing formats are a
-  // symptom of the unsolved player JS, not a stale probe.
-  if (isFormatAvailabilityError(errMsg) && job.audio_tracks && !isNChallengeError(errMsg)) {
+  // Selector-level format problem: the requested FORMAT does not exist for this
+  // video — "Requested format is not available". Not a dead video, and not
+  // something to keep re-running the identical command for. Two recoveries, in
+  // order, and then a terminal skip; this branch must stay before the
+  // permanent-error check, which matches the same message text.
+  //
+  //   1. Pinned multi-audio ids from an earlier `-J` probe went stale (YouTube
+  //      renumbers formats) → forget `audio_tracks` so the next attempt
+  //      re-probes, keeping the per-job language selection. Bounded by the
+  //      no-progress budget, because a re-probe can legitimately pin the same
+  //      stale ids again.
+  //   2. Otherwise the preset itself has nothing to grab → step down the
+  //      quality ladder (4k → … → 480p → highest), persist the lower preset as
+  //      this job's `video_quality` override, and retry immediately: the next
+  //      attempt is a different command, so there is nothing to wait for. The
+  //      ladder is monotonic, so it cannot loop and spends no retry budget.
+  //
+  // When the ladder is exhausted the video really has no usable formats: park
+  // it as terminal (never auto-requeued) with an explicit message instead of
+  // looping through cooldown sweeps.
+  if (isFormatAvailabilityError(errMsg) && !isNChallengeError(errMsg)) {
     const current = readProgressState(job.id);
     const retry = progressAwareRetryState(
       current.retryCount,
@@ -475,24 +506,64 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
       current.progress,
       perVideoCap(config),
     );
-    const status = retry.exhausted ? "failed" : "pending";
-    const landed = releaseOwned(
-      job,
-      "clearing stale audio formats",
-      `download_status = ?, retry_count = ?, best_progress = ?, audio_tracks = NULL, last_error = ?`,
-      [status, retry.retryCount, retry.bestProgress, errMsg.slice(0, 500)],
-    );
-    if (!landed) return;
-    if (retry.exhausted) {
-      stats.failed++;
-      notePipelineFailure("dl", config);
-      logError("download", `${job.id} ${job.title}: stale audio formats kept failing: ${errMsg.slice(0, 300)}`);
-      updateWorkerLine(id, `❌ Retry budget spent — waiting for cooldown | ${job.title}`, config);
-    } else {
+
+    // (1) Stale multi-audio probe.
+    if (job.audio_tracks && !retry.exhausted) {
+      const landed = releaseOwned(
+        job,
+        "clearing stale audio formats",
+        `download_status = 'pending', retry_count = ?, best_progress = ?, audio_tracks = NULL, last_error = ?`,
+        [retry.retryCount, retry.bestProgress, errMsg.slice(0, 500)],
+      );
+      if (!landed) return;
       const backoff = computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
       updateWorkerLine(id, `🎧 Audio formats went stale — re-probing in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
       await Bun.sleep(backoff);
+      return;
     }
+
+    // (2) Quality fallback ladder.
+    const from = effectiveVideoQuality(job, config);
+    const next = nextFormatFallback(from);
+    if (next) {
+      const message = formatSwitchMessage(from, next);
+      // `audio_tracks` goes with the step: the pinned ids were the most likely
+      // cause of a selector miss, and the next attempt re-probes them anyway.
+      const landed = releaseOwned(
+        job,
+        "switching to a fallback format",
+        `download_status = 'pending', video_quality = ?, audio_tracks = NULL, last_error = ?`,
+        [next, message],
+      );
+      if (!landed) return;
+      stats.formatFallbacks++;
+      logError(
+        "download",
+        `${job.id} ${job.title}: ${message} (yt-dlp: ${errMsg.replace(/\s+/g, " ").slice(0, 200)})`,
+      );
+      updateWorkerLine(id, `🎚️ Format ${from} not available — switched to ${next} | ${job.title}`, config);
+      // Hold the line long enough to be read. The recovery is immediate (the
+      // next attempt is a different command), so without this pause the
+      // announcement would be on screen for the few milliseconds it takes the
+      // worker to re-claim the job — and the operator, who is about to receive
+      // a lower-quality file than they asked for, is exactly who needs to see it.
+      await Bun.sleep(FORMAT_SWITCH_NOTICE_MS);
+      return;
+    }
+
+    // (3) Ladder exhausted: the video offers no formats this engine can fetch.
+    const exhaustedPartial =
+      job.partial_file_path && existsSync(job.partial_file_path)
+        ? job.partial_file_path
+        : await findPartialFile(job.output_directory, base);
+    parkTerminal(
+      id,
+      job,
+      config,
+      { code: "format_unavailable", label: `No format available (tried down to ${from})` },
+      errMsg,
+      exhaustedPartial || null,
+    );
     return;
   }
 
@@ -726,9 +797,20 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
   }
 
   // archiveLiveStreams mode: yt-dlp refused the job because the stream is
-  // live right now. Park it until the next full rescan or a manual retry —
-  // scans flip waiting_live jobs back to pending once a VOD exists.
-  if (lower.includes("does not pass filter") || lower.includes("is live") || lower.includes("live event")) {
+  // live (or has not started) right now. Park it until the next full rescan or
+  // a manual retry — scans flip waiting_live jobs back to pending once a VOD
+  // exists. Scheduled premieres/live events answer with "Premieres in 3 hours"
+  // / "This live event will begin in …", which used to fall through to the
+  // retry budget: the job burned attempts against a video that could not exist
+  // yet and spammed error.log until it was parked as failed. They wait here
+  // instead, exactly like a live stream.
+  if (
+    lower.includes("does not pass filter") ||
+    lower.includes("is live") ||
+    lower.includes("live event") ||
+    lower.includes("premieres in") ||
+    lower.includes("will begin in")
+  ) {
     const parked = releaseOwned(
       job,
       "parking a live stream",
@@ -736,13 +818,17 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
       [errMsg.slice(0, 500)],
     );
     if (!parked) return;
-    updateWorkerLine(id, `Live now — waiting for VOD | ${job.title}`, config);
+    updateWorkerLine(id, `🕒 Live/premiere — waiting for VOD | ${job.title}`, config);
     return;
   }
 
   // Video-level failures that cannot be fixed by retrying are parked
-  // immediately. Keep any partial around for a deliberate manual retry (e.g. a
-  // new cookies.txt), but the cooldown sweep will never auto-requeue this row.
+  // immediately as TERMINAL skips: the cooldown sweep and every requeue path
+  // treat the recorded marker as permanent, so a private or deleted video is
+  // attempted exactly once. Expected in archival — a playlist of 500 videos
+  // normally contains a few dead ones — so this path deliberately does NOT
+  // write an error.log line, does not spend retry budget, and does not feed the
+  // circuit breaker: it records the reason on the job row and moves on.
   if (isPermanentDownloadError(errMsg)) {
     // A deliberate re-download (dashboard retry on an archived video) stashed
     // the previous file. The re-fetch can never succeed, so put the previous
@@ -758,16 +844,7 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
       return;
     }
     const partial = await findPartialFile(job.output_directory, base);
-    const failed = releaseOwned(
-      job,
-      "parking a permanent failure",
-      `download_status = 'failed', partial_file_path = ?, last_error = ?`,
-      [partial || null, errMsg.slice(0, 500)],
-    );
-    if (!failed) return;
-    stats.failed++;
-    logError("download", `${job.id} ${job.title}: permanent failure: ${errMsg.slice(0, 500)}`);
-    updateWorkerLine(id, `🚫 Permanent failure | ${job.title}`, config);
+    parkTerminal(id, job, config, classifyTerminalDownloadError(errMsg) ?? GENERIC_TERMINAL_INFO, errMsg, partial || null);
     return;
   }
 
@@ -803,6 +880,49 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
   const message = isTransientDownloadError(errMsg) ? "🌐 Transient error" : "⚠️ Download error";
   updateWorkerLine(id, `${message}, retrying in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
   await Bun.sleep(backoff);
+}
+
+/**
+ * Park a job that retrying can never fix, as a TERMINAL skip.
+ *
+ * The reason travels in `last_error` behind `TERMINAL_ERROR_MARKER` (see
+ * retry.ts), which is what keeps the cooldown sweep, the dashboard's
+ * "Requeue failed" button and `retryableFailed` on `/api/reliability` from
+ * resurrecting it — while a human can still read *why* the video is missing
+ * and a deliberate `/api/jobs/:id/retry` still works.
+ *
+ * Deliberately quieter than a failure: one dashboard line and the job row, no
+ * `error.log` entry (a private video in a playlist is an expected archival
+ * outcome, not an incident to investigate), no retry budget, no circuit-breaker
+ * note. `stats.unavailable` counts them so the run report can tell "skipped,
+ * cannot exist" apart from "tried and failed".
+ */
+function parkTerminal(
+  id: number,
+  job: Job,
+  config: Config,
+  info: TerminalErrorInfo,
+  errMsg: string,
+  partial: string | null,
+): boolean {
+  const message = formatTerminalErrorMessage(info, errMsg);
+  const parked = releaseOwned(
+    job,
+    "parking a terminal failure",
+    `download_status = 'failed', partial_file_path = ?, last_error = ?`,
+    [partial, message],
+  );
+  if (!parked) return false;
+  stats.failed++;
+  stats.unavailable++;
+  // Only an unclassified permanent error is worth a line in error.log: the
+  // description table knows every expected class, so "not downloadable" means
+  // a message shape nobody has seen yet and an operator should look at it.
+  if (info.code === GENERIC_TERMINAL_INFO.code) {
+    logError("download", `${job.id} ${job.title}: terminal failure (unclassified): ${errMsg.slice(0, 300)}`);
+  }
+  updateWorkerLine(id, `⛔ Skipped — ${info.label} | ${job.title}`, config);
+  return true;
 }
 
 // --- small DB helpers --------------------------------------------------------

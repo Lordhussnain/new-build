@@ -18,6 +18,17 @@
 //   7. HTTP 416 resume        — a resume whose range the server no longer has
 //                              discards the partial AND its control file and
 //                              restarts the transfer from zero
+//   8. unavailable videos     — private/deleted entries are attempted exactly
+//                              once, recorded as terminal skips ("[terminal]
+//                              Private video — …"), and never resurrected by
+//                              the cooldown sweep, the requeue button or the
+//                              reliability counters — and they do not fill
+//                              error.log
+//   9. format fallback ladder — "Requested format is not available" steps the
+//                              quality down (1080p → 720p) with a readable
+//                              announcement instead of burning the retry
+//                              budget; a video that matches no selector at all
+//                              ends as a terminal "No format available" skip
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { copyFile, mkdir, mkdtemp, readdir, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
@@ -303,6 +314,7 @@ interface JobRow {
   file_path: string | null;
   partial_file_path: string | null;
   progress: number;
+  video_quality: string | null;
 }
 
 async function getJobs(engine: EngineHandle): Promise<JobRow[]> {
@@ -2256,6 +2268,81 @@ describe("mock contract: yt-dlp", () => {
       await engine.stop();
     }
   }, TEST_TIMEOUT);
+
+  test("failure-injection knobs: real wordings, custom marker, selector-scoped format failure", async () => {
+    const dir = await makeRunDir();
+    const toolsDir = await toolsDirFor(MOCKS);
+    const mockTool = join(toolsDir, WIN ? "yt-dlp.exe" : "yt-dlp");
+
+    // One attempt per candidate, each with its own output base so the mock's
+    // cross-process attempt counter cannot leak between them.
+    const run = async (
+      name: string,
+      extraEnv: Record<string, string>,
+      format = "bv+ba/b",
+    ): Promise<{ err: string; code: number }> => {
+      const proc = Bun.spawn(
+        [
+          mockTool,
+          "https://www.youtube.com/watch?v=mockvid001",
+          "-o",
+          join(dir, "downloads", `${name}.%(ext)s`),
+          "--format",
+          format,
+          "--newline",
+        ],
+        { cwd: dir, stdout: "pipe", stderr: "pipe", env: { ...process.env, ...extraEnv } },
+      );
+      const [, err, code] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      return { err, code };
+    };
+
+    // The two wordings this suite exists for: both are what YouTube really
+    // emits, and both must be terminal skips rather than retry candidates.
+    const priv = await run("priv", { FAKE_FAIL_TIMES: "1", FAKE_FAIL_MODE: "private" });
+    expect(priv.code).not.toBe(0);
+    expect(priv.err).toContain("This video is private");
+    const gone = await run("gone", { FAKE_FAIL_TIMES: "1", FAKE_FAIL_MODE: "unavailable" });
+    expect(gone.code).not.toBe(0);
+    expect(gone.err).toContain("This video is unavailable");
+    // The format mode carries yt-dlp's selector error verbatim.
+    const fmt = await run("fmt", { FAKE_FAIL_TIMES: "1", FAKE_FAIL_MODE: "format" });
+    expect(fmt.err).toContain("Requested format is not available");
+
+    // FAKE_FAIL_MESSAGE replaces the wording, which is how a scenario stamps a
+    // unique marker and proves where it did (and did not) land.
+    const marked = await run("marked", {
+      FAKE_FAIL_TIMES: "1",
+      FAKE_FAIL_MODE: "private",
+      FAKE_FAIL_MESSAGE: "ERROR: [youtube] mockvid001: This video is private (knob-marker-a1)",
+    });
+    expect(marked.err).toContain("knob-marker-a1");
+
+    // Selector-scoped injection: only selectors containing the substring fail,
+    // so the quality fallback ladder is observable end to end.
+    const badSelector = await run(
+      "badsel",
+      { FAKE_FORMAT_FAILS_SELECTOR: "height<=1080" },
+      "bv[height<=1080]+ba/b[height<=1080]",
+    );
+    expect(badSelector.code).not.toBe(0);
+    expect(badSelector.err).toContain("Requested format is not available");
+    const goodSelector = await run(
+      "goodsel",
+      { FAKE_FORMAT_FAILS_SELECTOR: "height<=1080" },
+      "bv[height<=720]+ba/b[height<=720]",
+    );
+    expect(goodSelector.code).toBe(0);
+    // The "all" sentinel fails even yt-dlp's most permissive selector: the
+    // shape of a video with no usable formats, which ends the ladder.
+    const noFormats = await run("allsel", { FAKE_FORMAT_FAILS_SELECTOR: "all" }, "bv+ba/b");
+    expect(noFormats.code).not.toBe(0);
+    expect(noFormats.err).toContain("Requested format is not available");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2554,6 +2641,246 @@ describe("mock contract: stdout vs stderr", () => {
     expect(code).toBe(1);
     expect(err).toContain("Connection reset by peer");
   });
+});
+
+// ---------------------------------------------------------------------------
+// Unavailable videos: skip once, never retry, stay quiet.
+//
+// A playlist routinely contains dead entries (private, deleted, members-only,
+// region-locked). The engine must classify the reason, park the job as a
+// TERMINAL skip, and move on — no retry budget, no cooldown requeue, no
+// error.log line per video. The wordings used here are the ones YouTube
+// actually emits, including the two that used to slip past the classifier
+// ("This video is private" / "This video is unavailable") and loop forever:
+// budget spent → failed → cooldown requeue → budget spent → …
+describe("integration: unavailable videos", () => {
+  test("is attempted exactly once and never resurrected by a sweep", async () => {
+    const dir = await makeRunDir();
+    // A marker unique to this scenario: its absence from the log delta proves
+    // the skip produced no error.log entry without depending on what other
+    // scenarios wrote earlier.
+    const marker = "deadsource-marker-7f21";
+    const engine = await startEngine(
+      dir,
+      4003,
+      BASE_CONFIG(4003, {
+        maxRetryAttempts: 3,
+        maxFailuresPerVideo: 3,
+        maxFailures: 50,
+        requeueFailedAfterMinutes: 0, // only the forced API requeue is in play
+      }),
+      {
+        FAKE_FAIL_TIMES: "999",
+        FAKE_FAIL_MODE: "private",
+        FAKE_FAIL_MESSAGE: `ERROR: [youtube] mockvid001: This video is private (${marker})`,
+        FAKE_DELAY_MS: "20",
+      },
+    );
+
+    const logBefore = await engineErrorLog(dir);
+    try {
+      const jobs = await waitForAllJobs(engine, (j) => j.download_status === "failed");
+      expect(jobs).toHaveLength(3);
+      for (const job of jobs) {
+        expect(job.retry_count).toBe(0); // a terminal skip spends no budget
+        expect(job.last_error!.startsWith("[terminal]")).toBe(true);
+        expect(job.last_error).toContain("Private video");
+        expect(job.last_error).toContain(marker); // the raw tail stays for diagnosis
+      }
+
+      // THE assertion for "stopped instead of retrying": one attempt per video.
+      // The mock counts attempts across processes, so a single retry would
+      // show up as "2".
+      const attempts = (await readdir(join(dir, "downloads", "Mock Playlist"))).filter((f) =>
+        f.endsWith(".attempts"),
+      );
+      expect(attempts).toHaveLength(3);
+      for (const file of attempts) {
+        expect(await Bun.file(join(dir, "downloads", "Mock Playlist", file)).text()).toBe("1");
+      }
+
+      // Nobody is told to go look at error.log: a dead video is an expected
+      // archival outcome, recorded on the job row.
+      const logDelta = (await engineErrorLog(dir)).slice(logBefore.length);
+      expect(logDelta).not.toContain(marker);
+
+      // The reason is legible through the API…
+      const failed = await engine.api("/api/failed");
+      expect(failed.failed).toHaveLength(3);
+      for (const row of failed.failed) expect(row.last_error).toContain("[terminal]");
+
+      // …it is not counted as retryable…
+      const reliability = await engine.api("/api/reliability");
+      expect(reliability.resumableFailed).toBe(0);
+      expect(reliability.sweeps.find((s: any) => s.id === "requeueFailed").pending).toBe(0);
+
+      // …and even a forced requeue (the dashboard's "Requeue failed" button)
+      // refuses to bring them back.
+      const requeued = await engine.api("/api/failed/requeue", { method: "POST" });
+      expect(requeued.ok).toBe(true);
+      expect(requeued.requeued.downloads).toBe(0);
+      await Bun.sleep(600);
+      const after = await getJobs(engine);
+      expect(after.every((j) => j.download_status === "failed")).toBe(true);
+      for (const file of attempts) {
+        expect(await Bun.file(join(dir, "downloads", "Mock Playlist", file)).text()).toBe("1");
+      }
+
+      // The run report reads as a skip, not as a stack trace.
+      const report = await engine.api("/api/logs?type=report");
+      expect(report.logs.join("\n")).toContain("Private video");
+      expect(report.logs.join("\n")).toContain("unavailable: 3");
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("a plain 'video is unavailable' wording is terminal too", async () => {
+    // Regression guard for the second gap: "This video is unavailable" used to
+    // classify as neither permanent nor transient — generic retry budget,
+    // cooldown requeue, loop.
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      4004,
+      BASE_CONFIG(4004, { maxRetryAttempts: 2, maxFailuresPerVideo: 2, maxFailures: 50, requeueFailedAfterMinutes: 0 }),
+      { FAKE_FAIL_TIMES: "999", FAKE_FAIL_MODE: "unavailable", FAKE_DELAY_MS: "20" },
+    );
+    try {
+      const jobs = await waitForAllJobs(engine, (j) => j.download_status === "failed");
+      expect(jobs).toHaveLength(3);
+      for (const job of jobs) {
+        expect(job.retry_count).toBe(0);
+        expect(job.last_error).toContain("Video unavailable");
+      }
+      const attempts = (await readdir(join(dir, "downloads", "Mock Playlist"))).filter((f) =>
+        f.endsWith(".attempts"),
+      );
+      for (const file of attempts) {
+        expect(await Bun.file(join(dir, "downloads", "Mock Playlist", file)).text()).toBe("1");
+      }
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
+// Format fallback ladder: "Requested format is not available" is a selector
+// problem, not a dead video. The worker must switch to the next lower quality
+// preset, say so, and download with it — instead of retrying the identical
+// selector until the budget runs out.
+describe("integration: format fallback", () => {
+  test("switches quality automatically, reports it, and downloads", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      4005,
+      BASE_CONFIG(4005, {
+        videoQuality: "1080p",
+        maxRetryAttempts: 3,
+        maxFailuresPerVideo: 3, // a switch must NOT eat into this budget
+        maxFailures: 50,
+        requeueFailedAfterMinutes: 0,
+      }),
+      // Only the 1080p selector fails; every other rung downloads fine.
+      { FAKE_FORMAT_FAILS_SELECTOR: "height<=1080", FAKE_DELAY_MS: "150" },
+    );
+
+    const logBefore = await engineErrorLog(dir);
+    try {
+      // Watch the dashboard while it happens: the switch is announced live.
+      const seen = new Set<string>();
+      let settled = false;
+      const collector = (async () => {
+        const deadline = Date.now() + 60_000;
+        while (!settled && Date.now() < deadline) {
+          try {
+            const s = await engine.api("/api/status");
+            for (const w of s.workers || []) if (w.status) seen.add(w.status);
+          } catch {}
+          await Bun.sleep(100);
+        }
+      })();
+
+      const jobs = await waitForAllJobs(engine, (j) => j.download_status === "downloaded");
+      settled = true;
+      await collector;
+
+      expect(jobs).toHaveLength(3);
+      for (const job of jobs) {
+        // The fallback preset was persisted per job, so it survives restarts,
+        // cooldowns and rescans…
+        expect(job.video_quality).toBe("720p");
+        // …and the switch itself cost no retry budget: it is a new command,
+        // not a failed attempt.
+        expect(job.retry_count).toBe(0);
+        expect(job.last_error).toBeNull();
+      }
+
+      // The engine said what it was doing, in the dashboard…
+      expect([...seen].join("\n")).toMatch(/Format 1080p not available — switched to 720p/);
+      // …and left a line an operator can find afterwards.
+      const logDelta = (await engineErrorLog(dir)).slice(logBefore.length);
+      expect(logDelta).toContain("Requested quality 1080p is not available for this video — switched to 720p");
+
+      // The download really used the fallback selector (the mock records argv).
+      const argsFile = (await readdir(join(dir, "downloads", "Mock Playlist"))).find((f) =>
+        f.endsWith(".ytdlp-args"),
+      )!;
+      const argv: string[] = JSON.parse(await Bun.file(join(dir, "downloads", "Mock Playlist", argsFile)).text());
+      const selector = argv[argv.indexOf("--format") + 1];
+      expect(selector).toContain("height<=720");
+      expect(selector).not.toContain("height<=1080");
+
+      // The report counts the recovery so a silent downgrade cannot hide.
+      const report = await engine.api("/api/logs?type=report");
+      expect(report.logs.join("\n")).toContain("format fallbacks: 3");
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("a bottomed-out ladder is parked as a terminal skip, not retried", async () => {
+    // Nothing matches ANY selector: the video is genuinely unformattable. The
+    // ladder ends at `highest`, so the job must be skipped with a reason
+    // instead of looping through the retry budget and the cooldown sweep.
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      4006,
+      BASE_CONFIG(4006, {
+        videoQuality: "720p",
+        maxRetryAttempts: 3,
+        maxFailuresPerVideo: 3,
+        maxFailures: 50,
+        requeueFailedAfterMinutes: 0,
+      }),
+      { FAKE_FORMAT_FAILS_SELECTOR: "all", FAKE_DELAY_MS: "20" },
+    );
+    try {
+      const jobs = await waitForAllJobs(engine, (j) => j.download_status === "failed");
+      expect(jobs).toHaveLength(3);
+      for (const job of jobs) {
+        expect(job.retry_count).toBe(0);
+        expect(job.last_error).toContain("[terminal]");
+        expect(job.last_error).toContain("No format available");
+        // The ladder descended as far as it goes.
+        expect(job.last_error).toContain("highest");
+      }
+      // 720p → 480p → highest = 3 attempts, then it stops for good.
+      const attempts = (await readdir(join(dir, "downloads", "Mock Playlist"))).filter((f) =>
+        f.endsWith(".attempts"),
+      );
+      for (const file of attempts) {
+        expect(await Bun.file(join(dir, "downloads", "Mock Playlist", file)).text()).toBe("3");
+      }
+      const requeued = await engine.api("/api/failed/requeue", { method: "POST" });
+      expect(requeued.requeued.downloads).toBe(0);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
 });
 
 // ---------------------------------------------------------------------------

@@ -2,15 +2,23 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  classifyTerminalDownloadError,
   computeBackoffMs,
   computeDownloadTimeoutMs,
+  FORMAT_FALLBACK_LADDER,
+  formatSwitchMessage,
+  formatTerminalErrorMessage,
   isDownloaderArgsError,
   isFormatAvailabilityError,
   isNChallengeError,
   isPermanentDownloadError,
+  isTerminalErrorMessage,
   isTransientDownloadError,
   isUnrecoverableResumeError,
+  nextFormatFallback,
+  parseStoredTerminalError,
   progressAwareRetryState,
+  TERMINAL_ERROR_MARKER,
 } from "../src/retry";
 
 describe("computeBackoffMs", () => {
@@ -302,5 +310,139 @@ describe("isUnrecoverableResumeError", () => {
     expect(isTransientDownloadError(YTDLP_416)).toBe(true);
     expect(isDownloaderArgsError(YTDLP_416)).toBe(false);
     expect(isFormatAvailabilityError(YTDLP_416)).toBe(false);
+  });
+});
+
+describe("permanent-classification gaps that used to loop forever", () => {
+  // The wordings YouTube actually emits for videos that can never be
+  // downloaded. Every one of these used to slip past the classifier, so the
+  // job burned its retry budget, parked as `failed`, and the cooldown sweep
+  // re-queued it again — an endless retry loop against a video that does not
+  // exist any more (the "showing errors and retrying again" complaint).
+  const terminalWordings = [
+    "ERROR: [youtube] abc: This video is private",
+    "ERROR: [youtube] abc: Video is private",
+    "ERROR: [youtube] abc: This video is unavailable",
+    "ERROR: [youtube] abc: Video is unavailable",
+    "ERROR: [youtube] abc: This video is no longer available",
+    "ERROR: [youtube] abc: This content is not available",
+    "ERROR: [youtube] abc: This video has been deleted",
+    "ERROR: [youtube] abc: This video requires payment to watch",
+    "ERROR: [youtube] abc: This video is only available to Music Premium members",
+  ];
+
+  test("every wording is both permanent and labelled", () => {
+    for (const wording of terminalWordings) {
+      expect(isPermanentDownloadError(wording)).toBe(true);
+      expect(classifyTerminalDownloadError(wording)).not.toBeNull();
+    }
+  });
+
+  test("labels the reason an operator needs, most specific rule first", () => {
+    expect(classifyTerminalDownloadError("ERROR: [youtube] abc: This video is private")!.code).toBe("private");
+    expect(classifyTerminalDownloadError("ERROR: [youtube] abc: This video is unavailable")!.code).toBe(
+      "unavailable",
+    );
+    expect(
+      classifyTerminalDownloadError("ERROR: [youtube] abc: Sign in to confirm your age")!.code,
+    ).toBe("age_restricted");
+    expect(classifyTerminalDownloadError("ERROR: members-only content")!.code).toBe("members_only");
+    expect(classifyTerminalDownloadError("ERROR: [youtube] abc: This video has been removed")!.code).toBe("removed");
+    expect(classifyTerminalDownloadError("HTTP Error 404: Not Found")!.code).toBe("not_found");
+    expect(classifyTerminalDownloadError("ERROR: [youtube] abc: No video formats found")!.code).toBe("no_formats");
+    // A region lock also reads as "not available": geo must win, or the
+    // operator would never think about cookies/VPN.
+    expect(
+      classifyTerminalDownloadError("The uploader has not made this video available in your country")!.code,
+    ).toBe("geo_blocked");
+    expect(classifyTerminalDownloadError("ERROR: Connection reset by peer")).toBeNull();
+  });
+
+  test("transient failures are never labelled terminal", () => {
+    for (const wording of [
+      "Unable to download webpage: Connection reset by peer",
+      "HTTP Error 503: Service Unavailable",
+      "The read operation timed out",
+    ]) {
+      expect(classifyTerminalDownloadError(wording)).toBeNull();
+      expect(isPermanentDownloadError(wording)).toBe(false);
+    }
+  });
+});
+
+describe("terminal error records", () => {
+  const privateMsg = "ERROR: [youtube] abc: This video is private";
+
+  test("a stored terminal message stays permanent even if the tail is gone", () => {
+    const stored = formatTerminalErrorMessage({ code: "private", label: "Private video" }, privateMsg);
+    expect(isTerminalErrorMessage(stored)).toBe(true);
+    expect(isPermanentDownloadError(stored)).toBe(true);
+    // …and the marker survives a raw tail that matches nothing on its own.
+    const bare = formatTerminalErrorMessage({ code: "other", label: "Video not downloadable" }, "weird failure");
+    expect(isPermanentDownloadError(bare)).toBe(true);
+  });
+
+  test("the raw yt-dlp tail is kept for diagnosis", () => {
+    const stored = formatTerminalErrorMessage({ code: "private", label: "Private video" }, privateMsg);
+    expect(stored.startsWith(TERMINAL_ERROR_MARKER)).toBe(true);
+    expect(stored).toContain("Private video");
+    expect(stored).toContain("This video is private");
+    expect(stored.length).toBeLessThanOrEqual(TERMINAL_ERROR_MARKER.length + 400);
+  });
+
+  test("label and detail round-trip for the report and the dashboard", () => {
+    const stored = formatTerminalErrorMessage({ code: "private", label: "Private video" }, privateMsg);
+    const parsed = parseStoredTerminalError(stored);
+    expect(parsed).toEqual({ label: "Private video", detail: `skipped, it will not be retried automatically. yt-dlp: ${privateMsg}` });
+    expect(parseStoredTerminalError(privateMsg)).toBeNull();
+    expect(parseStoredTerminalError(null)).toBeNull();
+  });
+
+  test("a switch note is not mistaken for a dead video", () => {
+    // The note is stored in `last_error` while the job is still pending. If it
+    // read as a permanent error, a later cooldown sweep would refuse to
+    // re-queue a perfectly healthy job.
+    const note = formatSwitchMessage("1080p", "720p");
+    expect(isPermanentDownloadError(note)).toBe(false);
+    expect(isTerminalErrorMessage(note)).toBe(false);
+    expect(classifyTerminalDownloadError(note)).toBeNull();
+    expect(isFormatAvailabilityError(note)).toBe(false);
+  });
+});
+
+describe("format fallback ladder", () => {
+  test("steps down one preset at a time and ends at the permissive rung", () => {
+    expect(nextFormatFallback("4k")).toBe("1440p");
+    expect(nextFormatFallback("1440p")).toBe("1080p");
+    expect(nextFormatFallback("1080p")).toBe("720p");
+    expect(nextFormatFallback("720p")).toBe("480p");
+    expect(nextFormatFallback("480p")).toBe("highest");
+  });
+
+  test("the ladder bottoms out instead of looping", () => {
+    // `highest` is `bv+ba/b`: it accepts any stream the extractor found, so a
+    // failure there means the video has no usable formats — the worker records
+    // a terminal skip rather than retrying forever.
+    expect(nextFormatFallback("highest")).toBeNull();
+    // Every rung is strictly lower than the previous one: a job can descend
+    // the ladder once and never oscillate, which is why stepping costs no
+    // retry budget.
+    const seen: string[] = [];
+    let rung: string | null = FORMAT_FALLBACK_LADDER[0];
+    while (rung) {
+      seen.push(rung);
+      rung = nextFormatFallback(rung);
+    }
+    expect(seen).toEqual([...FORMAT_FALLBACK_LADDER]);
+    expect(new Set(seen).size).toBe(seen.length);
+  });
+
+  test("audio-only and unknown presets have no video fallback", () => {
+    // Falling back to a video preset would silently download a video stream
+    // for an audio-only request.
+    expect(nextFormatFallback("audio")).toBeNull();
+    expect(nextFormatFallback("")).toBeNull();
+    expect(nextFormatFallback(null)).toBeNull();
+    expect(nextFormatFallback("240p")).toBeNull();
   });
 });

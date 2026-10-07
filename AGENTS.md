@@ -339,7 +339,9 @@ re-queues a failed sidecar pass on an already-converted job.
 | --- | --- | --- |
 | Exponential backoff + jitter | `retry.ts computeBackoffMs()` | base × 2^attempt, capped, +0–30% jitter; RNG injectable for tests |
 | Download watchdog | `retry.ts computeDownloadTimeoutMs()` | 3× duration + 5 min, clamped to config min/max; unknown duration → min |
-| Transient vs permanent errors | `retry.ts isTransientDownloadError / isPermanentDownloadError` | permanent = private/removed/age-gated/geo-blocked/404/410/copyright |
+| Transient vs permanent errors | `retry.ts isTransientDownloadError / isPermanentDownloadError` | permanent = private/removed/unavailable/members-only/age-gated/paid/geo-blocked/404/410/copyright. The classifier also *labels* the reason (`classifyTerminalDownloadError` → `Private video`, `Video unavailable`, `Not available in your region`, …) for the dashboard, `last_error`, `/api/failed` and the run report |
+| Terminal skips stay skipped | `retry.ts TERMINAL_ERROR_MARKER` + `workers/download.ts parkTerminal()` | A permanent failure is written as `[terminal] <label> — skipped, it will not be retried automatically. yt-dlp: <tail>`, so the reason survives a truncated tail and every requeue path (`requeueFailedJobs`, `POST /api/failed/requeue`, `/api/reliability`'s `resumableFailed`, the orphan-partial sweep) reads the same predicate. The raw tail is kept for diagnosis; the skip writes **no** `error.log` line and spends no retry budget (a playlist full of dead videos must not trip the circuit breaker). Only an unclassified permanent message still logs |
+| Format fallback ladder | `retry.ts nextFormatFallback()` + `workers/download.ts` format branch | `Requested format is not available` → clear a stale pinned audio probe if there is one, else persist the next lower `video_quality` override (`4k → 1440p → 1080p → 720p → 480p → highest`) and retry immediately with a readable message. The ladder is **monotonic**, so it cannot loop and needs no retry budget; `highest` is `bv+ba/b` (any stream), so failing there is a genuine terminal `No format available` skip. `audio` never falls back to a video preset |
 | Bad downloader arguments | `retry.ts isDownloaderArgsError` → pause in `workers/download.ts` | aria2c exit 28 + option help block; parks the job, pauses the engine (`BAD_DOWNLOADER_ARGS`) |
 | Retry-budget forgiveness | `workers/download.ts handleDownloadFailure()` + `retry.ts progressAwareRetryState()` | `retry_count` only increments when `progress <= best_progress`; `best_progress` is committed at a failure boundary, not every progress update |
 | Resume budget | `workers/download.ts` corrupt branch | `.part` kept until `resume_count >= maxResumeAttempts`, then discarded |
@@ -366,14 +368,27 @@ re-queues a failed sidecar pass on an already-converted job.
 
 **Adding a new failure class:** extend the classifiers in `retry.ts` (pure,
 unit-tested), then handle it in `workers/download.ts handleDownloadFailure()`
-in the right precedence order: signature → downloader-args → stale audio formats →
-**unrecoverable resume (416)** → corrupt → archive-scrub → live → permanent →
-transient/other retryable budget.
+in the right precedence order: signature → downloader-args → format availability
+(stale audio probe → quality fallback ladder → terminal) →
+**unrecoverable resume (416)** → corrupt → archive-scrub → live/premiere →
+permanent (terminal skip) → transient/other retryable budget.
 
 **The order is the design.** A broader classifier placed first swallows the
 narrower one: a 416 must precede the corrupt-resume branch (which would spend its
 budget resuming the very partial that cannot be resumed) and the permanent class
 (which would park the job while keeping the broken resume state on disk).
+The same rule binds the two **format-availability** halves: `isFormatAvailabilityError`
+matches text (`Requested format is not available`) that `isPermanentDownloadError`
+also matches, so the format branch must run first — otherwise a stale selector
+would park a perfectly downloadable video forever. Inside it, the stale-audio
+clear must run before the quality ladder (re-probing is cheaper and fixes the
+common cause), and the ladder before the terminal skip.
+
+**Terminal means terminal, but only for the sweeps.** `parkTerminal` writes the
+marker; a human can still re-queue the job deliberately
+(`POST /api/jobs/:id/retry` clears `last_error`). Do not add a "helpful"
+auto-requeue for these rows — the original complaint this class exists for is a
+playlist that retried its dead videos forever and filled `error.log` doing it.
 
 The **downloader-args** class (`retry.ts isDownloaderArgsError`, aria2c exit 28
 + the option's help block) is a global misconfiguration, not a video problem:
@@ -517,16 +532,29 @@ pointer recorded) is adopted back into place — otherwise
 `reconcileMissingFiles` would re-queue the video and the old file would stay
 unmanaged.
 
-#### Stale audio formats recover instead of parking the job
+#### Unavailable formats recover instead of parking the job
 
 `retry.ts isFormatAvailabilityError()` matches yt-dlp's *"Requested format is
 not available"* — which `isPermanentDownloadError` ALSO matches. The download
-worker checks it FIRST: when a job carried stored `audio_tracks`, YouTube has
-most likely renumbered its formats since the probe, so the worker clears
-`audio_tracks` (forcing a fresh probe; the per-job language selection
-survives) and retries within the normal budget instead of parking the job
-permanently. Only jobs with no multi-audio state fall through to the
-permanent-error classification.
+worker checks it FIRST, in two steps:
+
+1. **Stale multi-audio probe.** When a job carried stored `audio_tracks`,
+   YouTube has most likely renumbered its formats since the probe, so the
+   worker clears `audio_tracks` (forcing a fresh probe; the per-job language
+   selection survives) and retries within the normal no-progress budget — a
+   re-probe can pin the same stale ids again, so this half does need a bound.
+2. **Quality fallback ladder.** With no stale probe to blame, the preset itself
+   matched nothing: the worker persists the next lower `video_quality` override
+   and retries immediately (no backoff — the next attempt is a different
+   command), announcing it in the dashboard for `FORMAT_SWITCH_NOTICE_MS` so the
+   downgrade is visible, logging one line, and counting `stats.formatFallbacks`.
+   The ladder (`FORMAT_FALLBACK_LADDER`) is strictly descending and ends at
+   `highest` (`bv+ba/b`, i.e. "any stream the extractor found"), so it cannot
+   loop and spends no retry budget — see the table in section 6.
+
+Both steps run before the permanent classification. Only a job whose ladder is
+exhausted falls through to a terminal skip, labelled
+`No format available (tried down to <preset>)`.
 
 #### Control files: never delete a `.part` without its `.aria2`
 
@@ -626,7 +654,7 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 
 | File | Focus |
 | --- | --- |
-| `tests/retry.test.ts` | backoff math, watchdog scaling, error classification |
+| `tests/retry.test.ts` | backoff math, watchdog scaling, error classification, the terminal reason table + `[terminal]` record round-trip (including the wordings that used to loop: `This video is private`, `This video is unavailable`), and the format fallback ladder (strictly descending, bottoms out at `highest`, `audio`/unknown never fall back) |
 | `tests/util.test.ts` | formatters, Windows filename hardening, `fitBaseFilename`, hashing |
 | `tests/config.test.ts` | defaults, validation, cross-field refinements, atomic load/save |
 | `tests/sources.test.ts` | URL classification, canonicalization, persisted source lists, dedup, concurrent saves/settings, validation/auth/write failures |
@@ -700,7 +728,20 @@ paused job's ABSOLUTE `partial_file_path` survives the startup sweep while
 used to delete a day-old "orphan" that was the job's only resume state), and a
 crashed rename-first stash (`file_path` gone, `<file_path>.superseded` present)
 is adopted back on startup — the media's marker bytes prove it was restored,
-not re-downloaded.
+not re-downloaded. The error-handling classes have their own end-to-end
+scenarios: **unavailable videos** (`FAKE_FAIL_MODE=private|unavailable`,
+optionally with a unique `FAKE_FAIL_MESSAGE` marker) must be attempted exactly
+once — the mock's `.attempts` counter is the proof — with `[terminal]` in
+`last_error`, no marker in the `error.log` delta, `resumableFailed: 0` on
+`/api/reliability`, an unchanged `.attempts` after a forced
+`POST /api/failed/requeue`, and a report that reads `⛔ Private video`; and the
+**format fallback ladder** (`FAKE_FORMAT_FAILS_SELECTOR='height<=1080'`, or the
+sentinel `all` for a video with no usable formats) must step the persisted
+`video_quality` override down, announce it in the dashboard (the 1.5 s notice
+pause is what makes it observable), record it in `error.log`, download with the
+fallback selector recorded in the mock's `.ytdlp-args`, and — with `all` — stop
+after three attempts (720p → 480p → highest) as a terminal `No format
+available` skip instead of retrying.
 
 The mock aria2c reproduces the real control-file lifecycle (interrupted →
 `.part` + `.aria2`; resume → `resumed=yes`; success → control file removed) and
@@ -804,7 +845,12 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
    YouTube **n-challenge** failures (`n challenge solving failed`, missing JS
    runtime) are *not* permanent even when the same stderr also says
    `Requested format is not available` — that text is a symptom of the unsolved
-   player JS. `isNChallengeError()` wins.
+   player JS. `isNChallengeError()` wins (and is checked before the reason
+   table, but *after* the `[terminal]` marker: only the terminal path writes
+   that, and it never writes it for an n-challenge failure). Widening the
+   patterns is cheap; **narrowing** them is how the retry loop comes back — every
+   wording that fails to classify falls into the transient budget, parks as
+   `failed`, and is re-queued by the cooldown sweep forever.
 7. **`bun:sqlite` specifics.** `MAX(a,b)` is the scalar two-arg form; use
    `COALESCE` before it. `datetime('now', '-N minutes')` modifiers must be
    built from validated integers, never user text. Open read-only handles

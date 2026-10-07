@@ -10,6 +10,16 @@ export interface Stats {
   downloaded: number;
   skipped: number;
   failed: number;
+  /**
+   * Terminal skips: videos that can never be downloaded (private, deleted,
+   * members-only, region-locked, no usable formats). A subset of `failed` —
+   * they are counted there too because they were not archived — but kept
+   * separate so the run report can distinguish "this video does not exist any
+   * more" from "this video failed and may still recover".
+   */
+  unavailable: number;
+  /** Downloads whose selector was stepped down the quality ladder. */
+  formatFallbacks: number;
   totalQueued: number;
   metadata: number;
   converted: number;
@@ -19,6 +29,8 @@ export const stats: Stats = {
   downloaded: 0,
   skipped: 0,
   failed: 0,
+  unavailable: 0,
+  formatFallbacks: 0,
   totalQueued: 0,
   metadata: 0,
   converted: 0,

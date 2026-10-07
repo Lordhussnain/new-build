@@ -972,6 +972,7 @@
 
     let selectedJobs = new Set();
     let lastFailedCount = 0;
+    let lastUnavailableCount = 0;
     let wasPaused = false;
     let lastRefreshAt = 0;
 
@@ -1237,11 +1238,23 @@
         if (data.isPaused && !wasPaused) {
           showNotification(`⏸️ Downloads paused${data.pauseReason ? ` (${data.pauseReason})` : ''}`, 'warning');
         }
-        if ((data.stats?.failed || 0) > lastFailedCount) {
-          showNotification(`❌ ${(data.stats?.failed || 0) - lastFailedCount} download(s) failed`, 'error');
+        // Terminal skips are counted in `failed` (the video was not archived)
+        // but are not failures to worry about: "private video" is a permanent
+        // fact, not an incident. Report them separately so a playlist full of
+        // dead entries does not read as a broken engine.
+        const failedNow = data.stats?.failed || 0;
+        const unavailableNow = data.stats?.unavailable || 0;
+        const unavailableDelta = Math.max(0, unavailableNow - lastUnavailableCount);
+        const failedDelta = failedNow - lastFailedCount - unavailableDelta;
+        if (unavailableDelta > 0) {
+          showNotification(`⛔ ${unavailableDelta} video(s) skipped — unavailable, never retried`, 'warning');
+        }
+        if (failedDelta > 0) {
+          showNotification(`❌ ${failedDelta} download(s) failed`, 'error');
         }
 
-        lastFailedCount = data.stats?.failed || 0;
+        lastFailedCount = failedNow;
+        lastUnavailableCount = unavailableNow;
         wasPaused = data.isPaused || false;
 
         lastJobs = jobsData.jobs || [];
@@ -1401,8 +1414,10 @@
         const resumeNote = willResume
           ? `<div class="job-subnote"><span class="pill ok" title="${escapeHtml(job.partial_file_path)}\naria2c control: ${escapeHtml(`${job.partial_file_path}.aria2`)}">⏸️ partial · will resume</span></div>`
           : '';
+        const errorText = formatLastError(job.last_error);
+        const errorIcon = errorText.startsWith('⛔') ? '' : '⚠️ ';
         const errorNote = job.last_error && (status === 'failed' || status === 'paused')
-          ? `<div class="job-subnote" title="${escapeHtml(job.last_error)}">⚠️ ${escapeHtml(job.last_error.slice(0, 90))}</div>`
+          ? `<div class="job-subnote" title="${escapeHtml(errorText)}">${errorIcon}${escapeHtml(errorText.slice(0, 90))}</div>`
           : '';
         const isChecked = selectedJobs.has(job.id) ? 'checked' : '';
         const location = job.file_path || job.output_directory || job.folder || '';
@@ -1621,10 +1636,14 @@
           return;
         }
         
-        container.innerHTML = data.failed.map(job => `
+        container.innerHTML = data.failed.map(job => {
+          const reason = formatLastError(job.last_error) || 'Unknown error';
+          const terminal = reason.startsWith('⛔');
+          const reasonColor = terminal ? 'var(--text-secondary)' : 'var(--danger)';
+          return `
           <div class="history-item">
             <h4>${escapeHtml(job.title)}</h4>
-            <p style="color: var(--danger); margin: 10px 0;">${escapeHtml(job.last_error || 'Unknown error')}</p>
+            <p style="color: ${reasonColor}; margin: 10px 0;">${escapeHtml(reason)}</p>
             <div class="history-meta">
               <span>Folder: ${escapeHtml(job.folder)}</span>
               <span>Retries: ${job.retry_count || 0} · meta: ${job.metadata_retry_count || 0} · convert: ${job.conversion_retry_count || 0}</span>
@@ -1632,7 +1651,8 @@
               <button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" onclick="resetFailCount('${job.id}')">🔢 Reset Count</button>
             </div>
           </div>
-        `).join('');
+        `;
+        }).join('');
       } catch (err) {
         document.getElementById('failedItems').innerHTML = '<p style="padding: 20px; color: var(--danger);">Failed to load failed items</p>';
       }
@@ -1715,6 +1735,18 @@
       return `${s}s`;
     }
     
+    // The engine records a terminal skip as "[terminal] <reason> — skipped, it
+    // will not be retried automatically. yt-dlp: …" (see src/retry.ts). Show
+    // the reason, not the raw yt-dlp tail: a private video is not an error to
+    // debug, it is a decision the engine already made.
+    function formatLastError(message) {
+      const raw = String(message || '');
+      if (!raw.trimStart().toLowerCase().startsWith('[terminal]')) return raw;
+      const rest = raw.trimStart().slice('[terminal]'.length).trim();
+      const label = (rest.split(' — ')[0] || '').trim() || 'Not downloadable';
+      return `⛔ ${label} — skipped, never auto-retried`;
+    }
+
     function escapeHtml(text) {
       if (!text) return '';
       return text.toString()
@@ -2215,8 +2247,9 @@
           ${detailRow('Resumes', job.resume_count || 0)}
           ${detailRow('Kept partial', parts, true)}
           ${detailRow('aria2c control', control, true)}
-          ${detailRow('Last error', job.last_error)}
+          ${detailRow('Last error', formatLastError(job.last_error))}
         </div>
+        ${job.video_quality ? `<div style="margin-top:10px; font-size:0.74rem; color: var(--text-secondary); line-height:1.4;">🎚️ A quality override is either your own choice or one the engine applied automatically because the requested format was not available for this video. Every skipped video records its reason above and is never retried on its own.</div>` : ''}
         ${renderJobOverrideSection(job)}
         ${renderAudioTrackSection(job)}
         ${renderSidecarSection(job)}

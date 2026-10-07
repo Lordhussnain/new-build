@@ -5,6 +5,7 @@ import { db } from "./db";
 import { autoscaler, activeDlSlots } from "./autoscale";
 import { formatBytesPerSec, formatDuration } from "./util";
 import { getPauseReason, isPaused, stats } from "./state";
+import { parseStoredTerminalError } from "./retry";
 
 export function buildRunReport(): string[] {
   try {
@@ -54,14 +55,19 @@ export function buildRunReport(): string[] {
       `Metadata — pending: ${totals.meta_pending || 0}, in progress: ${totals.meta_active || 0}, done: ${totals.meta_done || 0}, failed: ${totals.meta_failed || 0}`,
     );
     lines.push(
-      `This run — queued: ${stats.totalQueued}, downloaded: ${stats.downloaded}, skipped: ${stats.skipped}, failed: ${stats.failed}, metadata: ${stats.metadata}, converted: ${stats.converted}`,
+      `This run — queued: ${stats.totalQueued}, downloaded: ${stats.downloaded}, skipped: ${stats.skipped}, failed: ${stats.failed} (of which unavailable: ${stats.unavailable}), format fallbacks: ${stats.formatFallbacks}, metadata: ${stats.metadata}, converted: ${stats.converted}`,
     );
     if (failures.length > 0) {
       lines.push("");
       lines.push("Recent failures:");
       for (const f of failures) {
+        // Terminal skips read as what they are — a reason, not a stack trace.
+        // Everything else keeps the full message: it is actionable.
+        const terminal = parseStoredTerminalError(f.last_error);
         lines.push(
-          `  ✗ [${f.id}] ${f.title} (retries: ${f.retry_count || 0}) — ${f.last_error || "no error recorded"}`,
+          terminal
+            ? `  ⛔ [${f.id}] ${f.title} — ${terminal.label} (skipped, never auto-retried)`
+            : `  ✗ [${f.id}] ${f.title} (retries: ${f.retry_count || 0}) — ${f.last_error || "no error recorded"}`,
         );
       }
     } else {
