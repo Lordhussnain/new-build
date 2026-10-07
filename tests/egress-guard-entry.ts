@@ -11,19 +11,39 @@
 // engine entry is loaded via dynamic import() (static imports are hoisted
 // and would execute before this module's top-level code).
 
+// `export {}` marks this file as a module (required for the top-level await
+// below). It imports nothing, so nothing can be hoisted ahead of the guard.
+export {};
+
 if (process.env.YTA_EGRESS_GUARD === "1") {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async function guardedFetch(input: any, init?: any) {
-    const url = typeof input === "string" ? input : input?.url ?? String(input);
-    const host = new URL(url).hostname;
-    const isLocal =
-      host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === "::1" || host === "[::1]";
-    if (!isLocal) {
-      throw new Error(`[egress-guard] blocked non-local fetch to ${host} — set YTA_EGRESS_GUARD=0 to allow`);
+
+  const isLocalHost = (host: string): boolean =>
+    host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === "::1" || host === "[::1]";
+
+  const assertLocal = (what: string, host: string): void => {
+    if (!isLocalHost(host)) {
+      throw new Error(`[egress-guard] blocked non-local ${what} to ${host} — set YTA_EGRESS_GUARD=0 to allow`);
     }
-    return originalFetch.call(this, input, init);
   };
+
+  // Bun's fetch carries a non-standard `preconnect()` (DNS/TCP warm-up), so
+  // the replacement is assembled with Object.assign to satisfy `typeof
+  // fetch`. preconnect is guarded too — it also opens network connections.
+  globalThis.fetch = Object.assign(
+    async function guardedFetch(this: typeof globalThis, input: any, init?: any): Promise<Response> {
+      const url = typeof input === "string" ? input : input?.url ?? String(input);
+      assertLocal("fetch", new URL(url).hostname);
+      return originalFetch.call(this, input, init);
+    },
+    {
+      preconnect(url: string | URL, options?: { dns?: boolean; tcp?: boolean; http?: boolean; https?: boolean }): void {
+        assertLocal("preconnect", new URL(url).hostname);
+        originalFetch.preconnect(url, options);
+      },
+    },
+  );
 }
 
 // Dynamic import: runs after the guard is installed, not before.
-await import("../batch_playlist_downloader.ts");
+await import("../batch_playlist_downloader");
