@@ -191,7 +191,11 @@ export async function main(): Promise<void> {
     `Web UI: http://${uiHost}:${config.webPort}${config.webToken ? "  (token required)" : ""}${config.webBind === "0.0.0.0" ? "  — listening on ALL interfaces" : ""}`,
   );
 
-  networkMonitor();
+  if (config.networkMonitorEnabled) {
+    networkMonitor();
+  } else {
+    console.log("🌐 Network monitor disabled (networkMonitorEnabled=false).");
+  }
   setInterval(() => {
     // Fire-and-forget: the tick must never overlap itself, and a failure is
     // already reported by the reaper. The void + catch keeps the interval from

@@ -146,7 +146,9 @@ if (failTimes > 0 && attempts <= failTimes) {
 // Record what yt-dlp actually asked for. This file is durable evidence for the
 // integration test, so it is intentionally NOT cleaned up on success. It also
 // carries whether this run resumed, proving --continue reached the downloader.
-await Bun.write(`${out}.aria2-args`, `${argv.join(" ")}\nresumed=${resuming ? "yes" : "no"}`);
+// JSON.stringify preserves argument boundaries — one string with spaces vs
+// several arguments — which is exactly what argv.join(" ") loses.
+await Bun.write(`${out}.aria2-args`, JSON.stringify({ args: argv, resumed: resuming }));
 await Bun.write(out, "fake-aria2c-payload");
 
 // A completed download removes its control file (yt-dlp passes

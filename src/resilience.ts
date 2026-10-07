@@ -80,13 +80,18 @@ const NETWORK_PROBES = [
   "https://manifest.googlevideo.com/favicon.ico",
 ];
 
-export async function checkInternet(): Promise<boolean> {
+export type NetworkProbe = () => Promise<boolean>;
+
+export async function defaultNetworkProbe(): Promise<boolean> {
   for (const url of NETWORK_PROBES) {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
-      await fetch(url, { signal: controller.signal, method: "HEAD", redirect: "follow" });
-      clearTimeout(timeout);
+      try {
+        await fetch(url, { signal: controller.signal, method: "HEAD", redirect: "follow" });
+      } finally {
+        clearTimeout(timeout);
+      }
       return true;
     } catch {
       // try the next probe
@@ -95,25 +100,78 @@ export async function checkInternet(): Promise<boolean> {
   return false;
 }
 
-export async function networkMonitor(): Promise<void> {
+export async function checkInternet(probe?: NetworkProbe): Promise<boolean> {
+  return (probe ?? defaultNetworkProbe)();
+}
+
+export interface NetworkMonitorDecision {
+  /** Consecutive failure count after this tick. */
+  consecutiveFails: number;
+  /** Whether the engine should be paused (network down). */
+  shouldPause: boolean;
+  /** Whether a network-caused pause should be resumed. */
+  shouldResume: boolean;
+}
+
+/**
+ * Pure decision logic for one network-monitor tick.
+ *
+ * Separated from the async loop so it is unit-testable without timers or the
+ * shared `abortController`.
+ */
+export function networkMonitorTick(
+  consecutiveFails: number,
+  isUp: boolean,
+  currentlyPaused: boolean,
+  currentPauseReason: string | null,
+): NetworkMonitorDecision {
+  if (!isUp) {
+    const next = consecutiveFails + 1;
+    return {
+      consecutiveFails: next,
+      shouldPause: next >= 2 && !currentlyPaused,
+      shouldResume: false,
+    };
+  }
+  return {
+    consecutiveFails: 0,
+    shouldPause: false,
+    shouldResume: consecutiveFails > 0 && currentPauseReason === "NETWORK_DISCONNECTED",
+  };
+}
+
+export interface NetworkMonitorOptions {
+  /** Injectable probe (default: real fetch against YouTube endpoints). */
+  probe?: NetworkProbe;
+  /** Milliseconds between probes (default: 15 000). */
+  intervalMs?: number;
+}
+
+/**
+ * Continuously monitor network reachability.
+ *
+ * Two consecutive failures pause the engine; a successful probe after a
+ * network-caused pause resumes it. User pauses are never cleared by the
+ * monitor (only "NETWORK_DISCONNECTED" is eligible for auto-resume).
+ */
+export async function networkMonitor(opts: NetworkMonitorOptions = {}): Promise<void> {
+  const probe = opts.probe ?? defaultNetworkProbe;
+  const intervalMs = opts.intervalMs ?? 15_000;
   let consecutiveFails = 0;
   console.log("🌐 Network monitor started.");
   while (!abortController.signal.aborted) {
-    const isUp = await checkInternet();
-    if (!isUp) {
-      consecutiveFails++;
-      if (consecutiveFails >= 2 && !isPaused()) {
-        triggerPause("NETWORK_DISCONNECTED");
-        console.log("🌐 Network down detected. Pausing engine gracefully.");
-      }
-    } else {
-      if (consecutiveFails > 0) {
-        console.log("🌐 Network restored!");
-        consecutiveFails = 0;
-        if (getPauseReason() === "NETWORK_DISCONNECTED") triggerResume();
-      }
+    const isUp = await checkInternet(probe);
+    const decision = networkMonitorTick(consecutiveFails, isUp, isPaused(), getPauseReason());
+    consecutiveFails = decision.consecutiveFails;
+    if (decision.shouldPause) {
+      triggerPause("NETWORK_DISCONNECTED");
+      console.log("🌐 Network down detected. Pausing engine gracefully.");
     }
-    await Bun.sleep(15000);
+    if (decision.shouldResume) {
+      console.log("🌐 Network restored!");
+      triggerResume();
+    }
+    await Bun.sleep(intervalMs);
   }
 }
 

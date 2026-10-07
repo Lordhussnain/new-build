@@ -163,7 +163,9 @@ const finalBase = stressOutput ? join(dirname(base), `final-${basename(base)}-�
 const finalPath = multiAudio ? `${finalBase}.mkv` : `${finalBase}.mp4`;
 const partPath = `${base}.f137.mp4.part`;
 // Record the argv so tests can assert which format selector / flags arrived.
-await Bun.write(`${base}.ytdlp-args`, argv.join(" "));
+// JSON.stringify preserves argument boundaries — one string with spaces vs
+// several arguments — which is exactly what argv.join(" ") loses.
+await Bun.write(`${base}.ytdlp-args`, JSON.stringify(argv));
 
 const failTimes = num("FAKE_FAIL_TIMES", 0);
 const failMode = process.env.FAKE_FAIL_MODE || "transient";

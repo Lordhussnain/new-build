@@ -113,6 +113,9 @@ export const ConfigSchema = z
     rssEnabled: z.boolean(),
     rssPollIntervalMinutes: z.number().min(1),
     rescanIntervalHours: z.number().min(0),
+    // Resilience: network connectivity monitor. When enabled, probes YouTube
+    // periodically and pauses the engine after consecutive failures.
+    networkMonitorEnabled: z.boolean(),
   })
   // Cross-field sanity: the backoff ceiling must be reachable from the base.
   .refine((c) => c.retryBackoffMaxSeconds >= c.retryBackoffBaseSeconds, {
@@ -196,6 +199,7 @@ export const DEFAULT_CONFIG: Config = {
   rssEnabled: true,
   rssPollIntervalMinutes: 15,
   rescanIntervalHours: 24,
+  networkMonitorEnabled: true,
 };
 
 // yt-dlp format selectors per quality preset.
