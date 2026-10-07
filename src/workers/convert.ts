@@ -23,26 +23,43 @@ import {
 import { computeBackoffMs } from "../retry";
 import { SIDECAR_SUFFIXES, hashFile } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
-import { abortController, getConfig, isPaused, stats, workerStatuses } from "../state";
+import {
+  abortController,
+  activeConvertJobs,
+  activeConvertProcs,
+  getConfig,
+  isPaused,
+  stats,
+  workerStatuses,
+} from "../state";
 import { notePipelineFailure, notePipelineSuccess } from "../resilience";
 import { logError } from "../logger";
 import { ffmpeg } from "../tools";
 import { effectiveTargetFormat } from "../download-args";
 import type { Config } from "../config";
 
-/** Run ffmpeg with a hard timeout so a wedged encode can never pin a worker. */
+/**
+ * Run ffmpeg with a hard timeout so a wedged encode can never pin a worker.
+ *
+ * `workerId` (when given) registers the child in `activeConvertProcs`, which is
+ * what lets the dashboard interrupt an in-flight encode: without it a job
+ * deleted mid-conversion left ffmpeg running in the terminal until it finished.
+ */
 export async function runFfmpeg(
   args: string[],
   timeoutMs: number,
+  workerId?: number,
 ): Promise<{ code: number; stderr: string; timedOut: boolean }> {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
     const proc = Bun.spawn([ffmpeg(), ...args], { stdout: "ignore", stderr: "pipe", signal: ctl.signal });
+    if (workerId !== undefined) activeConvertProcs.set(workerId, proc);
     const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
     return { code, stderr, timedOut: ctl.signal.aborted };
   } finally {
     clearTimeout(timer);
+    if (workerId !== undefined) activeConvertProcs.delete(workerId);
   }
 }
 
@@ -52,12 +69,13 @@ export async function runFfmpeg(
  * container instead of being remuxed to mp4. 0 on any probe failure — the
  * caller then behaves exactly like before multi-audio support.
  */
-export async function countAudioStreams(path: string): Promise<number> {
+export async function countAudioStreams(path: string, workerId?: number): Promise<number> {
   try {
     const proc = Bun.spawn([ffmpeg(), "-hide_banner", "-i", path], {
       stdout: "pipe",
       stderr: "pipe",
     });
+    if (workerId !== undefined) activeConvertProcs.set(workerId, proc);
     const [out, err] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
@@ -67,6 +85,8 @@ export async function countAudioStreams(path: string): Promise<number> {
     return (banner.match(/^\s*Stream #\d+:\d+[^\n]*:\s*Audio/gm) || []).length;
   } catch {
     return 0;
+  } finally {
+    if (workerId !== undefined) activeConvertProcs.delete(workerId);
   }
 }
 
@@ -90,14 +110,23 @@ export async function converterWorker(id: number, config: Config): Promise<void>
     // see, so the claim's lease is renewed here. Without this heartbeat the
     // fixed stale window was the only signal, and a live long encode looked
     // exactly like a dead worker.
-    const stopHeartbeat = startClaimHeartbeat("conversion", job.id, claimRef("conversion", job), () =>
-      logError("conversion", `${job.id} ${job.title}: conversion claim lost — the encode will not be recorded`),
-    );
+    const stopHeartbeat = startClaimHeartbeat("conversion", job.id, claimRef("conversion", job), () => {
+      logError("conversion", `${job.id} ${job.title}: conversion claim lost — the encode will not be recorded`);
+      const doomed = activeConvertProcs.get(id);
+      if (doomed && doomed.exitCode === null) {
+        try {
+          doomed.kill("SIGINT");
+        } catch {}
+      }
+    });
+    activeConvertJobs.set(id, job.id);
     try {
       await convertJob(job, config, id);
     } catch (err: any) {
       await handleConvertFailure(job, config, err, id);
     } finally {
+      activeConvertJobs.delete(id);
+      activeConvertProcs.delete(id);
       stopHeartbeat();
     }
   }
@@ -341,6 +370,7 @@ async function convertJob(job: Job, config: Config, id: number): Promise<void> {
     const res = await runFfmpeg(
       ["-y", "-i", sourcePath, "-vn", "-map", "0:a:0", "-c:a", "libmp3lame", "-q:a", "2", mp3Path],
       60 * 60 * 1000,
+      id,
     );
     if (res.code !== 0) {
       throw new Error(
@@ -356,7 +386,7 @@ async function convertJob(job: Job, config: Config, id: number): Promise<void> {
     // Multi-audio archives land as MKV holding every selected track. MP4
     // cannot carry them without re-encoding each dub, so a file with more
     // than one audio stream is kept exactly as yt-dlp muxed it.
-    const audioStreams = await countAudioStreams(sourcePath);
+    const audioStreams = await countAudioStreams(sourcePath, id);
     if (audioStreams >= 2) {
       updateConvertWorkerLine(id, `🎧 Remuxing ${audioStreams} audio tracks | ${job.title}`, config);
     }
@@ -365,7 +395,7 @@ async function convertJob(job: Job, config: Config, id: number): Promise<void> {
       targetFmt === "mp4"
         ? ["-y", "-i", sourcePath, "-map", "0:v:0?", "-map", "0:a?", "-map_metadata", "0", "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart", targetPath]
         : ["-y", "-i", sourcePath, "-map", "0:v:0?", "-map", "0:a?", "-map_metadata", "0", "-c:v", "copy", "-c:a", "copy", targetPath];
-    const res = await runFfmpeg(ffmpegArgs, 30 * 60 * 1000);
+    const res = await runFfmpeg(ffmpegArgs, 30 * 60 * 1000, id);
     if (res.code !== 0) {
       throw new Error(
         `FFmpeg remux to .${targetFmt} ${res.timedOut ? "timed out" : "failed"}: ${res.stderr.split("\n").filter((l) => l.trim()).slice(-2).join(" ")}`,
@@ -400,7 +430,11 @@ async function handleConvertFailure(job: Job, config: Config, err: any, id: numb
     [newStatus, attempts, errMsg],
   );
   if (landed !== 1) {
-    logError("conversion", `${job.id} ${job.title}: conversion claim lost before recording the failure`);
+    // A row that is gone was deleted on purpose (dashboard delete / purge /
+    // source removal) — nothing to record, nothing to warn about.
+    if (db.query("SELECT id FROM jobs WHERE id = ?").get(job.id)) {
+      logError("conversion", `${job.id} ${job.title}: conversion claim lost before recording the failure`);
+    }
     return;
   }
   if (newStatus === "failed") {
@@ -409,8 +443,14 @@ async function handleConvertFailure(job: Job, config: Config, err: any, id: numb
     notePipelineFailure("post", config);
     updateConvertWorkerLine(id, `❌ Failed | ${job.title}`, config);
   } else {
-    const backoff = computeBackoffMs(attempts, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
-    updateConvertWorkerLine(id, `🔁 Retrying in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
+    // The job was released back to the queue above, so any free converter may
+    // pick it up; this worker only pauses briefly to avoid hammering a broken
+    // ffmpeg. The full exponential backoff is applied by the failed-job sweep
+    // once the per-video budget is spent (see requeueFailedJobs) — sleeping the
+    // whole backoff here just parked a worker slot for minutes on end and made
+    // the dashboard look frozen.
+    const backoff = Math.min(computeBackoffMs(attempts, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds), 5_000);
+    updateConvertWorkerLine(id, `🔁 Retrying in ${Math.max(1, Math.round(backoff / 1000))}s | ${job.title}`, config);
     await Bun.sleep(backoff);
   }
 }

@@ -12,6 +12,7 @@ import {
   claimDownloadJob,
   claimRef,
   db,
+  ownsClaim,
   perVideoCap,
   releaseClaimedJob,
   startClaimHeartbeat,
@@ -40,7 +41,7 @@ import {
   progressAwareRetryState,
 } from "../retry";
 import { buildDownloadPlan, effectiveVideoQuality, jobFittedBaseFilename } from "../download-args";
-import { parseDownloadPath, readProcessOutput } from "../download-output";
+import { parseAria2cReadout, parseDownloadPath, readProcessOutput } from "../download-output";
 import {
   parseSelectionJson,
   parseTracksJson,
@@ -50,7 +51,16 @@ import {
 } from "../audio-tracks";
 import { findDownloadedFile, formatBytesPerSec, parseSpeedToBytesPerSec } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
-import { abortController, activeDownloadJobs, activeProcs, getConfig, isPaused, stats, workerStatuses } from "../state";
+import {
+  abortController,
+  activeDownloadJobs,
+  activeProcs,
+  getConfig,
+  isJobCancelled,
+  isPaused,
+  stats,
+  workerStatuses,
+} from "../state";
 import { logError } from "../logger";
 import type { Config } from "../config";
 
@@ -85,7 +95,15 @@ function releaseOwned(
 ): boolean {
   const changes = releaseClaimedJob("download", job.id, downloadClaim(job), setClause, params, extraCondition);
   if (changes === 1) return true;
-  logError("download", `${job.id} ${job.title}: lost the download claim while ${what} — job state left untouched`);
+  // A row that no longer exists was deleted on purpose (dashboard delete /
+  // purge / source removal). That is a normal outcome, not a lost race — the
+  // job is gone, so there is nothing to write and nothing to warn about.
+  const row = db.query("SELECT download_claim_token FROM jobs WHERE id = ?").get(job.id) as
+    | { download_claim_token: string | null }
+    | null;
+  if (row) {
+    logError("download", `${job.id} ${job.title}: lost the download claim while ${what} — job state left untouched`);
+  }
   return false;
 }
 
@@ -124,9 +142,20 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
     // The claim is a lease: heartbeat it for as long as this worker is on the
     // job, so a long transfer with no progress lines is never mistaken for a
     // dead worker by the reaper (progress updates renew it too).
-    const stopHeartbeat = startClaimHeartbeat("download", job.id, claimRef("download", job), () =>
-      logError("download", `${job.id} ${job.title}: download claim lost — the next update will not land`),
-    );
+    //
+    // Losing the lease mid-transfer (reaped as stale, or superseded by another
+    // engine) also stops the child: a downloader we no longer own must not keep
+    // writing into the video's folder — that is how a deleted job used to end
+    // up as an untracked file on disk.
+    const stopHeartbeat = startClaimHeartbeat("download", job.id, claimRef("download", job), () => {
+      logError("download", `${job.id} ${job.title}: download claim lost — the next update will not land`);
+      const doomed = activeProcs.get(id);
+      if (doomed && doomed.exitCode === null) {
+        try {
+          doomed.kill("SIGINT");
+        } catch {}
+      }
+    });
 
     try {
       await runDownload(id, job, config);
@@ -172,6 +201,15 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
   const engineTag = plan.engine === "aria2c" ? `aria2c×${config.connectionsPerDownload}` : "native";
   const audioTag = audioTracks.length > 0 ? `, ${audioTracks.length} audio track(s)` : "";
 
+  // The audio probe above is a network round-trip; the job can be paused,
+  // deleted, or purged while it runs. Spawning yt-dlp for a claim we no longer
+  // own is exactly how a cancelled job used to keep downloading in the
+  // terminal, so ownership is re-checked immediately before the spawn.
+  if (isJobCancelled(job.id) || !ownsClaim("download", job.id, downloadClaim(job))) {
+    updateWorkerLine(id, `⏹️ Cancelled before starting | ${job.title}`, config);
+    return;
+  }
+
   updateWorkerLine(id, `⬇️ Starting [${engineTag}${audioTag}]... | ${job.title}`, config);
   const args = [ytDlp(), ...plan.args];
 
@@ -187,36 +225,69 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     // same protected region: any throw after spawn must stop the child before
     // the worker can release the job claim and retry it.
     activeProcs.set(id, proc);
+    // The dashboard can delete/purge this job between the check above and this
+    // spawn (both are synchronous, but the probe before them is not). Now that
+    // the child is registered, verify ownership once more: if the row is gone
+    // or the claim moved on, the `finally` below reaps the child and nothing is
+    // recorded for a job that no longer exists.
+    if (isJobCancelled(job.id) || !ownsClaim("download", job.id, downloadClaim(job))) {
+      updateWorkerLine(id, `⏹️ Cancelled at start | ${job.title}`, config);
+      return;
+    }
     downloadTimer = setTimeout(() => {
       timedOut = true;
       downloadCtl.abort();
     }, timeoutMs);
 
+    // Every downloader engine funnels through this one writer: the native
+    // engine via yt-dlp's --progress-template, aria2c via its console readout
+    // (same stdout — yt-dlp lets the child inherit it and fires no progress
+    // hook of its own for an external downloader). One writer keeps the
+    // dashboard's progress/speed/ETA columns identical on both paths.
+    const reportProgress = (pctNum: number, bps: number, etaNum: number, totalBytes: number | null) => {
+      if (bps > 0) autoscaler.recordSpeed(id, bps);
+      if (Number.isNaN(pctNum) || pctNum < 0 || Date.now() - lastProgressUpdate <= 500) return;
+      // Backfill file_size from progress so the global ETA has a total to work with.
+      // best_progress is the high-water mark of this job's attempts: it is what
+      // lets the retry budget forgive repeated failures at increasing
+      // completion percentages (see handleDownloadFailure).
+      updateJobProgress(job.id, downloadClaim(job), pctNum, bps, etaNum, totalBytes);
+      const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
+      const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
+      updateWorkerLine(id, `⬇️ ${pctNum.toFixed(1)}% @ ${speedTxt}${etaTxt} | ${job.title}`, config);
+      lastProgressUpdate = Date.now();
+    };
+
     const stdoutPromise = readProcessOutput(proc.stdout, (line) => {
       if (line.startsWith("PROGRESS:")) {
         const parts = line.replace("PROGRESS:", "").split("|");
-        const bps = parseSpeedToBytesPerSec(parts[1]);
-        if (bps > 0) autoscaler.recordSpeed(id, bps);
         const sizeNum = parseInt(parts[3], 10);
         const dlNum = parseInt(parts[4], 10);
         let pctNum = parseFloat(parts[0]);
         if (Number.isNaN(pctNum) && dlNum > 0 && sizeNum > 0) pctNum = (dlNum / sizeNum) * 100;
-        if (!Number.isNaN(pctNum) && pctNum >= 0 && Date.now() - lastProgressUpdate > 500) {
-          // Backfill file_size from progress so the global ETA has a total to work with.
-          const totalBytes = Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : null;
-          // best_progress is the high-water mark of this job's attempts: it is
-          // what lets the retry budget forgive repeated failures at increasing
-          // completion percentages (see handleDownloadFailure).
-          updateJobProgress(job.id, downloadClaim(job), pctNum, bps, parseFloat(parts[2]) || 0, totalBytes);
-          const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
-          const etaNum = parseFloat(parts[2]);
-          const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
-          updateWorkerLine(id, `⬇️ ${pctNum.toFixed(1)}% @ ${speedTxt}${etaTxt} | ${job.title}`, config);
-          lastProgressUpdate = Date.now();
-        }
+        reportProgress(
+          pctNum,
+          parseSpeedToBytesPerSec(parts[1]),
+          parseFloat(parts[2]) || 0,
+          Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : null,
+        );
       } else {
         const path = parseDownloadPath(line);
-        if (path) finalFilePath = path;
+        if (path) {
+          finalFilePath = path;
+        } else {
+          // Not our FILEPATH record: on the aria2c path this is where the
+          // transfer's only live progress signal arrives.
+          const readout = parseAria2cReadout(line);
+          if (readout) {
+            reportProgress(
+              readout.percent,
+              readout.speedBps,
+              readout.etaSeconds,
+              readout.totalBytes > 0 ? readout.totalBytes : null,
+            );
+          }
+        }
       }
     });
 
@@ -785,7 +856,13 @@ export function recordSuccess(job: Job, filePath: string, fileSize: number): Dow
     [filePath, fileSize],
   );
   if (changes !== 1) {
-    logError("download", `${job.id} ${job.title}: lost the download claim before recording success — not recorded`);
+    // A deleted row is the expected outcome of a dashboard delete/purge: the
+    // file was written on purpose by the (now-cancelled) operation, so only an
+    // existing row with a different owner is worth an error line.
+    const existing = db.query("SELECT id FROM jobs WHERE id = ?").get(job.id);
+    if (existing) {
+      logError("download", `${job.id} ${job.title}: lost the download claim before recording success — not recorded`);
+    }
     return { ok: false, stayedPaused: false, lostClaim: true };
   }
   const row = db.query("SELECT pause_reason FROM jobs WHERE id = ?").get(job.id) as

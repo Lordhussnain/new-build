@@ -452,6 +452,12 @@ async function changeReliabilitySettings(config: Config): Promise<Config> {
     config.verifyExistingFiles,
   );
 
+  console.log("\n— Network monitor —");
+  config.networkMonitorEnabled = await askYesNo(
+    "Probe YouTube periodically and pause the engine after repeated network failures?",
+    config.networkMonitorEnabled,
+  );
+
   console.log("\n— Self-healing sweeps (run by the engine, not configurable here) —");
   console.log(`   • Crashed jobs resume        on startup`);
   const staleClaimThresholds = STALE_CLAIM_THRESHOLDS(config);

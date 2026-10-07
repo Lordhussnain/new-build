@@ -10,6 +10,7 @@ import { basename, dirname, join } from "node:path";
 import {
   claimMetadataJob,
   claimRef,
+  db,
   perVideoCap,
   releaseClaimedJob,
   startClaimHeartbeat,
@@ -20,7 +21,15 @@ import { cookiesArgs, jsRuntimeArgs, ytDlp } from "../tools";
 import { computeBackoffMs } from "../retry";
 import { SIDECAR_SUFFIXES } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
-import { abortController, activeMetadataProcs, getConfig, isPaused, stats, workerStatuses } from "../state";
+import {
+  abortController,
+  activeMetadataJobs,
+  activeMetadataProcs,
+  getConfig,
+  isPaused,
+  stats,
+  workerStatuses,
+} from "../state";
 import { notePipelineFailure, notePipelineSuccess } from "../resilience";
 import { logError } from "../logger";
 import type { Config } from "../config";
@@ -67,14 +76,25 @@ export async function metadataWorker(id: number, config: Config): Promise<void> 
     // the reaper nothing but `updated_at` to look at. The claim lease (owner,
     // token, heartbeat) is renewed here so a live fetch is never re-queued and
     // a stale worker can never write over the new owner.
-    const stopHeartbeat = startClaimHeartbeat("metadata", job.id, claimRef("metadata", job), () =>
-      logError("metadata", `${job.id} ${job.title}: metadata claim lost — the sidecar pass will not be recorded`),
-    );
+    const stopHeartbeat = startClaimHeartbeat("metadata", job.id, claimRef("metadata", job), () => {
+      logError("metadata", `${job.id} ${job.title}: metadata claim lost — the sidecar pass will not be recorded`);
+      // Same rule as downloads: a claim we no longer own must not keep a
+      // network fetch running against the video's folder.
+      const doomed = activeMetadataProcs.get(id);
+      if (doomed && doomed.exitCode === null) {
+        try {
+          doomed.kill("SIGINT");
+        } catch {}
+      }
+    });
+    activeMetadataJobs.set(id, job.id);
     try {
       await runMetadataJob(job, config, id);
     } catch (err: any) {
       await handleMetadataFailure(job, config, err, id);
     } finally {
+      activeMetadataJobs.delete(id);
+      activeMetadataProcs.delete(id);
       stopHeartbeat();
     }
   }
@@ -158,7 +178,11 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
     [JSON.stringify(sidecars)],
   );
   if (landed !== 1) {
-    logError("metadata", `${job.id} ${job.title}: metadata claim lost before recording the sidecars`);
+    // Gone row = deliberate deletion; an existing row with a different owner is
+    // the race worth reporting.
+    if (db.query("SELECT id FROM jobs WHERE id = ?").get(job.id)) {
+      logError("metadata", `${job.id} ${job.title}: metadata claim lost before recording the sidecars`);
+    }
     return;
   }
   stats.metadata++;
@@ -186,7 +210,9 @@ async function handleMetadataFailure(job: Job, config: Config, err: any, id: num
     [newStatus, attempts, errMsg],
   );
   if (landed !== 1) {
-    logError("metadata", `${job.id} ${job.title}: metadata claim lost before recording the failure`);
+    if (db.query("SELECT id FROM jobs WHERE id = ?").get(job.id)) {
+      logError("metadata", `${job.id} ${job.title}: metadata claim lost before recording the failure`);
+    }
     return;
   }
   if (newStatus === "failed") {
@@ -195,8 +221,11 @@ async function handleMetadataFailure(job: Job, config: Config, err: any, id: num
     notePipelineFailure("post", config);
     updateMetadataWorkerLine(id, `❌ Metadata failed | ${job.title}`, config);
   } else {
-    const backoff = computeBackoffMs(attempts, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
-    updateMetadataWorkerLine(id, `🔁 Retrying in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
+    // Bounded like the converter: the job is already re-queued for any free
+    // worker, so this delay only avoids hammering a failing endpoint. The
+    // failed-job sweep applies the real cooldown once the budget is spent.
+    const backoff = Math.min(computeBackoffMs(attempts, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds), 5_000);
+    updateMetadataWorkerLine(id, `🔁 Retrying in ${Math.max(1, Math.round(backoff / 1000))}s | ${job.title}`, config);
     await Bun.sleep(backoff);
   }
 }

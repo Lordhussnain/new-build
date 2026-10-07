@@ -57,7 +57,9 @@ describe("parseConfig", () => {
 
   test("rejects out-of-range values", () => {
     expect(() => parseConfig({ webPort: 99999 })).toThrow();
-    expect(() => parseConfig({ videoQuality: "4k" })).toThrow();
+    // "4k" is one of the seven presets the dashboard can set; "8k" is not.
+    expect(() => parseConfig({ videoQuality: "4k" })).not.toThrow();
+    expect(() => parseConfig({ videoQuality: "8k" })).toThrow();
     expect(() => parseConfig({ targetFormat: "avi" })).toThrow();
     expect(() => parseConfig({ subtitleFormat: "txt" })).toThrow();
     expect(() => parseConfig({ maxConcurrentDownloads: 0 })).toThrow();

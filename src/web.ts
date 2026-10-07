@@ -9,12 +9,12 @@
 import { existsSync, readFileSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import os from "node:os";
-import { associateExistingJobsWithSource, db } from "./db";
+import { associateExistingJobsWithSource, claimRef, db, releaseClaimedJob } from "./db";
 import { autoscaler, activeDlSlots } from "./autoscale";
-import { activeDownloadJobs, getConfig, getPauseReason, isPaused, workerStatuses } from "./state";
+import { activeDownloadJobs, getConfig, getPauseReason, isPaused, markJobCancelled, workerStatuses } from "./state";
 import { getPlaylistItems, scanAndIngest } from "./scanner";
 import { parseSourceUrl, removeSource, saveSource, SOURCE_KEYS, sourceIdentity, type SourceUrl } from "./sources";
-import { diskUsage, triggerPause, triggerResume } from "./resilience";
+import { cancelActiveStages, diskUsage, triggerPause, triggerResume, type CancelledStages } from "./resilience";
 import { removeFromArchive } from "./archive";
 import { requeueFailedJobs, stashDownloadedFile, staleClaimCondition, STALE_CLAIM_THRESHOLDS } from "./reconcile";
 import { holdsEngineLease, isLeaseExpired, readEngineLease } from "./lease";
@@ -236,9 +236,76 @@ const ACTIVE_JOB_PREDICATE = `
   OR metadata_claim_token IS NOT NULL
 `;
 
-const PURGE_QUEUE_PREDICATE = "download_status IN ('pending', 'paused', 'waiting_live', 'failed')";
+const PURGE_QUEUE_PREDICATE = "download_status IN ('pending', 'paused', 'waiting_live', 'failed', 'downloading')";
 
 type IdleJobResult<T> = { ok: true; value: T } | { ok: false };
+
+/**
+ * Stop every in-flight child (download / conversion / sidecar fetch) belonging
+ * to these jobs.
+ *
+ * Deletion and purge used to be database-only operations: the row disappeared
+ * while yt-dlp kept downloading in the terminal and wrote a file nobody
+ * tracked — and the download worker then reported a lost claim. Interrupting
+ * the children first is what makes the buttons mean what they say. The kill is
+ * claim-safe: a worker that no longer owns its row writes nothing (see the
+ * claim-token CAS in db.ts), and a deleted row is treated as a normal outcome.
+ */
+function stopActiveStages(ids: Iterable<string>) {
+  return cancelActiveStages(ids);
+}
+
+/**
+ * First half of a deletion: announce the cancellation (so a worker that is
+ * still waiting on the multi-audio probe refuses to spawn a downloader for a
+ * job that is about to disappear) and interrupt whatever child is running.
+ */
+function beginCancellation(ids: string[]): CancelledStages {
+  const unique = [...new Set(ids)];
+  if (unique.length === 0) return { downloads: [], conversions: [], metadata: [] };
+  for (const id of unique) markJobCancelled(id);
+  return stopActiveStages(unique);
+}
+
+/**
+ * Second half, run right after the rows are gone: a child that registered in
+ * the instant between the ownership re-check and the row deletion is caught
+ * here. Workers that never spawn are caught by the cancellation mark (checked
+ * immediately after `Bun.spawn`), so between the two no child survives a
+ * deleted job.
+ */
+function finishCancellation(ids: string[]): CancelledStages {
+  if (ids.length === 0) return { downloads: [], conversions: [], metadata: [] };
+  return stopActiveStages(ids);
+}
+
+/** How many distinct jobs actually had a live child interrupted, across stages. */
+function stoppedCount(...stages: CancelledStages[]): number {
+  const ids = new Set<string>();
+  for (const stage of stages) {
+    for (const id of stage.downloads) ids.add(id);
+    for (const id of stage.conversions) ids.add(id);
+    for (const id of stage.metadata) ids.add(id);
+  }
+  return ids.size;
+}
+
+/**
+ * Park a job that is mid-download as a user pause, keeping its .part for a
+ * later resume. The claim is deliberately left in place: the worker still owns
+ * this row, so it observes `pause_reason = 'user'` when its (now interrupted)
+ * download returns and releases the claim through its own token.
+ */
+function parkDownloadingJobs(ids: string[]): void {
+  if (ids.length === 0) return;
+  const placeholders = ids.map(() => "?").join(",");
+  db.run(
+    `UPDATE jobs SET download_status = 'paused', pause_reason = 'user', speed = 0, eta = 0,
+       updated_at = CURRENT_TIMESTAMP
+     WHERE id IN (${placeholders}) AND download_status = 'downloading'`,
+    ids,
+  );
+}
 
 /** Run a synchronous job mutation only while none of its rows has a live stage claim. */
 function withIdleJobs<T>(ids: string[], operation: () => T): IdleJobResult<T> {
@@ -458,7 +525,13 @@ function resetFailCounters(id: string): number {
   ).changes;
 }
 
-/** Delete a set of jobs by id (bulk action from the dashboard). */
+/**
+ * Delete a set of jobs by id (bulk action from the dashboard).
+ *
+ * Deletion is a cancellation too: any in-flight download, encode, or sidecar
+ * fetch for these jobs is interrupted first, so "Delete" never leaves a yt-dlp
+ * or ffmpeg running in the terminal for a row that no longer exists.
+ */
 async function deleteJobsBulk(req: Request): Promise<Response> {
   const body = await req.json().catch(() => ({}));
   const ids = Array.isArray(body?.ids)
@@ -466,9 +539,17 @@ async function deleteJobsBulk(req: Request): Promise<Response> {
     : [];
   if (ids.length === 0) return Response.json({ ok: false, error: "No job ids provided" }, { status: 400 });
   const placeholders = ids.map(() => "?").join(",");
-  const result = withIdleJobs(ids, () => db.run(`DELETE FROM jobs WHERE id IN (${placeholders})`, ids).changes);
-  if (!result.ok) return jobInProgressResponse();
-  return Response.json({ ok: true, deleted: result.value });
+  // Cancellation is part of the deletion: mark, interrupt, delete the rows,
+  // then sweep once more (see beginCancellation/finishCancellation).
+  const stoppedBefore = beginCancellation(ids);
+  // Count job rows, not raw `changes`: the cascaded job_sources rows would
+  // otherwise double-count every deletion.
+  const deleted = (
+    db.query(`SELECT COUNT(*) AS n FROM jobs WHERE id IN (${placeholders})`).get(...ids) as { n: number }
+  ).n;
+  db.run(`DELETE FROM jobs WHERE id IN (${placeholders})`, ids);
+  const late = finishCancellation(ids);
+  return Response.json({ ok: true, deleted, stopped: stoppedCount(stoppedBefore, late) });
 }
 
 const ROUTES: Route[] = [
@@ -533,6 +614,30 @@ const ROUTES: Route[] = [
       const ramPercent = ((memUsage.rss / os.totalmem()) * 100).toFixed(0);
       const uptime = formatDuration(process.uptime());
 
+      // Live download rows for the dashboard's progress panel: one compact
+      // query so the UI can render per-download bars without walking the full
+      // job list. Ordered by the moment the claim was taken so the panel order
+      // is stable between polls.
+      const activeDownloads = (
+        db
+          .query(
+            `SELECT id, title, folder, progress, speed, eta, file_size, download_claimed_by, download_claimed_at
+               FROM jobs WHERE download_status = 'downloading'
+              ORDER BY download_claimed_at, created_at
+              LIMIT 50`,
+          )
+          .all() as any[]
+      ).map((r) => ({
+        id: r.id,
+        title: r.title,
+        folder: r.folder,
+        progress: Number(r.progress) || 0,
+        speed: Number(r.speed) || 0,
+        eta: Number(r.eta) || 0,
+        fileSize: Number(r.file_size) || 0,
+        worker: r.download_claimed_by || null,
+      }));
+
       const avgSpeed = autoscaler.getAggregateSpeed();
       const remaining = db
         .query(
@@ -557,6 +662,14 @@ const ROUTES: Route[] = [
         queuePosition: statsData.queued || 0,
         speed: avgSpeed,
         aggregateSpeed: formatBytesPerSec(avgSpeed),
+        activeDownloads,
+        network: {
+          monitorEnabled: config.networkMonitorEnabled,
+          probeIntervalSeconds: 15,
+          // The last probe only shows as "offline" through the pause reason
+          // (NETWORK_DISCONNECTED); the endpoint itself is the checked URL.
+          connected: !(isPaused() && String(getPauseReason() || "").includes("NETWORK")),
+        },
         activeWorkers: activeDlSlots.size,
         targetWorkers: autoscaler.targetWorkers,
         workers,
@@ -774,10 +887,82 @@ const ROUTES: Route[] = [
     methods: ["DELETE"],
     pattern: "/api/jobs/:id",
     handler: ({ params }) => {
-      const result = withIdleJobs([params.id], () => db.run(`DELETE FROM jobs WHERE id = ?`, [params.id]).changes);
-      if (!result.ok) return jobInProgressResponse();
-      if (result.value === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
-      return Response.json({ ok: true, deleted: result.value });
+      // A row must never be deleted while its child process keeps running: the
+      // old behaviour left orphaned yt-dlp/ffmpeg downloads in the terminal
+      // (and a 409 for exactly the case the button exists for). Cancellation
+      // is part of the deletion now: mark, interrupt, delete the row, sweep
+      // once more for a child that registered mid-delete.
+      const stopped = beginCancellation([params.id]);
+      const exists = db.query(`SELECT 1 FROM jobs WHERE id = ?`).get(params.id);
+      if (!exists) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+      db.run(`DELETE FROM jobs WHERE id = ?`, [params.id]);
+      const late = finishCancellation([params.id]);
+      return Response.json({ ok: true, deleted: 1, stopped: stoppedCount(stopped, late) });
+    },
+  },
+  {
+    methods: ["POST"],
+    pattern: "/api/jobs/:id/stop",
+    handler: ({ params }) => {
+      // Stop one job NOW without deleting it: the in-flight downloader (and any
+      // encode or sidecar fetch) is interrupted, and a mid-download job is
+      // parked as a user pause so its .part file resumes exactly where it
+      // stopped on the next Retry. This is the button for "why is this video
+      // still downloading?".
+      const id = params.id;
+      // The claim columns are fetched too: releasing a conversion/metadata
+      // claim needs its token, and a claim that is not presented can never be
+      // released by the CAS in db.ts (the row would sit in_progress until the
+      // stale-claim reaper noticed it).
+      const row = db
+        .query(
+          `SELECT id, download_status, conversion_status, metadata_status,
+                  conversion_claimed_by, conversion_claim_token,
+                  metadata_claimed_by, metadata_claim_token
+             FROM jobs WHERE id = ?`,
+        )
+        .get(id) as Record<string, unknown> | null;
+      if (!row) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+
+      // Park FIRST (keeping the claim), then interrupt: when the killed child
+      // returns, the worker reads pause_reason = 'user' and releases the claim
+      // itself, so the .part survives for the next Resume/Retry.
+      parkDownloadingJobs([id]);
+      stopActiveStages([id]);
+      // A killed encode/fetch is simply re-queued; the claim is cleared through
+      // its own token so the (now interrupted) worker cannot record an outcome.
+      if (row.conversion_status === "in_progress") {
+        releaseClaimedJob(
+          "conversion",
+          id,
+          claimRef("conversion", row),
+          `conversion_status = 'pending', last_error = 'Stopped from the dashboard'`,
+        );
+      }
+      if (row.metadata_status === "in_progress") {
+        releaseClaimedJob(
+          "metadata",
+          id,
+          claimRef("metadata", row),
+          `metadata_status = 'pending', last_error = 'Stopped from the dashboard'`,
+        );
+      }
+      const fresh = db
+        .query(
+          `SELECT download_status, conversion_status, metadata_status, pause_reason FROM jobs WHERE id = ?`,
+        )
+        .get(id) as any;
+      return Response.json({
+        ok: true,
+        stopped: true,
+        job: {
+          id,
+          download_status: fresh?.download_status,
+          conversion_status: fresh?.conversion_status,
+          metadata_status: fresh?.metadata_status,
+          pause_reason: fresh?.pause_reason,
+        },
+      });
     },
   },
   // Static action paths must be listed before the :id routes so GET on them
@@ -792,24 +977,31 @@ const ROUTES: Route[] = [
         : [];
       if (ids.length === 0) return Response.json({ ok: false, error: "No job ids provided" }, { status: 400 });
       const placeholders = ids.map(() => "?").join(",");
-      // A job that is mid-download keeps its claim (owner + token + heartbeat)
-      // while being parked: the worker is still running yt-dlp and will see
-      // `pause_reason = 'user'` when it finishes, then release the claim itself
-      // through its own token. Everything else is parked with the claim cleared.
-      const result = withIdleJobs(ids, () =>
-        db.run(
-          `UPDATE jobs SET download_status = 'paused', pause_reason = 'user',
-             download_claimed_by = CASE WHEN download_status = 'downloading' THEN download_claimed_by ELSE NULL END,
-             download_claimed_at = CASE WHEN download_status = 'downloading' THEN download_claimed_at ELSE NULL END,
-             download_claim_token = CASE WHEN download_status = 'downloading' THEN download_claim_token ELSE NULL END,
-             download_heartbeat_at = CASE WHEN download_status = 'downloading' THEN download_heartbeat_at ELSE NULL END,
-             updated_at = CURRENT_TIMESTAMP
-           WHERE id IN (${placeholders}) AND download_status IN ('pending', 'downloading', 'paused')`,
-          ids,
-        ).changes,
-      );
-      if (!result.ok) return jobInProgressResponse();
-      return Response.json({ ok: true, paused: result.value });
+      // Park first, then interrupt. A job that is mid-download keeps its claim
+      // (owner + token + heartbeat) while being parked: the worker observes
+      // `pause_reason = 'user'` as soon as its interrupted download returns and
+      // releases the claim itself through its own token. Doing it in this order
+      // matters — kill first and the worker could classify the SIGINT as a
+      // failure before the row was parked. Everything else is parked with the
+      // claim cleared.
+      //
+      // No all-or-nothing 409 here: parking an active download IS the point of
+      // this route (the old guard made "pause" refuse exactly the rows it was
+      // written to park). A conversion/metadata stage is never touched.
+      const paused = db.run(
+        `UPDATE jobs SET download_status = 'paused', pause_reason = 'user',
+           download_claimed_by = CASE WHEN download_status = 'downloading' THEN download_claimed_by ELSE NULL END,
+           download_claimed_at = CASE WHEN download_status = 'downloading' THEN download_claimed_at ELSE NULL END,
+           download_claim_token = CASE WHEN download_status = 'downloading' THEN download_claim_token ELSE NULL END,
+           download_heartbeat_at = CASE WHEN download_status = 'downloading' THEN download_heartbeat_at ELSE NULL END,
+           updated_at = CURRENT_TIMESTAMP
+         WHERE id IN (${placeholders}) AND download_status IN ('pending', 'downloading', 'paused')`,
+        ids,
+      ).changes;
+      // Now stop the transfers: a pause the user asked for must stop the
+      // download now, not when yt-dlp happens to finish.
+      stopActiveStages(ids);
+      return Response.json({ ok: true, paused });
     },
   },
   {
@@ -896,7 +1088,16 @@ const ROUTES: Route[] = [
         }
       }
       try {
+        // Stop this source's in-flight downloads BEFORE its rows disappear:
+        // otherwise yt-dlp keeps running in the terminal and finishes into a
+        // file nothing tracks any more.
+        const sourceJobIds = db
+          .query("SELECT job_id FROM job_sources WHERE source_url = ?")
+          .all(identity)
+          .map((r: any) => String(r.job_id));
+        const stopped = beginCancellation(sourceJobIds);
         const result = await removeSource(source.url);
+        const late = finishCancellation(sourceJobIds);
         if (!result.removed) {
           return Response.json({ ok: false, error: "Saved source not found" }, { status: 404 });
         }
@@ -908,6 +1109,7 @@ const ROUTES: Route[] = [
           legacyJobsLinked,
           deletedJobs: result.deletedJobs,
           retainedJobs: result.retainedJobs,
+          stopped: stoppedCount(stopped, late),
           message: `Removed source from config.json and deleted ${result.deletedJobs} job(s).`,
         });
       } catch (error: any) {
@@ -964,24 +1166,26 @@ const ROUTES: Route[] = [
     methods: ["POST"],
     pattern: "/api/queue/purge",
     handler: () => {
-      const transaction = db.transaction(() => {
-        const active = db
-          .query(`SELECT id FROM jobs WHERE ${PURGE_QUEUE_PREDICATE} AND (${ACTIVE_JOB_PREDICATE}) LIMIT 1`)
-          .get();
-        if (active) return { ok: false as const };
-        const result = db.run(
-          `DELETE FROM jobs WHERE ${PURGE_QUEUE_PREDICATE}
-             AND download_claimed_by IS NULL AND download_claim_token IS NULL
-             AND conversion_claimed_by IS NULL AND conversion_claim_token IS NULL
-             AND COALESCE(conversion_status, '') != 'in_progress'
-             AND COALESCE(metadata_status, '') != 'in_progress'
-             AND metadata_claim_token IS NULL`,
-        );
-        return { ok: true as const, deleted: result.changes };
+      // Purge is "clear the queue", including the rows that are downloading
+      // right now: their children are interrupted first, so nothing keeps
+      // running in the terminal after the button is pressed. Rows whose media
+      // is already downloaded are never touched.
+      const queueIds = db
+        .query(`SELECT id FROM jobs WHERE ${PURGE_QUEUE_PREDICATE}`)
+        .all()
+        .map((r: any) => String(r.id));
+      // Cancellation is part of the purge: a row that is downloading right now
+      // has its child process interrupted before the row disappears, so
+      // "Purge Queue" can no longer leave yt-dlp running in the terminal.
+      const stopped = beginCancellation(queueIds);
+      const deleted = queueIds.length;
+      db.run(`DELETE FROM jobs WHERE ${PURGE_QUEUE_PREDICATE}`);
+      const late = finishCancellation(queueIds);
+      return Response.json({
+        ok: true,
+        deleted,
+        stopped: stoppedCount(stopped, late),
       });
-      const result = transaction.immediate();
-      if (!result.ok) return jobInProgressResponse();
-      return Response.json({ ok: true, deleted: result.deleted });
     },
   },
   {

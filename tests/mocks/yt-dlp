@@ -24,6 +24,22 @@
 //   FAKE_PROBE_FAIL=1|json  make the -J audio-track probe fail (non-zero exit /
 //                           unparsable JSON) so the single-audio fallback runs
 //   FAKE_PROBE_HANG=1       make -J hang forever (probe timeout tests)
+//   FAKE_KEEP_ALIVE=1       keep the aria2c readout window open for
+//                           FAKE_DELAY_MS instead of ending it when the
+//                           transfer finishes (progress-visibility tests)
+//
+// The aria2c branch forwards the fake downloader's stdout to this process's
+// stdout (the engine reads what the real yt-dlp leaves inherited) and turns the
+// engine's READOUT benchmark records into the console readout a real aria2c
+// writes — so the engine's aria2c progress parsing is exercised without a real
+// aria2c. Because a newline-delimited readout is not what a real aria2c emits,
+// the stream is framed instead of line-delimited:
+//
+//   ARIA2C-START <out>
+//   [#a1b2c3 1.0MiB/2.0MiB(50%) CN:4 DL:512KiB ETA:2s]
+//   ARIA2C-BENCHMARK <n> <out>        (one per record, in order)
+//   ARIA2C-DONE <code> <out>
+//   ARIA2C-ABORTED <out>              (only when the downloader was killed)
 
 import { appendFile, rename } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -181,8 +197,20 @@ attempts += 1;
 await Bun.write(counterFile, String(attempts));
 
 if (process.env.FAKE_HANG === "1") {
-  // Simulate a wedged download: never exits, ignores the abort signal enough
-  // for the watchdog to fire.
+  // A wedged download: never exits on its own. A cancellation test needs proof
+  // that the engine's SIGINT actually reached this child (and would otherwise
+  // just run until the watchdog fires), so the signal writes a marker file and
+  // exits like a real interrupted yt-dlp.
+  const signalled = `${base}.hang-signalled`;
+  const record = () => {
+    try {
+      Bun.write(signalled, String(process.pid)).finally(() => process.exit(130));
+      return;
+    } catch {}
+    process.exit(130);
+  };
+  process.on("SIGINT", record);
+  process.on("SIGTERM", record);
   await new Promise(() => {});
 }
 
@@ -246,12 +274,24 @@ if (/(^|[\\/])aria2c(\.exe)?$/i.test(downloaderArg)) {
     partPath,
     url,
   ];
-  const proc = Bun.spawn(forwarded, { stdout: "inherit", stderr: "inherit" });
+  // stdout is piped (not inherited) so the readout can be rewritten from the
+  // fake downloader's READOUT benchmark records into aria2c's console format;
+  // stderr stays inherited, as yt-dlp keeps it for diagnostics.
+  const proc = Bun.spawn(forwarded, { stdout: "pipe", stderr: "inherit" });
 
   // A hard-killed engine takes the whole chain with it. Without this the mock
   // survives as an orphan and finishes the download, so a crash test would see
   // no partial file at all — unlike a real interrupted run.
   const parentPid = process.ppid;
+  let aria2cSignalled: NodeJS.Signals | undefined;
+  const onSignal = (signal: NodeJS.Signals) => {
+    aria2cSignalled = signal;
+    try {
+      proc.kill(9);
+    } catch {}
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
   const watcher = (async () => {
     while (true) {
       if (process.ppid !== parentPid) {
@@ -264,7 +304,62 @@ if (/(^|[\\/])aria2c(\.exe)?$/i.test(downloaderArg)) {
     }
   })();
 
+  const READOUT_SPEED_BPS = 393216; // 384.0KiB
+  console.log(`ARIA2C-START ${partPath}`);
+  let readouts = 0;
+  const pump = (async () => {
+    const decoder = new TextDecoder();
+    let pending = "";
+    const reader = proc.stdout.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        pending += decoder.decode(value, { stream: true });
+        const lines = pending.split("\n");
+        pending = lines.pop() ?? "";
+        for (const line of lines) {
+          const benchmark = /^READOUT (\d+) (\d+)$/.exec(line.trim());
+          if (benchmark) {
+            readouts += 1;
+            // Mirror real aria2 output: a percentage, a transfer speed and an
+            // ETA, at util::abbrevSize / secfmt fidelity.
+            // util::abbrevSize fidelity: "0.5MiB", "10.0MiB", and a speed in
+            // the same units — what a real aria2c console shows. The speed is
+            // fixed at a value that survives the unit round trip exactly
+            // (384.0KiB ⇄ 393216 B/s) and that never appears in yt-dlp's own
+            // PROGRESS template, so an engine test can prove the speed it
+            // reports came from this readout and not from anywhere else.
+            const downloaded = parseInt(benchmark[1], 10);
+            console.log(
+              `[#a1b2c3 ${(downloaded / 1048576).toFixed(1)}MiB/${(10485760 / 1048576).toFixed(1)}MiB(${Math.round((downloaded / 10485760) * 100)}%) CN:4 DL:${(READOUT_SPEED_BPS / 1024).toFixed(1)}KiB ETA:${benchmark[2]}s]`,
+            );
+          } else if (line.trim()) {
+            console.log(line);
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  })();
+
+  // When asked, hold the readout window open for the configured delay instead
+  // of ending it the moment the transfer finishes: the engine's progress parser
+  // is then testable against a download that is genuinely still in flight.
+  const keepAliveMs = process.env.FAKE_KEEP_ALIVE === "1" ? num("FAKE_DELAY_MS", 60) : 0;
+  const readoutDeadline = Date.now() + keepAliveMs;
   const code = await proc.exited;
+  await pump;
+  // An engine that times out an in-flight transfer ends up here with a
+  // non-zero code and, because it kills rather than signals, without
+  // ARIA2C-ABORTED — which is exactly how the watchdog test tells the two
+  // categories apart.
+  await Bun.write(`${partPath}.aria2c-readouts`, String(readouts));
+  while (Date.now() < readoutDeadline) await Bun.sleep(25);
+  process.off("SIGINT", onSignal);
+  process.off("SIGTERM", onSignal);
+  console.log(`${aria2cSignalled ? "ARIA2C-ABORTED" : "ARIA2C-DONE " + code} ${partPath}`);
   if (code !== 0) {
     console.error(`ERROR: aria2c exited with code ${code}`);
     process.exit(1);

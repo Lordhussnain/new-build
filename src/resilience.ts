@@ -11,8 +11,43 @@ import { statfs } from "node:fs/promises";
 import { resolve } from "node:path";
 import { db } from "./db";
 import { logError } from "./logger";
-import { activeMetadataProcs, activeProcs, abortController, isPaused, getPauseReason, setPaused } from "./state";
+import {
+  activeConvertJobs,
+  activeConvertProcs,
+  activeDownloadJobs,
+  activeMetadataJobs,
+  activeMetadataProcs,
+  activeProcs,
+  abortController,
+  isPaused,
+  getPauseReason,
+  setPaused,
+} from "./state";
 import type { Config } from "./config";
+
+/**
+ * How long an interrupted child gets to exit on SIGINT before SIGKILL. yt-dlp
+ * needs the grace period to stop its own aria2c child cleanly; ffmpeg usually
+ * dies immediately, and a wedged one must never pin a worker.
+ */
+const KILL_GRACE_MS = 2_000;
+
+/** SIGINT a child, escalating to SIGKILL after the grace period. */
+function interruptChild(proc: Bun.Subprocess | undefined): boolean {
+  if (!proc || proc.exitCode !== null) return false;
+  try {
+    proc.kill("SIGINT");
+  } catch {
+    return true; // it exited between the checks; treat as handled
+  }
+  const timer = setTimeout(() => {
+    try {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+    } catch {}
+  }, KILL_GRACE_MS);
+  (timer as unknown as { unref?: () => void }).unref?.();
+  return true;
+}
 
 export function triggerPause(reason: string): void {
   if (isPaused() && getPauseReason() === reason) return;
@@ -23,6 +58,56 @@ export function triggerPause(reason: string): void {
       proc.kill("SIGINT");
     } catch {}
   }
+}
+
+export interface CancelledStages {
+  /** Jobs whose in-flight download process was interrupted. */
+  downloads: string[];
+  /** Jobs whose in-flight ffmpeg conversion was interrupted. */
+  conversions: string[];
+  /** Jobs whose in-flight sidecar fetch was interrupted. */
+  metadata: string[];
+}
+
+function stagesFor(predicate: (jobId: string) => boolean): CancelledStages {
+  const result: CancelledStages = { downloads: [], conversions: [], metadata: [] };
+  for (const [workerId, jobId] of activeDownloadJobs) {
+    if (!predicate(jobId)) continue;
+    result.downloads.push(jobId);
+    interruptChild(activeProcs.get(workerId));
+  }
+  for (const [workerId, jobId] of activeConvertJobs) {
+    if (!predicate(jobId)) continue;
+    result.conversions.push(jobId);
+    interruptChild(activeConvertProcs.get(workerId));
+  }
+  for (const [workerId, jobId] of activeMetadataJobs) {
+    if (!predicate(jobId)) continue;
+    result.metadata.push(jobId);
+    interruptChild(activeMetadataProcs.get(workerId));
+  }
+  return result;
+}
+
+/**
+ * Interrupt every in-flight child (yt-dlp download, ffmpeg conversion, sidecar
+ * fetch) that belongs to one of `jobIds`.
+ *
+ * This is what makes a dashboard Delete / Purge / Remove-source actually stop
+ * the work: without it the job row disappears but the child process keeps
+ * downloading in the terminal and writes a media file nobody tracks. The kill
+ * is deliberately fire-and-forget — the workers reap their own children and
+ * their claim-guarded updates decide what, if anything, is recorded.
+ */
+export function cancelActiveStages(jobIds: Iterable<string>): CancelledStages {
+  const wanted = new Set(jobIds);
+  if (wanted.size === 0) return { downloads: [], conversions: [], metadata: [] };
+  return stagesFor((jobId) => wanted.has(jobId));
+}
+
+/** Interrupt every in-flight child regardless of job (shutdown / pause-all). */
+export function cancelAllActiveStages(): CancelledStages {
+  return stagesFor(() => true);
 }
 
 export function triggerResume(): void {
@@ -380,6 +465,11 @@ export async function checkDiskSpace(
 // Kill in-flight children on shutdown; called by the lifecycle module.
 export function killActiveChildren(): void {
   for (const [, proc] of activeProcs) {
+    try {
+      proc.kill("SIGINT");
+    } catch {}
+  }
+  for (const [, proc] of activeConvertProcs) {
     try {
       proc.kill("SIGINT");
     } catch {}

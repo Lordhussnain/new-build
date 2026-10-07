@@ -19,6 +19,7 @@
 
 import { Database } from "bun:sqlite";
 import type { Config } from "./config";
+import { clearJobCancelled } from "./state";
 
 export interface Job {
   id: string;
@@ -277,6 +278,10 @@ export function initDatabase(path: string = "archive.db"): void {
          RETURNING *`,
       )
       .get(workerId, newClaimToken()) as Job | null;
+    // A fresh claim means the video is wanted again (e.g. its source was
+    // re-added after a delete): any leftover cancellation mark from a previous
+    // life of this job id must not block the new download.
+    if (row) clearJobCancelled(row.id);
     return row;
   });
 

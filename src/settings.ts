@@ -5,14 +5,33 @@
 // binding. So this module is the single allow-list of editable keys, each with
 // the metadata the UI needs to render a correct input (type, range, help text).
 //
-// Anything not listed here is invisible and immutable through the API — a
-// request naming an unlisted key is rejected rather than silently dropped, so
-// the UI and the engine can never disagree about what is tunable.
+// Everything the engine can read at runtime is exposed here — the panel is the
+// whole of config.json except for
+//   • playlists / channels / channelPlaylists — managed by the Sources panel,
+//     which understands ownership and per-source job cleanup, and
+//   • webToken — a credential; writing it through the API can lock the operator
+//     out of the dashboard, so it stays a config.json (or config manager) edit.
+//
+// Fields flagged `restartRequired` are read by the engine once at startup
+// (worker pool sizes, tool discovery, the HTTP listener, watcher intervals), so
+// a saved value applies on the next start; everything else is live.
 
 import { CONFIG_PATH, ConfigSchema, DEFAULT_CONFIG, saveConfig, type Config } from "./config";
 import { setConfig } from "./state";
 
 export type SettingType = "number" | "boolean" | "text" | "select" | "list";
+
+/** Panel groups, in the order the dashboard renders them. */
+export const SETTING_GROUPS = [
+  "downloader",
+  "media",
+  "concurrency",
+  "reliability",
+  "storage",
+  "watching",
+  "advanced",
+] as const;
+export type SettingGroup = (typeof SETTING_GROUPS)[number];
 
 export interface SettingField {
   key: keyof Config;
@@ -24,8 +43,21 @@ export interface SettingField {
   options?: { value: string; label: string }[];
   /** Rough unit hint for the UI (KB/s, minutes, …). */
   unit?: string;
-  group: "downloader" | "media" | "concurrency" | "reliability";
+  group: SettingGroup;
+  /** Read once at startup: the saved value applies after a restart. */
+  restartRequired?: boolean;
 }
+
+/** The quality presets the global `videoQuality` setting accepts. */
+const VIDEO_QUALITY_OPTIONS = [
+  { value: "highest", label: "Highest available" },
+  { value: "4k", label: "4K (up to 2160p)" },
+  { value: "1440p", label: "1440p" },
+  { value: "1080p", label: "1080p (default)" },
+  { value: "720p", label: "720p" },
+  { value: "480p", label: "480p" },
+  { value: "audio", label: "Best audio only" },
+];
 
 /**
  * The editable knobs, grouped for the settings panel.
@@ -36,11 +68,26 @@ export interface SettingField {
 export const EDITABLE_SETTINGS: SettingField[] = [
   // --- downloader -----------------------------------------------------------
   {
+    key: "videoQuality",
+    label: "Video quality",
+    type: "select",
+    group: "downloader",
+    options: VIDEO_QUALITY_OPTIONS,
+    help: "Default quality preset for new downloads. Per-video overrides live in each job's detail panel.",
+  },
+  {
     key: "useAria2c",
     label: "Use aria2c",
     type: "boolean",
     group: "downloader",
     help: "Multi-connection downloads. Falls back to yt-dlp's native downloader when aria2c is not installed, or for HLS/live streams.",
+  },
+  {
+    key: "autoscaleEnabled",
+    label: "Automatic download slots",
+    type: "boolean",
+    group: "downloader",
+    help: "Grow the download pool while the queue has backlog and bandwidth headroom, and shrink it when there is nothing to do.",
   },
   {
     key: "connectionsPerDownload",
@@ -170,6 +217,13 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     help: "Which subtitle languages to fetch: comma-separated codes (en, es, ja — regexes like en.* work), or \"all\" for every available language including auto-generated ones.",
   },
   {
+    key: "embedMetadata",
+    label: "Embed metadata & chapters",
+    type: "boolean",
+    group: "media",
+    help: "Embed thumbnail, metadata tags, and chapters into the downloaded file (yt-dlp --embed-*).",
+  },
+  {
     key: "writeThumbnail",
     label: "Save thumbnails",
     type: "boolean",
@@ -190,24 +244,43 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     group: "media",
     help: "Save yt-dlp's full metadata dump as a .info.json sidecar file.",
   },
+  {
+    key: "skipShorts",
+    label: "Skip Shorts",
+    type: "boolean",
+    group: "media",
+    help: "Do not queue YouTube Shorts when scanning (applies to new scans).",
+  },
+  {
+    key: "downloadShorts",
+    label: "Download Shorts only",
+    type: "boolean",
+    group: "media",
+    help: "Queue only Shorts when scanning (applies to new scans).",
+  },
+  {
+    key: "archiveLiveStreams",
+    label: "Archive live streams",
+    type: "boolean",
+    group: "media",
+    help: "Include currently-live streams: without this, a live video is parked as \"waiting for VOD\" until it ends.",
+  },
+  {
+    key: "verifyIntegrity",
+    label: "Verify file integrity",
+    type: "boolean",
+    group: "media",
+    help: "Record a SHA-256 hash of every converted file (shown in the job detail panel).",
+  },
   // --- concurrency ----------------------------------------------------------
   {
     key: "maxConcurrentDownloads",
-    label: "Download workers",
+    label: "Download slots",
     type: "number",
     min: 1,
     max: 20,
     group: "concurrency",
     help: "Slots allowed to claim downloads. Autoscaling tunes within this ceiling.",
-  },
-  {
-    key: "maxDownloadWorkers",
-    label: "Max download workers",
-    type: "number",
-    min: 1,
-    max: 20,
-    group: "concurrency",
-    help: "Autoscaler ceiling.",
   },
   {
     key: "minDownloadWorkers",
@@ -219,13 +292,24 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     help: "Autoscaler floor — slots kept alive even with an empty queue.",
   },
   {
+    key: "maxDownloadWorkers",
+    label: "Max download workers",
+    type: "number",
+    min: 1,
+    max: 20,
+    group: "concurrency",
+    restartRequired: true,
+    help: "Download worker processes started at launch (autoscaler ceiling). Takes effect after a restart.",
+  },
+  {
     key: "maxConcurrentConverts",
     label: "Convert workers",
     type: "number",
     min: 1,
     max: 10,
     group: "concurrency",
-    help: "Parallel ffmpeg conversions.",
+    restartRequired: true,
+    help: "Parallel ffmpeg conversions (worker processes start at launch). Takes effect after a restart.",
   },
   {
     key: "maxMetadataWorkers",
@@ -234,9 +318,34 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     min: 1,
     max: 10,
     group: "concurrency",
-    help: "Parallel subtitle/thumbnail/description fetches.",
+    restartRequired: true,
+    help: "Parallel subtitle/thumbnail/description fetches (worker processes start at launch). Takes effect after a restart.",
   },
   // --- reliability ----------------------------------------------------------
+  {
+    key: "maxRetryAttempts",
+    label: "Max retry attempts",
+    type: "number",
+    min: 1,
+    group: "reliability",
+    help: "Per-video retry budget for downloads (no-progress attempts; a retry that advances progress is free).",
+  },
+  {
+    key: "maxFailuresPerVideo",
+    label: "Max failures per video",
+    type: "number",
+    min: 1,
+    group: "reliability",
+    help: "Hard cap per video across download, conversion, and metadata stages.",
+  },
+  {
+    key: "maxFailures",
+    label: "Circuit breaker threshold",
+    type: "number",
+    min: 1,
+    group: "reliability",
+    help: "Consecutive pipeline failures (with no success in between) that pause the whole engine — expired cookies or a YouTube outage should not burn the queue one video at a time.",
+  },
   {
     key: "maxResumeAttempts",
     label: "Max resume attempts",
@@ -291,13 +400,176 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     group: "reliability",
     help: "Ceiling for the duration-aware timeout.",
   },
+  {
+    key: "verifyExistingFiles",
+    label: "Verify existing files on start",
+    type: "boolean",
+    group: "reliability",
+    restartRequired: true,
+    help: "At startup, re-queue jobs whose downloaded file is missing from disk. Takes effect after a restart.",
+  },
+  {
+    key: "minFreeSpaceGB",
+    label: "Minimum free disk space",
+    type: "number",
+    min: 1,
+    unit: "GB",
+    group: "reliability",
+    help: "Pause the engine instead of filling the disk when free space drops below this.",
+  },
+  {
+    key: "networkMonitorEnabled",
+    label: "Network monitor",
+    type: "boolean",
+    group: "reliability",
+    restartRequired: true,
+    help: "Probe YouTube periodically and pause the engine after consecutive failures. Takes effect after a restart.",
+  },
+  // --- storage --------------------------------------------------------------
+  {
+    key: "outputRoot",
+    label: "Output folder",
+    type: "text",
+    group: "storage",
+    help: "Where new downloads are written (relative to the app folder or absolute). Already-queued jobs keep their folder; applies to new scans.",
+  },
+  {
+    key: "secondaryStoragePath",
+    label: "Secondary storage",
+    type: "text",
+    group: "storage",
+    help: "Move finished files (media + sidecars) here once conversion succeeds. Blank = keep everything in the output folder.",
+  },
+  {
+    key: "deleteSourceAfterConvert",
+    label: "Delete source after convert",
+    type: "boolean",
+    group: "storage",
+    help: "Remove the pre-conversion file once the re-muxed/converted file is recorded. Off keeps both copies.",
+  },
+  {
+    key: "archiveFile",
+    label: "yt-dlp archive file",
+    type: "text",
+    group: "storage",
+    help: "yt-dlp --download-archive list of finished video ids; prevents re-downloading after a database reset.",
+  },
+  {
+    key: "cookiesFile",
+    label: "Cookies file",
+    type: "text",
+    group: "storage",
+    help: "Netscape cookies.txt used for authenticated downloads. The engine notices the file appearing or changing while it runs.",
+  },
+  // --- watching -------------------------------------------------------------
+  {
+    key: "rssEnabled",
+    label: "Watch channels (RSS)",
+    type: "boolean",
+    group: "watching",
+    help: "Cheap per-channel RSS polling that picks up new uploads without a full rescan.",
+  },
+  {
+    key: "rssPollIntervalMinutes",
+    label: "RSS poll interval",
+    type: "number",
+    min: 1,
+    unit: "min",
+    group: "watching",
+    restartRequired: true,
+    help: "How often channel feeds are checked. Takes effect after a restart.",
+  },
+  {
+    key: "daemonMode",
+    label: "Daemon mode",
+    type: "boolean",
+    group: "watching",
+    restartRequired: true,
+    help: "Keep running and rescan every source on a schedule instead of exiting when the queue drains. Takes effect after a restart.",
+  },
+  {
+    key: "rescanIntervalHours",
+    label: "Full rescan interval",
+    type: "number",
+    min: 0,
+    unit: "h",
+    group: "watching",
+    restartRequired: true,
+    help: "Daemon-mode full rescan cadence (0 disables). Takes effect after a restart.",
+  },
+  // --- advanced -------------------------------------------------------------
+  {
+    key: "ytDlpPath",
+    label: "yt-dlp path",
+    type: "text",
+    group: "advanced",
+    restartRequired: true,
+    help: "Explicit yt-dlp executable (blank = auto-discover on PATH). Takes effect after a restart.",
+  },
+  {
+    key: "ffmpegPath",
+    label: "ffmpeg path",
+    type: "text",
+    group: "advanced",
+    restartRequired: true,
+    help: "Explicit ffmpeg executable (blank = auto-discover on PATH). Takes effect after a restart.",
+  },
+  {
+    key: "aria2cPath",
+    label: "aria2c path",
+    type: "text",
+    group: "advanced",
+    restartRequired: true,
+    help: "Explicit aria2c executable, or \"none\" to force the native downloader even when aria2c is installed. Takes effect after a restart.",
+  },
+  {
+    key: "validateCookiesOnStart",
+    label: "Validate cookies on start",
+    type: "boolean",
+    group: "advanced",
+    restartRequired: true,
+    help: "Probe cookies.txt at startup and warn when it is expired. Takes effect after a restart.",
+  },
+  {
+    key: "webPort",
+    label: "Web UI port",
+    type: "number",
+    min: 1,
+    max: 65535,
+    group: "advanced",
+    restartRequired: true,
+    help: "HTTP port for this dashboard. Takes effect after a restart (the current page keeps working until then).",
+  },
+  {
+    key: "webBind",
+    label: "Web UI bind address",
+    type: "text",
+    group: "advanced",
+    restartRequired: true,
+    help: "127.0.0.1 = this machine only (default); 0.0.0.0 exposes the dashboard to the network — set a webToken in config.json if you do. Takes effect after a restart.",
+  },
 ];
 
 const EDITABLE_KEYS = new Set<string>(EDITABLE_SETTINGS.map((f) => f.key));
 
+/** Keys the dashboard may write but that only take effect on the next start. */
+const RESTART_KEYS = new Set<string>(EDITABLE_SETTINGS.filter((f) => f.restartRequired).map((f) => f.key));
+
+/** Loopback binds keep the dashboard on this machine; anything else is exposed. */
+function isNetworkExposed(host: string): boolean {
+  const h = String(host || "").trim().toLowerCase();
+  if (!h) return false; // empty = the server's loopback default
+  return !(h === "localhost" || h === "::1" || h === "[::1]" || h === "127.0.0.1" || h.startsWith("127."));
+}
+
 /** True when the dashboard is allowed to read/write this key. */
 export function isEditableSetting(key: string): boolean {
   return EDITABLE_KEYS.has(key);
+}
+
+/** True when a saved value of this key only applies after an engine restart. */
+export function requiresRestart(key: string): boolean {
+  return RESTART_KEYS.has(key);
 }
 
 export interface SettingsSnapshot {
@@ -325,6 +597,8 @@ export interface ApplySettingsResult {
   error?: string;
   /** Keys that were actually changed (and are now live). */
   changed: string[];
+  /** Changed keys whose value only applies after a restart. */
+  restartRequired?: string[];
   config?: Config;
 }
 
@@ -434,6 +708,21 @@ export async function applySettings(
   const changed = Object.keys(coerced).filter(
     (k) => JSON.stringify((current as any)[k]) !== JSON.stringify((validated as any)[k]),
   );
+  const restartRequired = changed.filter((k) => requiresRestart(k));
+
+  // Safety rail: binding the (token-less) dashboard to a network address is
+  // how an archive ends up on the LAN for anyone to purge. webToken is
+  // deliberately not editable here, so a patch that introduces a non-loopback
+  // bind on an unprotected dashboard is refused outright.
+  if (changed.includes("webBind") && isNetworkExposed(validated.webBind) && !validated.webToken) {
+    return {
+      ok: false,
+      error:
+        "Refusing to bind the dashboard to a network address while webToken is empty — " +
+        "set webToken in config.json first (or keep webBind on 127.0.0.1)",
+      changed: [],
+    };
+  }
 
   try {
     await saveConfig(validated, configPath);
@@ -444,5 +733,13 @@ export async function applySettings(
   // Make it live: workers read getConfig() each loop iteration, so this takes
   // effect on the next download without a restart.
   setConfig(validated);
-  return { ok: true, changed, config: validated };
+  return { ok: true, changed, restartRequired, config: validated };
 }
+
+/** Every config key the panel intentionally does not offer, with the reason. */
+export const NON_EDITABLE_SETTINGS: { key: keyof Config; reason: string }[] = [
+  { key: "playlists", reason: "managed by the Sources panel" },
+  { key: "channels", reason: "managed by the Sources panel" },
+  { key: "channelPlaylists", reason: "managed by the Sources panel" },
+  { key: "webToken", reason: "credential — edit config.json (or the config manager) to change it" },
+];

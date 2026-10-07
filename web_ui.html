@@ -1432,7 +1432,9 @@
             <td><span class="status-badge ${statusClass}">${escapeHtml(badgeText)}</span>${attemptNote}${resumeNote}${errorNote}</td>
             <td style="font-size: 0.78rem;">${metaBadge}</td>
             <td>
-              ${status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>` : '-'}
+              ${status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>` : ''}
+              ${isStoppable(job) ? `<button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" title="Interrupt this job now — the in-flight downloader is stopped, and a kept partial resumes on Retry." onclick="stopJob('${job.id}')">⏹️ Stop</button>` : ''}
+              ${status === 'failed' || isStoppable(job) ? '' : '-'}
             </td>
           </tr>
         `;
@@ -1443,6 +1445,34 @@
       await fetch(`/api/retry/${encodeURIComponent(id)}`, { method: 'POST' });
       showNotification('🔄 Job queued for retry', 'success');
       refreshData();
+    }
+
+    // Show Stop only while something is actually running — the row where "why
+    // is this still going?" is a real question. POST /api/jobs/:id/stop parks a
+    // downloading job as a user pause (keeping its partial, so Retry resumes
+    // it) and releases any conversion/metadata claim. A row that has not
+    // started yet is left alone: holding those is what the selection's
+    // "Pause Selected" is for.
+    function isStoppable(job) {
+      return job.download_status === 'downloading'
+        || job.conversion_status === 'in_progress'
+        || job.metadata_status === 'in_progress';
+    }
+
+    async function stopJob(id) {
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/stop`, { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+          const kept = data.job?.pause_reason === 'user' && data.job?.download_status === 'paused';
+          showNotification(kept ? '⏹️ Stopped — partial kept, Retry resumes it' : '⏹️ Job stopped', 'success');
+          refreshData();
+        } else {
+          showNotification(`❌ ${data.error || 'Stop failed'}`, 'error');
+        }
+      } catch {
+        showNotification('❌ Failed to stop the job', 'error');
+      }
     }
     
     async function togglePause() {
@@ -1738,19 +1768,34 @@
       const host = document.getElementById('settingsFields');
       if (!settingsSnapshot) { host.innerHTML = ''; return; }
 
+      // Every group the API sends is rendered, in the server's own order.
+      // A hardcoded list here used to silently DROP every field whose group it
+      // did not name — which is how storage, watching and advanced settings
+      // were missing from this panel even though /api/settings exposed them.
+      const GROUP_TITLES = {
+        downloader: '🚀 Downloader',
+        media: '🎵 Media & audio',
+        concurrency: '⚡ Concurrency',
+        reliability: '🛡️ Reliability & resume',
+        storage: '💾 Storage & disk',
+        watching: '📡 Sources & watching',
+        advanced: '🧪 Advanced',
+      };
+      const order = Object.keys(GROUP_TITLES);
+      const present = [...new Set(settingsSnapshot.fields.map(f => f.group))];
       const groups = [
-        ['downloader', '🚀 Downloader'],
-        ['media', '🎵 Media & audio'],
-        ['concurrency', '⚡ Concurrency'],
-        ['reliability', '🛡️ Reliability & resume'],
+        ...order.filter(g => present.includes(g)),
+        // A group the UI has no title for still renders under its raw name,
+        // so a future field can never vanish from the panel again.
+        ...present.filter(g => !order.includes(g)),
       ];
-      const byGroup = new Map(groups.map(g => [g[0], []]));
+      const byGroup = new Map(groups.map(g => [g, []]));
       for (const f of settingsSnapshot.fields) byGroup.get(f.group)?.push(f);
 
-      host.innerHTML = groups.map(([key, title]) => {
+      host.innerHTML = groups.map(key => {
         const rows = byGroup.get(key) || [];
         if (!rows.length) return '';
-        return `<div class="settings-group"><h4>${title}</h4>${rows.map(renderSettingRow).join('')}</div>`;
+        return `<div class="settings-group"><h4>${GROUP_TITLES[key] || escapeHtml(key)}</h4>${rows.map(renderSettingRow).join('')}</div>`;
       }).join('');
       updateSaveButton();
     }
@@ -1759,6 +1804,11 @@
       const value = settingsDraft[f.key] !== undefined ? settingsDraft[f.key] : settingsSnapshot.values[f.key];
       const dirty = settingsDraft[f.key] !== undefined ? ' is-dirty' : '';
       const unit = f.unit ? `<span class="unit">${escapeHtml(f.unit)}</span>` : '';
+      // The engine reads these once at launch, so the saved value is not live.
+      // Saying so on the row beats the old behaviour of silently ignoring it.
+      const restart = f.restartRequired
+        ? `<span class="pill warn" title="Read once at startup — the saved value applies after the engine restarts.">restart</span>`
+        : '';
       let control = '';
 
       if (f.type === 'boolean') {
@@ -1787,7 +1837,7 @@
 
       return `<div class="setting-row${dirty}" data-key="${f.key}">
           <div class="desc">
-            <div class="name">${escapeHtml(f.label)}</div>
+            <div class="name">${escapeHtml(f.label)}${restart}</div>
             <div class="help">${escapeHtml(f.help)}</div>
           </div>
           <div>${control}</div>
@@ -2174,6 +2224,7 @@
         ${job.last_error ? `<div style="margin-top:14px; font-size:0.74rem; color: var(--text-secondary); line-height:1.4;">A kept partial means the next attempt resumes from it. Permanent failures (private / removed / age-gated / geo-blocked) are never retried automatically.</div>` : ''}
         <div style="margin-top:16px; display:flex; gap:8px; flex-wrap:wrap;">
           <button class="btn btn-success" style="padding:6px 12px; font-size:0.75rem;" onclick="retryJob('${job.id}'); closeJobDetail();">🔄 Retry job</button>
+          ${isStoppable(job) ? `<button class="btn btn-warning" style="padding:6px 12px; font-size:0.75rem;" onclick="stopJob('${job.id}'); closeJobDetail();">⏹️ Stop job</button>` : ''}
           <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.75rem;" onclick="openJobDetailById('${job.id}')">🔄 Refresh</button>
           <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.75rem;" onclick="closeJobDetail()">Close</button>
         </div>`;

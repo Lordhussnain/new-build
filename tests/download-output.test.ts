@@ -4,6 +4,7 @@ import {
   MAX_DOWNLOAD_PATH_LENGTH,
   MAX_OUTPUT_LINE_LENGTH,
   MAX_OUTPUT_TAIL_LENGTH,
+  parseAria2cReadout,
   parseDownloadPath,
   readProcessOutput,
 } from "../src/download-output";
@@ -139,5 +140,78 @@ describe("readProcessOutput", () => {
     const broken = new ReadableStream<Uint8Array>({ pull(controller) { controller.error(new Error("pipe failed")); } });
     await expect(readProcessOutput(broken)).rejects.toThrow("pipe failed");
     expect(broken.locked).toBe(false);
+  });
+});
+
+describe("parseAria2cReadout", () => {
+  test("parses the console readout aria2c writes to a non-TTY stdout", () => {
+    // The live shape, byte for byte, from aria2's ConsoleStatCalc on a piped
+    // stdout: no padding, no colours, newline-terminated.
+    expect(parseAria2cReadout("[#208c72 1.4MiB/3.0MiB(48%) CN:16 DL:1.2MiB ETA:2m30s]")).toEqual({
+      percent: 48,
+      speedBps: 1.2 * 1024 * 1024,
+      etaSeconds: 150,
+      totalBytes: 3 * 1024 * 1024,
+      downloadedBytes: 1.4 * 1024 * 1024,
+    });
+  });
+
+  test("derives a percentage when aria2 omits one, and keeps raw byte counts", () => {
+    // aria2 only prints "(N%)" once it knows the total length. Until then the
+    // sizes are still usable — and the raw-byte form (511B, 1023B, long runs)
+    // must parse too, since abbrevSize only abbreviates above 1KiB.
+    expect(parseAria2cReadout("[#a1b2c3 524288B/10485760B CN:4 DL:671088B ETA:3s]")).toEqual({
+      percent: 5,
+      speedBps: 671088,
+      etaSeconds: 3,
+      totalBytes: 10485760,
+      downloadedBytes: 524288,
+    });
+    expect(parseAria2cReadout("[#a1b2c3 1,000B/2.0MiB(0%) CN:1 DL:1,000B ETA:3h]")?.percent).toBe(0);
+    expect(parseAria2cReadout("[#a1b2c3 0B/0B CN:1 DL:0B]")).toBeNull();
+  });
+
+  test("tolerates the padding and CR a Windows console leaves behind", () => {
+    const padded = "  [#abcdef 1.4MiB/3.0MiB(48%) CN:16 DL:1.2MiB ETA:2m30s]     ";
+    expect(parseAria2cReadout(padded)?.percent).toBe(48);
+  });
+
+  test("reads hours, minutes and seconds out of secfmt", () => {
+    expect(parseAria2cReadout("[#abcdef 1GiB/2GiB(50%) CN:16 DL:1GiB ETA:1h5m]")?.etaSeconds).toBe(3900);
+    expect(parseAria2cReadout("[#abcdef 1GiB/2GiB(50%) CN:16 DL:1GiB ETA:45s]")?.etaSeconds).toBe(45);
+  });
+
+  test("a finished transfer reports 100% with no speed or ETA", () => {
+    expect(parseAria2cReadout("[#abcdef 3.0MiB/3.0MiB(100%) CN:16]")).toEqual({
+      percent: 100,
+      speedBps: 0,
+      etaSeconds: 0,
+      totalBytes: 3 * 1024 * 1024,
+      downloadedBytes: 3 * 1024 * 1024,
+    });
+  });
+
+  test("rejects everything that is not a single-group readout", () => {
+    for (const line of [
+      // The compact multi-group form begins with "[DL:", not a group id.
+      "[DL:1.2MiB][#208c72 1.4MiB/3.0MiB(48%)][#abcdef 1MiB/2MiB(50%)]",
+      // yt-dlp's own channels must never be mistaken for readouts.
+      "PROGRESS:55.5|2.5MiB|6|10485760|5820416",
+      `${DOWNLOAD_PATH_PREFIX}/downloads/video.mp4`,
+      "[download] Destination: /downloads/video.mp4",
+      "[youtube] mockvid001: Downloading webpage",
+      "",
+      "[]",
+    ]) {
+      expect(parseAria2cReadout(line)).toBeNull();
+    }
+  });
+
+  test("ignores aria2c's other bracketed records, but not their own readout", () => {
+    // The engine gets one record per line, so a mixed line is not expected;
+    // what matters is that a readout among aria2's extras still parses.
+    expect(parseAria2cReadout("[#abcdef 1.0MiB/2.0MiB(50%) CN:16 DL:1MiB ETA:1s]")?.percent).toBe(50);
+    expect(parseAria2cReadout("[FileAlloc:#123456 1.0MiB/2.0MiB(50%)]")).toBeNull();
+    expect(parseAria2cReadout("[Checksum:#123456 1.0MiB/2.0MiB(50%)]")).toBeNull();
   });
 });

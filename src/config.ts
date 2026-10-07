@@ -56,7 +56,8 @@ export const ConfigSchema = z
     archiveFile: z.string(),
     cookiesFile: z.string(),
     deleteSourceAfterConvert: z.boolean(),
-    videoQuality: z.enum(["highest", "1080p", "720p", "480p", "audio"]),
+        // Every preset in QUALITY_FORMATS is selectable, globally and per job.
+    videoQuality: z.enum(["highest", "4k", "1440p", "1080p", "720p", "480p", "audio"]),
     targetFormat: z.enum(["mp4", "mkv", "webm", "mp3", "m4a"]),
     subtitleFormat: z.enum(["srt", "vtt", "ass", "lrc"]),
     // --- Multi-audio tracks --------------------------------------------------

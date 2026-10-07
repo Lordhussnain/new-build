@@ -27,6 +27,21 @@
 //   FAKE_ARIA2C_FAIL_MODE=transient|corrupt   what the failure looks like
 //   FAKE_ARIA2C_INFLIGHT_MS=3000   hold a transfer open (partial + control file
 //                                  on disk) so a hard kill can interrupt it
+//   FAKE_ARIA2C_READOUT_MS=250     console-readout cadence while in flight
+//   FAKE_ARIA2C_READOUT=1          emit READOUT benchmark records instead of
+//                                  printing the readout itself; the fake yt-dlp
+//                                  then renders them as aria2c's console format
+//
+// While a transfer is held open it also prints aria2c's console readout on
+// stdout, one record per interval, in the exact shape real aria2c writes to a
+// non-TTY stdout:
+//
+//   [#a1b2c3 1.0MiB/10.0MiB(10%) CN:4 DL:512KiB ETA:18s]
+//
+// The sizes are synthetic (a mock has no bytes to fetch) but the grammar is
+// real, because the engine parses these records to drive the dashboard's
+// progress/speed/ETA columns on the aria2c path: yt-dlp fires no progress hook
+// of its own while an external downloader runs.
 
 const argv = process.argv.slice(2);
 
@@ -114,12 +129,38 @@ if (inflightMs > 0) {
   await Bun.write(out, "x".repeat(4096));
   await Bun.write(controlFile, "mock-control-file");
   const parentPid = process.ppid;
-  const deadline = Date.now() + inflightMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + inflightMs;
+  // Never faster than a real aria2's once-a-second readout cadence.
+  const readoutMs = Math.max(1000, parseInt(process.env.FAKE_ARIA2C_READOUT_MS || "1000", 10) || 1000);
+  // A mock has no bytes to fetch, so the reported sizes are synthetic — but
+  // the grammar, the units and the cadence are the real ones, and the progress
+  // climbs without ever claiming a finished transfer (the file is still
+  // incomplete at every readout).
+  const TOTAL = 10 * 1024 * 1024;
+  const benchmark = process.env.FAKE_ARIA2C_READOUT === "1";
   let orphaned = false;
+  let nextReadout = startedAt;
   while (Date.now() < deadline) {
     if (process.ppid !== parentPid) {
       orphaned = true;
       break;
+    }
+    if (Date.now() >= nextReadout) {
+      const pct = Math.min(90, Math.max(5, Math.round(((Date.now() - startedAt) / inflightMs) * 100)));
+      const downloaded = Math.round((TOTAL * pct) / 100);
+      const etaSeconds = Math.max(1, Math.round((deadline - Date.now()) / 1000));
+      if (benchmark) {
+        // The fake yt-dlp turns this into a real-looking console readout on
+        // stdout, the channel yt-dlp leaves inherited for an external
+        // downloader — a newline-delimited record, so it needs framing.
+        console.log(`READOUT ${downloaded} ${etaSeconds}`);
+      } else {
+        console.log(
+          `[#a1b2c3 ${(downloaded / 1048576).toFixed(1)}MiB/${(TOTAL / 1048576).toFixed(1)}MiB(${pct}%) CN:4 DL:512KiB ETA:${etaSeconds}s]`,
+        );
+      }
+      nextReadout = Date.now() + readoutMs;
     }
     await Bun.sleep(25);
   }

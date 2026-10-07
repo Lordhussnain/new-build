@@ -222,21 +222,24 @@ describe("job mutations reject active pipeline claims", () => {
     expect(await readFile(archive, "utf-8")).toBe("youtube busyretry\n");
   });
 
-  test("single delete refuses an active metadata stage", async () => {
+  test("single delete cancels an active metadata stage and removes the row", async () => {
+    // Deleting IS cancelling now: the old route answered 409 for exactly the
+    // rows a user clicks Delete on, which left yt-dlp/ffmpeg running in the
+    // terminal for a job they had just told the dashboard to remove.
     insertJob("busydelete", { download_status: "downloaded", metadata_status: "in_progress" });
 
     const response = await api("/api/jobs/busydelete", { method: "DELETE" });
-    await expectInProgress(response);
-    expect(getJob("busydelete")).toMatchObject({
-      download_status: "downloaded",
-      metadata_status: "in_progress",
-    });
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data).toMatchObject({ ok: true, deleted: 1 });
+    expect(getJob("busydelete")).toBeNull();
   });
 
-  test("bulk delete is all-or-nothing when one requested job is downloading", async () => {
+  test("bulk delete removes downloading rows too (cancel then delete)", async () => {
     insertJob("bulk-active", {
       download_status: "downloading",
       download_claimed_by: "dl-1",
+      download_claim_token: "tok-dl-1",
     });
     insertJob("bulk-idle", { download_status: "pending" });
 
@@ -245,12 +248,14 @@ describe("job mutations reject active pipeline claims", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ids: ["bulk-active", "bulk-idle"] }),
     });
-    await expectInProgress(response);
-    expect(getJob("bulk-active")).toMatchObject({ download_status: "downloading", download_claimed_by: "dl-1" });
-    expect(getJob("bulk-idle")).toMatchObject({ download_status: "pending" });
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data.deleted).toBe(2);
+    expect(getJob("bulk-active")).toBeNull();
+    expect(getJob("bulk-idle")).toBeNull();
   });
 
-  test("bulk pause leaves every requested row unchanged if one stage is active", async () => {
+  test("bulk pause parks downloading rows but never touches a conversion stage", async () => {
     insertJob("pause-active", {
       download_status: "downloaded",
       conversion_status: "in_progress",
@@ -263,19 +268,24 @@ describe("job mutations reject active pipeline claims", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ids: ["pause-active", "pause-idle"] }),
     });
-    await expectInProgress(response);
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data).toMatchObject({ ok: true, paused: 1 });
+    // The row owned by the converter is untouched — a pause is a download
+    // action, and the encode keeps its worker.
     expect(getJob("pause-active")).toMatchObject({
       download_status: "downloaded",
       conversion_status: "in_progress",
       conversion_claimed_by: "cv-2",
     });
-    expect(getJob("pause-idle")).toMatchObject({ download_status: "pending" });
+    expect(getJob("pause-idle")).toMatchObject({ download_status: "paused", pause_reason: "user" });
   });
 
-  test("single-job pause refuses a currently downloading row and leaves it unchanged", async () => {
+  test("single-job pause parks a downloading row and keeps its claim for the worker", async () => {
     insertJob("pause-downloading", {
       download_status: "downloading",
       download_claimed_by: "dl-1",
+      download_claim_token: "tok-dl-1",
       pause_reason: null,
     });
 
@@ -284,29 +294,52 @@ describe("job mutations reject active pipeline claims", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ids: ["pause-downloading"] }),
     });
-    await expectInProgress(response);
+    expect(response.status).toBe(200);
     expect(getJob("pause-downloading")).toMatchObject({
-      download_status: "downloading",
-      pause_reason: null,
+      download_status: "paused",
+      pause_reason: "user",
+      // The claim stays with the worker so it can observe the user pause when
+      // its interrupted download returns and release the claim itself.
       download_claimed_by: "dl-1",
+      download_claim_token: "tok-dl-1",
     });
   });
 
-  test("purge refuses a paused row that still holds a download claim", async () => {
+  test("purge cancels and removes downloading and claimed rows, keeping finished media", async () => {
     insertJob("purge-active", {
       download_status: "paused",
       pause_reason: "user",
       download_claimed_by: "dl-3",
     });
     insertJob("purge-idle", { download_status: "pending" });
+    insertJob("purge-done", { download_status: "downloaded", conversion_status: "done" });
 
     const response = await api("/api/queue/purge", { method: "POST" });
-    await expectInProgress(response);
-    expect(getJob("purge-active")).toMatchObject({
-      download_status: "paused",
-      download_claimed_by: "dl-3",
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data).toMatchObject({ ok: true, deleted: 2 });
+    expect(getJob("purge-active")).toBeNull();
+    expect(getJob("purge-idle")).toBeNull();
+    // Purge clears the queue; it never deletes media that is already on disk.
+    expect(getJob("purge-done")).toMatchObject({ download_status: "downloaded" });
+  });
+
+  test("stop parks a downloading job without deleting it", async () => {
+    insertJob("stop-me", {
+      download_status: "downloading",
+      download_claimed_by: "dl-2",
+      download_claim_token: "tok-dl-2",
+      progress: 42,
     });
-    expect(getJob("purge-idle")).toMatchObject({ download_status: "pending" });
+
+    const response = await api("/api/jobs/stop-me/stop", { method: "POST" });
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data.ok).toBe(true);
+    expect(data.job).toMatchObject({ download_status: "paused", pause_reason: "user" });
+    const row = getJob("stop-me");
+    expect(row).toMatchObject({ download_status: "paused", pause_reason: "user", progress: 42 });
+    expect(row).not.toBeNull();
   });
 });
 

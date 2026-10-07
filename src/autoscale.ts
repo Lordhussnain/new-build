@@ -13,6 +13,13 @@ export const autoscaler = {
   targetWorkers: 3,
   minWorkers: 1,
   maxWorkers: 5,
+  /**
+   * How many download worker processes actually exist (supervised at startup).
+   * The ceiling can be lowered live, but never raised past the pool: extra
+   * slots would have no process to claim work. Raising `maxDownloadWorkers`
+   * therefore takes effect after a restart.
+   */
+  poolSize: 5,
   maxBandwidthKBps: 0,
   // Slots added per tick while a backlog exists (1 = the original slow ramp).
   rampStep: 2,
@@ -28,6 +35,7 @@ export const autoscaler = {
     this.enabled = c.autoscaleEnabled;
     this.minWorkers = c.minDownloadWorkers;
     this.maxWorkers = c.maxDownloadWorkers;
+    this.poolSize = c.maxDownloadWorkers;
     this.maxBandwidthKBps = c.maxBandwidthKBps;
     this.rampStep = Math.max(1, Math.floor(c.autoscaleRampStep));
     this.targetWorkers = Math.max(this.minWorkers, Math.min(c.maxConcurrentDownloads, this.maxWorkers));
@@ -63,9 +71,18 @@ export function setActiveSlots(target: number): void {
 // to minDownloadWorkers when there is nothing to do. With autoscaling
 // disabled the slot count stays pinned to maxConcurrentDownloads.
 export function autoscaleTick(): void {
+  // Read everything from the live config: toggling autoscaling, the ramp step,
+  // or the worker floor/ceiling from the dashboard applies on the next tick
+  // without a restart (the ceiling is clamped to the supervised pool size).
   const config = getConfig();
+  const minWorkers = Math.max(1, Math.min(20, Math.floor(config.minDownloadWorkers)));
+  const maxWorkers = Math.max(minWorkers, Math.min(20, autoscaler.poolSize, Math.floor(config.maxDownloadWorkers)));
+  autoscaler.minWorkers = minWorkers;
+  autoscaler.maxWorkers = maxWorkers;
+  autoscaler.rampStep = Math.max(1, Math.floor(config.autoscaleRampStep));
+  autoscaler.enabled = config.autoscaleEnabled;
   if (!autoscaler.enabled) {
-    setActiveSlots(Math.max(autoscaler.minWorkers, Math.min(config.maxConcurrentDownloads, autoscaler.maxWorkers)));
+    setActiveSlots(Math.max(minWorkers, Math.min(config.maxConcurrentDownloads, maxWorkers)));
     autoscaler.targetWorkers = activeDlSlots.size;
     return;
   }
@@ -80,16 +97,16 @@ export function autoscaleTick(): void {
       .get() as any;
     const backlog = q?.backlog || 0;
     const aggBps = autoscaler.getAggregateSpeed();
-    const capBps = autoscaler.maxBandwidthKBps * 1024;
+    const capBps = config.maxBandwidthKBps * 1024;
     let target = activeDlSlots.size;
     if (backlog === 0) {
-      target = autoscaler.minWorkers;
-    } else if (capBps > 0 && aggBps > capBps * 0.9 && target > autoscaler.minWorkers) {
+      target = minWorkers;
+    } else if (capBps > 0 && aggBps > capBps * 0.9 && target > minWorkers) {
       target--; // bandwidth saturated — fewer slots = more headroom each
-    } else if (backlog > target && target < autoscaler.maxWorkers && (capBps === 0 || aggBps < capBps * 0.7)) {
+    } else if (backlog > target && target < maxWorkers && (capBps === 0 || aggBps < capBps * 0.7)) {
       // Waiting jobs + bandwidth headroom: grow by the configured ramp step,
       // but never overshoot either the backlog or the worker ceiling.
-      target = Math.min(target + autoscaler.rampStep, backlog, autoscaler.maxWorkers);
+      target = Math.min(target + autoscaler.rampStep, backlog, maxWorkers);
     }
     setActiveSlots(target);
     autoscaler.targetWorkers = activeDlSlots.size;

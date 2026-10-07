@@ -14,7 +14,15 @@ import { join } from "node:path";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 import { activeDownloadJobs, getConfig, setConfig } from "../src/state";
 import { db, initDatabase } from "../src/db";
-import { EDITABLE_SETTINGS, applySettings, isEditableSetting, readSettings } from "../src/settings";
+import {
+  EDITABLE_SETTINGS,
+  NON_EDITABLE_SETTINGS,
+  SETTING_GROUPS,
+  applySettings,
+  isEditableSetting,
+  readSettings,
+  requiresRestart,
+} from "../src/settings";
 import { STALE_CLAIM_THRESHOLDS } from "../src/reconcile";
 import { handleRequest } from "../src/web";
 
@@ -59,9 +67,30 @@ describe("the editable allow-list", () => {
     }
   });
 
-  test("excludes credentials, paths, and the network binding", () => {
-    for (const k of ["webToken", "webBind", "webPort", "playlists", "channels", "cookiesFile", "archiveFile", "outputRoot", "ytDlpPath"]) {
+  test("excludes only credentials and the URL lists, and says why for each", () => {
+    // The panel is the whole of config.json except the keys that genuinely
+    // cannot be a form field: the token (a credential) and the source lists
+    // (managed by the Sources panel, which also knows how to clean up jobs).
+    const deliberatelyOut = ["webToken", "playlists", "channels", "channelPlaylists"];
+    for (const k of deliberatelyOut) {
       expect(isEditableSetting(k)).toBe(false);
+      // Every exclusion carries a reason, so the panel can explain itself.
+      expect(NON_EDITABLE_SETTINGS.find((s) => s.key === k)?.reason.length).toBeGreaterThan(0);
+    }
+  });
+
+  test("covers every config key: editable, or deliberately excluded with a reason", () => {
+    // Regression guard for "there is not all options in the WebUI": a new
+    // config key must be either rendered by the panel or explicitly excluded
+    // — it can never be silently missing from both.
+    const excluded = new Set<string>(NON_EDITABLE_SETTINGS.map((s) => s.key as string));
+    for (const key of Object.keys(DEFAULT_CONFIG)) {
+      expect(isEditableSetting(key) || excluded.has(key)).toBe(true);
+    }
+    // And the excluded list must only name real config keys.
+    for (const entry of NON_EDITABLE_SETTINGS) {
+      expect(Object.hasOwn(DEFAULT_CONFIG, entry.key)).toBe(true);
+      expect(isEditableSetting(entry.key as string)).toBe(false);
     }
   });
 
@@ -69,7 +98,7 @@ describe("the editable allow-list", () => {
     for (const f of EDITABLE_SETTINGS) {
       expect(f.label.length).toBeGreaterThan(0);
       expect(f.help.length).toBeGreaterThan(0);
-      expect(["downloader", "media", "concurrency", "reliability"]).toContain(f.group);
+      expect(SETTING_GROUPS as readonly string[]).toContain(f.group);
     }
   });
 
@@ -84,6 +113,17 @@ describe("the editable allow-list", () => {
     const conns = EDITABLE_SETTINGS.find((f) => f.key === "connectionsPerDownload")!;
     expect(conns.min).toBe(1);
     expect(conns.max).toBe(64);
+  });
+
+  test("settings read by the engine only at startup are marked restartRequired", () => {
+    // The panel must be able to tell an operator that a change needs a restart
+    // instead of implying it is live.
+    for (const key of ["ytDlpPath", "ffmpegPath", "aria2cPath", "maxDownloadWorkers", "webPort", "daemonMode"]) {
+      expect(requiresRestart(key)).toBe(true);
+    }
+    for (const key of ["useAria2c", "connectionsPerDownload", "videoQuality", "autoscaleEnabled"]) {
+      expect(requiresRestart(key)).toBe(false);
+    }
   });
 });
 
@@ -209,6 +249,28 @@ describe("applySettings", () => {
     const result = await applySettings(baseConfig(), { concurrentFragments: 16 }, join(dir, "config.json"));
     expect(result.ok).toBe(true);
     expect(result.changed).toEqual([]);
+  });
+
+  test("refuses to expose a token-less dashboard on a network address", async () => {
+    // Binding to the LAN is allowed (webBind is editable) — but not while the
+    // dashboard has no token, which would let anyone on the network purge jobs.
+    const dir = await makeConfigDir();
+    const cfgPath = join(dir, "config.json");
+    const denied = await applySettings(baseConfig({ webBind: "127.0.0.1" }), { webBind: "0.0.0.0" }, cfgPath);
+    expect(denied.ok).toBe(false);
+    expect(denied.error).toContain("webToken");
+    expect(getConfig().webBind).toBe("127.0.0.1");
+    expect(existsSync(cfgPath)).toBe(false);
+
+    // With a token set (hand-edited in config.json, as documented) the same
+    // change goes through.
+    const allowed = await applySettings(
+      baseConfig({ webBind: "127.0.0.1", webToken: "s3cret" }),
+      { webBind: "0.0.0.0" },
+      cfgPath,
+    );
+    expect(allowed.ok).toBe(true);
+    expect(getConfig().webBind).toBe("0.0.0.0");
   });
 
   test("rejects keys outside the allow-list instead of ignoring them", async () => {

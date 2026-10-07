@@ -723,6 +723,103 @@ describe("integration: aria2c multi-connection downloads", () => {
 });
 
 // ---------------------------------------------------------------------------
+describe("integration: live download progress", () => {
+  test("an aria2c transfer drives the dashboard's progress, speed and ETA", async () => {
+    // yt-dlp fires no progress hook of its own while an external downloader
+    // runs: it launches aria2c with stdout inherited and moves on. aria2c's
+    // console readout on that inherited stdout is therefore the ONLY live
+    // signal on the aria2c path — if the engine does not parse it, every
+    // download through the (default) external engine shows 0% and "0 B/s"
+    // for its whole duration. This test holds a transfer open and watches the
+    // values the dashboard reads.
+    //
+    // The speed asserted below is deliberate: 393216 B/s (384.0KiB in the
+    // readout) exists in exactly one place — the aria2c readout the fake
+    // downloader writes into its stdout window. yt-dlp's own PROGRESS template
+    // only prints after that window has closed (the external downloader has
+    // returned by then) and never reports this speed, so catching this value
+    // while the row is still 'downloading' proves the readout itself was
+    // parsed, not merely the eventual yt-dlp output.
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      4013,
+      BASE_CONFIG(4013, {
+        videoQuality: "audio",
+        useAria2c: true,
+        connectionsPerDownload: 4,
+        // One slot: exactly one transfer is ever in flight, so the row under
+        // test cannot be a neighbour's.
+        maxConcurrentDownloads: 1,
+        maxDownloadWorkers: 1,
+      }),
+      {
+        FAKE_ARIA2C_INFLIGHT_MS: "6000",
+        FAKE_ARIA2C_READOUT: "1",
+        FAKE_ARIA2C_READOUT_MS: "1200",
+      },
+    );
+
+    try {
+      // While the transfer is in flight the dashboard sees real numbers: a
+      // climbing percentage, the readout's speed, a total size for the bar and
+      // an ETA — all before the downloader is done.
+      let live: any = null;
+      await waitFor("live progress to reach the status endpoint", async () => {
+        const status = await engine.api("/api/status");
+        const row = status.activeDownloads?.[0];
+        if (row && row.speed === 393216) live = row;
+        return !!live;
+      });
+
+      expect(live.progress).toBeGreaterThan(0);
+      // The readout never claims a finished transfer — the file is incomplete
+      // at every record — so a clamped-100% row would be a parser bug.
+      expect(live.progress).toBeLessThanOrEqual(90);
+      expect(live.speed).toBe(393216);
+      expect(live.fileSize).toBe(10485760); // 10.0MiB total, backfilled from progress
+      expect(live.eta).toBeGreaterThan(0);
+
+      // The same numbers surface as an aggregate speed for the header.
+      const status = await engine.api("/api/status");
+      expect(status.speed).toBeGreaterThan(0);
+      expect(status.aggregateSpeed).not.toBe("0 B/s");
+
+      // ...and on the job row itself, so the job list and the progress panel
+      // agree instead of one of them showing 0.
+      const jobs = await engine.api("/api/jobs");
+      const active = jobs.jobs.find((j: any) => j.id === live.id);
+      expect(active.progress).toBeGreaterThan(0);
+      expect(active.speed).toBe(393216);
+      expect(active.file_size).toBe(10485760);
+
+      // The whole batch still finishes normally afterwards.
+      const done = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.conversion_status === "done",
+      );
+      expect(done).toHaveLength(3);
+
+      // At least two readouts were produced: the count is written by the fake
+      // downloader itself, so the engine cannot fabricate it.
+      const folder = join(dir, "downloads", "Mock Playlist");
+      const files = await readdir(folder);
+      const counts = files.filter((f) => f.endsWith(".aria2c-readouts"));
+      expect(counts.length).toBeGreaterThan(0);
+      for (const f of counts) {
+        expect(parseInt(await Bun.file(join(folder, f)).text(), 10)).toBeGreaterThanOrEqual(2);
+      }
+      // A finished run leaves no partial behind (the readout path must not
+      // disturb the normal success bookkeeping).
+      expect(files.filter((f) => f.endsWith(".part"))).toHaveLength(0);
+      expect(files.filter((f) => f.endsWith(".mp3"))).toHaveLength(3);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
 describe("integration: aria2c resume + self-healing", () => {
   test("an interrupted aria2c transfer resumes from its control file", async () => {
     // The failure originates INSIDE aria2c (FAKE_ARIA2C_FAIL_TIMES), so the
@@ -1434,6 +1531,84 @@ describe("integration: degradation paths (missing tool, failed audio probe)", ()
 });
 
 // ---------------------------------------------------------------------------
+describe("integration: dashboard cancellation", () => {
+  // What the user reported: "when i click the purge delete and removed source
+  // the some downloads still continue in terminal". Each action must stop the
+  // in-flight downloader, not just its database row. FAKE_HANG wedges the mock
+  // (it never finishes on its own) and the mock writes a `.hang-signalled`
+  // marker when the engine's SIGINT arrives, so the assertion is about the
+  // child process, not just about job state.
+  test.skipIf(WIN)(
+    "stop, delete, and remove-source all interrupt the running downloader",
+    async () => {
+      const dir = await makeRunDir();
+      const engine = await startEngine(
+        dir,
+        3994,
+        BASE_CONFIG(3994, {
+          videoQuality: "audio",
+          useAria2c: false,
+          maxConcurrentDownloads: 1,
+          maxDownloadWorkers: 1,
+          maxRetryAttempts: 5,
+          maxFailuresPerVideo: 5,
+          maxFailures: 50,
+        }),
+        { FAKE_HANG: "1" },
+      );
+
+      const folder = join(dir, "downloads", "Mock Playlist");
+      const signalled = async () => (await readdir(folder).catch(() => [] as string[])).filter((f) => f.endsWith(".hang-signalled")).length;
+
+      /** Wait until one job is downloading and its mock child has started. */
+      const waitForInFlight = async (): Promise<JobRow> => {
+        let active: JobRow | undefined;
+        await waitFor("a hung download in flight", async () => {
+          const jobs = await getJobs(engine);
+          active = jobs.find((j) => j.download_status === "downloading");
+          if (!active) return false;
+          const files = await readdir(folder).catch(() => [] as string[]);
+          return files.some((f) => f.endsWith(".ytdlp-args"));
+        });
+        return active!;
+      };
+
+      try {
+        // 1) Stop: the child is interrupted and the job is parked, not deleted.
+        const first = await waitForInFlight();
+        const stopResponse = await engine.api(`/api/jobs/${first.id}/stop`, { method: "POST" });
+        expect(stopResponse.ok).toBe(true);
+        await waitFor("the mock to record its SIGINT", async () => (await signalled()) >= 1);
+        const parked = (await getJobs(engine)).find((j) => j.id === first.id);
+        expect(parked).toMatchObject({ download_status: "paused", pause_reason: "user" });
+
+        // 2) Delete: the next hung download is interrupted and its row is gone.
+        const second = await waitForInFlight();
+        const deleteResponse = await engine.api(`/api/jobs/${second.id}`, { method: "DELETE" });
+        expect(deleteResponse.ok).toBe(true);
+        await waitFor("the mock to record its second SIGINT", async () => (await signalled()) >= 2);
+        expect((await getJobs(engine)).some((j) => j.id === second.id)).toBe(false);
+
+        // 3) Remove-source: the last in-flight download is interrupted and every
+        //    job of that source disappears.
+        const third = await waitForInFlight();
+        const removeResponse = await engine.api("/api/sources", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: "https://www.youtube.com/playlist?list=FAKELIST" }),
+        });
+        expect(removeResponse.ok).toBe(true);
+        await waitFor("the mock to record its third SIGINT", async () => (await signalled()) >= 3);
+        expect((await getJobs(engine)).length).toBe(0);
+        expect(third.id).toBeTruthy();
+      } finally {
+        await engine.stop();
+      }
+    },
+    TEST_TIMEOUT,
+  );
+});
+
 describe("integration: secondary-storage move", () => {
   test("moves finished media (and sidecars) to secondary storage and records the new path", async () => {
     // The whole hand-off in one engine run: remux to mkv, then move the media
