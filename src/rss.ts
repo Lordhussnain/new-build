@@ -6,7 +6,7 @@
 // net via rescanIntervalHours. New video ids go through the same ingestItems
 // dedup as every other source.
 
-import { cookiesArgs, ytDlp } from "./tools";
+import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
 import { ingestItems, type ListingItem } from "./scanner";
 import { logError } from "./logger";
 import { getConfig } from "./state";
@@ -23,7 +23,7 @@ export async function resolveChannelId(channelUrl: string, config: Config): Prom
   try {
     // @handle / custom URLs: resolve once via yt-dlp, then cache for the run.
     const proc = Bun.spawn(
-      [ytDlp(), ...cookiesArgs(config), "--flat-playlist", "--playlist-end", "1", "--print", "%(channel_id)s", channelUrl],
+      [ytDlp(), ...cookiesArgs(config), ...jsRuntimeArgs(), "--flat-playlist", "--playlist-end", "1", "--print", "%(channel_id)s", channelUrl],
       { stdout: "pipe", stderr: "pipe" },
     );
     const [out, , code] = await Promise.all([

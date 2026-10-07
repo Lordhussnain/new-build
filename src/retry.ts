@@ -74,11 +74,37 @@ const PERMANENT_ERROR_PATTERNS: RegExp[] = [
 ];
 
 /**
+ * True when yt-dlp failed YouTube's n-parameter / player JS challenge.
+ *
+ * That is an environment problem (no JS runtime, missing EJS solver scripts,
+ * or an outdated yt-dlp), not a dead video. The same stderr tail often also
+ * contains "Requested format is not available" / "Some formats may be missing"
+ * because the challenge failure strips formats — those look like the permanent
+ * "no video formats" class, so callers MUST check this first (and
+ * `isPermanentDownloadError` itself refuses to match when this is set).
+ */
+export function isNChallengeError(message: string | null | undefined): boolean {
+  if (!message) return false;
+  const m = message.toLowerCase();
+  return (
+    m.includes("n challenge") ||
+    m.includes("nchallengeinput") ||
+    m.includes("javascript runtime") ||
+    m.includes("js runtime") ||
+    m.includes("challenge solver") ||
+    m.includes("remote-components")
+  );
+}
+
+/**
  * True when a download error is permanent (the video can never be fetched) and
  * retrying is pointless.
  */
 export function isPermanentDownloadError(message: string | null | undefined): boolean {
   if (!message) return false;
+  // n-challenge failures are environmental; the format-missing text they leave
+  // behind must not park the job forever.
+  if (isNChallengeError(message)) return false;
   return PERMANENT_ERROR_PATTERNS.some((re) => re.test(message));
 }
 
@@ -147,6 +173,7 @@ export function progressAwareRetryState(
  * and an immediate-ish retry is worthwhile.
  */
 export function isTransientDownloadError(message: string): boolean {
+  if (isNChallengeError(message)) return true;
   const m = message.toLowerCase();
   return [
     "unable to download",

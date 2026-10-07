@@ -1291,9 +1291,10 @@
         engineEl.innerHTML = d.engine === 'aria2c'
           ? `<span class="pill ok">aria2c ×${d.connectionsPerDownload ?? '?'}</span>`
           : '<span class="pill">yt-dlp native</span>';
+        const js = d.jsRuntime ? `${d.jsRuntime.name} n-challenge solver` : 'no JS runtime (YouTube n-challenge will fail)';
         engineEl.title = d.engine === 'aria2c'
-          ? `aria2c at ${d.path || 'PATH'} — ${d.connectionsPerDownload ?? '?'} connections per download, ${d.maxBandwidthKBps ? d.maxBandwidthKBps + ' KB/s cap' : 'uncapped'}`
-          : 'yt-dlp built-in downloader (install aria2c for multi-connection speed)';
+          ? `aria2c at ${d.path || 'PATH'} — ${d.connectionsPerDownload ?? '?'} connections per download, ${d.maxBandwidthKBps ? d.maxBandwidthKBps + ' KB/s cap' : 'uncapped'}; ${js}`
+          : `yt-dlp built-in downloader (install aria2c for multi-connection speed); ${js}`;
       }
       setText('relConnections', d.engine === 'aria2c' ? `${d.connectionsPerDownload ?? '?'} / download` : 'n/a (native)');
       setText('relFragments', `${d.concurrentFragments ?? '?'} parallel`);

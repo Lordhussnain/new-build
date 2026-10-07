@@ -11,7 +11,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, test } from "bun:test";
-import { resolveTool } from "../src/tools";
+import { bunInterpreterPath, jsRuntimeArgs, resolveJsRuntime, resolveTool } from "../src/tools";
 
 const WIN = process.platform === "win32";
 
@@ -112,6 +112,56 @@ describe("resolveTool: aria2c discovery when it is installed", () => {
       env: { ...process.env, PATH: dir },
     });
     expect(found).toBeNull();
+  });
+});
+
+describe("jsRuntimeArgs", () => {
+  test("is empty without a runtime so unit tests stay flag-free", () => {
+    expect(jsRuntimeArgs(null)).toEqual([]);
+    expect(jsRuntimeArgs({ name: "deno", path: "" })).toEqual([]);
+  });
+
+  test("passes an explicit runtime:path plus EJS github fetch", () => {
+    expect(jsRuntimeArgs({ name: "node", path: "/usr/bin/node" })).toEqual([
+      "--js-runtimes",
+      "node:/usr/bin/node",
+      "--remote-components",
+      "ejs:github",
+    ]);
+  });
+});
+
+describe("bunInterpreterPath", () => {
+  test("accepts the bun interpreter and rejects a compiled exe", () => {
+    expect(bunInterpreterPath("/usr/local/bin/bun")).toBe("/usr/local/bin/bun");
+    expect(bunInterpreterPath("C:/Users/me/bun.exe")).toBe("C:/Users/me/bun.exe");
+    expect(bunInterpreterPath("C:/app/youtube-archive.exe")).toBeNull();
+    expect(bunInterpreterPath("/opt/youtube-archive")).toBeNull();
+  });
+});
+
+describe("resolveJsRuntime: empty search space", () => {
+  test("returns null when nothing is installed and no bun fallback is offered", async () => {
+    const empty = await makeDir("yta-jsrt-empty-");
+    const found = await resolveJsRuntime({
+      cwd: empty,
+      exeDir: empty,
+      platform: "linux",
+      env: NO_ENV,
+    });
+    expect(found).toBeNull();
+  });
+
+  test("uses the injected bun interpreter as last resort", async () => {
+    const empty = await makeDir("yta-jsrt-bun-");
+    const found = await resolveJsRuntime({
+      cwd: empty,
+      exeDir: empty,
+      platform: "linux",
+      env: NO_ENV,
+      bunInterpreter: "/opt/bun",
+    });
+    expect(found).toEqual({ name: "bun", path: "/opt/bun" });
   });
 });
 

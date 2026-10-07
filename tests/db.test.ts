@@ -407,6 +407,19 @@ describe("requeueFailedJobs", () => {
     expect(getJob("geo").download_status).toBe("failed");
   });
 
+  test("re-queues n-challenge failures that were wrongly parked as permanent", () => {
+    insertJob("nchal", {
+      download_status: "failed",
+      retry_count: 1,
+      last_error:
+        "n challenge solving failed: Some formats may be missing. Ensure you have a supported JavaScript runtime ERROR: Requested format is not available",
+      updated_at: "2020-01-01 00:00:00",
+    });
+    const config = testConfig({ requeueFailedAfterMinutes: 30, maxRetryAttempts: 3, maxFailuresPerVideo: 4 });
+    expect(requeueFailedJobs(config).downloads).toBe(1);
+    expect(getJob("nchal").download_status).toBe("pending");
+  });
+
   test("starts a fresh bounded retry window after a failed job cools down", () => {
     insertJob("spent", {
       download_status: "failed",

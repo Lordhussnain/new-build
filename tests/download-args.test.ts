@@ -274,6 +274,23 @@ describe("buildDownloadPlan", () => {
       expect(a).not.toContain("\r");
     }
   });
+
+  test("omits JS-runtime flags unless a runtime was injected", () => {
+    expect(build().args).not.toContain("--js-runtimes");
+    expect(build().args).not.toContain("--remote-components");
+  });
+
+  test("passes an explicit JS runtime path so yt-dlp does not have to rediscover it", () => {
+    const plan = buildDownloadPlan({
+      job,
+      config: cfg(),
+      activeSlots: 3,
+      aria2cAvailable: false,
+      jsRuntime: { name: "deno", path: join("/opt", "deno") },
+    });
+    expect(flagValue(plan.args, "--js-runtimes")).toBe(`deno:${join("/opt", "deno")}`);
+    expect(flagValue(plan.args, "--remote-components")).toBe("ejs:github");
+  });
 });
 
 // --- multi-audio tracks -------------------------------------------------------

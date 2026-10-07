@@ -25,7 +25,7 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Terminal UI (TUI)** with live progress across all workers
 - Correct format selection across VP9/AV1 containers (fixes yt-dlp/ffmpeg mismatches)
 - **Multi-audio tracks** — YouTube's multi-language audio (the player's *Audio track* menu: original + auto-dubbed tracks). Keep every track, or just the languages you want, muxed into one MKV whose audio is switchable in any player — plus a per-video track picker in the dashboard
-- Compatible with authenticated downloads (`--cookies`) alongside the Android player-client extractor args
+- Compatible with authenticated downloads (`--cookies`) and YouTube's n-challenge (a JS runtime — Deno, Node, or Bun — is discovered at startup and passed to yt-dlp)
 - **cookies.txt is watched while the engine runs** — export it from your browser after startup (or replace it when it expires) and the next download attempt uses it; the engine logs the switch and tells you how many credential-blocked jobs it may rescue
 - **Web dashboard** with live job status, bulk actions, failed-job recovery, a reliability panel, per-job detail, and an in-browser settings editor for the downloader
 
@@ -41,11 +41,12 @@ a terminal UI and a web dashboard to watch it all happen.
 - Bun ≥ 1.0
 - `yt-dlp` and `ffmpeg` available on `PATH` (or configured explicitly)
 - [aria2c](https://aria2.github.io/) **optional** — enables multi-connection downloads; without it the engine uses yt-dlp's native downloader
+- A JavaScript runtime for YouTube's n-challenge: [Deno](https://deno.com) (recommended; yt-dlp's default), Node.js ≥ 22, or Bun. The engine discovers one at startup and passes `--js-runtimes` to every yt-dlp call. Without a runtime, YouTube downloads fail with "n challenge solving failed" — that is retried, never parked as a permanent video error. See [yt-dlp EJS](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
 - Tested on Windows 11
 
 Dependencies are checked automatically on startup; the app exits with a clear
-error if anything required is missing. A missing aria2c is reported as a
-warning and never blocks startup.
+error if anything required is missing. A missing aria2c or JS runtime is
+reported as a warning and never blocks startup.
 
 ## Development
 
@@ -352,7 +353,7 @@ src/
   db.ts            SQLite schema, migrations, atomic job claims + claim leases (tokens, heartbeats)
   lease.ts         database-level engine lease (owner, expiry, fencing) — one engine per archive.db
   state.ts         shared mutable runtime state (pause, stats, workers)
-  tools.ts         yt-dlp/ffmpeg/aria2c discovery + cookies helpers
+  tools.ts         yt-dlp/ffmpeg/aria2c/JS-runtime discovery + cookies helpers
   download-args.ts pure yt-dlp command construction (downloader engine, tuning)
   download-output.ts bounded subprocess output parsing and final-path validation
   audio-tracks.ts  multi-audio track discovery, selection, and format probing

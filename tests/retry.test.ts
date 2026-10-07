@@ -6,6 +6,7 @@ import {
   computeDownloadTimeoutMs,
   isDownloaderArgsError,
   isFormatAvailabilityError,
+  isNChallengeError,
   isPermanentDownloadError,
   isTransientDownloadError,
   progressAwareRetryState,
@@ -104,6 +105,42 @@ describe("isPermanentDownloadError", () => {
   });
 });
 
+describe("isNChallengeError", () => {
+  // Production stderr tail (last ~4 lines joined). The n-challenge traceback
+  // is followed by "Requested format is not available" because missing formats
+  // are a *symptom* of the unsolved player JS — that used to park the job as
+  // a permanent failure.
+  const productionTail =
+    "input = NChallengeInput(player_url='https://www.youtube.com/s/player/1b3be681/player_ias.vflset/en_US/base.js', challenges=['Sp9r8zJeVzSHiW5cV']) " +
+    "Please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U " +
+    "WARNING: [youtube] QFrLzo7YLBA: n challenge solving failed: Some formats may be missing. Ensure you have a supported JavaScript runtime and challenge solver script " +
+    "ERROR: [youtube] QFrLzo7YLBA: Requested format is not available";
+
+  test("matches the production n-challenge + missing-formats tail", () => {
+    expect(isNChallengeError(productionTail)).toBe(true);
+    expect(isTransientDownloadError(productionTail)).toBe(true);
+    expect(isFormatAvailabilityError(productionTail)).toBe(true);
+    // The format-missing text must NOT win: this video is still downloadable
+    // once a JS runtime / updated solver is in place.
+    expect(isPermanentDownloadError(productionTail)).toBe(false);
+  });
+
+  test("matches the shorter warning-only form", () => {
+    expect(
+      isNChallengeError(
+        "WARNING: [youtube] abc: n challenge solving failed: Some formats may be missing. Ensure you have a supported JavaScript runtime",
+      ),
+    ).toBe(true);
+    expect(isPermanentDownloadError("No supported JavaScript runtime could be found")).toBe(false);
+  });
+
+  test("does not match unrelated errors", () => {
+    expect(isNChallengeError("ERROR: [youtube] abc: Video unavailable")).toBe(false);
+    expect(isNChallengeError("ERROR: Requested format is not available")).toBe(false);
+    expect(isNChallengeError(null)).toBe(false);
+  });
+});
+
 describe("progressAwareRetryState", () => {
   test("does not spend the retry budget when progress advances", () => {
     expect(progressAwareRetryState(2, 20, 35, 4)).toEqual({
@@ -158,6 +195,11 @@ describe("isTransientDownloadError", () => {
   test("does not flag permanent failures", () => {
     expect(isTransientDownloadError("Video unavailable")).toBe(false);
     expect(isTransientDownloadError("Private video")).toBe(false);
+  });
+
+  test("flags n-challenge / missing JS runtime as retryable", () => {
+    expect(isTransientDownloadError("n challenge solving failed")).toBe(true);
+    expect(isTransientDownloadError("Ensure you have a supported JavaScript runtime")).toBe(true);
   });
 });
 

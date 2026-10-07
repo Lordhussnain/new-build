@@ -15,7 +15,7 @@
 // are pure and unit-tested; `probeAudioTracks` is the only function that
 // spawns yt-dlp (one `-J` metadata call per job).
 
-import { cookiesArgs, ytDlp } from "./tools";
+import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
 import type { MultiAudioMode } from "./config";
 
 export interface AudioTrack {
@@ -212,6 +212,7 @@ export async function probeAudioTracks(
         ytDlp(),
         url,
         ...cookiesArgs(config),
+        ...jsRuntimeArgs(),
         "--dump-single-json",
         "--no-playlist",
         "--no-warnings",

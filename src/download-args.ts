@@ -18,7 +18,7 @@
 //     partial-file tracking and `--continue` resume behave identically.
 
 import { join } from "node:path";
-import { cookiesArgs } from "./tools";
+import { cookiesArgs, jsRuntimeArgs, type JsRuntime } from "./tools";
 import { DOWNLOAD_PATH_PREFIX } from "./download-output";
 import { fitBaseFilename, sanitizeFileName } from "./util";
 import { computeDownloadTimeoutMs } from "./retry";
@@ -150,6 +150,11 @@ export interface BuildDownloadPlanOptions {
    * with `--audio-multistreams` so the audio is switchable in any player.
    */
   audioTracks?: AudioTrack[];
+  /**
+   * JS runtime for YouTube's n-challenge. Production passes whatever
+   * `checkDependencies` found; omit/null to skip the flags (unit tests).
+   */
+  jsRuntime?: JsRuntime | null;
 }
 
 /** Build the complete yt-dlp invocation for one download attempt. */
@@ -173,6 +178,7 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
     // argv[0] is filled in by the caller (the resolved yt-dlp path).
     job.url,
     ...cookiesArgs(config),
+    ...jsRuntimeArgs(opts.jsRuntime ?? null),
     "--format",
     effectiveFormat,
     // Parallel fragments for DASH/HLS (native path). Ignored when aria2c is

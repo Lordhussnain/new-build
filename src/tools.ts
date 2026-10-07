@@ -6,13 +6,25 @@
 // path) all work without touching PATH.
 
 import { existsSync, statSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import os from "node:os";
 
 // aria2c is optional: when present it becomes the multi-connection downloader
 // (yt-dlp --downloader aria2c), and when absent the engine transparently uses
 // yt-dlp's native downloader. `aria2cPath` stays "" until discovery finds it.
-export const resolvedTools = { ytDlp: "yt-dlp", ffmpeg: "ffmpeg", aria2cPath: "" as string | null };
+export type JsRuntimeName = "deno" | "node" | "bun" | "quickjs";
+export interface JsRuntime {
+  name: JsRuntimeName;
+  /** Absolute or PATH-resolvable executable yt-dlp should invoke. */
+  path: string;
+}
+
+export const resolvedTools = {
+  ytDlp: "yt-dlp",
+  ffmpeg: "ffmpeg",
+  aria2cPath: "" as string | null,
+  jsRuntime: null as JsRuntime | null,
+};
 export function ytDlp(): string {
   return resolvedTools.ytDlp;
 }
@@ -26,6 +38,37 @@ export function aria2cPath(): string | null {
 /** The executable yt-dlp should hand transfers to, or "native" for its own. */
 export function activeDownloader(): "aria2c" | "native" {
   return resolvedTools.aria2cPath ? "aria2c" : "native";
+}
+/** JS runtime discovered for YouTube's n-challenge, or null. */
+export function jsRuntime(): JsRuntime | null {
+  return resolvedTools.jsRuntime;
+}
+
+/**
+ * yt-dlp flags that enable the YouTube n-challenge solver.
+ *
+ * Deno is yt-dlp's default and is enabled automatically when it is on PATH,
+ * but discovery often finds the binary next to the app / in a package-manager
+ * shim that the child process will not see — so we always pass an explicit
+ * `runtime:path`. `--remote-components ejs:github` lets pip/third-party
+ * installs fetch the EJS solver scripts when they are not bundled; official
+ * yt-dlp binaries already ship them and ignore the fetch.
+ */
+export function jsRuntimeArgs(runtime: JsRuntime | null = resolvedTools.jsRuntime): string[] {
+  if (!runtime) return [];
+  const path = (runtime.path || "").trim();
+  if (!path) return [];
+  return ["--js-runtimes", `${runtime.name}:${path}`, "--remote-components", "ejs:github"];
+}
+
+/**
+ * When this process *is* the bun interpreter (not a compiled archive.exe),
+ * yt-dlp can use it as a last-resort JS runtime. Compiled binaries keep
+ * `process.versions.bun` but `execPath` is not a JS runtime.
+ */
+export function bunInterpreterPath(execPath: string = process.execPath): string | null {
+  const base = basename(execPath).replace(/\.exe$/i, "").toLowerCase();
+  return base === "bun" ? execPath : null;
 }
 
 export interface CookiesState {
@@ -96,7 +139,15 @@ export function resetCookiesBaseline(): void {
 export async function validateCookies(cookiesFile: string): Promise<boolean> {
   if (!existsSync(cookiesFile)) return false;
   const proc = Bun.spawn(
-    [ytDlp(), "--cookies", cookiesFile, "--no-warnings", "--dump-single-json", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+    [
+      ytDlp(),
+      "--cookies",
+      cookiesFile,
+      ...jsRuntimeArgs(),
+      "--no-warnings",
+      "--dump-single-json",
+      "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    ],
     { stdout: "pipe", stderr: "pipe" },
   );
   const [, stderr, code] = await Promise.all([
@@ -127,6 +178,11 @@ export interface ToolSearchEnv {
   env?: Record<string, string | undefined>;
   /** Existence gate for absolute candidates. */
   exists?: (path: string) => boolean;
+  /**
+   * Last-resort bun interpreter (production: `bunInterpreterPath()`). Tests
+   * omit this so an empty search space really finds nothing.
+   */
+  bunInterpreter?: string | null;
 }
 
 async function probeBinary(
@@ -219,6 +275,30 @@ export async function resolveTool(
   return null;
 }
 
+const JS_RUNTIMES: { name: JsRuntimeName; posix: string[]; win: string[] }[] = [
+  { name: "deno", posix: ["deno"], win: ["deno.exe"] },
+  { name: "node", posix: ["node"], win: ["node.exe"] },
+  { name: "bun", posix: ["bun"], win: ["bun.exe"] },
+  { name: "quickjs", posix: ["qjs"], win: ["qjs.exe"] },
+];
+
+/**
+ * Find a JS runtime yt-dlp can use to solve YouTube's n-challenge.
+ *
+ * Preference matches yt-dlp's own: Deno (sandboxed, default) → Node → Bun →
+ * QuickJS. A missing runtime is never fatal — the engine still starts — but
+ * every YouTube download will then fail the n-challenge until one appears.
+ */
+export async function resolveJsRuntime(search: ToolSearchEnv = {}): Promise<JsRuntime | null> {
+  for (const rt of JS_RUNTIMES) {
+    const found = await resolveTool("", ["--version"], rt.posix, rt.win, search);
+    if (found) return { name: rt.name, path: found.path };
+  }
+  const bun = (search.bunInterpreter ?? null) || null;
+  if (bun && bun.trim()) return { name: "bun", path: bun.trim() };
+  return null;
+}
+
 export async function checkDependencies(
   config: {
     ytDlpPath: string;
@@ -243,6 +323,10 @@ export async function checkDependencies(
       ? Promise.resolve(null)
       : resolveTool(config.aria2cPath || "", ["--version"], ["aria2c"], ["aria2c.exe"], search),
   ]);
+  const jsRt = await resolveJsRuntime({
+    ...search,
+    bunInterpreter: search.bunInterpreter ?? bunInterpreterPath(),
+  });
 
   if (ytdlp) {
     resolvedTools.ytDlp = ytdlp.path;
@@ -281,6 +365,16 @@ export async function checkDependencies(
   } else if (config.useAria2c !== false) {
     console.log(
       "  ⚪ aria2c: not found — using yt-dlp's native downloader (install it for multi-connection speed: winget install aria2.aria2 | scoop install aria2 | choco install aria2)",
+    );
+  }
+
+  resolvedTools.jsRuntime = jsRt;
+  if (jsRt) {
+    const where = jsRt.path.includes("/") || jsRt.path.includes("\\") ? `  [${jsRt.path}]` : "  [PATH]";
+    console.log(`  ✅ JS runtime: ${jsRt.name}${where}  [YouTube n-challenge solver]`);
+  } else {
+    console.log(
+      "  ⚪ JS runtime: not found — YouTube downloads need Deno (recommended), Node.js ≥ 22, or Bun to solve the n-challenge. See https://github.com/yt-dlp/yt-dlp/wiki/EJS",
     );
   }
 

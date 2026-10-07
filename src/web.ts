@@ -20,7 +20,7 @@ import { requeueFailedJobs, stashDownloadedFile, staleClaimCondition, STALE_CLAI
 import { holdsEngineLease, isLeaseExpired, readEngineLease } from "./lease";
 import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
-import { aria2cPath } from "./tools";
+import { aria2cPath, jsRuntime } from "./tools";
 import { applySettings, readSettings } from "./settings";
 import { effectiveTargetFormat, effectiveVideoQuality, resolveDownloaderEngine } from "./download-args";
 import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-tracks";
@@ -1277,6 +1277,7 @@ function reliabilityHandler(config: Config): Response {
       concurrentFragments: config.concurrentFragments,
       maxBandwidthKBps: config.maxBandwidthKBps,
       autoscaleRampStep: config.autoscaleRampStep,
+      jsRuntime: jsRuntime(),
     },
   });
 }

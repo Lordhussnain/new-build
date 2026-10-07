@@ -20,7 +20,7 @@ import {
   type Job,
 } from "../db";
 import { activeDlSlots, autoscaler } from "../autoscale";
-import { aria2cPath, ytDlp } from "../tools";
+import { aria2cPath, jsRuntime, ytDlp } from "../tools";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
 import {
   dropSupersededFile,
@@ -34,6 +34,7 @@ import {
   computeBackoffMs,
   isDownloaderArgsError,
   isFormatAvailabilityError,
+  isNChallengeError,
   isPermanentDownloadError,
   isTransientDownloadError,
   progressAwareRetryState,
@@ -165,6 +166,7 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     aria2cAvailable: !!aria2cPath(),
     aria2cBinary: aria2cPath(),
     audioTracks,
+    jsRuntime: jsRuntime(),
   });
   const { baseFilename, timeoutMs } = plan;
   const engineTag = plan.engine === "aria2c" ? `aria2c×${config.connectionsPerDownload}` : "native";
@@ -335,6 +337,7 @@ export async function cleanupDownloadProcess(
  *                                        by maxResumeAttempts, then restart)
  *   • live stream in "wait for VOD"    → park as waiting_live
  *   • permanent (private/removed/…)    → fail fast, never auto-requeued
+ *   • n-challenge / missing JS runtime → retryable (not a dead video)
  *   • retry budget spent               → park as failed for the sweep
  */
 export async function handleDownloadFailure(id: number, job: Job, config: Config, err: any): Promise<void> {
@@ -387,7 +390,9 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
   // re-probes, and the per-job language selection survives the reset) instead
   // of parking the job permanently. Must run before the permanent-error check,
   // which matches the same message. Still bounded by the no-progress budget.
-  if (isFormatAvailabilityError(errMsg) && job.audio_tracks) {
+  // Skip when the same tail is an n-challenge failure: missing formats are a
+  // symptom of the unsolved player JS, not a stale probe.
+  if (isFormatAvailabilityError(errMsg) && job.audio_tracks && !isNChallengeError(errMsg)) {
     const current = readProgressState(job.id);
     const retry = progressAwareRetryState(
       current.retryCount,

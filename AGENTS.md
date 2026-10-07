@@ -49,7 +49,10 @@ bun run build:win      # cross-compile dist/youtube-archive.exe (Windows)
 
 Runtime requirements: `yt-dlp` and `ffmpeg` on `PATH` (or `ytDlpPath` /
 `ffmpegPath` in config). `checkDependencies()` probes them **before** the
-database opens and exits with install hints if missing.
+database opens and exits with install hints if missing. YouTube's n-challenge
+also needs a JS runtime (Deno recommended, then Node, then Bun); a missing
+runtime is a warning, not a startup failure, and n-challenge errors are
+retryable rather than permanent.
 
 **Sandbox note:** YouTube is unreachable from this environment. The test suite
 therefore runs the real engine against mock binaries (`tests/mocks/`) — see
@@ -91,7 +94,7 @@ src/
   db.ts          SQLite schema, migrations, atomic claim transactions, claim leases (token/heartbeat/CAS), helpers
   lease.ts       database-level engine lease (owner token, expiry, monotonic fencing) — one engine per archive.db
   state.ts       shared mutable runtime state (leaf module — imports nothing)
-  tools.ts       yt-dlp/ffmpeg/aria2c discovery, cookiesArgs, validateCookies
+  tools.ts       yt-dlp/ffmpeg/aria2c/JS-runtime discovery, cookiesArgs, jsRuntimeArgs, validateCookies
   download-args.ts PURE yt-dlp command construction (downloader engine, tuning)
   download-output.ts bounded pipe decoding + validated FILEPATH records (no fs calls)
   audio-tracks.ts PURE multi-audio track parsing/selection + the yt-dlp -J probe
@@ -776,6 +779,10 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
    (that was a real bug). Keep it in sync: set on failure, NULL on success.
 6. **Never re-queue permanent errors.** `isPermanentDownloadError()` gates the
    sweep; bypassing it causes infinite retry loops against dead videos.
+   YouTube **n-challenge** failures (`n challenge solving failed`, missing JS
+   runtime) are *not* permanent even when the same stderr also says
+   `Requested format is not available` — that text is a symptom of the unsolved
+   player JS. `isNChallengeError()` wins.
 7. **`bun:sqlite` specifics.** `MAX(a,b)` is the scalar two-arg form; use
    `COALESCE` before it. `datetime('now', '-N minutes')` modifiers must be
    built from validated integers, never user text. Open read-only handles

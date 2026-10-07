@@ -9,7 +9,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { db, getNextIndex, isVideoInDb } from "./db";
 import { isSourceBlocked, sourceIdentity } from "./sources";
-import { cookiesArgs, ytDlp } from "./tools";
+import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
 import { sanitizeFolderName } from "./util";
 import { stats } from "./state";
 import type { Config } from "./config";
@@ -45,6 +45,7 @@ export async function getPlaylistItems(url: string, config: Config): Promise<Lis
   const args = [
     ytDlp(),
     ...cookiesArgs(config),
+    ...jsRuntimeArgs(),
     "--flat-playlist",
     "--print",
     "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s",

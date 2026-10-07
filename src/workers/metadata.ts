@@ -16,7 +16,7 @@ import {
   type ClaimRef,
   type Job,
 } from "../db";
-import { cookiesArgs, ytDlp } from "../tools";
+import { cookiesArgs, jsRuntimeArgs, ytDlp } from "../tools";
 import { computeBackoffMs } from "../retry";
 import { SIDECAR_SUFFIXES } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
@@ -96,6 +96,7 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
     ytDlp(),
     job.url,
     ...cookiesArgs(config),
+    ...jsRuntimeArgs(),
     "--skip-download",
     "--no-simulate",
     "-o",
