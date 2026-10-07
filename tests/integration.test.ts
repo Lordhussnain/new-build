@@ -15,6 +15,9 @@
 //   6. aria2c resume          — interrupted transfers resume from the control
 //                              file, and the four self-healing sweeps all work
 //                              on the aria2c path
+//   7. HTTP 416 resume        — a resume whose range the server no longer has
+//                              discards the partial AND its control file and
+//                              restarts the transfer from zero
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { copyFile, mkdir, mkdtemp, readdir, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
@@ -931,6 +934,78 @@ describe("integration: aria2c resume + self-healing", () => {
       // could not have completed.
       const reliability = await engine.api("/api/reliability");
       expect(reliability.downloader.engine).toBe("aria2c");
+      expect(reliability.partialFiles.count).toBe(0);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("a resumed range the server no longer has (HTTP 416) discards the partial and restarts", async () => {
+    // The failure mode an operator hits as a video frozen at 99.0%: attempt 1 is
+    // interrupted and leaves `.part` + `.aria2`; attempt 2 resumes from them and
+    // the CDN answers the saved range with `HTTP Error 416: Requested range not
+    // satisfiable`, because the remote stream no longer has those bytes. Every
+    // further resume repeats that verbatim — progress can never beat
+    // best_progress, so the no-progress budget is charged on each attempt. The
+    // engine must therefore THROW the resume state away (both files) and start
+    // over; keeping the partial would loop until the job was parked as failed.
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      4100,
+      BASE_CONFIG(4100, {
+        useAria2c: true,
+        connectionsPerDownload: 4,
+        retryBackoffBaseSeconds: 1,
+        retryBackoffMaxSeconds: 2,
+        maxResumeAttempts: 5,
+        maxRetryAttempts: 10,
+        maxFailuresPerVideo: 10,
+        maxFailures: 50,
+      }),
+      { FAKE_ARIA2C_FAIL_TIMES: "1", FAKE_ARIA2C_FAIL_MODE: "range416", FAKE_DELAY_MS: "30" },
+    );
+
+    try {
+      // `not_needed` rather than `done`: an mp4 that needs no container change
+      // ends the conversion stage that way (see the audio-quality scenarios).
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) =>
+          j.download_status === "downloaded" &&
+          j.metadata_status === "done" &&
+          (j.conversion_status === "done" || j.conversion_status === "not_needed"),
+      );
+      expect(jobs).toHaveLength(3);
+      for (const job of jobs) {
+        expect(job.file_path).toBeTruthy();
+        // The unusable resume state is gone from the row as well as from disk.
+        expect(job.partial_file_path).toBeNull();
+        // Two charged attempts: the interruption and the 416 it left behind.
+        expect(job.retry_count).toBeGreaterThanOrEqual(2);
+        // It never became a "resume attempt": a 416 does not get resumed again,
+        // it gets discarded — that is the whole point of this branch.
+        expect(job.resume_count).toBe(0);
+      }
+
+      const folder = join(dir, "downloads", "Mock Playlist");
+      const files = await readdir(folder);
+      expect(files.filter((f) => f.endsWith(".part"))).toHaveLength(0);
+      expect(files.filter((f) => f.endsWith(".aria2"))).toHaveLength(0);
+      expect(files.filter((f) => f.endsWith(".mp4"))).toHaveLength(3);
+
+      // The transfer that finished the video did NOT resume — it restarted from
+      // scratch, which is the only thing a 416 can be recovered with.
+      const recorded = files.filter((f) => f.endsWith(".aria2-args"));
+      expect(recorded.length).toBeGreaterThanOrEqual(3);
+      for (const f of recorded) {
+        const { resumed } = JSON.parse(await Bun.file(join(folder, f)).text());
+        expect(resumed).toBe(false);
+      }
+      // The mock's hard failure — a control file whose data file is gone — never
+      // happened, i.e. the pair was always removed together.
+      expect(engine.stderr()).not.toContain("control file exists but the data file is gone");
+      const reliability = await engine.api("/api/reliability");
       expect(reliability.partialFiles.count).toBe(0);
     } finally {
       await engine.stop();

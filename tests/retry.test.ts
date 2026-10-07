@@ -9,6 +9,7 @@ import {
   isNChallengeError,
   isPermanentDownloadError,
   isTransientDownloadError,
+  isUnrecoverableResumeError,
   progressAwareRetryState,
 } from "../src/retry";
 
@@ -245,5 +246,61 @@ describe("isFormatAvailabilityError", () => {
     const msg = "ERROR: Requested format is not available";
     expect(isFormatAvailabilityError(msg)).toBe(true);
     expect(isPermanentDownloadError(msg)).toBe(true);
+  });
+});
+
+describe("isUnrecoverableResumeError", () => {
+  // The operator-visible failure this class exists for: a video stuck at 99.0%
+  // because `--continue` keeps asking the CDN for a range the remote stream no
+  // longer has. Retrying the same partial repeats it byte-for-byte forever.
+  const YTDLP_416 =
+    "ERROR: unable to download video data: HTTP Error 416: Requested range not satisfiable";
+
+  test("matches yt-dlp's 416 range failure verbatim", () => {
+    expect(isUnrecoverableResumeError(YTDLP_416)).toBe(true);
+    // The same failure with aria2c's warning glued in front (what a real run
+    // produces when thumbnail embedding already had to fall back to MKV).
+    expect(
+      isUnrecoverableResumeError(
+        "WARNING: webm doesn't support embedding a thumbnail, mkv will be used " + YTDLP_416,
+      ),
+    ).toBe(true);
+    expect(isUnrecoverableResumeError("HTTP Error 416: Requested Range Not Satisfiable")).toBe(true);
+    expect(isUnrecoverableResumeError("DEBUG: downloading ... status code 416")).toBe(true);
+  });
+
+  test("matches aria2c refusing to reuse the saved state", () => {
+    // --allow-overwrite=false default: nothing resumable AND no restart allowed.
+    expect(
+      isUnrecoverableResumeError(
+        "File 003 - video.f137.mp4.part exists, but a control file(*.aria2) does not exist. " +
+          "Download was canceled in order to prevent your file from being truncated to 0.",
+      ),
+    ).toBe(true);
+  });
+
+  test("does not match errors a resume can still fix", () => {
+    expect(isUnrecoverableResumeError("ERROR: unable to download video data: <urlopen error timed out>")).toBe(false);
+    expect(isUnrecoverableResumeError("ERROR: HTTP Error 503: Service Unavailable")).toBe(false);
+    expect(isUnrecoverableResumeError("ERROR: unable to resume download, incomplete or corrupt data")).toBe(false);
+    expect(isUnrecoverableResumeError("HTTP Error 416".slice(0, 0))).toBe(false);
+    expect(isUnrecoverableResumeError("")).toBe(false);
+    expect(isUnrecoverableResumeError(null)).toBe(false);
+    expect(isUnrecoverableResumeError(undefined)).toBe(false);
+    // "downloading is not supported by remote server": the data is fine, the
+    // remedy is to keep --continue and hand the transfer to the native
+    // downloader — discarding the partial there would throw away good work.
+    expect(
+      isUnrecoverableResumeError("cannot continue download: downloading is not supported by remote server"),
+    ).toBe(false);
+  });
+
+  test("a 416 is about our partial, not about the video — never permanent", () => {
+    // If the permanent class matched, the handler would park the job without
+    // ever discarding the broken resume state.
+    expect(isPermanentDownloadError(YTDLP_416)).toBe(false);
+    expect(isTransientDownloadError(YTDLP_416)).toBe(true);
+    expect(isDownloaderArgsError(YTDLP_416)).toBe(false);
+    expect(isFormatAvailabilityError(YTDLP_416)).toBe(false);
   });
 });

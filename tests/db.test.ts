@@ -12,11 +12,15 @@ import {
   claimConvertJob,
   claimDownloadJob,
   claimMetadataJob,
+  claimRef,
   db,
   getNextIndex,
+  heartbeatClaim,
   initDatabase,
   isVideoInDb,
   perVideoCap,
+  releaseClaimedJob,
+  startClaimHeartbeat,
 } from "../src/db";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 import { acquireEngineLease } from "../src/lease";
@@ -768,5 +772,62 @@ describe("pipeline claim exclusion", () => {
       metadata_status: "done",
     });
     expect(claimConvertJob("cv-6")?.id).toBe("cx6");
+  });
+});
+
+describe("startClaimHeartbeat", () => {
+  // `startClaimHeartbeat` floors the interval at 250 ms (a real engine renews
+  // every 30 s), so the waits below are sized against that floor — not against
+  // the tick value the test asks for.
+  const TICK_MS = 250;
+
+  test("renews the lease of a live claim and stays silent", async () => {
+    insertJob("hb1");
+    const job = claimDownloadJob("dl-hb")!;
+    const before = getJob("hb1").download_heartbeat_at;
+    await Bun.sleep(30); // no timer yet: nothing may move on its own
+    expect(getJob("hb1").download_heartbeat_at).toBe(before);
+
+    let lost = 0;
+    const stop = startClaimHeartbeat("download", job.id, claimRef("download", job), () => lost++, TICK_MS);
+    try {
+      await Bun.sleep(4 * TICK_MS);
+      expect(lost).toBe(0);
+      expect(heartbeatClaim("download", job.id, claimRef("download", job))).toBe(true);
+    } finally {
+      stop();
+    }
+  });
+
+  test("reports a lost lease ONCE — the worker's backoff sleep must not spam", async () => {
+    // This is the log line every operator sees on a retrying video: the worker
+    // releases its own claim when it records the outcome and THEN sleeps for
+    // the backoff, so the timer outlives the claim by design. Reporting the
+    // dead lease on every tick (every 30s, per video) used to bury error.log in
+    // "download claim lost — the next update will not land".
+    insertJob("hb2");
+    const job = claimDownloadJob("dl-hb")!;
+    let lost = 0;
+    const stop = startClaimHeartbeat("download", job.id, claimRef("download", job), () => lost++, TICK_MS);
+    try {
+      releaseClaimedJob("download", job.id, claimRef("download", job), "download_status = 'pending'");
+      // Long enough for several ticks: the callback must still fire exactly once.
+      await Bun.sleep(6 * TICK_MS);
+      expect(lost).toBe(1);
+    } finally {
+      stop();
+    }
+  });
+
+  test("no callback registered still stops renewing a released claim", async () => {
+    insertJob("hb3");
+    const job = claimDownloadJob("dl-hb")!;
+    const claim = claimRef("download", job);
+    const stop = startClaimHeartbeat("download", job.id, claim, undefined, TICK_MS);
+    releaseClaimedJob("download", job.id, claim, "download_status = 'pending'");
+    await Bun.sleep(4 * TICK_MS);
+    stop();
+    expect(getJob("hb3").download_heartbeat_at).toBeNull();
+    expect(heartbeatClaim("download", job.id, claim)).toBe(false);
   });
 });

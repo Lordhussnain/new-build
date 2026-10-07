@@ -12,6 +12,7 @@ a terminal UI and a web dashboard to watch it all happen.
 - **aria2c multi-connection downloads** — files split across up to 64 streams (16 by default) with automatic fallback to yt-dlp's native downloader when aria2c is not installed or for HLS/live streams. aria2c's own per-server connection cap (16) is clamped automatically, and a downloader argument aria2c rejects (exit 28) pauses the engine with a `BAD_DOWNLOADER_ARGS` reason instead of failing every video in the batch
 - **Bandwidth-aware scaling** — an optional global cap is split across the active download slots, and the autoscaler grows the pool while the queue has backlog and bandwidth headroom
 - **Resilient by design** — interrupted downloads keep their `.part` file and resume exactly where they stopped; the retry budget only shrinks while a video makes no forward progress
+- **A resume that can never finish is discarded, not retried** — when the saved partial no longer matches what the server will serve (`HTTP Error 416: Requested range not satisfiable`, or aria2c refusing a file whose control state is gone), resuming repeats the failure forever and the video sits at 99.0%. The engine deletes the `.part` **and** its `.aria2` control file, resets progress, and restarts that video from zero
 - **Automatic retries** with exponential backoff + jitter on transient failures (network drops, throttling, timeouts)
 - **Permanent-failure detection** — private / removed / age-gated / geo-blocked videos fail fast and are never auto-requeued
 - **Self-healing sweeps** — crashed jobs resume, stale claims are reclaimed, deleted downloads are re-fetched, and failed jobs are retried after a cooldown. With aria2c these sweeps resume from the download's `.aria2` control file, and a discarded partial always takes its control file with it
@@ -323,6 +324,12 @@ partial is unusable it deletes the `.part` **and** its control file: aria2c
 defaults to `--allow-overwrite=false`, under which a control file whose data is
 gone makes it neither resume nor restart, wedging the job permanently.
 
+Resume is dropped automatically in exactly one case, because resuming there is
+pointless: the server no longer has the bytes the saved partial asks for
+(`HTTP Error 416: Requested range not satisfiable`). YouTube re-slices a format
+while a download is in flight, so the resume request lands past the end of the
+remote stream — and every retry with the same partial fails identically.
+
 Edit downloader and media settings with `bun run config` → **Change Download
 Settings** or from the dashboard's **⚙️ Settings** editor. Reliability and resume
 settings are under **Change Reliability & Resume** in the terminal config manager.
@@ -523,6 +530,35 @@ powershell -ExecutionPolicy Bypass -File .\install-task.ps1 -Uninstall
 - If `statfs` is unavailable, free space falls back to PowerShell
   (`Get-PSDrive`); if that also fails the engine runs in degraded mode
   instead of pausing forever
+
+### A video sits at 99% with `HTTP Error 416: Requested range not satisfiable`
+
+The symptom is a job that never advances: `Progress` and `Best progress` both
+stuck at 99.0%, `Resumes` 0, `Retries` climbing, `Last error` reading
+`ERROR: unable to download video data: HTTP Error 416: Requested range not
+satisfiable`, and a `.part` + `.part.aria2` pair sitting in the job's folder.
+The saved partial is bigger than (or exactly as big as) what the CDN will now
+serve for that format — YouTube re-encoded or re-sliced it mid-download — so the
+range the resume asks for does not exist. No retry, backoff, re-probe or cookie
+refresh can fix that: only throwing the partial away can.
+
+Current builds do this themselves: a 416 discards the `.part` together with its
+aria2c control file, zeroes the progress and the high-water mark (which would
+otherwise mark every later attempt "no progress"), and re-queues the video for a
+fresh transfer. If you are on an older build, do it by hand:
+
+1. Stop the engine (or pause it) so no aria2c/yt-dlp still holds the files.
+2. Delete that video's `*.part` and `*.part.aria2` in its download folder.
+   Always both — a leftover control file makes aria2c refuse to restart.
+3. Press **Retry** on the job (or just start the engine again). The video
+   downloads from zero; the archive entry is untouched, so nothing else is
+   re-fetched.
+
+The same reasoning covers the `error.log` noise an operator may have learned to
+ignore: the claim-lost line ("download claim lost — the next update will not
+land") used to be printed once per heartbeat for every video in a retry backoff,
+which is a hundred-plus lines an hour. It is reported once per claim now, so a
+line there means something actually happened.
 
 ### Bun crashes with `panic: index out of bounds` on Windows
 

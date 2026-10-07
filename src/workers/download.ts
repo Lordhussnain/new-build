@@ -38,6 +38,7 @@ import {
   isNChallengeError,
   isPermanentDownloadError,
   isTransientDownloadError,
+  isUnrecoverableResumeError,
   progressAwareRetryState,
 } from "../retry";
 import { buildDownloadPlan, effectiveVideoQuality, jobFittedBaseFilename } from "../download-args";
@@ -403,13 +404,16 @@ export async function cleanupDownloadProcess(
  * Central failure handler: classifies the error, decides whether the partial
  * file survives, and computes the next state. The guiding rules:
  *
- *   • transient (network/timeout/5xx)  → requeue with exponential backoff
+ *   • resume refused (HTTP 416 range,  → DISCARD the partial + control file,
+ *     aria2c control-file refusal)         restart from zero: the bytes the
+ *                                        resume asks for no longer exist
  *   • corrupt/incomplete               → delete the partial and resume (bounded
  *                                        by maxResumeAttempts, then restart)
  *   • live stream in "wait for VOD"    → park as waiting_live
  *   • permanent (private/removed/…)    → fail fast, never auto-requeued
  *   • n-challenge / missing JS runtime → retryable (not a dead video)
  *   • retry budget spent               → park as failed for the sweep
+ *   • transient (network/timeout/5xx)  → requeue with exponential backoff
  */
 export async function handleDownloadFailure(id: number, job: Job, config: Config, err: any): Promise<void> {
   if (isUserPaused(job.id)) {
@@ -490,6 +494,102 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
       await Bun.sleep(backoff);
     }
     return;
+  }
+
+  // Unrecoverable resume (the "stuck at 99% forever" bug): an HTTP 416 for the
+  // saved partial's range — or aria2c refusing to touch a file whose control
+  // state is gone — means the resume can NEVER complete, because the remote
+  // stream no longer has the bytes `--continue` is asking for. Retrying with
+  // the same partial repeats the failure identically, so this branch discards
+  // the pair and restarts the transfer. It must run before the corrupt-resume
+  // branch (which spends its budget RESUMING) and before the permanent-error
+  // check: a 416 is about OUR partial, not about the video being unfetchable.
+  if (isUnrecoverableResumeError(errMsg)) {
+    const current = readProgressState(job.id);
+    const retry = progressAwareRetryState(
+      current.retryCount,
+      current.bestProgress,
+      current.progress,
+      perVideoCap(config),
+    );
+    const partial =
+      job.partial_file_path && existsSync(job.partial_file_path)
+        ? job.partial_file_path
+        : await findPartialFile(job.output_directory, base);
+    // The 99% high-water mark was reached with bytes the server no longer serves.
+    // Kept, it turns every later attempt into a "no progress" failure, so a
+    // restart clears progress/best_progress in the same statement that re-queues.
+    const status = retry.exhausted ? "failed" : "pending";
+
+    if (partial) {
+      // Both files, in the one safe order: a `.part` without its `.aria2` (or
+      // the reverse) leaves aria2c unable to resume AND unable to restart.
+      const removal = await removePartialFiles(partial);
+      if (removal.fatal) {
+        // Nothing was deleted and aria2c still refuses to restart, so this can
+        // only wait for the lock (an orphaned aria2c/ffmpeg, an AV scan) to go
+        // away — with its partial still recorded for whoever retries.
+        const msg =
+          `resume state is unusable (HTTP 416) and its partial is locked (${removal.error}). ` +
+          `Close the program holding it — usually an orphaned aria2c/ffmpeg or an antivirus scan on the download folder.`;
+        const parked = releaseOwned(
+          job,
+          "parking a locked 416 partial",
+          `download_status = ?, retry_count = ?, best_progress = ?, partial_file_path = ?, last_error = ?`,
+          [status, retry.retryCount, retry.bestProgress, partial, msg.slice(0, 500)],
+        );
+        logError("download", `${job.id} ${job.title}: ${msg}`);
+        if (!parked) return;
+        if (retry.exhausted) {
+          stats.failed++;
+          notePipelineFailure("dl", config);
+          updateWorkerLine(id, `❌ Retry budget spent — waiting for cooldown | ${job.title}`, config);
+        } else {
+          updateWorkerLine(id, `🔒 416 partial locked — will retry | ${job.title}`, config);
+          await Bun.sleep(computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
+        }
+        return;
+      }
+    }
+
+    const restarted = releaseOwned(
+      job,
+      "restarting after an unrecoverable resume",
+      `download_status = ?, retry_count = ?, resume_count = 0, partial_file_path = NULL,
+       progress = ?, best_progress = ?, speed = 0, eta = 0, last_error = ?`,
+      [
+        status,
+        retry.retryCount,
+        retry.exhausted ? retry.bestProgress : 0,
+        retry.exhausted ? retry.bestProgress : 0,
+        errMsg.slice(0, 500),
+      ],
+    );
+    if (!restarted) return;
+    if (retry.exhausted) {
+      // Budget spent — but the unusable resume state is gone, so the cooldown
+      // sweep's next attempt starts clean instead of straight back into a 416.
+      stats.failed++;
+      notePipelineFailure("dl", config);
+      logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 300)}`);
+      updateWorkerLine(id, `❌ Retry budget spent — partial discarded, cooldown will restart it | ${job.title}`, config);
+      return;
+    }
+    if (partial) {
+      // A fresh attempt still has to survive a genuinely broken stream, so the
+      // no-progress budget is charged (it forgives again as soon as the restart
+      // gets further than the previous attempt did).
+      const backoff = computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
+      updateWorkerLine(id, `🧹 Resume state unusable (HTTP 416) — restarting from scratch in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
+      await Bun.sleep(backoff);
+      return;
+    }
+    // Nothing on disk to resume: a 416 with no partial can only come from stale
+    // media-URL state, and the next attempt re-extracts the formats anyway.
+    // Nothing was deleted, so no work is lost — the budget just bounds the loop.
+    const backoff = computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
+    updateWorkerLine(id, `🧹 Resume refused (HTTP 416), nothing to discard — retrying in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
+    await Bun.sleep(backoff);
   }
 
   // Corrupt/incomplete partial: keep resuming up to maxResumeAttempts, then

@@ -198,6 +198,43 @@ export function isTransientDownloadError(message: string): boolean {
 }
 
 /**
+ * True when the error says the RESUME itself is impossible — the saved `.part`
+ * can never be finished, so ONLY discarding it (together with its aria2c
+ * control file, via `removePartialFiles`) lets the video download again.
+ *
+ * Two verified shapes, both of which repeat byte-for-byte on every attempt:
+ *
+ *   • `ERROR: unable to download video data: HTTP Error 416: Requested range
+ *     not satisfiable` — the resume asked the CDN for
+ *     `Range: bytes=<size of the .part>-` and the answer was "that range does
+ *     not exist": the remote stream shrank (YouTube re-encodes / re-slices a
+ *     format mid-flight) or the partial already sits at/past the server's
+ *     Content-Length. This is how a video strands at 99.0% forever: progress
+ *     can never beat `best_progress`, so every retry charges the no-progress
+ *     budget and the job ends up `failed` — while the next retry resumes from
+ *     the same partial and fails the same way.
+ *   • aria2c's refusal to touch the saved state: `File <name> exists, but a
+ *     control file(*.aria2) does not exist. Download was canceled ...` (its
+ *     default `--allow-overwrite=false`). Nothing is resume-able and starting
+ *     over on top of the existing file is refused, so the pair has to go.
+ *
+ * Deliberately NOT matched: aria2c's "cannot continue download: downloading is
+ * not supported by remote server" (a server without `Accept-Ranges`). There the
+ * data is fine and the remedy is to keep `--continue` and let the native
+ * downloader take over — routing it here would throw away good work.
+ */
+export function isUnrecoverableResumeError(message: string | null | undefined): boolean {
+  if (!message) return false;
+  const m = message.toLowerCase();
+  return (
+    m.includes("requested range not satisfiable") ||
+    m.includes("http error 416") ||
+    m.includes("status code 416") ||
+    m.includes("exists, but a control file(*.aria2) does not exist")
+  );
+}
+
+/**
  * True when aria2c rejected the command line itself instead of downloading:
  * exit 28 is "bad/unrecognized option was given or unexpected option argument
  * was given", and aria2c prints the offending option's help block (e.g.

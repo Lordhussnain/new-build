@@ -8,6 +8,7 @@
 // new cookies may rescue.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { utimesSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -94,6 +95,48 @@ describe("detectCookiesChange", () => {
     await writeFile(cookiesFile, "second, longer");
     // mtime granularity can hide a same-millisecond rewrite; the size differs.
     expect(detectCookiesChange(cfg()).change).toBe("updated");
+  });
+
+  test("a rewrite of the SAME bytes is not an update", async () => {
+    // What the operator hit: a browser extension re-exports cookies.txt on its
+    // own timer. The content never changes, the mtime changes on every write,
+    // and the old mtime-based signal printed one "cookies.txt updated" line per
+    // poll — 1440 lines a day, which is what rotated error.log and buried the
+    // real failures.
+    const same = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tx\n";
+    writeFileSync(cookiesFile, same);
+    expect(detectCookiesChange(cfg()).change).toBeNull();
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(cookiesFile, same);
+      utimesSync(cookiesFile, new Date(), new Date(Date.now() + 1000 * (i + 1)));
+      expect(detectCookiesChange(cfg()).change).toBeNull();
+    }
+    // Same size, different bytes: still a real change, and it is reported.
+    const swapped = same.replace("\tSID\tx", "\tSID\ty");
+    expect(swapped.length).toBe(same.length);
+    writeFileSync(cookiesFile, swapped);
+    expect(detectCookiesChange(cfg()).change).toBe("updated");
+  });
+
+  test("a 0-byte cookies.txt stays 'absent' and only real content registers", async () => {
+    // An empty file yields no hash (nothing to hash), so the watcher is running
+    // on presence/size here — and it must stay quiet: touching an empty file is
+    // never an update, and neither is a metadata-only rewrite.
+    await writeFile(cookiesFile, "");
+    expect(detectCookiesChange(cfg()).change).toBeNull(); // baseline: absent (0 bytes)
+    for (let i = 0; i < 3; i++) {
+      writeFileSync(cookiesFile, "");
+      utimesSync(cookiesFile, new Date(), new Date(Date.now() + 1000 * (i + 1)));
+      expect(detectCookiesChange(cfg()).change).toBeNull();
+    }
+    await writeFile(cookiesFile, "aaaa");
+    expect(detectCookiesChange(cfg()).change).toBe("appeared");
+    await writeFile(cookiesFile, "bbbb"); // hashable both sides: a real change
+    expect(detectCookiesChange(cfg()).change).toBe("updated");
+    unlinkSync(cookiesFile);
+    expect(detectCookiesChange(cfg()).change).toBe("disappeared");
+    writeFileSync(cookiesFile, ""); // an empty file is still 'absent' cookies
+    expect(detectCookiesChange(cfg()).change).toBeNull();
   });
 
   test("present → missing is 'disappeared'", async () => {

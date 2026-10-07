@@ -367,3 +367,71 @@ Worth recording so they are not re-litigated:
   on rejection.
 - **Type escapes** — zero `as unknown as`, zero `@ts-ignore`. The 23 `as any` are almost
   all `db.query(...).get()/.all()` results, which a shared `JobRow` helper would clean up.
+
+---
+
+## Field-fix log — 2026-10-07 (branch `arena/ec6eb278-new-build`)
+
+Three operator-reported symptoms, root-caused from `error.log` + the dashboard's
+job detail (`QFrLzo7YLBA`, `8T5boxtoc4s`, `vrEUVK50958`, `NBAbJWrikcc`).
+
+### F1 A video stranded at 99.0% forever — RESOLVED
+
+`Last error: ERROR: unable to download video data: HTTP Error 416: Requested range not
+satisfiable`, `Retries` 1–3, `Resumes` 0, `Progress` = `Best progress` = 99.0%, and a
+`.part` + `.part.aria2` pair in the job folder, on all four videos.
+
+`buildDownloadPlan` passes `--continue`, so every attempt asks the CDN for
+`Range: bytes=<size of the .part>-`. YouTube re-slices/re-encodes a format while a
+download is in flight (here: `f137`/`f399`), so the saved partial is at or past the end
+of what the server now serves and the answer is 416 — byte-for-byte identical on every
+attempt. The failure was classified as *transient* (`isTransientDownloadError` matches
+"unable to download"), so the handler kept the partial, re-queued, resumed, and failed
+again; because `progress > best_progress` can never hold at 99.0%, each attempt charged
+the no-progress budget until the row was parked `failed` — where the cooldown sweep
+re-queued it into the same loop.
+
+**Fix:** new pure classifier `retry.ts isUnrecoverableResumeError` (416 range failures +
+aria2c's `--allow-overwrite=false` refusal), handled in `handleDownloadFailure` **before**
+the corrupt-resume and permanent branches: `removePartialFiles` discards the `.part` *and*
+its control file (never one without the other — gotcha 14/19), `progress`/`best_progress`
+are zeroed so the fresh transfer is not pre-judged "no progress", and the job is re-queued.
+A locked pair is still parked with the reason instead of being forced (gotcha 19).
+
+**Tests:** `tests/retry.test.ts` (classification + "never permanent"), new
+`tests/download-resume-416.test.ts` (7 handler cases), and an integration scenario in
+`tests/integration.test.ts` backed by a new mock-aria2c mode (`FAKE_ARIA2C_FAIL_MODE=range416`,
+which bites *only* on a resume) that asserts the pair is gone and the successful transfer
+recorded `resumed=false`. The scenario was verified to fail (jobs never settle) with the
+worker branch disabled.
+
+### F2 `error.log` filled with "download claim lost" every 30 s — RESOLVED
+
+One line per retrying video, every heartbeat interval, in long runs of 600+ lines an hour,
+while the videos were sitting in their F1 retry loop. `startClaimHeartbeat`'s `onLost` fired on
+*tick*: the worker releases its own claim in the same statement that records the outcome
+(`releaseOwned`, `recordSuccess`, the pause parks) and then sleeps for the backoff inside the
+try-block, so the timer keeps ticking against a lease that was cleared on purpose.
+
+**Fix:** `onLost` is now one-shot per claim (the loss is already recorded by the release), so a
+real takeover still produces exactly one line.
+
+**Tests:** `tests/db.test.ts` `describe("startClaimHeartbeat")` — live claim renews and stays
+silent, released claim reports once across several ticks, no-callback case stops renewing.
+
+### F3 `cookies.txt updated` logged once a minute forever — RESOLVED
+
+The operator's cookies jar was re-exported by a browser tool on a timer; the content stayed
+identical (2993 bytes both times) but `detectCookiesChange` judged `mtimeMs`, so every 60 s
+poll reported an update to stdout *and* `error.log` — and the ~1 MB log rotation then dropped
+the retained tail that the F1/F2 diagnosis needed.
+
+**Fix:** the watcher compares a SHA-256 of the file (`cookiesWatchState`, used by
+`detectCookiesChange`); a rewrite of the same bytes is not an update. The hash read is kept out
+of `cookiesState`/`cookiesArgs`, which stay a single stat on the download hot path (gotcha 9).
+Presence transitions are unchanged, and when the file cannot be read the watcher degrades to the
+size signal instead of logging noise.
+
+**Tests:** `tests/cookies.test.ts` — same-bytes rewrite (5× touch) stays quiet, same-size/different-bytes
+is reported, an empty file stays "absent" without noise.
+

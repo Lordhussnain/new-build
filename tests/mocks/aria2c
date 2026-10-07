@@ -24,7 +24,11 @@
 // Failure injection (independent of the yt-dlp mock's own FAKE_FAIL_TIMES, so a
 // failure can originate inside the external downloader):
 //   FAKE_ARIA2C_FAIL_TIMES=2   fail the first N attempts
-//   FAKE_ARIA2C_FAIL_MODE=transient|corrupt   what the failure looks like
+//   FAKE_ARIA2C_FAIL_MODE=transient|corrupt|range416   what the failure looks
+//                              like. `range416` only bites when the run RESUMES
+//                              from a control file: the server answers the saved
+//                              range with "416 Requested range not satisfiable",
+//                              the exact shape of a video stuck at 99.0%.
 //   FAKE_ARIA2C_INFLIGHT_MS=3000   hold a transfer open (partial + control file
 //                                  on disk) so a hard kill can interrupt it
 //   FAKE_ARIA2C_READOUT_MS=250     console-readout cadence while in flight
@@ -120,6 +124,19 @@ if (controlExists && !(await Bun.file(out).exists())) {
 }
 
 const resuming = controlExists;
+
+// The "stuck at 99%" state, reproduced: the resume asks the CDN for
+// `Range: bytes=<size of the .part>-` and the remote stream no longer has those
+// bytes (it shrank, or was re-sliced), so the answer is 416. This repeats on
+// every attempt that keeps the same partial — only discarding it helps, and
+// that is what the engine has to do.
+if (failMode === "range416" && resuming) {
+  console.error(
+    "ERROR: Unable to download video data: HTTP Error 416: Requested range not satisfiable",
+  );
+  console.error(`aria2c mock: refused to resume a stale range (attempt ${attempts})`);
+  process.exit(3);
+}
 
 // Simulate a genuinely in-flight transfer: the partial and its control file
 // exist while bytes are still arriving, which is the state a hard kill leaves

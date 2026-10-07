@@ -249,6 +249,8 @@ ingest ──► pending ──claim──► downloading ──success──►
               ▲                    │
               │                    ├─ transient ──► pending (keep .part, backoff)
               │                    ├─ corrupt ────► pending (resume_count++, .part kept)
+              │                    ├─ resume refused (416 range / aria2c control file)
+              │                    │                ► pending, .part + .aria2 DISCARDED (restart)
               │                    ├─ permanent ──► failed immediately (never auto-requeued)
               │                    ├─ live ───────► waiting_live (requeued by next scan)
               │                    └─ shutdown ───► paused + interrupted (auto-resume)
@@ -341,6 +343,8 @@ re-queues a failed sidecar pass on an already-converted job.
 | Bad downloader arguments | `retry.ts isDownloaderArgsError` → pause in `workers/download.ts` | aria2c exit 28 + option help block; parks the job, pauses the engine (`BAD_DOWNLOADER_ARGS`) |
 | Retry-budget forgiveness | `workers/download.ts handleDownloadFailure()` + `retry.ts progressAwareRetryState()` | `retry_count` only increments when `progress <= best_progress`; `best_progress` is committed at a failure boundary, not every progress update |
 | Resume budget | `workers/download.ts` corrupt branch | `.part` kept until `resume_count >= maxResumeAttempts`, then discarded |
+| Unrecoverable resume (HTTP 416) | `retry.ts isUnrecoverableResumeError` → `workers/download.ts` | `--continue` asks the CDN for a range the remote stream no longer has — the "stuck at 99.0%" loop. Resuming can never finish, so the `.part` AND its `.aria2` go through `removePartialFiles`, `progress`/`best_progress` are zeroed, and the job restarts from scratch |
+| Claim-lost reporting | `db.ts startClaimHeartbeat()` | `onLost` fires AT MOST ONCE per claim: the worker releases its own claim in the statement that records the outcome and then sleeps for the backoff, so a per-tick report printed "download claim lost" every 30 s per retrying video and buried error.log |
 | Partial-file bookkeeping | `workers/download.ts` + `reconcile.ts findPartialFile()` | recorded on failure, cleared on success |
 | Partial-path freeze | `reconcile.ts recordJobPartial() / recordPartialPaths()` | records the on-disk `.part` before a job stops being `downloading`, so a paused/interrupted job really resumes instead of restarting |
 | Pause bookkeeping | `workers/download.ts parkPaused()` | parks an in-flight job as `paused` **and** freezes its partial path |
@@ -362,8 +366,14 @@ re-queues a failed sidecar pass on an already-converted job.
 
 **Adding a new failure class:** extend the classifiers in `retry.ts` (pure,
 unit-tested), then handle it in `workers/download.ts handleDownloadFailure()`
-in the right precedence order: signature → downloader-args → corrupt →
-archive-scrub → live → permanent → transient/other retryable budget.
+in the right precedence order: signature → downloader-args → stale audio formats →
+**unrecoverable resume (416)** → corrupt → archive-scrub → live → permanent →
+transient/other retryable budget.
+
+**The order is the design.** A broader classifier placed first swallows the
+narrower one: a 416 must precede the corrupt-resume branch (which would spend its
+budget resuming the very partial that cannot be resumed) and the permanent class
+(which would park the job while keeping the broken resume state on disk).
 
 The **downloader-args** class (`retry.ts isDownloaderArgsError`, aria2c exit 28
 + the option's help block) is a global misconfiguration, not a video problem:
@@ -631,6 +641,7 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/download-output.test.ts` | bounded CR/LF pipe parsing, split UTF-8, oversized-record discard, validated final-path markers |
 | `tests/download-process.test.ts` | a progress-callback failure kills/reaps the downloader and clears active process tracking |
 | `tests/download-pause.test.ts` | user pause state survives download failure and successful file recording |
+| `tests/download-resume-416.test.ts` | the unrecoverable-resume branch: an HTTP 416 (or aria2c's control-file refusal) discards the `.part` WITH its `.aria2`, zeroes progress/best_progress and re-queues for a fresh transfer; the budget still bounds it; a lost claim writes nothing over the new owner's row; a plain corrupt error still KEEPS the partial |
 | `tests/audio-tracks.test.ts` | track parsing (variant collapse, drc drop, ordering), selection policy incl. per-job override, selector splicing, JSON column round-trips, and `probeAudioTracks` failures against a real child process (non-zero exit, unparsable JSON, and the abort at the timeout — every path the worker's single-audio fallback depends on) |
 | `tests/metadata.test.ts` | `subtitleArgs` — `all`/blank keep fetch-everything, explicit language lists pass through verbatim |
 | `tests/autoscale.test.ts` | slot ramp step, backlog/ceiling clamps, idle collapse, disabled mode |
@@ -679,7 +690,11 @@ failing the batch), and
 four aria2c resume/self-healing scenarios: resume from the control file,
 discarding a partial *with* its control file when the resume budget runs out, a
 hard kill mid-transfer followed by a resume on restart, and deleted files being
-re-fetched. Two more scenarios pin the durable-work guarantees end to end: a
+re-fetched — plus the HTTP 416 scenario, where the mock aria2c answers a RESUME
+only (never a fresh transfer) with `HTTP Error 416: Requested range not
+satisfiable`; the run must end downloaded, with the `.part` + `.aria2` pair gone
+and `resumed=false` in the mock's argv record, proving the engine restarted from
+scratch instead of looping on the stale resume state. Two more scenarios pin the durable-work guarantees end to end: a
 paused job's ABSOLUTE `partial_file_path` survives the startup sweep while
 `outputRoot` is the default RELATIVE `./downloads` (the counterexample that
 used to delete a day-old "orphan" that was the job's only resume state), and a
@@ -744,7 +759,7 @@ Mock controls (environment variables):
 | `FAKE_PROBE_HANG=1` | make `-J` never answer, so the probe watchdog fires (pair with `YTA_AUDIO_PROBE_TIMEOUT_MS` to keep the test short) |
 | `FAKE_ARIA2C_BIN` | absolute path of the sibling aria2c mock (set by the integration harness so that hop never depends on PATH) |
 | `FAKE_ARIA2C_FAIL_TIMES=N` | fail the first N attempts *inside* aria2c, leaving the `.part` + `.part.aria2` pair |
-| `FAKE_ARIA2C_FAIL_MODE` | `transient` \| `corrupt` (which aria2c-side error message to emit) |
+| `FAKE_ARIA2C_FAIL_MODE` | `transient` \| `corrupt` \| `range416` (which aria2c-side error message to emit; `range416` bites ONLY when the run resumes from a control file — the "stuck at 99%" state) |
 | `FAKE_ARIA2C_INFLIGHT_MS=N` | hold a transfer open N ms so a hard kill lands mid-flight, with partial + control file on disk |
 
 **When adding an engine behavior, add an integration scenario rather than
@@ -965,6 +980,17 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     share it. Keep the heartbeat interval well inside the stage's window
     (`startClaimHeartbeat`, default 30 s, `YTA_CLAIM_HEARTBEAT_MS` as the
     test-only override; the tightest window is metadata's 15 min).
+33. **A claim is released in the same statement that records the outcome — so the
+    heartbeat outlives it by design.** `releaseOwned` (failure paths),
+    `recordSuccess` and the pause parks all clear the claim, and the worker then
+    keeps sleeping for the backoff inside the try-block, so the timer ticks
+    against a dead lease on purpose. That is why `startClaimHeartbeat`'s `onLost`
+    is **one-shot**: a per-tick report printed "download claim lost — the next
+    update will not land" every 30 s for every retrying video (four stuck videos
+    ≈ 100 alarming lines an hour) and pushed real errors out of error.log's
+    retained tail. Keep the one-shot when adding a stage, and never write job
+    state from an `onLost` callback: the lease is gone, so the row belongs to
+    somebody else.
 
 ---
 

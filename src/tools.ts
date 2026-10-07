@@ -5,7 +5,8 @@
 // installs (exe next to the app, scoop, choco, winget, or an explicit config
 // path) all work without touching PATH.
 
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, dirname, basename } from "node:path";
 import os from "node:os";
 
@@ -99,7 +100,57 @@ export function cookiesArgs(config: { cookiesFile: string }): string[] {
 
 export type CookiesChange = "appeared" | "disappeared" | "updated" | null;
 
-let cookiesBaseline: CookiesState | null = null;
+/**
+ * What the cookies watcher remembers between polls: identity of the file plus a
+ * SHA-256 of its bytes.
+ *
+ * `size`/`mtimeMs` alone are NOT a content signal. A browser extension that
+ * re-exports cookies.txt on its own timer (or a cloud-sync client / an
+ * antivirus touch) rewrites the file with byte-identical content, and a
+ * metadata-only rewrite can even keep the size. Judged on mtime that reads as a
+ * fresh credential set on EVERY poll — one "cookies.txt updated" line per minute
+ * in `error.log`, forever, which buries the failures the log exists to show.
+ */
+export interface CookiesWatchState {
+  /** The configured path, used verbatim in messages (relative paths work). */
+  file: string;
+  /** Exists AND non-empty — a 0-byte cookies.txt is not usable cookies. */
+  present: boolean;
+  size: number;
+  mtimeMs: number;
+  /** SHA-256 of the content, or null when it could not be read (locked file). */
+  hash: string | null;
+}
+
+/**
+ * Watcher-side snapshot. Never throws.
+ *
+ * The read is deliberately NOT inside `cookiesState()`: that one runs on the hot
+ * path (`cookiesArgs()` before every yt-dlp invocation) and stays a single stat.
+ * A cookies.txt is a few KB of text and the watcher runs once a minute, so
+ * hashing it here is affordable — and it is the only way to tell a real
+ * credential change from a touch of the same bytes.
+ */
+export function cookiesWatchState(
+  config: { cookiesFile: string },
+  onUnreadable?: (msg: string) => void,
+): CookiesWatchState {
+  const base = cookiesState(config);
+  let hash: string | null = null;
+  if (base.present) {
+    try {
+      hash = createHash("sha256").update(readFileSync(base.file)).digest("hex");
+    } catch (e: any) {
+      // Locked (a browser mid-export) or vanished between the stat and the read.
+      // A missing hash is never treated as a content change; the caller may log
+      // that the check was skipped.
+      onUnreadable?.(`cookies.txt could not be read for the change check (${e?.code || e?.message || e})`);
+    }
+  }
+  return { file: base.file, present: base.present, size: base.size, mtimeMs: base.mtimeMs, hash };
+}
+
+let cookiesBaseline: CookiesWatchState | null = null;
 
 /**
  * Compare the cookies file with the last observation and remember this one.
@@ -110,21 +161,27 @@ let cookiesBaseline: CookiesState | null = null;
  * (see `reconcile.ts cookiesWatch`) so the operator sees the file being picked
  * up, replaced, or vanishing instead of wondering why age-gated videos
  * suddenly work or suddenly fail.
+ *
+ * `updated` means the BYTES changed. A re-export of identical content is not a
+ * credential change and must not be reported as one.
  */
 export function detectCookiesChange(config: {
   cookiesFile: string;
-}): { change: CookiesChange; state: CookiesState } {
-  const state = cookiesState(config);
+  onUnreadable?: (msg: string) => void;
+}): { change: CookiesChange; state: CookiesWatchState } {
+  const state = cookiesWatchState(config, config.onUnreadable);
   const prev = cookiesBaseline;
   cookiesBaseline = state;
   if (!prev) return { change: null, state }; // first observation = baseline
   if (!prev.present && state.present) return { change: "appeared", state };
   if (prev.present && !state.present) return { change: "disappeared", state };
-  if (
-    prev.present &&
-    state.present &&
-    (prev.size !== state.size || prev.mtimeMs !== state.mtimeMs)
-  ) {
+  if (prev.present && state.present && prev.hash !== null && state.hash !== null) {
+    return { change: prev.hash !== state.hash ? "updated" : null, state };
+  }
+  // Hashing was impossible for one of the two observations: fall back to the
+  // size signal (mtime alone is exactly what false-positives) so an unreadable
+  // file never turns the watcher off completely.
+  if (prev.present && state.present && prev.size !== state.size) {
     return { change: "updated", state };
   }
   return { change: null, state };

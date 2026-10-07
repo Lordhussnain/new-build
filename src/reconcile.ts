@@ -392,9 +392,17 @@ export function reconcileMissingFiles(config: Config): number {
  * browser *after* the engine is already running (or replace it when it expires),
  * and the download attempts must start using it without a restart. Returns the
  * transition so tests can assert on it; null means nothing changed.
+ *
+ * "Changed" means the CONTENT changed (see `detectCookiesChange`). An extension
+ * that re-exports the same bytes on a timer used to log an update every poll —
+ * 1440 `error.log` lines a day, which is also what rotated the ~1MB log every
+ * few hours and pushed the real failures out of its retained tail.
  */
 export function cookiesWatch(config: Config): CookiesChange {
-  const { change, state } = detectCookiesChange(config);
+  const { change, state } = detectCookiesChange({
+    cookiesFile: config.cookiesFile,
+    onUnreadable: (msg) => logError("cookies", msg),
+  });
   if (!change) return null;
   if (change === "appeared" || change === "updated") {
     // Jobs parked by a credential-shaped permanent error are the ones this

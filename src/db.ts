@@ -517,6 +517,15 @@ export function ownsClaim(stage: ClaimStage, jobId: string, claim: ClaimRef): bo
  * Returns the stop function — every caller must stop it when the stage ends,
  * including on failure, or the heartbeat would keep renewing a claim whose
  * outcome was already written.
+ *
+ * `onLost` fires AT MOST ONCE. A worker releases its own claim in the same
+ * statement that records the outcome (retry re-queue, park-as-failed, success),
+ * and then usually sleeps for the backoff *inside* the try-block — so the timer
+ * outlives the claim by design and every later tick would find a dead lease.
+ * Reporting that per tick printed one alarming
+ * "download claim lost — the next update will not land" line every heartbeat
+ * interval per retrying video, which buried the real error in error.log while
+ * saying nothing the release had not already recorded.
  */
 export function startClaimHeartbeat(
   stage: ClaimStage,
@@ -525,12 +534,19 @@ export function startClaimHeartbeat(
   onLost?: () => void,
   intervalMs: number = claimHeartbeatMs(),
 ): () => void {
+  let lostReported = false;
   const timer = setInterval(() => {
     try {
-      if (!heartbeatClaim(stage, jobId, claim)) onLost?.();
+      if (heartbeatClaim(stage, jobId, claim)) return;
     } catch {
       // The database can be mid-shutdown; the CAS updates are the real guard.
+      return;
     }
+    if (lostReported || !onLost) return;
+    lostReported = true;
+    // A lost lease is never renewed again: firing the callback on every later
+    // tick would only repeat a fact the release already recorded.
+    onLost();
   }, Math.max(250, intervalMs));
   // A heartbeat must never keep a shutting-down process alive.
   (timer as unknown as { unref?: () => void }).unref?.();
