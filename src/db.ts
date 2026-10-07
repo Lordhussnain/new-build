@@ -3,6 +3,19 @@
 // Every stage transition (claim, complete, fail) goes through here so the
 // worker pools stay crash-safe: claims are single atomic UPDATE … RETURNING
 // statements, so two workers can never grab the same video.
+//
+// A claim is a LEASE, not just a status flag: alongside the human-readable
+// worker id and timestamp it carries
+//   • a random CLAIM TOKEN — worker ids like `dl-1` repeat across processes, so
+//     a stale worker could otherwise look like the new owner; the token is
+//     unique per claim and every later update must present it, and
+//   • a HEARTBEAT timestamp — the reaper reclaims only when the lease has
+//     actually expired (no heartbeat within the stage's window), so a live
+//     long-running stage is never mistaken for a dead one.
+// Ownership-changing updates go through `updateClaimedJob`/`releaseClaimedJob`
+// (compare-and-swap on token + owner); a worker that lost its claim changes no
+// job state. See also `src/lease.ts` for the engine-wide (database-level)
+// lease that keeps two engine processes out of one `archive.db`.
 
 import { Database } from "bun:sqlite";
 import type { Config } from "./config";
@@ -26,8 +39,22 @@ export interface Job {
   metadata_files: string | null;
   download_claimed_by: string | null;
   download_claimed_at: string | null;
+  /** Unique token for the current download claim (required by every claim update). */
+  download_claim_token: string | null;
+  /** Last heartbeat of the download claim's lease (progress updates renew it). */
+  download_heartbeat_at: string | null;
   conversion_claimed_by: string | null;
   conversion_claimed_at: string | null;
+  /** Unique token for the current conversion claim. */
+  conversion_claim_token: string | null;
+  /** Last heartbeat of the conversion claim's lease. */
+  conversion_heartbeat_at: string | null;
+  metadata_claimed_by: string | null;
+  metadata_claimed_at: string | null;
+  /** Unique token for the current metadata claim. */
+  metadata_claim_token: string | null;
+  /** Last heartbeat of the metadata claim's lease. */
+  metadata_heartbeat_at: string | null;
   partial_file_path: string | null;
   retry_count: number;
   conversion_retry_count: number;
@@ -93,10 +120,18 @@ export function initDatabase(path: string = "archive.db"): void {
       metadata_files TEXT,
       pause_reason TEXT,
       metadata_retry_count INTEGER DEFAULT 0,
+      metadata_claimed_by TEXT,
+      metadata_claimed_at TEXT,
+      metadata_claim_token TEXT,
+      metadata_heartbeat_at TEXT,
       download_claimed_by TEXT,
       download_claimed_at TEXT,
+      download_claim_token TEXT,
+      download_heartbeat_at TEXT,
       conversion_claimed_by TEXT,
       conversion_claimed_at TEXT,
+      conversion_claim_token TEXT,
+      conversion_heartbeat_at TEXT,
       partial_file_path TEXT,
       retry_count INTEGER DEFAULT 0,
       last_error TEXT,
@@ -142,6 +177,27 @@ export function initDatabase(path: string = "archive.db"): void {
        total_queued INTEGER
      )`,
   );
+  // Database-level engine lease: exactly one engine process may own `archive.db`.
+  //
+  // The web port is still the HTTP lock, but it is not an ownership primitive for
+  // the database: two engines with different `webPort` values used to bind their
+  // own ports and then both run the startup reconciliation on the same jobs,
+  // each resetting the other's in-flight claims. The lease row is the
+  // authoritative owner: `owner` is a random per-process token, `expires_at` is
+  // renewed by a heartbeat, and `fencing` increases monotonically on every
+  // acquisition so a stale holder can be told apart from the current one.
+  db.run(
+    `CREATE TABLE IF NOT EXISTS engine_lease (
+       id INTEGER PRIMARY KEY CHECK (id = 1),
+       owner TEXT,
+       fencing INTEGER NOT NULL DEFAULT 0,
+       pid INTEGER,
+       host TEXT,
+       acquired_at TEXT,
+       heartbeat_at TEXT,
+       expires_at TEXT
+     )`,
+  );
 
   // Schema migrations for databases created by older versions.
   ensureColumn("jobs", "metadata_status", "metadata_status TEXT DEFAULT 'not_needed'");
@@ -161,6 +217,22 @@ export function initDatabase(path: string = "archive.db"): void {
   // Re-download safety net: the previous media file, moved aside while a
   // manual retry re-fetches the video (see reconcile.ts superseded helpers).
   ensureColumn("jobs", "superseded_file", "superseded_file TEXT");
+  // Claim leases: a random token plus a heartbeat timestamp per stage. Rows
+  // claimed by an older engine version have neither (token/claimed_by NULL),
+  // which the CAS updates treat as a legacy claim — the reaper may still take
+  // it over once its `*_claimed_at` ages out.
+  ensureColumn("jobs", "metadata_claimed_by", "metadata_claimed_by TEXT");
+  ensureColumn("jobs", "metadata_claimed_at", "metadata_claimed_at TEXT");
+  ensureColumn("jobs", "metadata_claim_token", "metadata_claim_token TEXT");
+  ensureColumn("jobs", "metadata_heartbeat_at", "metadata_heartbeat_at TEXT");
+  ensureColumn("jobs", "download_claim_token", "download_claim_token TEXT");
+  ensureColumn("jobs", "download_heartbeat_at", "download_heartbeat_at TEXT");
+  ensureColumn("jobs", "conversion_claim_token", "conversion_claim_token TEXT");
+  ensureColumn("jobs", "conversion_heartbeat_at", "conversion_heartbeat_at TEXT");
+  // The lease records which process (and host) owns the database, so a restart
+  // after a hard kill can take over immediately instead of waiting out the TTL.
+  ensureColumn("engine_lease", "pid", "pid INTEGER");
+  ensureColumn("engine_lease", "host", "host TEXT");
   db.run(
     `UPDATE jobs SET metadata_status = CASE
        WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
@@ -185,7 +257,10 @@ export function initDatabase(path: string = "archive.db"): void {
   claimDownloadJob = db.transaction((workerId: string) => {
     const row = db
       .query(
-        `UPDATE jobs SET download_status = 'downloading', pause_reason = NULL, download_claimed_by = ?, download_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        `UPDATE jobs SET download_status = 'downloading', pause_reason = NULL,
+           download_claimed_by = ?, download_claimed_at = CURRENT_TIMESTAMP,
+           download_claim_token = ?, download_heartbeat_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
          WHERE id = (
            SELECT id FROM jobs
            WHERE (download_status = 'pending'
@@ -201,7 +276,7 @@ export function initDatabase(path: string = "archive.db"): void {
          )
          RETURNING *`,
       )
-      .get(workerId) as Job | null;
+      .get(workerId, newClaimToken()) as Job | null;
     return row;
   });
 
@@ -209,7 +284,10 @@ export function initDatabase(path: string = "archive.db"): void {
   claimConvertJob = db.transaction((workerId: string) => {
     const row = db
       .query(
-        `UPDATE jobs SET conversion_status = 'in_progress', conversion_claimed_by = ?, conversion_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        `UPDATE jobs SET conversion_status = 'in_progress',
+           conversion_claimed_by = ?, conversion_claimed_at = CURRENT_TIMESTAMP,
+           conversion_claim_token = ?, conversion_heartbeat_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
          WHERE id = (
            SELECT id FROM jobs
            WHERE download_status = 'downloaded' AND conversion_status = 'pending'
@@ -218,16 +296,22 @@ export function initDatabase(path: string = "archive.db"): void {
          )
          RETURNING *`,
       )
-      .get(workerId) as Job | null;
+      .get(workerId, newClaimToken()) as Job | null;
     return row;
   });
 
   // Metadata claim — sidecars (subs/thumbnail/description/info.json) for
-  // finished downloads whose flags say metadata is wanted.
+  // finished downloads whose flags say metadata is wanted. The claim records
+  // its owner, timestamp, token and heartbeat like the other two stages: the
+  // reaper needs a lease to compare against, and the worker needs a token to
+  // present on every later update.
   claimMetadataJob = db.transaction((workerId: string) => {
     const row = db
       .query(
-        `UPDATE jobs SET metadata_status = 'in_progress', updated_at = CURRENT_TIMESTAMP
+        `UPDATE jobs SET metadata_status = 'in_progress',
+           metadata_claimed_by = ?, metadata_claimed_at = CURRENT_TIMESTAMP,
+           metadata_claim_token = ?, metadata_heartbeat_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
          WHERE id = (
            SELECT id FROM jobs
            WHERE download_status = 'downloaded' AND metadata_status = 'pending'
@@ -241,9 +325,211 @@ export function initDatabase(path: string = "archive.db"): void {
          )
          RETURNING *`,
       )
-      .get(workerId) as Job | null;
+      .get(workerId, newClaimToken()) as Job | null;
     return row;
   });
+}
+
+// ---------------------------------------------------------------------------
+// Claim leases: tokens, compare-and-swap updates, heartbeats
+// ---------------------------------------------------------------------------
+
+/** The three independently claimable pipeline stages. */
+export type ClaimStage = "download" | "conversion" | "metadata";
+
+interface ClaimColumns {
+  /** Stage status column (`downloading` for downloads, `in_progress` otherwise). */
+  status: string;
+  /** Status value that means "this stage is claimed right now". */
+  claimedStatus: string;
+  /** Human-readable owner (worker id) column. */
+  by: string;
+  /** Claim timestamp column. */
+  at: string;
+  /** Random per-claim token column. */
+  token: string;
+  /** Lease heartbeat column, renewed while the stage runs. */
+  heartbeat: string;
+}
+
+const CLAIM_COLUMNS: Record<ClaimStage, ClaimColumns> = {
+  download: {
+    status: "download_status",
+    claimedStatus: "downloading",
+    by: "download_claimed_by",
+    at: "download_claimed_at",
+    token: "download_claim_token",
+    heartbeat: "download_heartbeat_at",
+  },
+  conversion: {
+    status: "conversion_status",
+    claimedStatus: "in_progress",
+    by: "conversion_claimed_by",
+    at: "conversion_claimed_at",
+    token: "conversion_claim_token",
+    heartbeat: "conversion_heartbeat_at",
+  },
+  metadata: {
+    status: "metadata_status",
+    claimedStatus: "in_progress",
+    by: "metadata_claimed_by",
+    at: "metadata_claimed_at",
+    token: "metadata_claim_token",
+    heartbeat: "metadata_heartbeat_at",
+  },
+};
+
+/** Column names for one stage's claim — the single source of truth. */
+export function claimColumns(stage: ClaimStage): ClaimColumns {
+  return CLAIM_COLUMNS[stage];
+}
+
+/** A claim's identity: what a CAS update matches against. */
+export interface ClaimRef {
+  by: string | null;
+  token: string | null;
+}
+
+/**
+ * The claim coordinates of a row, for passing to `updateClaimedJob`.
+ *
+ * `null`/`null` (no token, no owner) is the legacy claim written by an engine
+ * version that predated tokens; it is still updatable, and the reaper may take
+ * it over once its `*_claimed_at` ages out — exactly like before.
+ */
+export function claimRef(stage: ClaimStage, row: Record<string, unknown> | Job): ClaimRef {
+  const c = CLAIM_COLUMNS[stage];
+  const r = row as Record<string, unknown>;
+  return {
+    by: (r[c.by] as string | null | undefined) ?? null,
+    token: (r[c.token] as string | null | undefined) ?? null,
+  };
+}
+
+/**
+ * A fresh, unique claim token.
+ *
+ * Worker ids (`dl-1`, `cv-2`) are positional and repeat across processes: a
+ * worker restarted in a second engine process looks like the first one. The
+ * token is what actually identifies a claim, so a stale worker's late update
+ * cannot be mistaken for the live owner's.
+ */
+export function newClaimToken(): string {
+  return crypto.randomUUID();
+}
+
+/** How often a claimed stage renews its lease (test override: YTA_CLAIM_HEARTBEAT_MS). */
+export function claimHeartbeatMs(): number {
+  const override = Number(process.env.YTA_CLAIM_HEARTBEAT_MS);
+  return Number.isFinite(override) && override > 0 ? override : 30_000;
+}
+
+/**
+ * Compare-and-swap an update on a claimed job.
+ *
+ * The row is touched only when `claim` still identifies its live claim, so a
+ * worker (or reaper) whose claim was reaped, released, or taken over by another
+ * process cannot change job state: it gets 0 changed rows and must walk away.
+ * The caller checks the result — `1` means the update landed.
+ *
+ * `extraCondition` is appended to the WHERE clause for callers that need an
+ * additional precondition (e.g. reaping only a lease that has actually
+ * expired, or a user pause that is still recorded).
+ */
+export function updateClaimedJob(
+  stage: ClaimStage,
+  jobId: string,
+  claim: ClaimRef,
+  setClause: string,
+  params: unknown[] = [],
+  extraCondition?: string,
+): number {
+  const c = CLAIM_COLUMNS[stage];
+  const extra = extraCondition ? ` AND (${extraCondition})` : "";
+  return db.run(
+    `UPDATE jobs SET ${setClause} WHERE id = ? AND ${c.token} IS ? AND ${c.by} IS ?${extra}`,
+    [...params, jobId, claim.token, claim.by] as any,
+  ).changes;
+}
+
+/**
+ * The release flavour of `updateClaimedJob`: the matched claim is cleared in
+ * the same statement that writes the new state, so a job is never left with a
+ * status that says "finished" while a claim still points at a worker that is
+ * gone (or worse, while a *new* owner's claim is overwritten).
+ */
+export function releaseClaimedJob(
+  stage: ClaimStage,
+  jobId: string,
+  claim: ClaimRef,
+  setClause: string,
+  params: unknown[] = [],
+  extraCondition?: string,
+): number {
+  const c = CLAIM_COLUMNS[stage];
+  const release = [
+    `${c.by} = NULL`,
+    `${c.at} = NULL`,
+    `${c.token} = NULL`,
+    `${c.heartbeat} = NULL`,
+    "updated_at = CURRENT_TIMESTAMP",
+  ].join(", ");
+  const set = [setClause, release].filter((s) => s && s.trim().length > 0).join(", ");
+  return updateClaimedJob(stage, jobId, claim, set, params, extraCondition);
+}
+
+/**
+ * Renew a claim's lease. Returns false when the claim is no longer ours, which
+ * the worker's heartbeat callback reports — the ownership checks and CAS
+ * updates then keep it from touching anything the new owner controls.
+ */
+export function heartbeatClaim(stage: ClaimStage, jobId: string, claim: ClaimRef): boolean {
+  const c = CLAIM_COLUMNS[stage];
+  return (
+    db.run(
+      `UPDATE jobs SET ${c.heartbeat} = CURRENT_TIMESTAMP
+        WHERE id = ? AND ${c.token} IS ? AND ${c.by} IS ? AND ${c.status} = ?`,
+      [jobId, claim.token, claim.by, c.claimedStatus] as any,
+    ).changes === 1
+  );
+}
+
+/** Is this claim still the live owner of the stage on this row? */
+export function ownsClaim(stage: ClaimStage, jobId: string, claim: ClaimRef): boolean {
+  const c = CLAIM_COLUMNS[stage];
+  return !!db
+    .query(
+      `SELECT 1 FROM jobs
+        WHERE id = ? AND ${c.token} IS ? AND ${c.by} IS ? AND ${c.status} = ? LIMIT 1`,
+    )
+    .get(jobId, claim.token, claim.by, c.claimedStatus);
+}
+
+/**
+ * Keep a claim's lease alive while its stage runs, so the reaper can tell a
+ * long conversion or metadata fetch apart from a dead worker.
+ *
+ * Returns the stop function — every caller must stop it when the stage ends,
+ * including on failure, or the heartbeat would keep renewing a claim whose
+ * outcome was already written.
+ */
+export function startClaimHeartbeat(
+  stage: ClaimStage,
+  jobId: string,
+  claim: ClaimRef,
+  onLost?: () => void,
+  intervalMs: number = claimHeartbeatMs(),
+): () => void {
+  const timer = setInterval(() => {
+    try {
+      if (!heartbeatClaim(stage, jobId, claim)) onLost?.();
+    } catch {
+      // The database can be mid-shutdown; the CAS updates are the real guard.
+    }
+  }, Math.max(250, intervalMs));
+  // A heartbeat must never keep a shutting-down process alive.
+  (timer as unknown as { unref?: () => void }).unref?.();
+  return () => clearInterval(timer);
 }
 
 /** Per-video failure cap: the smaller of the two knobs, so both stay honest. */

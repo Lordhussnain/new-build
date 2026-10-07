@@ -8,7 +8,18 @@
 import { cp, mkdir, readdir, rename, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { claimConvertJob, db, perVideoCap, type Job } from "../db";
+import {
+  claimConvertJob,
+  claimRef,
+  db,
+  ownsClaim,
+  perVideoCap,
+  releaseClaimedJob,
+  startClaimHeartbeat,
+  updateClaimedJob,
+  type ClaimRef,
+  type Job,
+} from "../db";
 import { computeBackoffMs } from "../retry";
 import { SIDECAR_SUFFIXES, hashFile } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
@@ -75,10 +86,19 @@ export async function converterWorker(id: number, config: Config): Promise<void>
       await Bun.sleep(2000);
       continue;
     }
+    // A conversion can run for hours (ffmpeg) and emits nothing the reaper can
+    // see, so the claim's lease is renewed here. Without this heartbeat the
+    // fixed stale window was the only signal, and a live long encode looked
+    // exactly like a dead worker.
+    const stopHeartbeat = startClaimHeartbeat("conversion", job.id, claimRef("conversion", job), () =>
+      logError("conversion", `${job.id} ${job.title}: conversion claim lost — the encode will not be recorded`),
+    );
     try {
       await convertJob(job, config, id);
     } catch (err: any) {
       await handleConvertFailure(job, config, err, id);
+    } finally {
+      stopHeartbeat();
     }
   }
 }
@@ -87,19 +107,20 @@ export async function converterWorker(id: number, config: Config): Promise<void>
  * True when this worker still owns the job's conversion claim.
  *
  * Claims can be lost mid-flight: the stale-claim reaper re-queues conversions
- * after its three-hour timeout, and (before the web-port single-instance gate)
- * a second engine instance could reset them at startup.
- * A converter that kept working would then race a second converter on the same
- * files — the loser's source gets deleted under it, which on Windows either
- * fails silently (locked handle) or corrupts the winner's output. Every
- * destructive step (source delete, secondary-storage move, final update)
- * therefore re-checks ownership first and walks away if it was stolen.
+ * whose lease expired, and a second engine process could reset them at startup
+ * if this one's lease lapsed. A converter that kept working would then race a
+ * second converter on the same files — the loser's source gets deleted under
+ * it, which on Windows either fails silently (locked handle) or corrupts the
+ * winner's output. Every destructive step (source delete, secondary-storage
+ * move, final update) therefore re-checks ownership first and walks away if it
+ * was stolen.
+ *
+ * Ownership is identified by the claim TOKEN, not the worker id: `cv-1` exists
+ * in every engine process, so a stale worker's id can look exactly like the new
+ * owner's.
  */
-function stillOwnsConversion(job: Pick<Job, "id">, workerId: string): boolean {
-  const row = db
-    .query("SELECT conversion_status, conversion_claimed_by FROM jobs WHERE id = ?")
-    .get(job.id) as any;
-  return !!row && row.conversion_status === "in_progress" && row.conversion_claimed_by === workerId;
+function stillOwnsConversion(job: Job): boolean {
+  return ownsClaim("conversion", job.id, claimRef("conversion", job));
 }
 
 /**
@@ -124,14 +145,9 @@ export function findConvertedOutput(sourcePath: string, wantsMp3: boolean, targe
 }
 
 /** Delete the pre-conversion source — but never out from under a stolen claim. */
-async function deleteConvertedSource(
-  job: Job,
-  config: Config,
-  workerId: string,
-  sourcePath: string,
-): Promise<void> {
+async function deleteConvertedSource(job: Job, config: Config, sourcePath: string): Promise<void> {
   if (!config.deleteSourceAfterConvert) return;
-  if (!stillOwnsConversion(job, workerId)) {
+  if (!stillOwnsConversion(job)) {
     logError("conversion", `${job.id} ${job.title}: conversion claim lost mid-job — keeping the source file`);
     return;
   }
@@ -154,16 +170,15 @@ async function finalizeConversion(
   job: Job,
   config: Config,
   id: number,
-  workerId: string,
   finalPath: string,
 ): Promise<void> {
-  if (!stillOwnsConversion(job, workerId)) {
+  if (!stillOwnsConversion(job)) {
     logError("conversion", `${job.id} ${job.title}: conversion claim lost mid-job — not finalizing`);
     return;
   }
   if (config.secondaryStoragePath) {
     const moved = await moveToSecondaryStorage(job, config.secondaryStoragePath, finalPath, () =>
-      stillOwnsConversion(job, workerId),
+      stillOwnsConversion(job),
     );
     if (moved.stopped) {
       // Ownership is gone: the thief owns these files now, so nothing else is
@@ -177,15 +192,18 @@ async function finalizeConversion(
   if (config.verifyIntegrity) {
     integrity = await hashFile(finalPath);
   }
-  // The claim guard in the WHERE clause makes the done-update itself atomic
-  // with ownership: if the claim was stolen while hashing, changes is 0 and
-  // the thief owns the job now — touch nothing further.
-  const claimed = db.run(
-    `UPDATE jobs SET conversion_status = 'done', file_path = ?, integrity = ?, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
-     WHERE id = ? AND conversion_claimed_by = ? AND conversion_status = 'in_progress'`,
-    [finalPath, integrity, job.id, workerId],
+  // The claim-token CAS makes the done-update itself atomic with ownership: if
+  // the claim was stolen while hashing, changes is 0 and the thief owns the job
+  // now — touch nothing further.
+  const claimed = releaseClaimedJob(
+    "conversion",
+    job.id,
+    claimRef("conversion", job),
+    `conversion_status = 'done', file_path = ?, integrity = ?`,
+    [finalPath, integrity],
+    `conversion_status = 'in_progress'`,
   );
-  if (claimed.changes === 0) {
+  if (claimed === 0) {
     logError("conversion", `${job.id} ${job.title}: conversion claim lost before finalize — files left untouched`);
     return;
   }
@@ -299,7 +317,6 @@ async function moveFileCopy(
 }
 
 async function convertJob(job: Job, config: Config, id: number): Promise<void> {
-  const workerId = `cv-${id}`;
   updateConvertWorkerLine(id, `🔄 Converting | ${job.title}`, config);
   const sourcePath = job.file_path!;
   const targetFmt = effectiveTargetFormat(job, config);
@@ -311,7 +328,7 @@ async function convertJob(job: Job, config: Config, id: number): Promise<void> {
     const adopted = findConvertedOutput(sourcePath, wantsMp3, targetFmt);
     if (adopted) {
       logError("conversion", `${job.id} ${job.title}: source missing but already converted — adopting ${adopted}`);
-      await finalizeConversion(job, config, id, workerId, adopted);
+      await finalizeConversion(job, config, id, adopted);
       return;
     }
     throw new Error(`Source file missing: ${sourcePath || "(null)"}`);
@@ -331,8 +348,10 @@ async function convertJob(job: Job, config: Config, id: number): Promise<void> {
       );
     }
     finalPath = mp3Path;
-    db.run(`UPDATE jobs SET file_path = ? WHERE id = ?`, [finalPath, job.id]);
-    await deleteConvertedSource(job, config, workerId, sourcePath);
+    // Claim-checked: a stale worker must not point the row at a file the new
+    // owner is not converting.
+    updateClaimedJob("conversion", job.id, claimRef("conversion", job), `file_path = ?`, [finalPath]);
+    await deleteConvertedSource(job, config, sourcePath);
   } else if (!wantsMp3 && !sourcePath.endsWith(`.${targetFmt}`)) {
     // Multi-audio archives land as MKV holding every selected track. MP4
     // cannot carry them without re-encoding each dub, so a file with more
@@ -353,10 +372,12 @@ async function convertJob(job: Job, config: Config, id: number): Promise<void> {
       );
     }
     finalPath = targetPath;
-    db.run(`UPDATE jobs SET file_path = ? WHERE id = ?`, [finalPath, job.id]);
-    await deleteConvertedSource(job, config, workerId, sourcePath);
+    // Claim-checked: a stale worker must not point the row at a file the new
+    // owner is not converting.
+    updateClaimedJob("conversion", job.id, claimRef("conversion", job), `file_path = ?`, [finalPath]);
+    await deleteConvertedSource(job, config, sourcePath);
   }
-  await finalizeConversion(job, config, id, workerId, finalPath);
+  await finalizeConversion(job, config, id, finalPath);
 }
 
 /**
@@ -369,10 +390,19 @@ async function handleConvertFailure(job: Job, config: Config, err: any, id: numb
   const attempts = (job.conversion_retry_count || 0) + 1;
   const cap = perVideoCap(config);
   const newStatus = attempts >= cap ? "failed" : "pending";
-  db.run(
-    `UPDATE jobs SET conversion_status = ?, conversion_retry_count = ?, last_error = ?, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [newStatus, attempts, errMsg, job.id],
+  // CAS on the claim token: losing the claim means the outcome belongs to the
+  // new owner, so this worker changes nothing and reports nothing.
+  const landed = releaseClaimedJob(
+    "conversion",
+    job.id,
+    claimRef("conversion", job),
+    `conversion_status = ?, conversion_retry_count = ?, last_error = ?`,
+    [newStatus, attempts, errMsg],
   );
+  if (landed !== 1) {
+    logError("conversion", `${job.id} ${job.title}: conversion claim lost before recording the failure`);
+    return;
+  }
   if (newStatus === "failed") {
     stats.failed++;
     logError("conversion", `${job.id} ${job.title}: ${errMsg}`);

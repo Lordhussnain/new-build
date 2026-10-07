@@ -217,6 +217,45 @@ Small, cheap, one-liner-ish each.
 | 3.12 | Await/`.catch` the floating `handleShutdown` (`engine.ts:39`) and `networkMonitor` (`:137`) |
 | 3.13 | Guard the awaits that sit **outside** the worker try-blocks (`download.ts:53,60`, `convert.ts:72`, `metadata.ts:31`) — all four can throw `SQLITE_BUSY` and kill the loop without releasing the claim |
 
+### 3.14 Multi-process concurrency: the DB is the lock, a claim token is the identity — RESOLVED
+
+Audit finding: the web port was the **only** thing keeping two engines apart, and it
+is not a database lock — a second engine started on another port re-ran the crash
+sweeps against the first one's in-flight claims. Worse, a claim was identified by the
+worker id (`dl-1`), which every process reuses, so a stale worker whose claim had been
+reclaimed could still write progress, success, or failure over the new owner's row.
+
+- **Engine lease** (`src/lease.ts`, `engine_lease` singleton row): owner token +
+  expiry + monotonic `fencing` number, acquired in one immediate transaction right
+  after `initDatabase()` and **before any sweep**. A live foreign owner is refused
+  (exit 1, no job row touched, web port irrelevant); an expired lease or one whose
+  owning PID is provably gone is taken over instantly with `fencing + 1`, which is
+  what makes a crash-and-restart not wait out the TTL. Renewed every 20 s (60 s TTL),
+  released on graceful shutdown (row kept so fencing survives), and a lease lost to a
+  takeover pauses the engine with `ENGINE_LEASE_LOST`. `reconcileCrashedJobs()` and
+  `reapStaleClaims()` refuse to run while another live owner holds the lease.
+- **Claim tokens** (`jobs.*_claim_token`, `db.ts`): every claim mints a random token;
+  each later write (progress, success, failure, release) goes through
+  `updateClaimedJob`/`releaseClaimedJob`, which require the token **and** the worker
+  id and return the changed-row count. **0** means ownership was lost, and the worker
+  drops the job instead of mutating it — the fix for a re-claimed job being stomped
+  by its previous owner. Covers conversion and metadata as well as download.
+- **Heartbeats** (`jobs.*_heartbeat_at`): conversion and metadata renew their claim on
+  an interval (long encodes are legitimate), downloads renew on progress. Staleness is
+  measured from the heartbeat, not `updated_at` (which other writers bump), so the
+  reaper no longer has to guess from a stage's start time.
+- **CAS reaper**: reclaiming is now `reapStaleClaim()` — a single UPDATE whose
+  predicate carries the claim token, worker id, stage status, and the (re-evaluated)
+  expired-heartbeat window. A worker that renewed, or a second reaper that got there
+  first, makes it match 0 rows; the stranded-`.aria2` sweep only touches jobs actually
+  reclaimed this tick.
+- **Tests**: `tests/engine-lease.test.ts` (takeover honesty, fencing, refusal,
+  renew/release, sweeps gated on ownership) and `tests/claim-races.test.ts`
+  (two connections, and three real OS processes draining one queue: no double claim,
+  stale worker refused after a reclaim, heartbeating conversion not reaped, two
+  reapers racing one expired claim), plus a same-database/second-port integration
+  scenario asserting the fresh engine exits without touching the first engine's jobs.
+
 ---
 
 ## Phase 4 — Tests + CI
@@ -298,7 +337,8 @@ Ordered by value-per-line — the data model already supports most of these.
 
 `0.x` hygiene/docs → `1.1` reaper → `1.2` route 409s → `1.3` child leak → `1.4` `-U`
 timeout → `1.5` user pause → `1.6` logging → `2.x` perf (one commit each) → `3.x`
-hardening → `4.1` failure-policy refactor → `4.2`-`4.8` tests/CI → `5.1`-`5.7` features.
+hardening → `3.14` engine lease + claim tokens → `4.1` failure-policy refactor →
+`4.2`-`4.8` tests/CI → `5.1`-`5.7` features.
 
 ---
 

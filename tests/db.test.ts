@@ -19,6 +19,7 @@ import {
   perVideoCap,
 } from "../src/db";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
+import { acquireEngineLease } from "../src/lease";
 import { activeDownloadJobs } from "../src/state";
 import { ingestItems } from "../src/scanner";
 import {
@@ -63,6 +64,9 @@ function minutesAgo(minutes: number): string {
 
 beforeEach(() => {
   initDatabase(":memory:");
+  // The startup sweeps and the reaper only run for the engine that owns
+  // archive.db; the tests play that engine.
+  acquireEngineLease();
 });
 
 const tmpDirs: string[] = [];

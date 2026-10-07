@@ -14,6 +14,7 @@ import { getPlaylistItems } from "./src/scanner";
 import { resolvedTools } from "./src/tools";
 import { SOURCE_KEYS, sourceIdentity } from "./src/sources";
 import { STALE_CLAIM_THRESHOLDS } from "./src/reconcile";
+import { describeEngineLease, hasLiveLeaseOwner, holdsEngineLease, readEngineLease } from "./src/lease";
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
@@ -455,7 +456,7 @@ async function changeReliabilitySettings(config: Config): Promise<Config> {
   console.log(`   • Crashed jobs resume        on startup`);
   const staleClaimThresholds = STALE_CLAIM_THRESHOLDS(config);
   console.log(
-    `   • Stale claims reclaimed      every 60s — inactive downloads ${staleClaimThresholds.download.replace("-", "idle longer than ")}, conversions ${staleClaimThresholds.conversion.replace("-", "")}, metadata ${staleClaimThresholds.metadata.replace("-", "")}`,
+    `   • Stale claims reclaimed      every 60s — by lease heartbeat: downloads silent longer than ${staleClaimThresholds.download.replace("-", "")}, conversions ${staleClaimThresholds.conversion.replace("-", "")}, metadata ${staleClaimThresholds.metadata.replace("-", "")}`,
   );
   console.log(`   • Deleted files re-fetched   on startup`);
   console.log(
@@ -563,28 +564,40 @@ async function mainMenu() {
         if (saved && existsSync("archive.db")) {
           try {
             initDatabase("archive.db");
-            const activeSources = new Set(
-              SOURCE_KEYS.flatMap((key) => config[key].map((url) => sourceIdentity(url))),
-            );
-            for (const [identity, sourceUrl] of originalSources) {
-              if (activeSources.has(identity)) continue;
-              const tracked = db
-                .query("SELECT COUNT(*) AS count FROM job_sources WHERE source_url = ?")
-                .get(identity) as { count: number };
-              if ((tracked?.count || 0) > 0) continue;
-              try {
-                if (config.ytDlpPath.trim()) resolvedTools.ytDlp = config.ytDlpPath.trim();
-                const items = await getPlaylistItems(sourceUrl, config);
-                associateExistingJobsWithSource(identity, items.map((item) => item.id));
-              } catch (e: any) {
-                console.warn(`⚠️ Could not backfill old jobs for ${sourceUrl}: ${e?.message || e}`);
+            // A running engine owns archive.db through the engine lease. Deleting
+            // jobs for removed sources underneath it could remove a row it is
+            // working on (the queue purge's idle guard does not apply here), so
+            // the cleanup is skipped and the engine's next start applies it —
+            // the same path that catches config.json edited by hand.
+            if (hasLiveLeaseOwner() && !holdsEngineLease()) {
+              console.log(
+                `\n⚠️ An engine is running and owns archive.db (${describeEngineLease(readEngineLease())}).`,
+              );
+              console.log("   Skipping database job cleanup — the next engine start applies it.");
+            } else {
+              const activeSources = new Set(
+                SOURCE_KEYS.flatMap((key) => config[key].map((url) => sourceIdentity(url))),
+              );
+              for (const [identity, sourceUrl] of originalSources) {
+                if (activeSources.has(identity)) continue;
+                const tracked = db
+                  .query("SELECT COUNT(*) AS count FROM job_sources WHERE source_url = ?")
+                  .get(identity) as { count: number };
+                if ((tracked?.count || 0) > 0) continue;
+                try {
+                  if (config.ytDlpPath.trim()) resolvedTools.ytDlp = config.ytDlpPath.trim();
+                  const items = await getPlaylistItems(sourceUrl, config);
+                  associateExistingJobsWithSource(identity, items.map((item) => item.id));
+                } catch (e: any) {
+                  console.warn(`⚠️ Could not backfill old jobs for ${sourceUrl}: ${e?.message || e}`);
+                }
               }
+              const cleanup = pruneJobsForUnconfiguredSources(activeSources);
+              console.log(
+                `🗑️ Removed ${cleanup.deletedJobs} database job(s) for sources no longer configured.` +
+                  (cleanup.retainedJobs ? ` Kept ${cleanup.retainedJobs} shared job(s).` : ""),
+              );
             }
-            const cleanup = pruneJobsForUnconfiguredSources(activeSources);
-            console.log(
-              `🗑️ Removed ${cleanup.deletedJobs} database job(s) for sources no longer configured.` +
-                (cleanup.retainedJobs ? ` Kept ${cleanup.retainedJobs} shared job(s).` : ""),
-            );
           } catch (e: any) {
             console.error("\n⚠️ Config saved, but database cleanup failed:", e?.message || e);
           } finally {

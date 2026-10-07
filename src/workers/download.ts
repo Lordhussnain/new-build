@@ -8,7 +8,17 @@
 
 import { stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { claimDownloadJob, db, perVideoCap, type Job } from "../db";
+import {
+  claimDownloadJob,
+  claimRef,
+  db,
+  perVideoCap,
+  releaseClaimedJob,
+  startClaimHeartbeat,
+  updateClaimedJob,
+  type ClaimRef,
+  type Job,
+} from "../db";
 import { activeDlSlots, autoscaler } from "../autoscale";
 import { aria2cPath, ytDlp } from "../tools";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
@@ -45,6 +55,39 @@ import type { Config } from "../config";
 
 export const aliveDownloadWorkers = new Set<number>();
 
+/**
+ * The claim this worker holds on `job`, as the CAS primitives expect it.
+ *
+ * The claim snapshot comes straight from `claimDownloadJob`, so it always
+ * carries the token minted for THIS claim — never a worker id that another
+ * process could reuse.
+ */
+function downloadClaim(job: Job): ClaimRef {
+  return claimRef("download", job);
+}
+
+/**
+ * Write a download-state change that only the claim's current owner may make.
+ *
+ * Every progress/success/failure/release update goes through here (or through
+ * `updateClaimedJob` for updates that keep the claim). The WHERE clause carries
+ * the claim token, so a worker whose claim was reaped — or taken over by a
+ * second engine — gets 0 changed rows and must not touch job state: it returns
+ * false and the caller leaves the row to its new owner.
+ */
+function releaseOwned(
+  job: Job,
+  what: string,
+  setClause: string,
+  params: unknown[] = [],
+  extraCondition?: string,
+): boolean {
+  const changes = releaseClaimedJob("download", job.id, downloadClaim(job), setClause, params, extraCondition);
+  if (changes === 1) return true;
+  logError("download", `${job.id} ${job.title}: lost the download claim while ${what} — job state left untouched`);
+  return false;
+}
+
 export async function downloadWorker(id: number, config: Config): Promise<void> {
   const workerId = `dl-${id}`;
   aliveDownloadWorkers.add(id);
@@ -77,12 +120,19 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
       continue;
     }
     activeDownloadJobs.set(id, job.id);
+    // The claim is a lease: heartbeat it for as long as this worker is on the
+    // job, so a long transfer with no progress lines is never mistaken for a
+    // dead worker by the reaper (progress updates renew it too).
+    const stopHeartbeat = startClaimHeartbeat("download", job.id, claimRef("download", job), () =>
+      logError("download", `${job.id} ${job.title}: download claim lost — the next update will not land`),
+    );
 
     try {
       await runDownload(id, job, config);
     } catch (err: any) {
       await handleDownloadFailure(id, job, config, err);
     } finally {
+      stopHeartbeat();
       activeDownloadJobs.delete(id);
       activeProcs.delete(id);
       autoscaler.clearWorker(id);
@@ -155,7 +205,7 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
           // best_progress is the high-water mark of this job's attempts: it is
           // what lets the retry budget forgive repeated failures at increasing
           // completion percentages (see handleDownloadFailure).
-          updateJobProgress(job.id, `dl-${id}`, pctNum, bps, parseFloat(parts[2]) || 0, totalBytes);
+          updateJobProgress(job.id, downloadClaim(job), pctNum, bps, parseFloat(parts[2]) || 0, totalBytes);
           const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
           const etaNum = parseFloat(parts[2]);
           const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
@@ -193,7 +243,12 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
       throw new Error("Download finished but output file could not be located");
     }
     const fileSize = (await stat(filePath)).size;
-    if (recordSuccess(job.id, filePath, fileSize)) {
+    const recorded = recordSuccess(job, filePath, fileSize);
+    if (recorded.lostClaim) {
+      updateWorkerLine(id, `⚠️ Claim lost — output belongs to another worker | ${job.title}`, config);
+      return;
+    }
+    if (recorded.stayedPaused) {
       updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
       return;
     }
@@ -304,7 +359,7 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
     console.warn("⚠️ Signature challenge failed. Auto-updating yt-dlp...");
     const updateProc = Bun.spawn([ytDlp(), "-U"], { stdout: "pipe", stderr: "pipe" });
     await updateProc.exited;
-    resetForRetry(job.id);
+    resetForRetry(job);
     updateWorkerLine(id, `🔄 Auto-updated yt-dlp, retrying... | ${job.title}`, config);
     return;
   }
@@ -341,12 +396,13 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
       perVideoCap(config),
     );
     const status = retry.exhausted ? "failed" : "pending";
-    db.run(
-      `UPDATE jobs SET download_status = ?, retry_count = ?, best_progress = ?,
-         audio_tracks = NULL, download_claimed_by = NULL, download_claimed_at = NULL,
-         last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [status, retry.retryCount, retry.bestProgress, errMsg.slice(0, 500), job.id],
+    const landed = releaseOwned(
+      job,
+      "clearing stale audio formats",
+      `download_status = ?, retry_count = ?, best_progress = ?, audio_tracks = NULL, last_error = ?`,
+      [status, retry.retryCount, retry.bestProgress, errMsg.slice(0, 500)],
     );
+    if (!landed) return;
     if (retry.exhausted) {
       stats.failed++;
       notePipelineFailure("dl", config);
@@ -388,13 +444,14 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
         // retryable failure, but its no-progress attempt still spends budget.
         const msg = `partial file locked, cannot restart cleanly (${removal.error}). Close the program holding it — usually an orphaned aria2c/ffmpeg or antivirus scanning the download folder.`;
         const status = retry.exhausted ? "failed" : "pending";
-        db.run(
-          `UPDATE jobs SET download_status = ?, retry_count = ?, resume_count = ?,
-             partial_file_path = ?, best_progress = ?, download_claimed_by = NULL,
-             download_claimed_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-          [status, retry.retryCount, resumeCount, partial, retry.bestProgress, msg.slice(0, 500), job.id],
+        const parked = releaseOwned(
+          job,
+          "parking a locked partial",
+          `download_status = ?, retry_count = ?, resume_count = ?, partial_file_path = ?, best_progress = ?, last_error = ?`,
+          [status, retry.retryCount, resumeCount, partial, retry.bestProgress, msg.slice(0, 500)],
         );
         logError("download", `${job.id} ${job.title}: ${msg}`);
+        if (!parked) return;
         if (retry.exhausted) {
           stats.failed++;
           notePipelineFailure("dl", config);
@@ -410,19 +467,19 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
 
     if (retry.exhausted) {
       const keepPartial = partial && !partialRemoved ? partial : null;
-      db.run(
-        `UPDATE jobs SET download_status = 'failed', retry_count = ?, resume_count = ?,
-           partial_file_path = ?, best_progress = ?, download_claimed_by = NULL,
-           download_claimed_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      const failed = releaseOwned(
+        job,
+        "parking an exhausted corrupt resume",
+        `download_status = 'failed', retry_count = ?, resume_count = ?, partial_file_path = ?, best_progress = ?, last_error = ?`,
         [
           retry.retryCount,
           restartFromScratch ? 0 : resumeCount,
           keepPartial,
           retry.bestProgress,
           errMsg.slice(0, 500),
-          job.id,
         ],
       );
+      if (!failed) return;
       stats.failed++;
       notePipelineFailure("dl", config);
       logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
@@ -431,13 +488,14 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
     }
 
     if (restartFromScratch) {
-      db.run(
-        `UPDATE jobs SET download_status = 'pending', retry_count = ?, resume_count = 0,
-           partial_file_path = NULL, progress = 0, best_progress = ?, speed = 0, eta = 0,
-           download_claimed_by = NULL, download_claimed_at = NULL, last_error = ?,
-           updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-        [retry.retryCount, retry.bestProgress, errMsg.slice(0, 500), job.id],
+      const restarted = releaseOwned(
+        job,
+        "restarting from scratch",
+        `download_status = 'pending', retry_count = ?, resume_count = 0, partial_file_path = NULL,
+         progress = 0, best_progress = ?, speed = 0, eta = 0, last_error = ?`,
+        [retry.retryCount, retry.bestProgress, errMsg.slice(0, 500)],
       );
+      if (!restarted) return;
       updateWorkerLine(id, `🗑️ Restarting from scratch | ${job.title}`, config);
       await Bun.sleep(computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
       return;
@@ -445,12 +503,13 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
 
     // Keep and record the partial, count the resume attempt, and try again
     // shortly. Commit the high-water mark only at this failure boundary.
-    db.run(
-      `UPDATE jobs SET download_status = 'pending', retry_count = ?, resume_count = ?,
-         partial_file_path = ?, best_progress = ?, download_claimed_by = NULL,
-         download_claimed_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [retry.retryCount, resumeCount, partial, retry.bestProgress, errMsg.slice(0, 500), job.id],
+    const resumed = releaseOwned(
+      job,
+      "recording a resume attempt",
+      `download_status = 'pending', retry_count = ?, resume_count = ?, partial_file_path = ?, best_progress = ?, last_error = ?`,
+      [retry.retryCount, resumeCount, partial, retry.bestProgress, errMsg.slice(0, 500)],
     );
+    if (!resumed) return;
     updateWorkerLine(id, `⏳ Resuming (attempt ${resumeCount}/${config.maxResumeAttempts}) | ${job.title}`, config);
     await Bun.sleep(computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
     return;
@@ -470,12 +529,14 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
     );
     const status = retry.exhausted ? "failed" : "pending";
     const partial = await findPartialFile(job.output_directory, base);
-    db.run(
-      `UPDATE jobs SET download_status = ?, retry_count = ?, best_progress = ?,
-         partial_file_path = ?, resume_count = 0, download_claimed_by = NULL,
-         download_claimed_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [status, retry.retryCount, retry.bestProgress, partial || null, errMsg.slice(0, 500), job.id],
+    const landed = releaseOwned(
+      job,
+      "re-queueing a missing output file",
+      `download_status = ?, retry_count = ?, best_progress = ?, partial_file_path = ?,
+       resume_count = 0, last_error = ?`,
+      [status, retry.retryCount, retry.bestProgress, partial || null, errMsg.slice(0, 500)],
     );
+    if (!landed) return;
     if (retry.exhausted) {
       stats.failed++;
       notePipelineFailure("dl", config);
@@ -492,10 +553,13 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
   // live right now. Park it until the next full rescan or a manual retry —
   // scans flip waiting_live jobs back to pending once a VOD exists.
   if (lower.includes("does not pass filter") || lower.includes("is live") || lower.includes("live event")) {
-    db.run(
-      `UPDATE jobs SET download_status = 'waiting_live', download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [errMsg.slice(0, 500), job.id],
+    const parked = releaseOwned(
+      job,
+      "parking a live stream",
+      `download_status = 'waiting_live', last_error = ?`,
+      [errMsg.slice(0, 500)],
     );
+    if (!parked) return;
     updateWorkerLine(id, `Live now — waiting for VOD | ${job.title}`, config);
     return;
   }
@@ -507,8 +571,9 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
     // A deliberate re-download (dashboard retry on an archived video) stashed
     // the previous file. The re-fetch can never succeed, so put the previous
     // file back instead of leaving the job empty-handed — the archive keeps
-    // exactly what it had before the retry.
-    if (restoreSupersededFile(job.id, `re-download failed permanently: ${errMsg.slice(0, 300)}`)) {
+    // exactly what it had before the retry. The restore is claim-guarded: a
+    // stale worker must not move the previous file over the new owner's work.
+    if (restoreSupersededFile(job.id, `re-download failed permanently: ${errMsg.slice(0, 300)}`, downloadClaim(job))) {
       logError(
         "download",
         `${job.id} ${job.title}: permanent re-download failure, previous file restored: ${errMsg.slice(0, 300)}`,
@@ -517,11 +582,13 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
       return;
     }
     const partial = await findPartialFile(job.output_directory, base);
-    db.run(
-      `UPDATE jobs SET download_status = 'failed', partial_file_path = ?, download_claimed_by = NULL,
-         download_claimed_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [partial || null, errMsg.slice(0, 500), job.id],
+    const failed = releaseOwned(
+      job,
+      "parking a permanent failure",
+      `download_status = 'failed', partial_file_path = ?, last_error = ?`,
+      [partial || null, errMsg.slice(0, 500)],
     );
+    if (!failed) return;
     stats.failed++;
     logError("download", `${job.id} ${job.title}: permanent failure: ${errMsg.slice(0, 500)}`);
     updateWorkerLine(id, `🚫 Permanent failure | ${job.title}`, config);
@@ -540,11 +607,13 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
     perVideoCap(config),
   );
   const newStatus = retry.exhausted ? "failed" : "pending";
-  db.run(
-    `UPDATE jobs SET download_status = ?, retry_count = ?, best_progress = ?, partial_file_path = ?,
-       download_claimed_by = NULL, download_claimed_at = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [newStatus, retry.retryCount, retry.bestProgress, partial || null, errMsg.slice(0, 500), job.id],
+  const landed = releaseOwned(
+    job,
+    "re-queueing after a failed attempt",
+    `download_status = ?, retry_count = ?, best_progress = ?, partial_file_path = ?, last_error = ?`,
+    [newStatus, retry.retryCount, retry.bestProgress, partial || null, errMsg.slice(0, 500)],
   );
+  if (!landed) return;
 
   if (newStatus === "failed") {
     stats.failed++;
@@ -577,9 +646,10 @@ async function resolveJobAudioTracks(job: Job, config: Config): Promise<AudioTra
   if (config.multiAudioMode === "off" && selection.length === 0) return null;
   try {
     const tracks = await probeAudioTracks(job.url, config);
-    db.run(`UPDATE jobs SET audio_tracks = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [
+    // Claim-checked: the probe runs inside the claimed download slot, so a
+    // stolen claim must not have its audio state overwritten by the loser.
+    updateClaimedJob("download", job.id, downloadClaim(job), `audio_tracks = ?, updated_at = CURRENT_TIMESTAMP`, [
       JSON.stringify(tracks),
-      job.id,
     ]);
     return tracks;
   } catch (err: any) {
@@ -600,10 +670,18 @@ function baseNameOf(job: Job): string {
   return jobFittedBaseFilename(job);
 }
 
-/** Record progress, keeping best_progress as the high-water mark. */
+/**
+ * Record progress, keeping best_progress as the high-water mark.
+ *
+ * Every progress event also renews the claim's lease: a transfer that is
+ * producing output is by definition alive. The update is a claim-token CAS, so
+ * a worker whose claim was reaped cannot keep writing progress over the new
+ * owner's row (the CAS simply changes 0 rows; progress is high-frequency, so
+ * that is not logged here — the outcome paths report the lost claim).
+ */
 function updateJobProgress(
   id: string,
-  workerId: string,
+  claim: ClaimRef,
   pct: number,
   bps: number,
   eta: number,
@@ -613,11 +691,14 @@ function updateJobProgress(
   // is committed only when an attempt fails so failure handling can tell whether
   // this attempt advanced; eagerly taking MAX here would make that comparison
   // always false.
-  db.run(
-    `UPDATE jobs SET progress = ?, speed = ?, eta = ?, file_size = COALESCE(?, file_size),
-       download_claimed_at = CURRENT_TIMESTAMP
-     WHERE id = ? AND download_status = 'downloading' AND download_claimed_by = ?`,
-    [pct, bps, eta, totalBytes, id, workerId],
+  updateClaimedJob(
+    "download",
+    id,
+    claim,
+    `progress = ?, speed = ?, eta = ?, file_size = COALESCE(?, file_size),
+     download_heartbeat_at = CURRENT_TIMESTAMP`,
+    [pct, bps, eta, totalBytes],
+    `download_status = 'downloading'`,
   );
 }
 
@@ -639,51 +720,73 @@ function isUserPaused(id: string): boolean {
 }
 
 function parkUserPaused(job: Job): void {
-  const result = db.run(
-    `UPDATE jobs SET download_status = 'paused', pause_reason = 'user',
-       download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
-     WHERE id = ? AND pause_reason = 'user'`,
-    [job.id],
+  // Only a still-recorded user pause is parked, and only by the claim's owner:
+  // the pause may have been resumed (or the claim reaped) since the worker's
+  // snapshot was taken.
+  const parked = releaseOwned(
+    job,
+    "parking a user pause",
+    `download_status = 'paused', pause_reason = 'user'`,
+    [],
+    `pause_reason = 'user'`,
   );
-  if (result.changes > 0) recordJobPartial(job);
+  if (parked) recordJobPartial(job);
 }
 
 function parkPaused(job: Job): void {
-  db.run(
-    `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
-       download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [job.id],
-  );
+  const parked = releaseOwned(job, "parking an interrupted download", `download_status = 'paused', pause_reason = 'interrupted'`);
+  if (!parked) return;
   // Freeze the resume point: the .part is on disk, and without recording it the
   // job is paused with no resumable partial, so the next attempt restarts the
   // video from zero instead of continuing.
   recordJobPartial(job);
 }
 
-function resetForRetry(id: string): void {
-  db.run(
-    `UPDATE jobs SET download_status = 'pending', retry_count = 0,
-       download_claimed_by = NULL, download_claimed_at = NULL,
-       progress = 0, best_progress = 0, speed = 0, eta = 0, resume_count = 0,
-       updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [id],
+function resetForRetry(job: Job): void {
+  releaseOwned(
+    job,
+    "resetting for an immediate retry",
+    `download_status = 'pending', retry_count = 0, progress = 0, best_progress = 0,
+     speed = 0, eta = 0, resume_count = 0`,
   );
 }
 
-export function recordSuccess(id: string, filePath: string, fileSize: number): boolean {
-  const row = db
-    .query(
-      `UPDATE jobs SET
-         download_status = CASE WHEN pause_reason = 'user' THEN 'paused' ELSE 'downloaded' END,
-         pause_reason = CASE WHEN pause_reason = 'user' THEN 'user' ELSE NULL END,
-         file_path = ?, file_size = ?, partial_file_path = NULL,
-         progress = 100, best_progress = 100, last_error = NULL,
-         download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ?
-       RETURNING pause_reason`,
-    )
-    .get(filePath, fileSize, id) as { pause_reason: string | null } | null;
-  return row?.pause_reason === "user";
+/** What a completed attempt actually managed to do. */
+export interface DownloadSuccessResult {
+  /** False when the claim was no longer ours — no state was written. */
+  ok: boolean;
+  /** True (with `ok`) when the row was user-paused and must stay parked. */
+  stayedPaused: boolean;
+  /** True when the claim was lost: the caller must not touch the job further. */
+  lostClaim: boolean;
+}
+
+/**
+ * Record the finished media file for `job`.
+ *
+ * The write is a claim-token CAS, so a stale worker whose claim was reclaimed
+ * (or taken over by a second engine process) cannot record its output over the
+ * new owner's row — it reports `lostClaim` and walks away.
+ */
+export function recordSuccess(job: Job, filePath: string, fileSize: number): DownloadSuccessResult {
+  const changes = releaseClaimedJob(
+    "download",
+    job.id,
+    downloadClaim(job),
+    `download_status = CASE WHEN pause_reason = 'user' THEN 'paused' ELSE 'downloaded' END,
+     pause_reason = CASE WHEN pause_reason = 'user' THEN 'user' ELSE NULL END,
+     file_path = ?, file_size = ?, partial_file_path = NULL,
+     progress = 100, best_progress = 100, last_error = NULL`,
+    [filePath, fileSize],
+  );
+  if (changes !== 1) {
+    logError("download", `${job.id} ${job.title}: lost the download claim before recording success — not recorded`);
+    return { ok: false, stayedPaused: false, lostClaim: true };
+  }
+  const row = db.query("SELECT pause_reason FROM jobs WHERE id = ?").get(job.id) as
+    | { pause_reason: string | null }
+    | null;
+  return { ok: true, stayedPaused: row?.pause_reason === "user", lostClaim: false };
 }
 
 function updateWorkerLine(id: number, text: string, _config: Config): void {

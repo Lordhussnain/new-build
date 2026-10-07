@@ -1763,3 +1763,82 @@ describe("integration: Web UI source persistence", () => {
     }
   }, TEST_TIMEOUT);
 });
+
+// ---------------------------------------------------------------------------
+// The database-level engine lease. The web port is the HTTP lock, but two
+// engines with different `webPort` values could both bind successfully and then
+// both run startup reconciliation against the same jobs. The lease row is the
+// actual owner of `archive.db`, acquired before the port and before any sweep.
+describe("integration: engine lease", () => {
+  test("a second engine on the same archive.db (different web port) refuses to start", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      4004,
+      BASE_CONFIG(4004, { videoQuality: "audio", maxDownloadWorkers: 1, maxConcurrentDownloads: 1 }),
+    );
+
+    try {
+      await waitFor("3 jobs ingested", async () => (await getJobs(engine)).length === 3);
+
+      // The lease is acquired before the port is bound, so an engine that
+      // answers /api/ping is already the owner of the database.
+      const reliability = await engine.api("/api/reliability");
+      expect(reliability.engine.lease.owner).toBeTruthy();
+      expect(reliability.engine.lease.heldByMe).toBe(true);
+      const fencing = reliability.engine.lease.fencing;
+
+      // The second engine points at the same directory (same archive.db) but
+      // listens on its own port. It must refuse to start: no sweeps, no job
+      // rows touched, no lease takeover.
+      let refusal = "";
+      try {
+        const second = await startEngine(dir, 4005, BASE_CONFIG(4005, { videoQuality: "audio" }));
+        await second.stop();
+      } catch (e: any) {
+        refusal = String(e?.message || e);
+      }
+      expect(refusal).toContain("archive.db is owned by another live engine instance");
+      expect(refusal).toContain("different web port does NOT make a second instance safe");
+
+      // The live engine still owns the database with the same fencing
+      // generation, and its pipeline still completes — proof the refused
+      // instance did not re-queue or reset anything.
+      const after = await engine.api("/api/reliability");
+      expect(after.engine.lease.owner).toBe(reliability.engine.lease.owner);
+      expect(after.engine.lease.fencing).toBe(fencing);
+      expect(after.engine.lease.heldByMe).toBe(true);
+
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.conversion_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("a clean restart re-acquires the lease without waiting for an expiry", async () => {
+    const dir = await makeRunDir();
+    const first = await startEngine(dir, 4006, BASE_CONFIG(4006, { videoQuality: "audio" }));
+    let firstFencing = 0;
+    try {
+      await waitFor("3 jobs ingested", async () => (await getJobs(first)).length === 3);
+      firstFencing = (await first.api("/api/reliability")).engine.lease.fencing;
+    } finally {
+      // Graceful shutdown must release the lease: the next start must not have
+      // to wait out a TTL or take over a "live" lease from a dead process.
+      await first.stop();
+    }
+
+    const second = await startEngine(dir, 4006, BASE_CONFIG(4006, { videoQuality: "audio" }));
+    try {
+      const lease = (await second.api("/api/reliability")).engine.lease;
+      expect(lease.heldByMe).toBe(true);
+      expect(lease.fencing).toBe(firstFencing + 1);
+    } finally {
+      await second.stop();
+    }
+  }, TEST_TIMEOUT);
+});

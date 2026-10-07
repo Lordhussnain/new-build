@@ -16,7 +16,8 @@ import { getPlaylistItems, scanAndIngest } from "./scanner";
 import { parseSourceUrl, removeSource, saveSource, SOURCE_KEYS, sourceIdentity, type SourceUrl } from "./sources";
 import { diskUsage, triggerPause, triggerResume } from "./resilience";
 import { removeFromArchive } from "./archive";
-import { requeueFailedJobs, stashDownloadedFile, STALE_CLAIM_THRESHOLDS } from "./reconcile";
+import { requeueFailedJobs, stashDownloadedFile, staleClaimCondition, STALE_CLAIM_THRESHOLDS } from "./reconcile";
+import { holdsEngineLease, isLeaseExpired, readEngineLease } from "./lease";
 import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
 import { aria2cPath } from "./tools";
@@ -220,12 +221,19 @@ function mapJobRow(r: any) {
   };
 }
 
+// A job is "in progress" (never safe to mutate from the dashboard) when any
+// stage is running or any claim lease is still attached. Claims are identified
+// by their token as well as the worker id, so a row whose status was flipped
+// without releasing its claim cannot slip past the guard.
 const ACTIVE_JOB_PREDICATE = `
   COALESCE(download_status, '') = 'downloading'
   OR download_claimed_by IS NOT NULL
+  OR download_claim_token IS NOT NULL
   OR COALESCE(conversion_status, '') = 'in_progress'
   OR conversion_claimed_by IS NOT NULL
+  OR conversion_claim_token IS NOT NULL
   OR COALESCE(metadata_status, '') = 'in_progress'
+  OR metadata_claim_token IS NOT NULL
 `;
 
 const PURGE_QUEUE_PREDICATE = "download_status IN ('pending', 'paused', 'waiting_live', 'failed')";
@@ -392,8 +400,14 @@ function retryJobById(id: string, config: Config, override?: JobOverride): numbe
            WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
            ELSE metadata_status END,
          metadata_retry_count = 0,
-         last_error = NULL, download_claimed_by = NULL, download_claimed_at = NULL,
-         conversion_claimed_by = NULL, conversion_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
+         last_error = NULL,
+         download_claimed_by = NULL, download_claimed_at = NULL,
+         download_claim_token = NULL, download_heartbeat_at = NULL,
+         conversion_claimed_by = NULL, conversion_claimed_at = NULL,
+         conversion_claim_token = NULL, conversion_heartbeat_at = NULL,
+         metadata_claimed_by = NULL, metadata_claimed_at = NULL,
+         metadata_claim_token = NULL, metadata_heartbeat_at = NULL,
+         updated_at = CURRENT_TIMESTAMP
        WHERE id = ? AND NOT (${ACTIVE_JOB_PREDICATE})`,
       [conversionStatus, id],
     ).changes;
@@ -424,6 +438,8 @@ function saveJobOverrideById(id: string, config: Config, override: JobOverride):
     if (row.download_status !== "downloaded" && needsConversion) {
       db.run(
         `UPDATE jobs SET conversion_status = 'pending', conversion_retry_count = 0,
+           conversion_claimed_by = NULL, conversion_claimed_at = NULL,
+           conversion_claim_token = NULL, conversion_heartbeat_at = NULL,
            updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
         [id],
       );
@@ -734,7 +750,10 @@ const ROUTES: Route[] = [
           `UPDATE jobs SET metadata_status = CASE
              WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0
                THEN 'pending' ELSE metadata_status END,
-             metadata_retry_count = 0, updated_at = CURRENT_TIMESTAMP
+             metadata_retry_count = 0,
+             metadata_claimed_by = NULL, metadata_claimed_at = NULL,
+             metadata_claim_token = NULL, metadata_heartbeat_at = NULL,
+             updated_at = CURRENT_TIMESTAMP
            WHERE id = ?`,
           [id],
         );
@@ -773,10 +792,17 @@ const ROUTES: Route[] = [
         : [];
       if (ids.length === 0) return Response.json({ ok: false, error: "No job ids provided" }, { status: 400 });
       const placeholders = ids.map(() => "?").join(",");
+      // A job that is mid-download keeps its claim (owner + token + heartbeat)
+      // while being parked: the worker is still running yt-dlp and will see
+      // `pause_reason = 'user'` when it finishes, then release the claim itself
+      // through its own token. Everything else is parked with the claim cleared.
       const result = withIdleJobs(ids, () =>
         db.run(
           `UPDATE jobs SET download_status = 'paused', pause_reason = 'user',
              download_claimed_by = CASE WHEN download_status = 'downloading' THEN download_claimed_by ELSE NULL END,
+             download_claimed_at = CASE WHEN download_status = 'downloading' THEN download_claimed_at ELSE NULL END,
+             download_claim_token = CASE WHEN download_status = 'downloading' THEN download_claim_token ELSE NULL END,
+             download_heartbeat_at = CASE WHEN download_status = 'downloading' THEN download_heartbeat_at ELSE NULL END,
              updated_at = CURRENT_TIMESTAMP
            WHERE id IN (${placeholders}) AND download_status IN ('pending', 'downloading', 'paused')`,
           ids,
@@ -945,9 +971,11 @@ const ROUTES: Route[] = [
         if (active) return { ok: false as const };
         const result = db.run(
           `DELETE FROM jobs WHERE ${PURGE_QUEUE_PREDICATE}
-             AND download_claimed_by IS NULL AND conversion_claimed_by IS NULL
+             AND download_claimed_by IS NULL AND download_claim_token IS NULL
+             AND conversion_claimed_by IS NULL AND conversion_claim_token IS NULL
              AND COALESCE(conversion_status, '') != 'in_progress'
-             AND COALESCE(metadata_status, '') != 'in_progress'`,
+             AND COALESCE(metadata_status, '') != 'in_progress'
+             AND metadata_claim_token IS NULL`,
         );
         return { ok: true as const, deleted: result.changes };
       });
@@ -1149,8 +1177,9 @@ function reliabilityHandler(config: Config): Response {
         WHERE download_status = 'paused' AND pause_reason = 'interrupted'`,
     )
     .get() as any;
-  // What the stale-claim reaper would reclaim right now — same thresholds and
-  // active-download protection as the sweep itself, so the panel cannot drift.
+  // What the stale-claim reaper would reclaim right now — same thresholds,
+  // same lease-expiry predicate (heartbeat-based) and same active-download
+  // protection as the sweep itself, so the panel cannot drift.
   const t = STALE_CLAIM_THRESHOLDS(config);
   const activeJobIds = Array.from(activeDownloadJobs.values());
   const activeJobFilter = activeJobIds.length
@@ -1159,14 +1188,17 @@ function reliabilityHandler(config: Config): Response {
   const staleClaimsQuery = db.query(
     `SELECT
        (SELECT COUNT(*) FROM jobs WHERE download_status = 'downloading'
-          AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${t.download}')) ${activeJobFilter})
+          AND ${staleClaimCondition("download", t.download)} ${activeJobFilter})
      + (SELECT COUNT(*) FROM jobs WHERE conversion_status = 'in_progress'
-          AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', '${t.conversion}')))
+          AND ${staleClaimCondition("conversion", t.conversion)})
      + (SELECT COUNT(*) FROM jobs WHERE metadata_status = 'in_progress'
-          AND updated_at < datetime('now', '${t.metadata}'))
+          AND ${staleClaimCondition("metadata", t.metadata)})
      AS count`,
   );
   const staleClaims = (activeJobIds.length ? staleClaimsQuery.get(...activeJobIds) : staleClaimsQuery.get()) as any;
+  // Which engine owns archive.db right now. Two engines with different web
+  // ports used to look fine here; the lease is what actually decides ownership.
+  const lease = readEngineLease();
 
   // The four self-healing sweeps, with what each currently has in scope.
   // `pending: null` means "not counted here" — the missing-files sweep has to
@@ -1215,6 +1247,20 @@ function reliabilityHandler(config: Config): Response {
       staleClaims: staleClaims?.count || 0,
     },
     sweeps,
+    engine: {
+      // The database-level lease: owner token, generation, expiry. `heldByMe`
+      // is false on the dashboard of an engine that lost the lease (or never
+      // acquired it — it would not reach this endpoint in that case).
+      lease: {
+        owner: lease?.owner ?? null,
+        fencing: lease?.fencing ?? 0,
+        acquiredAt: lease?.acquiredAt ?? null,
+        heartbeatAt: lease?.heartbeatAt ?? null,
+        expiresAt: lease?.expiresAt ?? null,
+        expired: isLeaseExpired(lease),
+        heldByMe: holdsEngineLease(),
+      },
+    },
     policy: {
       maxResumeAttempts: config.maxResumeAttempts,
       retryBackoffBaseSeconds: config.retryBackoffBaseSeconds,

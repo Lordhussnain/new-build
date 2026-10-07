@@ -16,7 +16,9 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Permanent-failure detection** — private / removed / age-gated / geo-blocked videos fail fast and are never auto-requeued
 - **Self-healing sweeps** — crashed jobs resume, stale claims are reclaimed, deleted downloads are re-fetched, and failed jobs are retried after a cooldown. With aria2c these sweeps resume from the download's `.aria2` control file, and a discarded partial always takes its control file with it
 - **Resume state is protected, not aged away** — the startup sweep only deletes a `.part` once nothing will resume it: a `pending`, `paused`, or `waiting_live` job keeps its partial as long as the job exists, and a crash in the deliberate-re-download hand-off (`.superseded`) is rolled back or finished at the next start instead of leaving the old file unmanaged
-- **Single-instance safety** — the web port acts as a lock: starting a second engine against the same `archive.db` refuses to start (with an actionable message) instead of re-queueing the running instance's in-flight work. If a restart-from-scratch hits a partial file locked by another program (orphaned aria2c/ffmpeg, antivirus), the video is retried later with that exact reason in `last_error` instead of being wedged. The same rule holds for every sweep: a locked resume pair is kept intact and reported, never counted as cleaned, and a stranded `.aria2` control file left by a dead worker is swept before the reclaimed job retries — a control file whose data is gone makes aria2c neither resume nor restart
+- **Single-instance safety: one engine per `archive.db`** — a database-level engine lease (owner token + expiring heartbeat + monotonic fencing number) is taken before the startup sweeps, so a second engine pointed at the same database refuses to start with an actionable message even if it uses a different `webPort` — it can never re-queue the running instance's in-flight work. The lease is renewed while the engine runs, released on a clean exit, taken over automatically after a crash, and shown on the reliability panel
+- **Claims are leases, not names** — every job claim carries a unique token and a heartbeat: download progress renews a download's lease, conversion and metadata stages heartbeat on an interval, and every progress, success, failure and release update must present that token (compare-and-swap). A worker that lost its claim — reaped after its lease lapsed, or superseded by a restarted engine — changes no job state instead of overwriting the new owner's
+- **Locked work is never destroyed to make progress** — if a restart-from-scratch hits a partial file locked by another program (orphaned aria2c/ffmpeg, antivirus), the video is retried later with that exact reason in `last_error` instead of being wedged. The same rule holds for every sweep: a locked resume pair is kept intact and reported, never counted as cleaned, and a stranded `.aria2` control file left by a dead worker is swept before the reclaimed job retries — a control file whose data is gone makes aria2c neither resume nor restart
 - **Duration-aware watchdog** — long videos are not killed by a flat 15-minute timeout
 - **Disk space precheck** before starting a batch
 - **Graceful shutdown** — safely stops in-flight downloads on exit
@@ -253,11 +255,17 @@ not a static list of settings:
   `.aria2` control file.
 - **Interrupted** — jobs parked as `paused` + `interrupted`, i.e. the ones the
   crashed-jobs sweep will re-claim and continue rather than restart.
-- **Stale claims** — what the reaper would reclaim right now: download claims
-  idle longer than `max(20 min, maxDownloadMinutes)`, conversion claims idle over
-  3 h, and metadata claims idle over 15 min. The panel and reaper share
-  `STALE_CLAIM_THRESHOLDS(config)`, so the displayed timeout follows the live
-  watchdog setting and cannot drift from the sweep.
+- **Stale claims** — what the reaper would reclaim right now, measured from
+  each claim's last *heartbeat* (not from when the work started, and not from
+  `updated_at`): downloads silent for longer than
+  `max(20 min, maxDownloadMinutes)`, conversions silent over 3 h, and metadata
+  claims silent over 15 min. A long-running conversion or metadata pass renews
+  its claim on an interval, so it never looks stale. The panel and reaper share
+  `STALE_CLAIM_THRESHOLDS(config)` and the same expired-heartbeat predicate, so
+  the displayed window follows the live watchdog setting and cannot drift from
+  the sweep.
+- **Engine lease** — the owner token, fencing generation and expiry of the
+  database-level lock, and whether the dashboard's own process holds it.
 - **Self-healing sweeps** — the four sweeps with their cadence and a pending
   count. Deleted-files is `startup`-only and stats every recorded file, so its
   count is reported as unknown rather than guessed.
@@ -341,7 +349,8 @@ update_config.ts                 interactive config manager (shares src/config.t
 web_ui.html                      dashboard frontend (served by src/web.ts)
 src/
   config.ts        Zod schema + defaults + load/save (single source of truth)
-  db.ts            SQLite schema, migrations, atomic job claims
+  db.ts            SQLite schema, migrations, atomic job claims + claim leases (tokens, heartbeats)
+  lease.ts         database-level engine lease (owner, expiry, fencing) — one engine per archive.db
   state.ts         shared mutable runtime state (pause, stats, workers)
   tools.ts         yt-dlp/ffmpeg/aria2c discovery + cookies helpers
   download-args.ts pure yt-dlp command construction (downloader engine, tuning)
@@ -369,9 +378,10 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
 ## How It Works
 
 1. **Startup** — load config, verify dependencies, open/migrate the database,
-   then self-heal: reconcile crashed jobs, recover interrupted `.superseded`
-   hand-offs, re-queue jobs whose files vanished, clean up unusable partials
-   and stale backups
+   take the engine lease (a live foreign owner means this process exits without
+   touching a single job row), bind the web port, then self-heal: reconcile
+   crashed jobs, recover interrupted `.superseded` hand-offs, re-queue jobs
+   whose files vanished, clean up unusable partials and stale backups
 2. **Scan** — every configured playlist/channel is listed (yt-dlp flat scan or
    cheap RSS polling) and deduplicated into the jobs table by video id
 3. **Download workers** — pull videos into the configured output directory
@@ -387,8 +397,12 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
    is copy-then-remove: if the destination copy fails (full disk, unwritable
    share, cross-volume copy error) both copies are kept and the job is retried,
    so a broken secondary store can never delete the only copy
-6. **Sweeps** — every minute: reclaim stale claims, re-queue cooled-down
-   transient failures, heartbeat the run history
+6. **Sweeps** — every minute: reclaim claims whose lease heartbeat has lapsed
+   (download progress renews a download's lease; conversion and metadata stages
+   heartbeat on an interval), re-queue cooled-down transient failures, renew the
+   engine lease, heartbeat the run history. Each reclaim is a compare-and-swap
+   on the claim token, so a reaper can never reset a job that was renewed or
+   already reclaimed by someone else
 
 ## Security & operations
 
@@ -414,6 +428,15 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
   slots toward `maxDownloadWorkers` while a backlog exists and bandwidth
   headroom remains, sheds slots when the cap saturates, and returns to
   `minDownloadWorkers` when idle.
+- **One engine per `archive.db`, enforced in the database** — starting the
+  engine against a database that another live engine owns refuses to start
+  (exit code 1, with the current owner and expiry in the message) instead of
+  running the self-healing sweeps against work that is already in flight. A
+  crashed engine's lease is taken over automatically — immediately when its
+  process is provably gone on the same host, otherwise once the lease expires —
+  and each takeover increments a fencing number, so "written by the previous
+  engine" is always decidable. The web port still acts as the HTTP lock; it is
+  simply no longer the only thing keeping two engines apart.
 - **Cheap new-upload watching** — `rssEnabled` polls each channel's RSS feed
   every `rssPollIntervalMinutes` (one HTTP GET per channel, ~15 min latency)
   instead of waiting for a full rescan.

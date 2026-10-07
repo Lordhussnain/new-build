@@ -30,6 +30,7 @@ import {
 } from "../src/reconcile";
 import { jobBaseFilename, jobFittedBaseFilename } from "../src/download-args";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
+import { acquireEngineLease } from "../src/lease";
 
 const tmpDirs: string[] = [];
 
@@ -96,6 +97,9 @@ function testConfig(overrides: Partial<Config> = {}): Config {
 
 beforeEach(() => {
   initDatabase(":memory:");
+  // The startup sweeps and the reaper only run for the engine that owns
+  // archive.db; the tests play that engine.
+  acquireEngineLease();
 });
 
 describe("partialSidecars", () => {

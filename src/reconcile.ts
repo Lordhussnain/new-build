@@ -13,13 +13,23 @@
 import { existsSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { readdir, rm, stat, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { db, perVideoCap, type Job } from "./db";
+import {
+  claimColumns,
+  db,
+  ownsClaim,
+  perVideoCap,
+  releaseClaimedJob,
+  type ClaimRef,
+  type ClaimStage,
+  type Job,
+} from "./db";
 import { removeFromArchive } from "./archive";
 import { logError } from "./logger";
 import { detectCookiesChange, type CookiesChange } from "./tools";
 import { isPermanentDownloadError } from "./retry";
 import { jobFittedBaseFilename } from "./download-args";
 import { activeDownloadJobs } from "./state";
+import { holdsEngineLease, readEngineLease, describeEngineLease } from "./lease";
 import type { Config } from "./config";
 
 /**
@@ -28,11 +38,28 @@ import type { Config } from "./config";
  * off via yt-dlp --continue). User-paused jobs stay held; orphan claims left
  * by older per-job pause requests are cleared without resuming those jobs.
  */
-export function reconcileCrashedJobs(): void {
+export function reconcileCrashedJobs(): number {
+  // The engine lease gates this sweep: it resets EVERY in-flight claim, so it
+  // may only run while this process owns `archive.db`. A second engine that
+  // skipped the lease would re-queue the live engine's work behind its back —
+  // exactly what the port lock prevented for equal-port instances, and never
+  // prevented for different-port ones.
+  if (!holdsEngineLease()) {
+    logError(
+      "reconcile",
+      `refusing to reconcile crashed jobs: this process does not hold the engine lease (${describeEngineLease(readEngineLease())})`,
+    );
+    return 0;
+  }
   // Persist the on-disk resume point before flipping the status. This is also
   // needed at startup after a hard kill, where the normal shutdown hook never
   // had a chance to run its partial-path freeze.
   const recorded = recordPartialPaths();
+  // The claims reset here all belong to the PREVIOUS engine generation: the
+  // lease was free or expired when this process took it (bumping `fencing`), so
+  // these tokens cannot belong to a live owner of this database. Clearing the
+  // token and heartbeat is what fences a stale worker out — its late updates no
+  // longer match the row, and the CAS helpers refuse them.
   const stmt = db.run(
     `UPDATE jobs SET
        download_status = CASE WHEN download_status = 'downloading' THEN 'paused' ELSE download_status END,
@@ -40,7 +67,11 @@ export function reconcileCrashedJobs(): void {
        conversion_status = CASE WHEN conversion_status = 'in_progress' THEN 'pending' ELSE conversion_status END,
        metadata_status = CASE WHEN metadata_status = 'in_progress' THEN 'pending' ELSE metadata_status END,
        download_claimed_by = NULL, download_claimed_at = NULL,
+       download_claim_token = NULL, download_heartbeat_at = NULL,
        conversion_claimed_by = NULL, conversion_claimed_at = NULL,
+       conversion_claim_token = NULL, conversion_heartbeat_at = NULL,
+       metadata_claimed_by = NULL, metadata_claimed_at = NULL,
+       metadata_claim_token = NULL, metadata_heartbeat_at = NULL,
        updated_at = CURRENT_TIMESTAMP
      WHERE download_status = 'downloading'
         OR (download_status = 'paused' AND pause_reason IS NULL)
@@ -53,14 +84,21 @@ export function reconcileCrashedJobs(): void {
       `🔄 Reconciled ${stmt.changes} interrupted/stale-claim job(s) (${recorded} partial(s) recorded) — interrupted jobs will resume automatically.`,
     );
   }
+  return stmt.changes;
 }
 
 /**
- * How long a claim may sit untouched before `reapStaleClaims` treats its owner
- * as dead and re-queues the job. The download window is never shorter than
- * either the 20-minute baseline or the configured maximum download timeout.
- * Exported so the dashboard and config manager report the exact thresholds
- * enforced by the sweep.
+ * How long a claim's lease may stay un-renewed before `reapStaleClaims` treats
+ * its owner as dead and re-queues the job. The download window is never shorter
+ * than either the 20-minute baseline or the configured maximum download
+ * timeout. Exported so the dashboard and config manager report the exact
+ * thresholds enforced by the sweep.
+ *
+ * These are LEASE-EXPIRY windows: they are measured from the claim's last
+ * heartbeat, not from the moment the work started. A download renews its lease
+ * on every progress line, and conversion/metadata renew theirs on an interval
+ * (`startClaimHeartbeat`), so a live long-running stage never looks stale no
+ * matter how long it runs.
  */
 export function STALE_CLAIM_THRESHOLDS(config: Pick<Config, "maxDownloadMinutes">) {
   return {
@@ -68,6 +106,52 @@ export function STALE_CLAIM_THRESHOLDS(config: Pick<Config, "maxDownloadMinutes"
     conversion: "-3 hours",
     metadata: "-15 minutes",
   };
+}
+
+/**
+ * The one predicate that decides whether a stage's claim lease has expired.
+ *
+ * `modifier` is a SQLite datetime modifier built from validated numbers (the
+ * same strings `STALE_CLAIM_THRESHOLDS` hands to the dashboard). A claim with
+ * no heartbeat yet (legacy rows claimed before heartbeats existed, or a test
+ * fixture) falls back to its claim timestamp.
+ *
+ * The sweep AND the dashboard's stale-claims count both go through this, so the
+ * panel cannot drift from what the reaper actually does.
+ */
+export function staleClaimCondition(stage: ClaimStage, modifier: string, alias = ""): string {
+  const c = claimColumns(stage);
+  const heartbeat = `COALESCE(${alias}${c.heartbeat}, ${alias}${c.at})`;
+  return `(${heartbeat} IS NULL OR ${heartbeat} < datetime('now', '${modifier}'))`;
+}
+
+/**
+ * Reclaim ONE stale claim with a compare-and-swap on the claim token, the way
+ * the owner last looked.
+ *
+ * This is what keeps two reapers (or a reaper racing a live worker's renewal)
+ * from double-resetting a job: the update lands only if the row still carries
+ * exactly the claim that was seen AND that claim's lease is still expired at
+ * update time. A worker that renewed its heartbeat, or a second reaper that
+ * already re-queued the job, makes this return false and the caller leaves the
+ * row alone.
+ *
+ * Exported for the tests: the cross-connection races are only observable when
+ * the CAS can be driven independently of the sweep loop.
+ */
+export function reapStaleClaim(
+  stage: ClaimStage,
+  jobId: string,
+  claim: ClaimRef,
+  modifier: string,
+): boolean {
+  const c = claimColumns(stage);
+  const setClause =
+    stage === "download"
+      ? `download_status = 'paused', pause_reason = 'interrupted'`
+      : `${c.status} = 'pending'`;
+  const extra = `${c.status} = '${c.claimedStatus}' AND ${staleClaimCondition(stage, modifier)}`;
+  return releaseClaimedJob(stage, jobId, claim, setClause, [], extra) === 1;
 }
 
 /**
@@ -90,6 +174,15 @@ export interface ReapSummary {
 export async function reapStaleClaims(config: Config): Promise<ReapSummary> {
   const thresholds = STALE_CLAIM_THRESHOLDS(config);
   const reaped: ReapSummary = { downloads: 0, conversions: 0, metadata: 0, stranded: 0, locked: 0 };
+  // Lease-aware: only the engine that owns `archive.db` may reclaim claims. A
+  // process without the lease would be guessing about rows it does not own.
+  if (!holdsEngineLease()) {
+    logError(
+      "reaper",
+      `skipped: this process does not hold the engine lease (${describeEngineLease(readEngineLease())})`,
+    );
+    return reaped;
+  }
   try {
     // Freeze each in-flight download's `.part` path while the job is still
     // 'downloading' (that is this function's own filter) — otherwise the
@@ -99,67 +192,90 @@ export async function reapStaleClaims(config: Config): Promise<ReapSummary> {
     const activeJobFilter = activeJobIds.length
       ? `AND id NOT IN (${activeJobIds.map(() => "?").join(", ")})`
       : "";
-    // Snapshot what is about to be reclaimed so the resume state of EXACTLY
-    // those jobs can be checked below, before the status update loses them.
-    const staleRows = db
+    // Snapshot the claims about to be reclaimed, TOKEN INCLUDED, so each
+    // reclaim below is a CAS against exactly this claim. If the owner renews
+    // its lease (or another reaper/worker gets there first) between this SELECT
+    // and the UPDATE, the CAS matches nothing and the row is left alone.
+    const dlCols = claimColumns("download");
+    const staleDownloads = db
       .query(
-        `SELECT id, "index", title, output_directory FROM jobs
-          WHERE download_status = 'downloading'
-            AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', ?)) ${activeJobFilter}`,
+        `SELECT id, "index", title, output_directory,
+                ${dlCols.by} AS claim_by, ${dlCols.token} AS claim_token
+           FROM jobs
+          WHERE ${dlCols.status} = '${dlCols.claimedStatus}'
+            AND ${staleClaimCondition("download", thresholds.download)} ${activeJobFilter}`,
       )
-      .all(thresholds.download, ...activeJobIds) as { id: string; index: number; title: string; output_directory: string }[];
-    const dlQuery =
-      `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
-         download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
-       WHERE download_status = 'downloading'
-         AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', ?)) ${activeJobFilter}`;
-    const dl = db.run(dlQuery, [thresholds.download, ...activeJobIds]);
-    const cv = db.run(
-      `UPDATE jobs SET conversion_status = 'pending', conversion_claimed_by = NULL,
-         conversion_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
-       WHERE conversion_status = 'in_progress'
-         AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', ?))`,
-      [thresholds.conversion],
-    );
-    const md = db.run(
-      `UPDATE jobs SET metadata_status = 'pending', updated_at = CURRENT_TIMESTAMP
-       WHERE metadata_status = 'in_progress' AND updated_at < datetime('now', ?)`,
-      [thresholds.metadata],
-    );
-    // A reclaimed download whose worker died can leave half a resume pair: the
-    // `.aria2` control file with no data file beside it. The next attempt hands
-    // that control file to aria2c, which can neither resume (the data is gone)
-    // nor start over — the job wedges. The startup sweep clears these, but only
-    // after a day and only for jobs it sees; the reaper owns them from now on.
-    // A locked control file is reported and left alone, exactly like the
-    // corrupt-partial path: retry on the next tick rather than risk stranding.
-    let stranded = 0;
-    let locked = 0;
-    for (const row of staleRows) {
+      .all(...activeJobIds) as {
+      id: string;
+      index: number;
+      title: string;
+      output_directory: string;
+      claim_by: string | null;
+      claim_token: string | null;
+    }[];
+    for (const row of staleDownloads) {
+      const claim: ClaimRef = { by: row.claim_by, token: row.claim_token };
+      if (!reapStaleClaim("download", row.id, claim, thresholds.download)) continue;
+      reaped.downloads++;
+      // A reclaimed download whose worker died can leave half a resume pair:
+      // the `.aria2` control file with no data file beside it. The next attempt
+      // hands that control file to aria2c, which can neither resume (the data
+      // is gone) nor start over — the job wedges. Only jobs this tick actually
+      // reclaimed are swept, so the stranded files of a live claim stay put. A
+      // locked control file is reported and left alone, exactly like the
+      // corrupt-partial path: retry on the next tick rather than risk
+      // stranding.
       const found = await sweepStrandedControlFiles(row);
-      stranded += found.removed;
-      locked += found.locked;
+      reaped.stranded += found.removed;
+      reaped.locked += found.locked;
     }
-    // Report what the UPDATEs actually changed, not just the stranded sweep:
-    // a caller (the dashboard/test) can now tell "nothing to do" from "wrote".
-    const total = dl.changes + cv.changes + md.changes;
-    if (total > 0 || stranded > 0) {
+
+    const cvCols = claimColumns("conversion");
+    const staleConversions = db
+      .query(
+        `SELECT id, ${cvCols.by} AS claim_by, ${cvCols.token} AS claim_token
+           FROM jobs
+          WHERE ${cvCols.status} = '${cvCols.claimedStatus}'
+            AND ${staleClaimCondition("conversion", thresholds.conversion)}`,
+      )
+      .all() as { id: string; claim_by: string | null; claim_token: string | null }[];
+    for (const row of staleConversions) {
+      if (reapStaleClaim("conversion", row.id, { by: row.claim_by, token: row.claim_token }, thresholds.conversion)) {
+        reaped.conversions++;
+      }
+    }
+
+    const mdCols = claimColumns("metadata");
+    const staleMetadata = db
+      .query(
+        `SELECT id, ${mdCols.by} AS claim_by, ${mdCols.token} AS claim_token
+           FROM jobs
+          WHERE ${mdCols.status} = '${mdCols.claimedStatus}'
+            AND ${staleClaimCondition("metadata", thresholds.metadata)}`,
+      )
+      .all() as { id: string; claim_by: string | null; claim_token: string | null }[];
+    for (const row of staleMetadata) {
+      if (reapStaleClaim("metadata", row.id, { by: row.claim_by, token: row.claim_token }, thresholds.metadata)) {
+        reaped.metadata++;
+      }
+    }
+
+    const total = reaped.downloads + reaped.conversions + reaped.metadata;
+    if (total > 0 || reaped.stranded > 0) {
       console.log(
-        `🧟 Reclaimed ${dl.changes} stale download(s) (${recorded} partial path(s) recorded, ${stranded} stranded control file(s) swept), ${cv.changes} conversion(s), ${md.changes} metadata job(s).`,
+        `🧟 Reclaimed ${reaped.downloads} stale download(s) (${recorded} partial path(s) recorded, ${reaped.stranded} stranded control file(s) swept), ${reaped.conversions} conversion(s), ${reaped.metadata} metadata job(s).`,
       );
-      logError("reaper", `reclaimed stale claims: downloads=${dl.changes} conversions=${cv.changes} metadata=${md.changes}`);
-    }
-    if (locked > 0) {
       logError(
         "reaper",
-        `${locked} stranded aria2c control file(s) are locked — kept both files; the next sweep retries`,
+        `reclaimed stale claims: downloads=${reaped.downloads} conversions=${reaped.conversions} metadata=${reaped.metadata}`,
       );
     }
-    reaped.downloads = dl.changes;
-    reaped.conversions = cv.changes;
-    reaped.metadata = md.changes;
-    reaped.stranded = stranded;
-    reaped.locked = locked;
+    if (reaped.locked > 0) {
+      logError(
+        "reaper",
+        `${reaped.locked} stranded aria2c control file(s) are locked — kept both files; the next sweep retries`,
+      );
+    }
   } catch (e: any) {
     logError("reaper", String(e?.message || e));
   }
@@ -246,7 +362,12 @@ export function reconcileMissingFiles(config: Config): number {
            metadata_status = CASE
              WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
              ELSE metadata_status END,
-           download_claimed_by = NULL, conversion_claimed_by = NULL,
+           download_claimed_by = NULL, download_claimed_at = NULL,
+           download_claim_token = NULL, download_heartbeat_at = NULL,
+           conversion_claimed_by = NULL, conversion_claimed_at = NULL,
+           conversion_claim_token = NULL, conversion_heartbeat_at = NULL,
+           metadata_claimed_by = NULL, metadata_claimed_at = NULL,
+           metadata_claim_token = NULL, metadata_heartbeat_at = NULL,
            last_error = 'file missing on startup — re-queued',
            updated_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
@@ -353,7 +474,9 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
       // no-progress budget here; the next worker outcome is what spends it.
       db.run(
         `UPDATE jobs SET download_status = 'pending', retry_count = 0, pause_reason = NULL,
-           download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+           download_claimed_by = NULL, download_claimed_at = NULL,
+           download_claim_token = NULL, download_heartbeat_at = NULL,
+           updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
         [row.id],
       );
       result.downloads++;
@@ -369,7 +492,9 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
     for (const row of failedConversions) {
       db.run(
         `UPDATE jobs SET conversion_status = 'pending', conversion_retry_count = 0,
-           conversion_claimed_by = NULL, conversion_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+           conversion_claimed_by = NULL, conversion_claimed_at = NULL,
+           conversion_claim_token = NULL, conversion_heartbeat_at = NULL,
+           updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
         [row.id],
       );
       result.conversions++;
@@ -387,6 +512,8 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
       if (!row.file_path || !existsSync(row.file_path)) continue;
       db.run(
         `UPDATE jobs SET metadata_status = 'pending', metadata_retry_count = 0,
+           metadata_claimed_by = NULL, metadata_claimed_at = NULL,
+           metadata_claim_token = NULL, metadata_heartbeat_at = NULL,
            updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
         [row.id],
       );
@@ -941,8 +1068,18 @@ export function dropSupersededFile(jobId: string): void {
  * The re-download failed permanently — put the previous file back and mark
  * the job downloaded again, so the operator keeps exactly what was archived
  * before the retry. Returns false when there was nothing to restore.
+ *
+ * `claim` is the download claim the caller still believes it holds (the worker
+ * passes its claim; the startup sweeps pass none). When given, ownership is
+ * verified BEFORE the file is moved and the row update is a CAS on the claim
+ * token, so a worker whose claim was reclaimed cannot restore an old file over
+ * the new owner's work.
  */
-export function restoreSupersededFile(jobId: string, reason: string): boolean {
+export function restoreSupersededFile(jobId: string, reason: string, claim?: ClaimRef): boolean {
+  if (claim && !ownsClaim("download", jobId, claim)) {
+    logError("reconcile", `${jobId}: refusing to restore the superseded backup — the download claim was lost`);
+    return false;
+  }
   const row = db
     .query(
       `SELECT superseded_file, COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) AS wants
@@ -969,15 +1106,26 @@ export function restoreSupersededFile(jobId: string, reason: string): boolean {
   // The restored file is the previous pipeline OUTPUT (already converted and
   // in its final location), so conversion is not needed again; sidecars are
   // re-fetched lazily if any are wanted.
-  db.run(
-    `UPDATE jobs SET file_path = ?, file_size = ?, superseded_file = NULL,
+  const setClause = `file_path = ?, file_size = ?, superseded_file = NULL,
        download_status = 'downloaded', progress = 100, best_progress = 100,
        partial_file_path = NULL, retry_count = 0, resume_count = 0,
        conversion_status = 'not_needed',
        metadata_status = CASE WHEN ? > 0 THEN 'pending' ELSE 'not_needed' END,
+       last_error = ?`;
+  const params = [original, size, row.wants, reason] as unknown[];
+  if (claim) {
+    if (releaseClaimedJob("download", jobId, claim, setClause, params) !== 1) {
+      logError("reconcile", `${jobId}: superseded backup restored but the download claim was lost before recording it`);
+      return false;
+    }
+    return true;
+  }
+  db.run(
+    `UPDATE jobs SET ${setClause},
        download_claimed_by = NULL, download_claimed_at = NULL,
-       last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [original, size, row.wants, reason, jobId],
+       download_claim_token = NULL, download_heartbeat_at = NULL,
+       updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [...params, jobId] as any,
   );
   return true;
 }

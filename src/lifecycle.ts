@@ -6,6 +6,7 @@
 // interrupted pipeline so the next start resumes rather than re-downloads.
 
 import { db } from "./db";
+import { holdsEngineLease, releaseEngineLease } from "./lease";
 import { killActiveChildren, triggerPause } from "./resilience";
 import { heartbeatRunHistory } from "./history";
 import { logError } from "./logger";
@@ -33,26 +34,49 @@ export async function handleShutdown(sig: string, webServer: { stop: (closeActiv
     // written into its job while the worker loops are already stopped, so the
     // "interrupted jobs resume from their partial" claim is actually true
     // instead of just a status the next start re-downloads from scratch.
-    recordPartialPaths();
-    // Persist an accurate picture of the interrupted pipeline:
-    //  - in-flight downloads become 'paused' + 'interrupted' (auto-resumed
-    //    and continued from where they left off on the next start)
-    //  - in-flight conversions/metadata re-queue to run again on next start
-    db.run(
-      `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
-         download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
-       WHERE download_status = 'downloading'`,
-    );
-    db.run(
-      `UPDATE jobs SET conversion_status = 'pending', conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
-       WHERE conversion_status = 'in_progress'`,
-    );
-    db.run(
-      `UPDATE jobs SET metadata_status = 'pending', updated_at = CURRENT_TIMESTAMP
-       WHERE metadata_status = 'in_progress'`,
-    );
+    //
+    // Only the engine that still owns the lease may rewrite in-flight claims:
+    // if another engine took over (our lease lapsed, e.g. a suspended laptop),
+    // these rows belong to it now, and a blanket reset would re-queue its work
+    // behind its back. The stale workers' own writes are already fenced by
+    // their claim tokens.
+    if (!holdsEngineLease()) {
+      logError("lifecycle", "not persisting interrupted state: the engine lease was lost (another engine owns archive.db)");
+    } else {
+      recordPartialPaths();
+      // Persist an accurate picture of the interrupted pipeline:
+      //  - in-flight downloads become 'paused' + 'interrupted' (auto-resumed
+      //    and continued from where they left off on the next start)
+      //  - in-flight conversions/metadata re-queue to run again on next start
+      db.run(
+        `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
+           download_claimed_by = NULL, download_claimed_at = NULL,
+           download_claim_token = NULL, download_heartbeat_at = NULL,
+           updated_at = CURRENT_TIMESTAMP
+         WHERE download_status = 'downloading'`,
+      );
+      db.run(
+        `UPDATE jobs SET conversion_status = 'pending',
+           conversion_claimed_by = NULL, conversion_claimed_at = NULL,
+           conversion_claim_token = NULL, conversion_heartbeat_at = NULL,
+           updated_at = CURRENT_TIMESTAMP
+         WHERE conversion_status = 'in_progress'`,
+      );
+      db.run(
+        `UPDATE jobs SET metadata_status = 'pending',
+           metadata_claimed_by = NULL, metadata_claimed_at = NULL,
+           metadata_claim_token = NULL, metadata_heartbeat_at = NULL,
+           updated_at = CURRENT_TIMESTAMP
+         WHERE metadata_status = 'in_progress'`,
+      );
+    }
     // Final history flush (row was created at startup + heartbeated since).
     heartbeatRunHistory();
+    // Give up the database lease: a clean exit must never block the next
+    // start (a hard kill needs no release — the lease simply expires).
+    try {
+      if (releaseEngineLease()) console.log("🔓 Engine lease released.");
+    } catch {}
     // Fold the WAL back into the main database file so archive.db stays
     // self-contained after the process exits.
     try {

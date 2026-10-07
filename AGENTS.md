@@ -88,7 +88,8 @@ archive.db                     SQLite job store (+ -wal/-shm while running)
 error.log                      rotating error log
 src/
   config.ts      Zod schema, DEFAULT_CONFIG, load/loadSafe/save (atomic), live-write lock, QUALITY_FORMATS
-  db.ts          SQLite schema, migrations, atomic claim transactions, helpers
+  db.ts          SQLite schema, migrations, atomic claim transactions, claim leases (token/heartbeat/CAS), helpers
+  lease.ts       database-level engine lease (owner token, expiry, monotonic fencing) — one engine per archive.db
   state.ts       shared mutable runtime state (leaf module — imports nothing)
   tools.ts       yt-dlp/ffmpeg/aria2c discovery, cookiesArgs, validateCookies
   download-args.ts PURE yt-dlp command construction (downloader engine, tuning)
@@ -124,19 +125,20 @@ config.ts, util.ts, logger.ts, retry.ts,
 archive.ts, tools.ts, download-output.ts         │ (leaf modules, zero deps)
 audio-tracks.ts → config (types), tools          │ (pure parsing/selection + -J probe)
 db.ts → config                                  │
+lease.ts → db, logger                           │ (the engine lease; db must never import it)
 resilience.ts → config, db, logger, state       │
-reconcile.ts → archive, config, db, download-args, logger, retry, state, tools│
+reconcile.ts → archive, config, db, download-args, lease, logger, retry, state, tools│
 sources.ts → config, state                     │
 scanner.ts → config, db, state, tools, util     │
 autoscale.ts → db, state                        │
 dashboard.ts → autoscale, config, db, state, util│
 report.ts → autoscale, db, state, util          │
 download-args.ts → audio-tracks, config, db (types), download-output, retry, tools, util    │ (pure)
-web.ts → audio-tracks, autoscale, config, db, download-args, logger, reconcile, report, resilience, retry, scanner, sources, state, tools, util
+web.ts → audio-tracks, autoscale, config, db, download-args, lease, logger, reconcile, report, resilience, retry, scanner, sources, state, tools, util
 rss.ts → config, logger, scanner, state, tools   │
 polling.ts → config, logger, scanner, state     │
 history.ts → db, logger, state                  │
-lifecycle.ts → dashboard, db, history, logger, resilience, state
+lifecycle.ts → dashboard, db, history, lease, logger, resilience, state
 workers/* → config, dashboard, db, download-args, download-output, logger, resilience, retry, state, tools, util (+ autoscale/archive/reconcile; download.ts also audio-tracks)
 engine.ts → everything (composition root)
 ```
@@ -150,25 +152,32 @@ dependency-free — it is the module that breaks every import cycle.
 1. `loadConfig()` → `setConfig()` (must be first: dependency search uses paths from it)
 2. `checkDependencies()` — fails fast with install hints
 3. `initDatabase("archive.db")` — schema + migrations + claim transactions
-4. `startWebServer()` — **before any sweep: the web port is the single-instance
-   lock**. A second instance (autostart task + a manual start) dies here with an
-   actionable error instead of re-queueing a live instance's in-flight work.
-5. `reconcileCrashedJobs()` → `reconcileSupersededFiles()` →
+4. `acquireEngineLease()` — **before any sweep: the database-level single-instance
+   lock**. A live owner (another process, whatever its web port) makes this
+   process exit 1 without touching a job row; an expired lease — or one whose
+   owning process is provably gone — is taken over with `fencing + 1`.
+   `startEngineLeaseHeartbeat()` renews it for the rest of the run; a lost lease
+   pauses the engine (`ENGINE_LEASE_LOST`).
+5. `startWebServer()` — the HTTP lock, acquired second so a refused start never
+   holds the port. A second instance (autostart task + a manual start) dies here
+   with an actionable error instead of re-queueing a live instance's work.
+6. `reconcileCrashedJobs()` → `reconcileSupersededFiles()` →
    `reconcileMissingFiles()` (the superseded sweep MUST run before the
    missing-file sweep: an interrupted `.superseded` stash looks like a deleted
    file to it, and the video would be re-queued over a backup that is sitting
    right there; the missing-file sweep itself skips jobs with a conversion in
    progress — the converter legitimately has those files in mid-transition
-   under `deleteSourceAfterConvert`)
-6. `startRunHistory()` + heartbeat interval
-7. `mkdir(outputRoot)` → `cleanOrphanedFiles()` → `autoscaler.init()`
-8. cookie validation (if enabled)
-9. scan every configured playlist/channel into the jobs table
-10. `initDashboard()`
-11. `networkMonitor()`, `reapStaleClaims` (60s), `autoscaleTick` (15s),
-    `requeueFailedJobs` (60s), `cookiesWatch` (60s), `startRssPolling()`
-12. supervised worker pools (download × N, metadata × N, convert × N)
-13. `startAutonomousPolling()` if daemon mode
+   under `deleteSourceAfterConvert`; every one of these sweeps refuses to run
+   without the engine lease)
+7. `startRunHistory()` + heartbeat interval
+8. `mkdir(outputRoot)` → `cleanOrphanedFiles()` → `autoscaler.init()`
+9. cookie validation (if enabled)
+10. scan every configured playlist/channel into the jobs table
+11. `initDashboard()`
+12. `networkMonitor()`, `reapStaleClaims` (60s, lease-gated), `autoscaleTick`
+    (15s), `requeueFailedJobs` (60s), `cookiesWatch` (60s), `startRssPolling()`
+13. supervised worker pools (download × N, metadata × N, convert × N)
+14. `startAutonomousPolling()` if daemon mode
 
 ---
 
@@ -190,7 +199,9 @@ dependency-free — it is the module that breaks every import cycle.
 | `conversion_status` | `pending` \| `in_progress` \| `done` \| `failed` \| `not_needed` |
 | `metadata_status` | `pending` \| `in_progress` \| `done` \| `failed` \| `not_needed` |
 | `pause_reason` | `user` \| `interrupted` \| `waiting_live` \| NULL |
-| `*_claimed_by` / `*_claimed_at` | worker id + timestamp of the atomic claim |
+| `*_claimed_by` / `*_claimed_at` | worker id + timestamp of the atomic claim (display/diagnostics; ownership is the token) |
+| `*_claim_token` | random UUID minted by the claim — the claim's real identity, since worker ids (`dl-1`) repeat across processes. Every progress/success/failure/release update is a CAS on it |
+| `*_heartbeat_at` | last lease renewal for that stage's claim. Downloads renew it on every progress line and on a timer; conversion/metadata renew on an interval (`startClaimHeartbeat`, default 30 s, test override `YTA_CLAIM_HEARTBEAT_MS`). The reaper's staleness window is measured from `COALESCE(heartbeat, claimed_at)`, never from `updated_at` |
 | `retry_count` | no-progress download failures in the current retry window |
 | `conversion_retry_count`, `metadata_retry_count` | per-stage attempt budgets |
 | `resume_count` | `--continue` resumes spent for this job |
@@ -204,7 +215,22 @@ dependency-free — it is the module that breaks every import cycle.
 | `last_error` | last failure message (classified by `retry.ts`) |
 
 Other tables: `playlist_state(folder, next_index)`,
-`run_history(id, started_at, ended_at, duration_seconds, downloaded, skipped, failed, total_queued)`.
+`run_history(id, started_at, ended_at, duration_seconds, downloaded, skipped, failed, total_queued)`,
+and `engine_lease` — the database-level single-instance row (`id = 1`):
+
+| Field | Meaning |
+| --- | --- |
+| `owner` | random per-process token (`host:pid:random`), NULL when free/released |
+| `fencing` | monotonic generation counter, incremented on every acquisition/takeover |
+| `pid`, `host` | the owning process, so a restart can prove a crashed owner is gone and take over at once |
+| `acquired_at` / `heartbeat_at` / `expires_at` | acquisition time, last renewal, and the expiry used by refusal/takeover |
+
+Acquisition is one immediate transaction (`src/lease.ts`): it refuses a live
+foreign owner without writing anything, and otherwise takes the row over with
+`fencing + 1` (`INSERT … ON CONFLICT DO UPDATE … WHERE owner IS NULL OR
+expires_at <= now OR the owner process is gone RETURNING …`). `owner` is
+released on graceful shutdown (the row is kept, so fencing survives); a hard
+kill is handled by the PID check or, failing that, the expiry.
 
 ### State machine
 
@@ -227,6 +253,26 @@ downloaded ──► convert worker ──► conversion: pending → in_progres
 atomic `UPDATE … WHERE id = (SELECT … LIMIT 1) RETURNING *` inside a
 `db.transaction`. Two workers can never grab the same job. Never add a
 read-then-write claim sequence.
+
+**A claim is a lease, and the token is its identity.** The claim mints a random
+`*_claim_token` (worker ids like `dl-1` repeat across processes and mean
+nothing for ownership) and stamps `*_heartbeat_at`; the worker renews it while
+the stage runs. Every later write — progress, success, failure, release — goes
+through `updateClaimedJob` / `releaseClaimedJob` (`db.ts`), which append
+`AND <stage>_claim_token IS ? AND <stage>_claimed_by IS ?` and return the
+changed-row count:
+
+- **1** → the update landed;
+- **0** → the claim was reaped, released, or taken over — the worker must not
+  change job state (it logs and walks away). Do not write a bare
+  `UPDATE jobs … WHERE id = ?` in a worker for anything that depends on owning
+  the job.
+
+The reaper uses the same primitive, with the lease-expiry predicate as an extra
+condition (`reapStaleClaim`), so it cannot reset a job whose claim was renewed
+or already reclaimed by someone else. `ownsClaim` is the read-only form, used
+before destructive filesystem steps (the converter's source delete, the
+secondary-storage move, the `.superseded` restore).
 
 Conversion claims additionally require `metadata_status IN ('done','not_needed','failed')`
 — the converter waits for metadata to be *terminal*, not necessarily successful.
@@ -289,18 +335,19 @@ re-queues a failed sidecar pass on an already-converted job.
 | Partial-path freeze | `reconcile.ts recordJobPartial() / recordPartialPaths()` | records the on-disk `.part` before a job stops being `downloading`, so a paused/interrupted job really resumes instead of restarting |
 | Pause bookkeeping | `workers/download.ts parkPaused()` | parks an in-flight job as `paused` **and** freezes its partial path |
 | Circuit breaker | `resilience.ts notePipelineFailure()` | N consecutive failures per stage pauses the engine (`TOO_MANY_FAILURES`) |
-| Pause / resume | `resilience.ts triggerPause / triggerResume` | SIGINTs child yt-dlp; resume re-queues paused jobs |
+| Pause / resume | `resilience.ts triggerPause / triggerResume` | SIGINTs child yt-dlp; resume re-queues paused jobs and clears their claim columns. Parking an in-flight download keeps its claim (owner+token) so the worker's own release still matches |
 | Network monitor | `resilience.ts networkMonitor()` | probes 3 hosts, pauses after 2 consecutive failures |
 | Cookies watcher | `reconcile.ts cookiesWatch()` + `tools.ts detectCookiesChange()` | 60s sweep: reports cookies.txt appearing / changing / vanishing mid-run and counts the credential-blocked jobs it may rescue (never auto-requeues them) |
 | Disk guard | `resilience.ts diskUsage()` → `checkDiskSpace()` | `diskUsage` is the **only** `statfs` caller: statfs → PowerShell `Get-PSDrive` fallback → `-1/-1` degraded mode (never bricks the engine, never 500s `/api/status`) |
-| Crash recovery | `reconcile.ts reconcileCrashedJobs()` | `downloading` → `paused + interrupted` (auto-claimable); also clears orphan claims from legacy user-paused downloads while keeping them held |
-| Stale-claim reaper | `reconcile.ts reapStaleClaims(config)` | downloads idle >`max(20 min, maxDownloadMinutes)` (actively owned jobs are protected and progress heartbeats the claim), conversions >3 h, metadata >15 min; thresholds come from `STALE_CLAIM_THRESHOLDS(config)` so the dashboard cannot drift from them. Also sweeps the stranded `.aria2` control files of the jobs it reclaims (a dead worker's pair whose data file is gone would wedge the next attempt) through the same `removePartialFiles` contract: a locked control file is reported and retried on the next tick, never forced |
+| Crash recovery | `reconcile.ts reconcileCrashedJobs()` | `downloading` → `paused + interrupted` (auto-claimable); also clears orphan claims from legacy user-paused downloads while keeping them held. **Refuses to run without the engine lease** — this sweep resets every in-flight claim, so it may only touch a database its own process owns. Clearing each row's claim token is what fences the previous engine's stale workers out |
+| Stale-claim reaper | `reconcile.ts reapStaleClaims(config)` | Lease-gated (only the engine holding the engine lease reaps) and **heartbeat-based**: downloads silent >`max(20 min, maxDownloadMinutes)` (actively owned jobs are additionally protected in-process, and progress renews the heartbeat), conversions silent >3 h, metadata silent >15 min — `staleClaimCondition()` is the single predicate, shared with the dashboard's stale-claims panel so the two cannot drift. Each reclaim is `reapStaleClaim()`, a CAS on `(token, owner, status, expired-heartbeat)`: a worker that renewed its heartbeat, or a second reaper that got there first, makes the update match 0 rows and the job is left alone. Also sweeps the stranded `.aria2` control files of the jobs it actually reclaimed this tick (a dead worker's pair whose data file is gone would wedge the next attempt) through the same `removePartialFiles` contract: a locked control file is reported and retried on the next tick, never forced |
 | Missing-file reconciliation | `reconcile.ts reconcileMissingFiles()` | scrubs the yt-dlp archive + re-queues |
 | Failed-job sweep | `reconcile.ts requeueFailedJobs()` | after cooldown, non-permanent failures start a fresh per-video retry window; permanent download errors are skipped; `ignoreCooldown` for the UI button |
 | Partial-file cleanup | `reconcile.ts cleanOrphanedFiles()` | keeps every resume-able partial — `pending`/`downloading`/`paused`/`waiting_live` owners and retryable failures waiting for cooldown are **never** aged out; deletes exhausted partials when auto-requeue is disabled, partials nothing will resume once they are a week old (`PARTIAL_MAX_AGE_MS`), day-old orphans (`ORPHAN_PARTIAL_MAX_AGE_MS`) and unowned `.superseded` backups. Recorded paths and walked paths are compared through `pathKey()` (absolute + case-folded), because the DB stores absolute paths while the walk is relative to `outputRoot`. Returns `{removed, locked}`: a partial whose control file is locked keeps BOTH files, is counted as `locked`, logged, and retried by a later sweep — never counted as removed |
 | Superseded-file recovery | `reconcile.ts reconcileSupersededFiles()` | startup heal of the deliberate-re-download hand-off: rolls back a stash whose rename never ran (`file_path` not yet recorded), restores a backup whose retry never became claimable, drops a backup whose re-download already finished, and adopts a legacy rename-first backup instead of letting the missing-file sweep re-queue the video |
 | Archive scrubbing | `archive.ts removeFromArchive()` | needed whenever a file disappears, else yt-dlp skips it forever |
 | Signature self-heal | `workers/download.ts` | auto-runs `yt-dlp -U` and retries with a clean budget |
+| Engine lease release | `lease.ts releaseEngineLease()` (from `lifecycle.ts handleShutdown()`) | owner → NULL with an immediate expiry, so a clean restart never waits for a TTL; the row (and its fencing counter) is kept |
 | WAL checkpoint | `lifecycle.ts handleShutdown()` | keeps `archive.db` self-contained after exit |
 
 **Adding a new failure class:** extend the classifiers in `retry.ts` (pure,
@@ -564,6 +611,8 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/config.test.ts` | defaults, validation, cross-field refinements, atomic load/save |
 | `tests/sources.test.ts` | URL classification, canonicalization, persisted source lists, dedup, concurrent saves/settings, validation/auth/write failures |
 | `tests/db.test.ts` | schema + legacy migration, atomic claims, the pipeline claim exclusions, all reconcile/requeue sweeps, ingestion dedupe |
+| `tests/engine-lease.test.ts` | the database-level engine lease: acquisition/refusal, takeover of an expired lease and of one whose owning process is gone, renewal failure after a takeover, the heartbeat's lost-lease signal, release + clean restart (fencing survives), and that the startup/reaper sweeps refuse to run without the lease. Uses file-backed databases and a real second process (`tests/fixtures/claim-worker.ts`) |
+| `tests/claim-races.test.ts` | claim ownership across SEPARATE connections and PROCESSES: two handles cannot claim the same job twice, three processes draining 40 jobs never double-claim (unique token per row), a crashed owner reclaimed only after its lease lapses, a stale worker's progress/release refused after its claim was taken, a long-running heartbeating conversion never reaped (and reaped once the heartbeat stops), metadata reaped on its heartbeat rather than `updated_at`, and two reapers racing one expired claim where exactly one CAS wins |
 | `tests/cookies.test.ts` | `cookiesArgs`/`cookiesState` on a missing/empty/present file, the appeared/updated/disappeared transitions, and `cookiesWatch`'s credential-blocked count |
 | `tests/rss.test.ts` | `parseRssFeed` against a realistic feed (CDATA, missing duration); timer picks up live-added channels after an empty startup |
 | `tests/webauth.test.ts` | token extraction, timing-safe compare, authorization |
@@ -767,9 +816,16 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 17. **New yt-dlp flags belong in `buildDownloadPlan`.** The download worker
     passes the URL first and the plan's args after it, so the mock's URL
     detection (`argv[0]`) depends on that ordering.
-18. **One instance per `archive.db`.** The web port is the lock and `main()`
-    binds it before the sweeps; anything that mutates job state must stay
-    after `startWebServer()` in the startup order.
+18. **One instance per `archive.db` — the LEASE is the lock.** `main()` takes
+    the engine lease (`src/lease.ts`) right after `initDatabase()` and before
+    the port and before every sweep: a live foreign owner (a different
+    `webPort` proves nothing) means exit 1 with no job row touched. Anything
+    that mutates job state must stay after `acquireEngineLease()` in the
+    startup order, and every sweep that rewrites claims must be gated on
+    `holdsEngineLease()` (`reconcileCrashedJobs`, `reapStaleClaims` and the
+    shutdown reset all are). A crashed owner is taken over immediately when its
+    PID is provably gone, otherwise once the lease expires; every takeover
+    increments `fencing`.
 19. **`removePartialFiles` removes the `.aria2` control file FIRST and
     reports a `fatal` result when it is locked** (orphaned aria2c, antivirus).
     Never delete the `.part` after a fatal — that strands the control file and
@@ -864,6 +920,27 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     sibling probe. Any lookup for a job's file on disk must also use
     `jobFittedBaseFilename()` — `fitBaseFilename` truncation means the raw
     title is not the name on disk.
+31. **Every claim write is a CAS on the claim token — never a bare
+    `WHERE id = ?`.** Worker ids repeat across processes, so only
+    `*_claim_token` identifies the claim: use `updateClaimedJob` /
+    `releaseClaimedJob` (they append `AND <stage>_claim_token IS ? AND
+    <stage>_claimed_by IS ?`) and check the changed-row count — **1** means the
+    update landed, **0** means ownership was lost and the worker must not touch
+    job state (no status change, no `stats.*`, no failure counters). The same
+    applies to updates that keep the claim (progress, audio probe) and to the
+    reaper (`reapStaleClaim` adds the expired-heartbeat predicate so a renewed
+    claim survives the race). `*_claimed_by`/`*_claimed_at` are display/legacy
+    data; `reconcileCrashedJobs` clears all four columns per stage, and that is
+    what fences a previous engine's stranded workers out.
+32. **Staleness is measured from the claim's HEARTBEAT — not `updated_at`, and
+    not the claim's start time.** A conversion or metadata pass renews its lease
+    on an interval while it runs, so a three-hour encode is not "stale"; a dead
+    worker stops renewing and ages out on schedule. Never write a stale-claim
+    query with its own timestamp logic — use `staleClaimCondition(stage,
+    modifier)` (`reconcile.ts`); the reaper and the `/api/reliability` panel
+    share it. Keep the heartbeat interval well inside the stage's window
+    (`startClaimHeartbeat`, default 30 s, `YTA_CLAIM_HEARTBEAT_MS` as the
+    test-only override; the tightest window is metadata's 15 min).
 
 ---
 
@@ -875,7 +952,8 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 | Add a failure class | `src/retry.ts` classifier → `src/workers/download.ts` handler branch → unit test |
 | Add an API endpoint | `src/web.ts` `ROUTES` table (after the auth gate; pattern `:params`, `{ok}` envelope) → `web_ui.html` caller |
 | Add a dashboard field | `src/web.ts` response → `web_ui.html` render function |
-| Change claim semantics | `src/db.ts` claim transactions + `tests/db.test.ts` atomicity tests |
+| Change claim semantics | `src/db.ts` claim transactions + claim-lease primitives (`updateClaimedJob` / `releaseClaimedJob` / `heartbeatClaim`) → `tests/db.test.ts` (atomicity) + `tests/claim-races.test.ts` (two connections / two processes) |
+| Change engine ownership | `src/lease.ts` (acquisition/renewal/release/fencing) → `tests/engine-lease.test.ts` → the same-database integration scenario in `tests/integration.test.ts` |
 | Add a sweep | `src/reconcile.ts` (pure-ish, take `Config`) → register interval in `src/engine.ts` |
 | Add a worker | `src/workers/<name>.ts` → claim fn in `db.ts` → `supervise()` in `engine.ts` → TUI line in `dashboard.ts` |
 | Support a new site/URL shape | `src/sources.ts parseSourceUrl()` (Web UI validation/source identity) + `src/scanner.ts normalizeVideoUrl()` (job URL canonicalization) |
