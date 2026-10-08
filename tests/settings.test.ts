@@ -177,7 +177,7 @@ describe("readSettings", () => {
     expect(DOWNLOAD_SPEED_PROFILES.aggressive.values).toMatchObject({
       useAria2c: true,
       connectionsPerDownload: 32,
-      minSplitSize: "512K",
+      minSplitSize: "1M",
       concurrentFragments: 64,
       httpChunkSize: "10M",
       bufferSize: "64K",

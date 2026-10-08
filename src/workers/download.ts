@@ -168,7 +168,9 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
 
     try {
       await runDownload(id, job, config);
+      stopHeartbeat();
     } catch (err: any) {
+      stopHeartbeat();
       await handleDownloadFailure(id, job, config, err);
     } finally {
       stopHeartbeat();

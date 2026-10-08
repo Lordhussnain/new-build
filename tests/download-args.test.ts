@@ -64,6 +64,7 @@ describe("buildAria2cArgs", () => {
 
   test("adds --min-split-size only when it differs from yt-dlp's default", () => {
     expect(buildAria2cArgs(cfg({ minSplitSize: "1M" }))).not.toContain("--min-split-size");
+    expect(buildAria2cArgs(cfg({ minSplitSize: "512K" }))).not.toContain("--min-split-size");
     expect(buildAria2cArgs(cfg({ minSplitSize: "4M" }))).toBe("-x 16 -s 16 -j 16 --min-split-size 4M");
   });
 
@@ -229,7 +230,7 @@ describe("buildDownloadPlan", () => {
     const planAria2 = build(DOWNLOAD_SPEED_PROFILES.aggressive.values, true);
     expect(planAria2.engine).toBe("aria2c");
     expect(planAria2.args).toContain("--downloader-args");
-    expect(flagValue(planAria2.args, "--downloader-args")).toBe("aria2c:-x 16 -s 32 -j 32 --min-split-size 512K");
+    expect(flagValue(planAria2.args, "--downloader-args")).toBe("aria2c:-x 16 -s 32 -j 32");
   });
 
   test("adds the download archive and live filter only when enabled", () => {
