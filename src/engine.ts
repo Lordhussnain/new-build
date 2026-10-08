@@ -8,17 +8,25 @@ import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { loadConfig } from "./config";
 import { aria2cPath, checkDependencies, validateCookies } from "./tools";
-import { initDatabase } from "./db";
+import { initDatabase, pruneJobsForUnconfiguredSources } from "./db";
+import {
+  acquireEngineLease,
+  describeEngineLease,
+  releaseEngineLease,
+  startEngineLeaseHeartbeat,
+} from "./lease";
+import { SOURCE_KEYS, sourceIdentity } from "./sources";
 import {
   cleanOrphanedFiles,
   cookiesWatch,
   reconcileCrashedJobs,
   reconcileMissingFiles,
+  reconcileSupersededFiles,
   reapStaleClaims,
   requeueFailedJobs,
 } from "./reconcile";
 import { autoscaleTick, autoscaler } from "./autoscale";
-import { networkMonitor } from "./resilience";
+import { networkMonitor, triggerPause } from "./resilience";
 import { scanAndIngest } from "./scanner";
 import { startWebServer } from "./web";
 import { initDashboard, renderDashboard } from "./dashboard";
@@ -41,11 +49,15 @@ export async function main(): Promise<void> {
   // Windows: Ctrl+Break / console close events surface as SIGBREAK.
   process.on("SIGBREAK", () => handleShutdown("SIGBREAK", webServer));
   process.on("unhandledRejection", (reason) => {
-    logError("process", `unhandledRejection: ${reason instanceof Error ? reason.stack || String(reason) : String(reason)}`);
+    const detail = reason instanceof Error ? reason.stack || String(reason) : String(reason);
+    logError("process", `fatal unhandledRejection: ${detail}`);
+    console.error("‼️ Unhandled rejection — stopping safely:", reason);
+    void handleShutdown("unhandledRejection", webServer, 1);
   });
   process.on("uncaughtException", (err) => {
-    logError("process", `uncaughtException: ${err?.stack || err}`);
-    console.error("‼️ Uncaught exception (engine continues):", err);
+    logError("process", `fatal uncaughtException: ${err?.stack || err}`);
+    console.error("‼️ Uncaught exception — stopping safely:", err);
+    void handleShutdown("uncaughtException", webServer, 1);
   });
 
   // 1) Load configuration first (dependency search may use ytDlpPath/ffmpegPath
@@ -69,12 +81,42 @@ export async function main(): Promise<void> {
   //    run left behind (crash, hard kill, files moved behind our back).
   initDatabase("archive.db");
 
-  // Single-instance gate: bind the web port BEFORE any state-mutating sweep.
-  // A second instance (autostart task + a manual start, two terminals) used to
-  // run reconcileCrashedJobs/reconcileMissingFiles first — re-queueing the
-  // live instance's in-flight work behind its back, which looked like workers
-  // fighting each other — and only then die on the busy port. The port is now
-  // the lock: whoever holds it owns the job database.
+  // 2a) Database-level single-instance gate: take the engine lease BEFORE any
+  //     state-mutating sweep. The web port only guards instances that share a
+  //     port — two engines with different `webPort` values used to both bind
+  //     successfully and then both run startup reconciliation against the same
+  //     jobs, each re-queueing the other's in-flight work behind its back.
+  //     Whoever holds the lease owns `archive.db`; a live holder means this
+  //     process must refuse to start rather than touch a single job row.
+  const lease = acquireEngineLease();
+  if (!lease.acquired) {
+    console.error(
+      `\n❌ archive.db is owned by another live engine instance (${describeEngineLease(lease.lease)}).`,
+    );
+    console.error("   Stop that instance first (autostart task, another terminal, or a still-exiting process).");
+    console.error("   The engine lease is database-level: a different web port does NOT make a second instance safe.");
+    if (lease.lease?.owner) {
+      console.error(
+        `   If that engine is gone for good, wait for its lease to expire (${lease.lease.expiresAt} UTC) and start again.`,
+      );
+    }
+    process.exit(1);
+  }
+  console.log(
+    `🔐 Engine lease acquired (fencing ${lease.lease?.fencing}${lease.tookOver ? ", took over an expired lease" : ""}).`,
+  );
+  // Renew it for the life of the process. Losing it means another engine took
+  // over while this one was stalled; pausing stops new claims immediately, and
+  // the per-claim tokens fence everything already in flight.
+  const stopLeaseHeartbeat = startEngineLeaseHeartbeat({
+    onLost: () => {
+      logError("lease", "engine lease lost — pausing so this instance stops claiming work");
+      triggerPause("ENGINE_LEASE_LOST");
+    },
+  });
+
+  // 2b) HTTP gate: the port stays the lock for the dashboard and API. It is
+  //     acquired second, so a refused start never leaves the port held.
   try {
     webServer = startWebServer(config.webPort, config);
   } catch (err: any) {
@@ -84,12 +126,31 @@ export async function main(): Promise<void> {
       );
       console.error("   Stop that instance first (autostart task, another terminal, or a still-exiting process).");
       console.error("   Two instances against one archive.db corrupt each other's job state.");
+      stopLeaseHeartbeat();
+      releaseEngineLease();
       process.exit(1);
     }
+    stopLeaseHeartbeat();
+    releaseEngineLease();
     throw err;
   }
 
+  // The source manager deletes jobs immediately; this also catches a playlist
+  // removed by directly editing config.json while the engine was stopped.
+  const activeSourceUrls = new Set(
+    SOURCE_KEYS.flatMap((key) => config[key].map((url) => sourceIdentity(url))),
+  );
+  const staleSourceJobs = pruneJobsForUnconfiguredSources(activeSourceUrls);
+  if (staleSourceJobs.deletedJobs > 0) {
+    console.log(`🗑️ Removed ${staleSourceJobs.deletedJobs} job(s) for sources no longer in config.json.`);
+  }
+
   reconcileCrashedJobs();
+  // Heal the `.superseded` hand-off before the missing-file sweep: an
+  // interrupted stash looks like "downloaded file vanished" to
+  // reconcileMissingFiles, which would re-queue a download over a file that is
+  // sitting right there as a `.superseded` backup.
+  reconcileSupersededFiles();
   reconcileMissingFiles(config);
   // Run history: row created now, heartbeated so hard kills still leave data.
   startRunHistory();
@@ -134,8 +195,17 @@ export async function main(): Promise<void> {
     `Web UI: http://${uiHost}:${config.webPort}${config.webToken ? "  (token required)" : ""}${config.webBind === "0.0.0.0" ? "  — listening on ALL interfaces" : ""}`,
   );
 
-  networkMonitor();
-  setInterval(reapStaleClaims, 60_000);
+  if (config.networkMonitorEnabled) {
+    networkMonitor();
+  } else {
+    console.log("🌐 Network monitor disabled (networkMonitorEnabled=false).");
+  }
+  setInterval(() => {
+    // Fire-and-forget: the tick must never overlap itself, and a failure is
+    // already reported by the reaper. The void + catch keeps the interval from
+    // surfacing an unhandled rejection if the DB is mid-shutdown.
+    void reapStaleClaims(getConfig()).catch(() => {});
+  }, 60_000);
   // Dynamic download-slot autoscaling (no-op when autoscaleEnabled=false).
   setInterval(autoscaleTick, 15_000);
   // Failed-job sweep: re-queue transient failures after their cooldown.

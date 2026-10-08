@@ -6,17 +6,56 @@
 //   • --version
 //   • --flat-playlist --print "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s"
 //   • download mode (-o TEMPLATE …): writes a fake media file, prints
-//     PROGRESS lines and the final path
+//     PROGRESS lines and the final path; honours --download-archive (skips
+//     ids already recorded with yt-dlp's real message, records successes)
 //   • --skip-download (metadata): writes sidecar files
 //   • -U (self-update)
 //
 // Failure injection via environment variables:
 //   FAKE_FAIL_TIMES=2        fail the first N download attempts (leaves a .part)
-//   FAKE_FAIL_MODE=transient|permanent|corrupt   what the failure looks like
+//   FAKE_FAIL_MODE=transient|permanent|corrupt|private|unavailable|format|signature
+//                            what the failure looks like ("private"/"unavailable"
+//                            are the wordings YouTube actually emits, which the
+//                            engine must skip terminally; "format" is a selector
+//                            failure; "signature" exercises the bounded -U path)
+//   FAKE_FAIL_MESSAGE=…      override the failure text (unique markers let a
+//                            test assert where the message did and did not land)
+//   FAKE_UPDATE_FAIL=1       make `yt-dlp -U` fail with a diagnostic
+//   FAKE_UPDATE_HANG=1       make `yt-dlp -U` hang until the engine kills it
+//   FAKE_UPDATE_LOG=path     append each `-U` call (cooldown/coalescing tests)
+//   FAKE_FORMAT_FAILS_SELECTOR='height<=1080'
+//                            fail with "Requested format is not available" only
+//                            while --format contains the substring, so the
+//                            quality-ladder fallback is observable
+//   FAKE_FAIL_PROGRESS_SEQUENCE=20,40 emit progress before failed attempts
 //   FAKE_HANG=1             hang forever (watchdog test)
 //   FAKE_DELAY_MS=250       per-attempt delay (progress parsing)
+//   FAKE_OUTPUT_STRESS=1    noisy pipes + split Unicode final path without LF
+//   FAKE_OMIT_FINAL_PATH=1  exercise directory-based final-path recovery
+//   FAKE_SCAN_LOG=path      append every scanned URL (source persistence tests)
+//   FAKE_EMPTY_SCAN=1       a valid source with no videos yet
+//   FAKE_PROBE_FAIL=1|json  make the -J audio-track probe fail (non-zero exit /
+//                           unparsable JSON) so the single-audio fallback runs
+//   FAKE_PROBE_HANG=1       make -J hang forever (probe timeout tests)
+//   FAKE_KEEP_ALIVE=1       keep the aria2c readout window open for
+//                           FAKE_DELAY_MS instead of ending it when the
+//                           transfer finishes (progress-visibility tests)
+//
+// The aria2c branch forwards the fake downloader's stdout to this process's
+// stdout (the engine reads what the real yt-dlp leaves inherited) and turns the
+// engine's READOUT benchmark records into the console readout a real aria2c
+// writes — so the engine's aria2c progress parsing is exercised without a real
+// aria2c. Because a newline-delimited readout is not what a real aria2c emits,
+// the stream is framed instead of line-delimited:
+//
+//   ARIA2C-START <out>
+//   [#a1b2c3 1.0MiB/2.0MiB(50%) CN:4 DL:512KiB ETA:2s]
+//   ARIA2C-BENCHMARK <n> <out>        (one per record, in order)
+//   ARIA2C-DONE <code> <out>
+//   ARIA2C-ABORTED <out>              (only when the downloader was killed)
 
-import { rename } from "node:fs/promises";
+import { appendFile, rename } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 
 const argv = process.argv.slice(2);
 
@@ -39,6 +78,12 @@ if (flag("--version")) {
 }
 
 if (flag("-U")) {
+  if (process.env.FAKE_UPDATE_LOG) await appendFile(process.env.FAKE_UPDATE_LOG, "update\n");
+  if (process.env.FAKE_UPDATE_HANG === "1") await new Promise(() => {});
+  if (process.env.FAKE_UPDATE_FAIL === "1") {
+    console.error("mock yt-dlp self-update failed");
+    process.exit(17);
+  }
   console.log("yt-dlp is up to date (mock)");
   process.exit(0);
 }
@@ -48,6 +93,19 @@ if (flag("-U")) {
 // (original + two dubs), each in two quality variants plus a -drc duplicate
 // the engine must ignore.
 if (flag("--dump-single-json")) {
+  // Probe-failure injection: a real -J call fails on network errors, and the
+  // engine's promise is that the download still proceeds single-audio.
+  if (process.env.FAKE_PROBE_FAIL === "1") {
+    console.error("ERROR: Unable to download webpage: HTTP Error 503: Service Unavailable");
+    process.exit(1);
+  }
+  if (process.env.FAKE_PROBE_FAIL === "json") {
+    console.log("not-json-at-all");
+    process.exit(0);
+  }
+  if (process.env.FAKE_PROBE_HANG === "1") {
+    await new Promise(() => {}); // never answers: the probe's watchdog must fire
+  }
   console.log(
     JSON.stringify({
       id: "mockvid001",
@@ -85,6 +143,8 @@ if (flag("--skip-download")) {
 
 // --- flat playlist listing ----------------------------------------------------
 if (flag("--flat-playlist")) {
+  if (process.env.FAKE_SCAN_LOG) await appendFile(process.env.FAKE_SCAN_LOG, `${argv.at(-1)}\n`);
+  if (process.env.FAKE_EMPTY_SCAN === "1") process.exit(0);
   const lines = [
     "Mock Playlist|||mockvid001|||First Mock Video|||125",
     "Mock Playlist|||mockvid002|||Second Mock Video|||640",
@@ -95,23 +155,57 @@ if (flag("--flat-playlist")) {
 }
 
 // --- download -----------------------------------------------------------------
+// The engine always puts the video URL first (yt-dlp <url> --flags …).
+const url = argv[0] && !argv[0].startsWith("-") ? argv[0] : "";
+let videoId = "";
+try {
+  const u = new URL(url);
+  videoId =
+    (u.hostname === "youtu.be" ? u.pathname.slice(1).split("/")[0] : u.searchParams.get("v")) || "";
+} catch {}
+
+// --download-archive fidelity: ids already recorded are skipped with yt-dlp's
+// real message and exit 0 — NO file is written, NO progress is printed. This
+// is exactly the behaviour that makes deliberate re-downloads require an
+// archive scrub, so the integration tests exercise that contract for real.
+const archiveFile = flagValue("--download-archive");
+if (archiveFile && videoId) {
+  try {
+    const alreadyRecorded = (await Bun.file(archiveFile).text())
+      .split("\n")
+      .some((line) => {
+        const parts = line.trim().split(/\s+/);
+        return parts.length > 0 && parts[parts.length - 1] === videoId;
+      });
+    if (alreadyRecorded) {
+      console.log(`[youtube] ${videoId}: has already been recorded in the archive`);
+      process.exit(0);
+    }
+  } catch {
+    // no archive file yet — nothing recorded, proceed with the download
+  }
+}
+
 const outTemplate = flagValue("-o") || "./video.%(ext)s";
 const base = outTemplate.replace(/\.%\(ext\)s$/, "");
 // --audio-multistreams + --merge-output-format mkv means a multi-audio
 // download: the real yt-dlp would mux every track into one MKV, so the mock
 // produces (and the mock ffmpeg probes) an .mkv with two audio streams.
 const multiAudio = flag("--audio-multistreams");
-const finalPath = multiAudio ? `${base}.mkv` : `${base}.mp4`;
+const stressOutput = process.env.FAKE_OUTPUT_STRESS === "1";
+// Different basename prevents directory fallback from hiding a broken parser.
+const finalBase = stressOutput ? join(dirname(base), `final-${basename(base)}-数学 🧮`) : base;
+const finalPath = multiAudio ? `${finalBase}.mkv` : `${finalBase}.mp4`;
 const partPath = `${base}.f137.mp4.part`;
 // Record the argv so tests can assert which format selector / flags arrived.
-await Bun.write(`${base}.ytdlp-args`, argv.join(" "));
+// JSON.stringify preserves argument boundaries — one string with spaces vs
+// several arguments — which is exactly what argv.join(" ") loses.
+await Bun.write(`${base}.ytdlp-args`, JSON.stringify(argv));
 
 const failTimes = num("FAKE_FAIL_TIMES", 0);
 const failMode = process.env.FAKE_FAIL_MODE || "transient";
 const delayMs = num("FAKE_DELAY_MS", 60);
 const counterFile = `${base}.attempts`;
-// The engine always puts the video URL first (yt-dlp <url> --flags …).
-const url = argv[0] && !argv[0].startsWith("-") ? argv[0] : "";
 
 // Count attempts across processes so a retry loop sees the same counter.
 let attempts = 0;
@@ -122,23 +216,80 @@ attempts += 1;
 await Bun.write(counterFile, String(attempts));
 
 if (process.env.FAKE_HANG === "1") {
-  // Simulate a wedged download: never exits, ignores the abort signal enough
-  // for the watchdog to fire.
+  // A wedged download: never exits on its own. A cancellation test needs proof
+  // that the engine's SIGINT actually reached this child (and would otherwise
+  // just run until the watchdog fires), so the signal writes a marker file and
+  // exits like a real interrupted yt-dlp.
+  const signalled = `${base}.hang-signalled`;
+  const record = () => {
+    try {
+      Bun.write(signalled, String(process.pid)).finally(() => process.exit(130));
+      return;
+    } catch {}
+    process.exit(130);
+  };
+  process.on("SIGINT", record);
+  process.on("SIGTERM", record);
   await new Promise(() => {});
+}
+
+if (stressOutput) {
+  // The old LF-only parser concatenated CR updates into a 50KB+ "filename"
+  // and passed it to existsSync, panicking Bun 1.3.14's Windows path converter.
+  await Bun.write(Bun.stdout, "[#abcdef 1MiB/2MiB(50%) CN:16 DL:1MiB ETA:1s]\r".repeat(3000) + "\n");
+  await Bun.write(Bun.stdout, "x".repeat(60_000) + "\n");
+  await Bun.write(Bun.stderr, "chatty downloader diagnostic\n".repeat(4000));
 }
 
 if (failTimes > 0 && attempts <= failTimes) {
   // Leave a partial file behind — exactly like a real interrupted download —
   // so the engine's resume path has something to continue from.
   await Bun.write(partPath, "x".repeat(4096));
+  const progressSequence = (process.env.FAKE_FAIL_PROGRESS_SEQUENCE || "")
+    .split(",")
+    .map((x) => parseFloat(x.trim()))
+    .filter((x) => Number.isFinite(x));
+  const progressPct = progressSequence[Math.min(attempts - 1, progressSequence.length - 1)];
+  if (progressPct !== undefined && progressPct > 0) {
+    const downloaded = Math.round((10_485_760 * Math.min(progressPct, 100)) / 100);
+    console.log(`PROGRESS:${progressPct.toFixed(1)}|1.0MiB|12|10485760|${downloaded}`);
+  }
   await Bun.sleep(delayMs);
+  // FAKE_FAIL_MESSAGE wins so a scenario can stamp a unique marker into the
+  // text and prove exactly where it was (and was not) recorded.
   const msg =
-    failMode === "permanent"
+    process.env.FAKE_FAIL_MESSAGE ||
+    (failMode === "permanent"
       ? "ERROR: [youtube] mockvid001: Video unavailable. This video is private"
-      : failMode === "corrupt"
-        ? "ERROR: unable to resume download, incomplete or corrupt data"
-        : "ERROR: Unable to download webpage: Connection reset by peer (transient mock failure)";
+      : failMode === "private"
+        ? "ERROR: [youtube] mockvid001: This video is private"
+        : failMode === "unavailable"
+          ? "ERROR: [youtube] mockvid001: This video is unavailable"
+          : failMode === "format"
+            ? "ERROR: [youtube] mockvid001: Requested format is not available"
+            : failMode === "signature"
+              ? "ERROR: [youtube] mockvid001: Signature extraction failed: Some formats may be missing"
+              : failMode === "corrupt"
+              ? "ERROR: unable to resume download, incomplete or corrupt data"
+              : "ERROR: Unable to download webpage: Connection reset by peer (transient mock failure)");
   console.error(msg);
+  process.exit(1);
+}
+
+// Selector-scoped failure injection: a real yt-dlp answers "Requested format is
+// not available" when the requested selector matches nothing. Failing only for
+// selectors containing FAKE_FORMAT_FAILS_SELECTOR lets a test watch the engine
+// step its quality ladder down (every rung uses a different selector) and then
+// download successfully with the fallback one.
+// The sentinel "all" fails every selector (including yt-dlp's most permissive
+// default): the shape of a video with no usable formats at all, which must end
+// the quality ladder instead of looping.
+const failsSelector = process.env.FAKE_FORMAT_FAILS_SELECTOR || "";
+const selectorFails =
+  failsSelector === "all" || (!!failsSelector && (flagValue("--format") || "").includes(failsSelector));
+if (selectorFails) {
+  await Bun.sleep(delayMs);
+  console.error("ERROR: [youtube] mockvid001: Requested format is not available");
   process.exit(1);
 }
 
@@ -170,12 +321,24 @@ if (/(^|[\\/])aria2c(\.exe)?$/i.test(downloaderArg)) {
     partPath,
     url,
   ];
-  const proc = Bun.spawn(forwarded, { stdout: "inherit", stderr: "inherit" });
+  // stdout is piped (not inherited) so the readout can be rewritten from the
+  // fake downloader's READOUT benchmark records into aria2c's console format;
+  // stderr stays inherited, as yt-dlp keeps it for diagnostics.
+  const proc = Bun.spawn(forwarded, { stdout: "pipe", stderr: "inherit" });
 
   // A hard-killed engine takes the whole chain with it. Without this the mock
   // survives as an orphan and finishes the download, so a crash test would see
   // no partial file at all — unlike a real interrupted run.
   const parentPid = process.ppid;
+  let aria2cSignalled: NodeJS.Signals | undefined;
+  const onSignal = (signal: NodeJS.Signals) => {
+    aria2cSignalled = signal;
+    try {
+      proc.kill(9);
+    } catch {}
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
   const watcher = (async () => {
     while (true) {
       if (process.ppid !== parentPid) {
@@ -188,7 +351,62 @@ if (/(^|[\\/])aria2c(\.exe)?$/i.test(downloaderArg)) {
     }
   })();
 
+  const READOUT_SPEED_BPS = 393216; // 384.0KiB
+  console.log(`ARIA2C-START ${partPath}`);
+  let readouts = 0;
+  const pump = (async () => {
+    const decoder = new TextDecoder();
+    let pending = "";
+    const reader = proc.stdout.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        pending += decoder.decode(value, { stream: true });
+        const lines = pending.split("\n");
+        pending = lines.pop() ?? "";
+        for (const line of lines) {
+          const benchmark = /^READOUT (\d+) (\d+)$/.exec(line.trim());
+          if (benchmark) {
+            readouts += 1;
+            // Mirror real aria2 output: a percentage, a transfer speed and an
+            // ETA, at util::abbrevSize / secfmt fidelity.
+            // util::abbrevSize fidelity: "0.5MiB", "10.0MiB", and a speed in
+            // the same units — what a real aria2c console shows. The speed is
+            // fixed at a value that survives the unit round trip exactly
+            // (384.0KiB ⇄ 393216 B/s) and that never appears in yt-dlp's own
+            // PROGRESS template, so an engine test can prove the speed it
+            // reports came from this readout and not from anywhere else.
+            const downloaded = parseInt(benchmark[1], 10);
+            console.log(
+              `[#a1b2c3 ${(downloaded / 1048576).toFixed(1)}MiB/${(10485760 / 1048576).toFixed(1)}MiB(${Math.round((downloaded / 10485760) * 100)}%) CN:4 DL:${(READOUT_SPEED_BPS / 1024).toFixed(1)}KiB ETA:${benchmark[2]}s]`,
+            );
+          } else if (line.trim()) {
+            console.log(line);
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  })();
+
+  // When asked, hold the readout window open for the configured delay instead
+  // of ending it the moment the transfer finishes: the engine's progress parser
+  // is then testable against a download that is genuinely still in flight.
+  const keepAliveMs = process.env.FAKE_KEEP_ALIVE === "1" ? num("FAKE_DELAY_MS", 60) : 0;
+  const readoutDeadline = Date.now() + keepAliveMs;
   const code = await proc.exited;
+  await pump;
+  // An engine that times out an in-flight transfer ends up here with a
+  // non-zero code and, because it kills rather than signals, without
+  // ARIA2C-ABORTED — which is exactly how the watchdog test tells the two
+  // categories apart.
+  await Bun.write(`${partPath}.aria2c-readouts`, String(readouts));
+  while (Date.now() < readoutDeadline) await Bun.sleep(25);
+  process.off("SIGINT", onSignal);
+  process.off("SIGTERM", onSignal);
+  console.log(`${aria2cSignalled ? "ARIA2C-ABORTED" : "ARIA2C-DONE " + code} ${partPath}`);
   if (code !== 0) {
     console.error(`ERROR: aria2c exited with code ${code}`);
     process.exit(1);
@@ -208,9 +426,28 @@ await Bun.sleep(delayMs);
 console.log(`PROGRESS:100.0|2.5MiB|0|10485760|10485760`);
 
 await Bun.write(finalPath, "fake-mp4-bytes");
+// Record the successful download in the archive, like real yt-dlp does.
+if (archiveFile && videoId) {
+  await appendFile(archiveFile, `youtube ${videoId}\n`);
+}
 // Clean up the bookkeeping file so reruns start fresh.
 try {
   await Bun.file(counterFile).unlink();
 } catch {}
-console.log(finalPath);
+if (process.env.FAKE_OMIT_FINAL_PATH !== "1") {
+  // Honour the actual --print template rather than hard-coding the engine's
+  // marker: this also verifies buildDownloadPlan and the parser agree.
+  const record = (flagValue("--print") || "%(filepath)s")
+    .replace(/^after_move:/, "")
+    .replace("%(filepath)s", finalPath);
+  if (stressOutput) {
+    const bytes = new TextEncoder().encode(record);
+    const split = bytes.indexOf(0xf0) + 2; // halfway through the emoji's UTF-8
+    await Bun.write(Bun.stdout, bytes.subarray(0, split));
+    await Bun.sleep(30);
+    await Bun.write(Bun.stdout, bytes.subarray(split)); // no trailing newline
+  } else {
+    console.log(record);
+  }
+}
 process.exit(0);

@@ -1,7 +1,13 @@
 // tests/rss.test.ts — channel RSS feed parsing.
 
-import { describe, expect, test } from "bun:test";
-import { parseRssFeed } from "../src/rss";
+import { describe, expect, spyOn, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DEFAULT_CONFIG } from "../src/config";
+import { db, initDatabase } from "../src/db";
+import { getConfig, setConfig } from "../src/state";
+import { parseRssFeed, startRssPolling } from "../src/rss";
 
 const SAMPLE_FEED = `<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns:media="http://search.yahoo.com/mrss/" xmlns="http://www.w3.org/2005/Atom">
@@ -86,5 +92,43 @@ describe("parseRssFeed", () => {
     expect(parseRssFeed("").items).toEqual([]);
     expect(parseRssFeed("<html>404</html>").items).toEqual([]);
     expect(parseRssFeed("<feed><title>Only Title</title></feed>").items).toEqual([]);
+  });
+});
+
+
+describe("RSS polling after Web UI source changes", () => {
+  test("starts with no channels and reads live channels on the next scheduled tick", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-rss-live-"));
+    initDatabase(":memory:");
+    const initial = { ...DEFAULT_CONFIG, outputRoot: dir, channels: [], rssEnabled: true, skipShorts: false };
+    setConfig(initial);
+    const ticks: Array<() => Promise<void>> = [];
+    // Control the timer boundary instead of waiting a real minute; fetch, too,
+    // is a boundary fixture. The real RSS parser, ingestion and DB still run.
+    const captureTick = (fn: unknown) => {
+      ticks.push(fn as () => Promise<void>);
+      return 0;
+    };
+    const timeout = spyOn(globalThis, "setTimeout").mockImplementation(captureTick as unknown as typeof setTimeout);
+    const interval = spyOn(globalThis, "setInterval").mockImplementation(captureTick as unknown as typeof setInterval);
+    const fetchFeed = spyOn(globalThis, "fetch").mockResolvedValue(new Response(SAMPLE_FEED));
+    try {
+      startRssPolling(initial);
+      expect(ticks).toHaveLength(2);
+      setConfig({ ...initial, channels: ["https://www.youtube.com/channel/UC1234567890abcdefghij"] });
+      await ticks[0]();
+      expect(fetchFeed).toHaveBeenCalledTimes(1);
+      expect(db.query("SELECT COUNT(*) AS n FROM jobs").get()).toEqual({ n: 3 });
+      // Disabling it live must also be respected by the already-created timer.
+      setConfig({ ...getConfig(), rssEnabled: false });
+      await ticks[1]();
+      expect(fetchFeed).toHaveBeenCalledTimes(1);
+    } finally {
+      timeout.mockRestore();
+      interval.mockRestore();
+      fetchFeed.mockRestore();
+      setConfig({ ...DEFAULT_CONFIG });
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

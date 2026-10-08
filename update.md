@@ -39,70 +39,63 @@ and stays readable in history. Sign out of Google/YouTube in that browser profil
 
 Six verified bugs. Each is a small diff with a concrete failure mode.
 
-### 1.1 The stale-claim reaper steals live downloads — HIGHEST
+### 1.1 Stale-claim timeout does not follow long download watchdogs — RESOLVED
 
-`src/reconcile.ts:56` reaps downloads at `-20 minutes`. `download_claimed_at` is set once
-at claim (`src/db.ts:162`) and **never refreshed**. But `maxDownloadMinutes` defaults to
-**180** (schema max 2880), and `computeDownloadTimeoutMs` (`src/retry.ts:32-41`)
-legitimises a run that long.
+The original audit description that `download_claimed_at` was never refreshed did not
+match this checkout: `updateJobProgress` already heartbeats it in the existing
+500 ms-throttled progress `UPDATE`, and `reapStaleClaims` already excludes jobs owned by
+live download workers. Those protections prevent an active in-process transfer from
+being re-queued while yt-dlp writes.
 
-Result: any transfer taking >20 min is re-queued as `paused/interrupted` **while its
-yt-dlp is still writing**. A second worker claims it and spawns a second yt-dlp on the
-same `outTemplate`; whichever finishes first clobbers `file_path`
-(`src/workers/download.ts:195`).
+The remaining gap was the fixed `-20 minutes` stale threshold, which was shorter than
+the configured download watchdog (180 minutes by default). The reaper now takes the
+current `Config` and uses `-${Math.max(20, config.maxDownloadMinutes)} minutes`; the
+shared `STALE_CLAIM_THRESHOLDS(config)` function keeps the dashboard and config manager
+in sync. Progress heartbeats and the live-worker exclusion remain in place.
 
-**Fix — both halves:**
+**Tests** (`tests/db.test.ts`, `tests/settings.test.ts`): verify that a claim within a
+configured 60-minute window survives, a claim beyond it is reclaimed, the 20-minute
+minimum is retained for smaller configured timeouts, and the dashboard reports the same
+window.
 
-1. *Heartbeat the claim on progress.* In `updateJobProgress`
-   (`src/workers/download.ts`, ~line 400) add `download_claimed_at = CURRENT_TIMESTAMP`
-   to the existing 500 ms-throttled `UPDATE` — same round-trip, no extra write. The
-   reaper then measures *no progress* rather than *claim age*.
-2. *Make the floor config-aware.* `reapStaleClaims` takes a `Config`; the download
-   threshold becomes `-${max(20, maxDownloadMinutes)} minutes` so it can never undercut
-   the watchdog. `STALE_CLAIM_THRESHOLDS` becomes a function; keep the exported name so
-   `web.ts:731` and `update_config.ts` cannot drift (AGENTS.md §6 invariant).
+### 1.2 Job mutation routes bypass active-stage exclusions — RESOLVED
 
-**Test** (`tests/reconcile.test.ts`): a 25-min-old claim with a fresh `download_claimed_at`
-survives; the same claim with a stale one is reaped; the threshold never drops below
-`maxDownloadMinutes`.
+Retry, single/bulk delete, queue purge, and per-job bulk pause previously mutated rows
+without checking whether a download, conversion, or metadata worker still owned the
+media/sidecars. In particular, retry cleared stage claims and purge could delete paused
+rows that still held a download claim.
 
-### 1.2 Routes bypass the three claim exclusions
+These routes now use `withIdleJobs()` and an immediate SQLite transaction to reject
+active downloads, conversions, metadata work, and lingering download/conversion claims
+with HTTP 409 `{ ok: false, error: "Job is currently in progress" }` before changing files or rows.
+Bulk operations are all-or-nothing; purge also explicitly deletes only rows with
+`download_claimed_by IS NULL` and no active side-stage claim. Both retry route aliases
+share the same guard. Startup reconciliation clears orphaned claims from legacy
+user-paused rows without changing their held status.
 
-`retryJobById` (`src/web.ts:214-224`) flips `conversion_status` `'in_progress' →
-'pending'` and nulls the claim. The download guard at `src/db.ts:172` then passes, so
-yt-dlp writes over the exact file ffmpeg is reading. Same hole in
-`DELETE /api/jobs/:id` (`web.ts:451`), bulk delete (`:239`), `/api/queue/purge`
-(`:530` — which deletes `paused` rows *holding live claims*), and the per-job bulk pause
-(`:472`).
+**Tests** (`tests/web-routes.test.ts`, `tests/db.test.ts`): active conversion retry leaves
+its archive/file untouched; single delete, mixed bulk delete, bulk pause, and purge
+return 409 without mutating active or idle rows. Startup recovery releases an orphaned
+user-pause claim while preserving the user pause.
 
-**Fix:**
-- `retryJobById` gains `AND conversion_status != 'in_progress' AND metadata_status != 'in_progress'`
-- **409 `{ok:false, error:"job is in progress"}`** when any stage is live, on retry,
-  delete, bulk delete, pause, and purge
-- Purge additionally requires `download_claimed_by IS NULL`
+### 1.3 `runDownload` can leave a live downloader on an unexpected failure — RESOLVED
 
-**Test** (`tests/web-routes.test.ts`): retry / delete / pause / purge against an in-flight
-job → 409, and every status column unchanged.
+The initial report overstated two paths in this checkout: the output-drain
+`Promise.all` already had a `finally`, so an asynchronous `updateJobProgress` throw
+rejected the stdout-reader promise and reached cleanup; `existsSync` ran only after
+`proc.exited` had completed. However, setup between `Bun.spawn()` and that `try` was
+not protected, and cleanup only aborted the signal then waited indefinitely if the
+child did not exit.
 
-### 1.3 `runDownload` leaks a live yt-dlp on any throw
+All post-spawn setup and output handling now share one `try/finally`. The cleanup
+clears the watchdog, sends SIGINT so yt-dlp can stop aria2c cleanly, escalates to
+SIGKILL after a bounded grace period, awaits `proc.exited`, and removes `activeProcs`
+in a nested `finally`. Thus an output/progress callback error cannot release the job
+for retry while its downloader is still writing.
 
-`src/workers/download.ts:112-170`: `clearTimeout(downloadTimer)`,
-`activeProcs.delete(id)` and `await proc.exited` all sit **after** the progress loop. The
-worker `finally` (`:70-73`) has already removed the id, so the orphan is invisible to
-`killActiveChildren()`.
-
-A throw at `updateJobProgress` (`:148` — `SQLITE_BUSY` after the 5 s busy timeout) or
-`existsSync` (`:157`) exits without killing the child. It survives shutdown and keeps
-writing to a `.part` another worker has claimed — the exact "file written under a live
-worker" class the rest of the codebase works hard to prevent.
-
-**Fix:** wrap spawn → cleanup in
-`try { … } finally { clearTimeout(downloadTimer); activeProcs.delete(id); if (!proc.killed) proc.kill(); }`,
-moving the work into a `runSpawnedDownload()` so success/failure classification stays
-outside. Audit the same pattern in `metadata.ts:81` and `convert.ts:27`.
-
-**Test:** integration — a mid-transfer throw leaves no live child (assert via the
-`/api/status` worker list) and the `.part` stays resumable.
+**Test** (`tests/download-process.test.ts`): a simulated `SQLITE_BUSY` from the
+progress callback rejects the output-drain promise; the regression asserts that cleanup
+reaps the child and clears its active-process tracking entry.
 
 ### 1.4 The `yt-dlp -U` self-heal can wedge the pool
 
@@ -113,16 +106,19 @@ claim with nothing able to kill it.
 **Fix:** `AbortController` + 120 s timeout, drain both pipes, register in `activeProcs`
 under a reserved key so `killActiveChildren()` reaches it.
 
-### 1.5 Per-job user pause is silently discarded
+### 1.5 Per-job user pause is silently discarded — RESOLVED
 
-`web.ts:468` sets `download_status='paused', pause_reason='user'`, but
-`handleDownloadFailure` checks only the **global** `isPaused()` (`download.ts:223`) — a
-paused job that errors falls into the transient branch and is written back to `pending`;
-one that succeeds goes to `downloaded` via `recordSuccess`.
+The download handlers now read the persisted pause reason when processing a result
+(rather than trusting the possibly stale `Job` snapshot). A failed attempt keeps a
+`pause_reason='user'` row paused and records its partial; a successful file is recorded
+without advancing the download status or pipeline. The success update is atomic, so a
+concurrent pause cannot be overwritten. The route-level active-claim guard from 1.2
+remains in force; these worker checks protect a user pause already persisted when a
+completion/failure handler runs.
 
-**Fix:** `recordSuccess` and `handleDownloadFailure` (and the converter) honour
-`job.pause_reason === 'user'` by parking instead of advancing. Same for
-`metadata.ts:115` writing `done` unconditionally after a re-queue.
+**Tests** (`tests/download-pause.test.ts`): cover a failure with a stale worker snapshot
+and a successful file result; both preserve `download_status='paused'` and
+`pause_reason='user'`.
 
 ### 1.6 Silent swallows that hide real failures
 
@@ -221,6 +217,45 @@ Small, cheap, one-liner-ish each.
 | 3.12 | Await/`.catch` the floating `handleShutdown` (`engine.ts:39`) and `networkMonitor` (`:137`) |
 | 3.13 | Guard the awaits that sit **outside** the worker try-blocks (`download.ts:53,60`, `convert.ts:72`, `metadata.ts:31`) — all four can throw `SQLITE_BUSY` and kill the loop without releasing the claim |
 
+### 3.14 Multi-process concurrency: the DB is the lock, a claim token is the identity — RESOLVED
+
+Audit finding: the web port was the **only** thing keeping two engines apart, and it
+is not a database lock — a second engine started on another port re-ran the crash
+sweeps against the first one's in-flight claims. Worse, a claim was identified by the
+worker id (`dl-1`), which every process reuses, so a stale worker whose claim had been
+reclaimed could still write progress, success, or failure over the new owner's row.
+
+- **Engine lease** (`src/lease.ts`, `engine_lease` singleton row): owner token +
+  expiry + monotonic `fencing` number, acquired in one immediate transaction right
+  after `initDatabase()` and **before any sweep**. A live foreign owner is refused
+  (exit 1, no job row touched, web port irrelevant); an expired lease or one whose
+  owning PID is provably gone is taken over instantly with `fencing + 1`, which is
+  what makes a crash-and-restart not wait out the TTL. Renewed every 20 s (60 s TTL),
+  released on graceful shutdown (row kept so fencing survives), and a lease lost to a
+  takeover pauses the engine with `ENGINE_LEASE_LOST`. `reconcileCrashedJobs()` and
+  `reapStaleClaims()` refuse to run while another live owner holds the lease.
+- **Claim tokens** (`jobs.*_claim_token`, `db.ts`): every claim mints a random token;
+  each later write (progress, success, failure, release) goes through
+  `updateClaimedJob`/`releaseClaimedJob`, which require the token **and** the worker
+  id and return the changed-row count. **0** means ownership was lost, and the worker
+  drops the job instead of mutating it — the fix for a re-claimed job being stomped
+  by its previous owner. Covers conversion and metadata as well as download.
+- **Heartbeats** (`jobs.*_heartbeat_at`): conversion and metadata renew their claim on
+  an interval (long encodes are legitimate), downloads renew on progress. Staleness is
+  measured from the heartbeat, not `updated_at` (which other writers bump), so the
+  reaper no longer has to guess from a stage's start time.
+- **CAS reaper**: reclaiming is now `reapStaleClaim()` — a single UPDATE whose
+  predicate carries the claim token, worker id, stage status, and the (re-evaluated)
+  expired-heartbeat window. A worker that renewed, or a second reaper that got there
+  first, makes it match 0 rows; the stranded-`.aria2` sweep only touches jobs actually
+  reclaimed this tick.
+- **Tests**: `tests/engine-lease.test.ts` (takeover honesty, fencing, refusal,
+  renew/release, sweeps gated on ownership) and `tests/claim-races.test.ts`
+  (two connections, and three real OS processes draining one queue: no double claim,
+  stale worker refused after a reclaim, heartbeating conversion not reaped, two
+  reapers racing one expired claim), plus a same-database/second-port integration
+  scenario asserting the fresh engine exits without touching the first engine's jobs.
+
 ---
 
 ## Phase 4 — Tests + CI
@@ -302,7 +337,8 @@ Ordered by value-per-line — the data model already supports most of these.
 
 `0.x` hygiene/docs → `1.1` reaper → `1.2` route 409s → `1.3` child leak → `1.4` `-U`
 timeout → `1.5` user pause → `1.6` logging → `2.x` perf (one commit each) → `3.x`
-hardening → `4.1` failure-policy refactor → `4.2`-`4.8` tests/CI → `5.1`-`5.7` features.
+hardening → `3.14` engine lease + claim tokens → `4.1` failure-policy refactor →
+`4.2`-`4.8` tests/CI → `5.1`-`5.7` features.
 
 ---
 
@@ -331,3 +367,81 @@ Worth recording so they are not re-litigated:
   on rejection.
 - **Type escapes** — zero `as unknown as`, zero `@ts-ignore`. The 23 `as any` are almost
   all `db.query(...).get()/.all()` results, which a shared `JobRow` helper would clean up.
+
+---
+
+## Field-fix log — 2026-10-07 (branch `arena/ec6eb278-new-build`)
+
+Three operator-reported symptoms, root-caused from `error.log` + the dashboard's
+job detail (`QFrLzo7YLBA`, `8T5boxtoc4s`, `vrEUVK50958`, `NBAbJWrikcc`).
+
+### F1 A video stranded at 99.0% forever — RESOLVED
+
+`Last error: ERROR: unable to download video data: HTTP Error 416: Requested range not
+satisfiable`, `Retries` 1–3, `Resumes` 0, `Progress` = `Best progress` = 99.0%, and a
+`.part` + `.part.aria2` pair in the job folder, on all four videos.
+
+`buildDownloadPlan` passes `--continue`, so every attempt asks the CDN for
+`Range: bytes=<size of the .part>-`. YouTube re-slices/re-encodes a format while a
+download is in flight (here: `f137`/`f399`), so the saved partial is at or past the end
+of what the server now serves and the answer is 416 — byte-for-byte identical on every
+attempt. The failure was classified as *transient* (`isTransientDownloadError` matches
+"unable to download"), so the handler kept the partial, re-queued, resumed, and failed
+again; because `progress > best_progress` can never hold at 99.0%, each attempt charged
+the no-progress budget until the row was parked `failed` — where the cooldown sweep
+re-queued it into the same loop.
+
+**Fix:** new pure classifier `retry.ts isUnrecoverableResumeError` (416 range failures +
+aria2c's `--allow-overwrite=false` refusal), handled in `handleDownloadFailure` **before**
+the corrupt-resume and permanent branches: `removePartialFiles` discards the `.part` *and*
+its control file (never one without the other — gotcha 14/19), `progress`/`best_progress`
+are zeroed so the fresh transfer is not pre-judged "no progress", and the job is re-queued.
+A locked pair is still parked with the reason instead of being forced (gotcha 19).
+
+Cross-checked against upstream [yt-dlp#8313](https://github.com/yt-dlp/yt-dlp/issues/8313), which is the same
+message and was closed as caller-side behaviour: the maintainer's diagnosis is that the resume is attempted from
+a file whose "filesize … is either the same size or larger than that of the file on youtube's servers", and in
+that report it came from `nopart: True` plus one fixed output template — an already *complete* file being
+mistaken for a partial. Neither variant of that cause is reachable here (the plan never passes `--no-part`, and
+every job's template carries its video id), so the size mismatch is the only shape that matters and discarding
+is the correct remedy. Recorded in `isUnrecoverableResumeError`'s docstring so this class is not "fixed" later
+with a yt-dlp self-update or a `--no-continue` probe; unlike the signature-challenge class, an upgrade changes
+nothing about it.
+
+**Tests:** `tests/retry.test.ts` (classification + "never permanent"), new
+`tests/download-resume-416.test.ts` (7 handler cases), and an integration scenario in
+`tests/integration.test.ts` backed by a new mock-aria2c mode (`FAKE_ARIA2C_FAIL_MODE=range416`,
+which bites *only* on a resume) that asserts the pair is gone and the successful transfer
+recorded `resumed=false`. The scenario was verified to fail (jobs never settle) with the
+worker branch disabled.
+
+### F2 `error.log` filled with "download claim lost" every 30 s — RESOLVED
+
+One line per retrying video, every heartbeat interval, in long runs of 600+ lines an hour,
+while the videos were sitting in their F1 retry loop. `startClaimHeartbeat`'s `onLost` fired on
+*tick*: the worker releases its own claim in the same statement that records the outcome
+(`releaseOwned`, `recordSuccess`, the pause parks) and then sleeps for the backoff inside the
+try-block, so the timer keeps ticking against a lease that was cleared on purpose.
+
+**Fix:** `onLost` is now one-shot per claim (the loss is already recorded by the release), so a
+real takeover still produces exactly one line.
+
+**Tests:** `tests/db.test.ts` `describe("startClaimHeartbeat")` — live claim renews and stays
+silent, released claim reports once across several ticks, no-callback case stops renewing.
+
+### F3 `cookies.txt updated` logged once a minute forever — RESOLVED
+
+The operator's cookies jar was re-exported by a browser tool on a timer; the content stayed
+identical (2993 bytes both times) but `detectCookiesChange` judged `mtimeMs`, so every 60 s
+poll reported an update to stdout *and* `error.log` — and the ~1 MB log rotation then dropped
+the retained tail that the F1/F2 diagnosis needed.
+
+**Fix:** the watcher compares a SHA-256 of the file (`cookiesWatchState`, used by
+`detectCookiesChange`); a rewrite of the same bytes is not an update. The hash read is kept out
+of `cookiesState`/`cookiesArgs`, which stay a single stat on the download hot path (gotcha 9).
+Presence transitions are unchanged, and when the file cannot be read the watcher degrades to the
+size signal instead of logging noise.
+
+**Tests:** `tests/cookies.test.ts` — same-bytes rewrite (5× touch) stays quiet, same-size/different-bytes
+is reported, an empty file stays "absent" without noise.
+

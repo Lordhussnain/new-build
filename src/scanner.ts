@@ -8,7 +8,8 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { db, getNextIndex, isVideoInDb } from "./db";
-import { cookiesArgs, ytDlp } from "./tools";
+import { isSourceBlocked, sourceIdentity } from "./sources";
+import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
 import { sanitizeFolderName } from "./util";
 import { stats } from "./state";
 import type { Config } from "./config";
@@ -39,23 +40,72 @@ export function normalizeVideoUrl(url: string): string {
   }
 }
 
+/** Maximum time a flat-playlist listing may keep its pipes and worker occupied. */
+export const PLAYLIST_SCAN_TIMEOUT_MS = 10 * 60 * 1000;
+
 /** Fetch a flat listing of a playlist/channel URL via yt-dlp. */
-export async function getPlaylistItems(url: string, config: Config): Promise<ListingItem[]> {
+export async function getPlaylistItems(
+  url: string,
+  config: Config,
+  opts: { timeoutMs?: number } = {},
+): Promise<ListingItem[]> {
   const args = [
     ytDlp(),
     ...cookiesArgs(config),
+    ...jsRuntimeArgs(),
     "--flat-playlist",
     "--print",
     "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s",
     url,
   ];
-  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
-  const [out, , code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  if (code !== 0) return [];
+  const ctl = new AbortController();
+  const timeoutMs = opts.timeoutMs ?? PLAYLIST_SCAN_TIMEOUT_MS;
+  let proc: Bun.Subprocess | null = null;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctl.abort();
+    // Do not leave a stubborn yt-dlp process or open output pipes behind.
+    if (proc && proc.exitCode === null) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+  }, timeoutMs);
+  let out = "";
+  let stderr = "";
+  let code = -1;
+  try {
+    const child = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: ctl.signal });
+    proc = child;
+    [out, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+  } catch (error) {
+    if (proc && proc.exitCode === null) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+      await proc.exited.catch(() => {});
+    }
+    if (timedOut) throw new Error(`yt-dlp playlist scan timed out after ${timeoutMs}ms`);
+    throw new Error(`Could not start yt-dlp playlist scan: ${error instanceof Error ? error.message : error}`);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (timedOut) throw new Error(`yt-dlp playlist scan timed out after ${timeoutMs}ms`);
+  if (code !== 0) {
+    const detail = stderr
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(-3)
+      .join(" ")
+      .slice(-500);
+    throw new Error(`yt-dlp playlist scan failed (exit ${code})${detail ? `: ${detail}` : ""}`);
+  }
   return out
     .split("\n")
     .filter((l) => l.trim())
@@ -79,11 +129,17 @@ export async function ingestItems(
   items: ListingItem[],
   config: Config,
   overrideFolderName?: string,
+  sourceUrl?: string,
 ): Promise<{ found: number; added: number; skipped: number }> {
   if (items.length === 0) return { found: 0, added: 0, skipped: 0 };
+  const sourceKey = sourceUrl ? sourceIdentity(sourceUrl) : null;
   const folder = sanitizeFolderName(overrideFolderName || items[0].playlist || "Single Videos");
   const outputDir = join(config.outputRoot, folder);
   await mkdir(outputDir, { recursive: true });
+  // A delete may have landed while this scan was awaiting the directory I/O.
+  if (sourceKey && isSourceBlocked(sourceKey)) {
+    return { found: items.length, added: 0, skipped: items.length };
+  }
   const targetFormat = config.videoQuality === "audio" ? "mp3" : (config.targetFormat || "mp4");
   const wantSubs = config.downloadSubtitles ? 1 : 0;
   const wantThumb = config.writeThumbnail ? 1 : 0;
@@ -101,19 +157,10 @@ export async function ingestItems(
          (id, url, title, output_directory, target_format, want_subtitles, want_thumbnail, want_description, folder, "index", duration, download_status, conversion_status, metadata_status)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
     );
+    const sourceStmt = sourceKey
+      ? db.prepare("INSERT OR IGNORE INTO job_sources (source_url, job_id) VALUES (?, ?)")
+      : null;
     for (const item of batch) {
-      if (isVideoInDb(item.id)) {
-        // A job parked as waiting_live (stream was live at download time) may
-        // have ended by now — any fresh listing that still contains it requeues
-        // it; the !is_live filter drops it again if it is somehow still live.
-        db.run(
-          `UPDATE jobs SET download_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND download_status = 'waiting_live'`,
-          [item.id],
-        );
-        skipped++;
-        stats.skipped++;
-        continue;
-      }
       if (
         config.skipShorts &&
         !config.downloadShorts &&
@@ -121,6 +168,21 @@ export async function ingestItems(
         item.duration > 0 &&
         item.duration < 60
       ) {
+        skipped++;
+        stats.skipped++;
+        continue;
+      }
+      if (isVideoInDb(item.id)) {
+        // Record additional source ownership even though the video job itself
+        // is deduplicated globally.
+        if (sourceKey) sourceStmt?.run(sourceKey, item.id);
+        // A job parked as waiting_live (stream was live at download time) may
+        // have ended by now — any fresh listing that still contains it requeues
+        // it; the !is_live filter drops it again if it is somehow still live.
+        db.run(
+          `UPDATE jobs SET download_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND download_status = 'waiting_live'`,
+          [item.id],
+        );
         skipped++;
         stats.skipped++;
         continue;
@@ -141,6 +203,7 @@ export async function ingestItems(
         conversionStatus,
         metadataStatus,
       );
+      if (sourceKey) sourceStmt?.run(sourceKey, item.id);
       added++;
       stats.totalQueued++;
     }
@@ -155,6 +218,7 @@ export async function scanAndIngest(
   config: Config,
   overrideFolderName?: string,
 ): Promise<{ found: number; added: number; skipped: number }> {
+  if (isSourceBlocked(url)) return { found: 0, added: 0, skipped: 0 };
   const items = await getPlaylistItems(url, config);
-  return ingestItems(items, config, overrideFolderName);
+  return ingestItems(items, config, overrideFolderName, url);
 }

@@ -12,13 +12,19 @@ import {
   claimConvertJob,
   claimDownloadJob,
   claimMetadataJob,
+  claimRef,
   db,
   getNextIndex,
+  heartbeatClaim,
   initDatabase,
   isVideoInDb,
   perVideoCap,
+  releaseClaimedJob,
+  startClaimHeartbeat,
 } from "../src/db";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
+import { acquireEngineLease } from "../src/lease";
+import { activeDownloadJobs } from "../src/state";
 import { ingestItems } from "../src/scanner";
 import {
   cleanOrphanedFiles,
@@ -56,8 +62,15 @@ function getJob(id: string): any {
   return db.query("SELECT * FROM jobs WHERE id = ?").get(id);
 }
 
+function minutesAgo(minutes: number): string {
+  return (db.query("SELECT datetime('now', ?) AS timestamp").get(`-${minutes} minutes`) as any).timestamp;
+}
+
 beforeEach(() => {
   initDatabase(":memory:");
+  // The startup sweeps and the reaper only run for the engine that owns
+  // archive.db; the tests play that engine.
+  acquireEngineLease();
 });
 
 const tmpDirs: string[] = [];
@@ -92,6 +105,7 @@ describe("schema & migrations", () => {
       .all()
       .map((r: any) => r.name);
     expect(tables).toContain("jobs");
+    expect(tables).toContain("job_sources");
     expect(tables).toContain("playlist_state");
     expect(tables).toContain("run_history");
   });
@@ -128,6 +142,7 @@ describe("schema & migrations", () => {
       expect(row.conversion_retry_count).toBe(0);
       expect(row.resume_count).toBe(0);
       expect(row.best_progress).toBe(0);
+      expect(row.video_quality).toBeNull();
       // A legacy row with want_subtitles=1 gets metadata_status backfilled.
       expect(row.metadata_status).toBe("pending");
     } finally {
@@ -200,13 +215,20 @@ describe("atomic claims", () => {
 describe("reconcileCrashedJobs", () => {
   test("interrupted downloads become auto-resumable; user pauses survive", () => {
     insertJob("inflight", { download_status: "downloading" });
-    insertJob("userpaused", { download_status: "paused", pause_reason: "user" });
+    insertJob("userpaused", {
+      download_status: "paused",
+      pause_reason: "user",
+      download_claimed_by: "dl-stale",
+      download_claimed_at: "2020-01-01 00:00:00",
+    });
     insertJob("conv", { download_status: "downloaded", conversion_status: "in_progress" });
     insertJob("meta", { download_status: "downloaded", metadata_status: "in_progress" });
     reconcileCrashedJobs();
     expect(getJob("inflight").download_status).toBe("paused");
     expect(getJob("inflight").pause_reason).toBe("interrupted");
     expect(getJob("userpaused").pause_reason).toBe("user");
+    expect(getJob("userpaused").download_claimed_by).toBeNull();
+    expect(getJob("userpaused").download_claimed_at).toBeNull();
     expect(getJob("conv").conversion_status).toBe("pending");
     expect(getJob("meta").metadata_status).toBe("pending");
     // ...and the interrupted job is immediately claimable again
@@ -215,7 +237,22 @@ describe("reconcileCrashedJobs", () => {
 });
 
 describe("reapStaleClaims", () => {
-  test("re-queues claims older than the watchdog windows", () => {
+  test("does not reclaim a stale-looking download while a worker still owns its claim", async () => {
+    insertJob("long-download", {
+      download_status: "downloading",
+      download_claimed_by: "dl-7",
+      download_claimed_at: "2020-01-01 00:00:00",
+    });
+    activeDownloadJobs.set(7, "long-download");
+    try {
+      await reapStaleClaims(testConfig());
+      expect(getJob("long-download").download_status).toBe("downloading");
+    } finally {
+      activeDownloadJobs.delete(7);
+    }
+  });
+
+  test("re-queues claims older than the watchdog windows", async () => {
     insertJob("stale-dl", {
       download_status: "downloading",
       download_claimed_by: "dl-1",
@@ -232,11 +269,47 @@ describe("reapStaleClaims", () => {
       conversion_claimed_by: "cv-1",
       conversion_claimed_at: "2020-01-01 00:00:00",
     });
-    reapStaleClaims();
+    await reapStaleClaims(testConfig());
     expect(getJob("stale-dl").download_status).toBe("paused");
     expect(getJob("stale-dl").pause_reason).toBe("interrupted");
     expect(getJob("fresh-dl").download_status).toBe("downloading"); // untouched
     expect(getJob("stale-cv").conversion_status).toBe("pending");
+  });
+
+  test("uses the configured maximum download time as the stale-claim floor", async () => {
+    insertJob("within-download-window", {
+      download_status: "downloading",
+      download_claimed_by: "dl-1",
+      download_claimed_at: minutesAgo(25),
+    });
+    insertJob("past-download-window", {
+      download_status: "downloading",
+      download_claimed_by: "dl-2",
+      download_claimed_at: minutesAgo(61),
+    });
+
+    await reapStaleClaims(testConfig({ maxDownloadMinutes: 60 }));
+
+    expect(getJob("within-download-window").download_status).toBe("downloading");
+    expect(getJob("past-download-window").download_status).toBe("paused");
+  });
+
+  test("keeps the 20-minute minimum when maxDownloadMinutes is lower", async () => {
+    insertJob("inside-minimum", {
+      download_status: "downloading",
+      download_claimed_by: "dl-1",
+      download_claimed_at: minutesAgo(19),
+    });
+    insertJob("outside-minimum", {
+      download_status: "downloading",
+      download_claimed_by: "dl-2",
+      download_claimed_at: minutesAgo(21),
+    });
+
+    await reapStaleClaims(testConfig({ downloadTimeoutMinutes: 5, maxDownloadMinutes: 10 }));
+
+    expect(getJob("inside-minimum").download_status).toBe("downloading");
+    expect(getJob("outside-minimum").download_status).toBe("paused");
   });
 });
 
@@ -314,22 +387,44 @@ describe("requeueFailedJobs", () => {
     const result = requeueFailedJobs(config);
     expect(result.downloads).toBe(1);
     expect(getJob("flaky").download_status).toBe("pending");
-    expect(getJob("flaky").retry_count).toBe(2);
+    // Queueing does not spend a retry; failure of the next attempt does.
+    expect(getJob("flaky").retry_count).toBe(0);
   });
 
-  test("never re-queues permanent failures", () => {
+  test("never re-queues permanent failures, even when cooldown is ignored", () => {
     insertJob("private", {
       download_status: "failed",
       retry_count: 1,
       last_error: "ERROR: [youtube] xyz: Video unavailable",
       updated_at: "2020-01-01 00:00:00",
     });
+    insertJob("geo", {
+      download_status: "failed",
+      retry_count: 1,
+      last_error: "This video is geo-restricted in your location",
+      updated_at: "2020-01-01 00:00:00",
+    });
     const config = testConfig({ requeueFailedAfterMinutes: 30 });
     expect(requeueFailedJobs(config).downloads).toBe(0);
+    expect(requeueFailedJobs(config, { ignoreCooldown: true }).downloads).toBe(0);
     expect(getJob("private").download_status).toBe("failed");
+    expect(getJob("geo").download_status).toBe("failed");
   });
 
-  test("respects the per-video retry cap", () => {
+  test("re-queues n-challenge failures that were wrongly parked as permanent", () => {
+    insertJob("nchal", {
+      download_status: "failed",
+      retry_count: 1,
+      last_error:
+        "n challenge solving failed: Some formats may be missing. Ensure you have a supported JavaScript runtime ERROR: Requested format is not available",
+      updated_at: "2020-01-01 00:00:00",
+    });
+    const config = testConfig({ requeueFailedAfterMinutes: 30, maxRetryAttempts: 3, maxFailuresPerVideo: 4 });
+    expect(requeueFailedJobs(config).downloads).toBe(1);
+    expect(getJob("nchal").download_status).toBe("pending");
+  });
+
+  test("starts a fresh bounded retry window after a failed job cools down", () => {
     insertJob("spent", {
       download_status: "failed",
       retry_count: 99,
@@ -337,7 +432,31 @@ describe("requeueFailedJobs", () => {
       updated_at: "2020-01-01 00:00:00",
     });
     const config = testConfig({ requeueFailedAfterMinutes: 30, maxRetryAttempts: 3, maxFailuresPerVideo: 4 });
-    expect(requeueFailedJobs(config).downloads).toBe(0);
+    expect(requeueFailedJobs(config).downloads).toBe(1);
+    expect(getJob("spent").download_status).toBe("pending");
+    expect(getJob("spent").retry_count).toBe(0);
+  });
+
+  test("cooldown requeue retains the aria2c resume pair for the next claim", async () => {
+    const dir = await makeTmpDir();
+    const part = join(dir, "video.part");
+    const control = `${part}.aria2`;
+    await writeFile(part, "partial-bytes");
+    await writeFile(control, "control-bytes");
+    insertJob("resume-after-cooldown", {
+      download_status: "failed",
+      retry_count: 99,
+      partial_file_path: part,
+      last_error: "The read operation timed out",
+      updated_at: "2020-01-01 00:00:00",
+    });
+
+    expect(requeueFailedJobs(testConfig({ requeueFailedAfterMinutes: 30 })).downloads).toBe(1);
+    expect(getJob("resume-after-cooldown").retry_count).toBe(0);
+    expect(getJob("resume-after-cooldown").partial_file_path).toBe(part);
+    expect(existsSync(part)).toBe(true);
+    expect(existsSync(control)).toBe(true);
+    expect(claimDownloadJob("dl-resume")?.id).toBe("resume-after-cooldown");
   });
 
   test("skips jobs that have not cooled down yet", () => {
@@ -383,8 +502,9 @@ describe("requeueFailedJobs", () => {
     expect(result.conversions).toBe(1);
     expect(result.metadata).toBe(1); // the one whose file still exists
     expect(getJob("convfail").conversion_status).toBe("pending");
-    expect(getJob("convfail").conversion_retry_count).toBe(1);
+    expect(getJob("convfail").conversion_retry_count).toBe(0);
     expect(getJob("metafail").metadata_status).toBe("pending");
+    expect(getJob("metafail").metadata_retry_count).toBe(0);
     expect(getJob("metafail-nofile").metadata_status).toBe("failed");
   });
 
@@ -433,7 +553,10 @@ describe("findPartialFile & cleanOrphanedFiles", () => {
     const part = join(dir, "001 - Video.mp4.part");
     await writeFile(part, "partial");
     insertJob("v1", { download_status: "failed", retry_count: 9, partial_file_path: part });
-    await cleanOrphanedFiles(dir, testConfig({ maxRetryAttempts: 3, maxFailuresPerVideo: 4 }));
+    await cleanOrphanedFiles(
+      dir,
+      testConfig({ maxRetryAttempts: 3, maxFailuresPerVideo: 4, requeueFailedAfterMinutes: 0 }),
+    );
     expect(existsSync(part)).toBe(false);
   });
 
@@ -649,5 +772,62 @@ describe("pipeline claim exclusion", () => {
       metadata_status: "done",
     });
     expect(claimConvertJob("cv-6")?.id).toBe("cx6");
+  });
+});
+
+describe("startClaimHeartbeat", () => {
+  // `startClaimHeartbeat` floors the interval at 250 ms (a real engine renews
+  // every 30 s), so the waits below are sized against that floor — not against
+  // the tick value the test asks for.
+  const TICK_MS = 250;
+
+  test("renews the lease of a live claim and stays silent", async () => {
+    insertJob("hb1");
+    const job = claimDownloadJob("dl-hb")!;
+    const before = getJob("hb1").download_heartbeat_at;
+    await Bun.sleep(30); // no timer yet: nothing may move on its own
+    expect(getJob("hb1").download_heartbeat_at).toBe(before);
+
+    let lost = 0;
+    const stop = startClaimHeartbeat("download", job.id, claimRef("download", job), () => lost++, TICK_MS);
+    try {
+      await Bun.sleep(4 * TICK_MS);
+      expect(lost).toBe(0);
+      expect(heartbeatClaim("download", job.id, claimRef("download", job))).toBe(true);
+    } finally {
+      stop();
+    }
+  });
+
+  test("reports a lost lease ONCE — the worker's backoff sleep must not spam", async () => {
+    // This is the log line every operator sees on a retrying video: the worker
+    // releases its own claim when it records the outcome and THEN sleeps for
+    // the backoff, so the timer outlives the claim by design. Reporting the
+    // dead lease on every tick (every 30s, per video) used to bury error.log in
+    // "download claim lost — the next update will not land".
+    insertJob("hb2");
+    const job = claimDownloadJob("dl-hb")!;
+    let lost = 0;
+    const stop = startClaimHeartbeat("download", job.id, claimRef("download", job), () => lost++, TICK_MS);
+    try {
+      releaseClaimedJob("download", job.id, claimRef("download", job), "download_status = 'pending'");
+      // Long enough for several ticks: the callback must still fire exactly once.
+      await Bun.sleep(6 * TICK_MS);
+      expect(lost).toBe(1);
+    } finally {
+      stop();
+    }
+  });
+
+  test("no callback registered still stops renewing a released claim", async () => {
+    insertJob("hb3");
+    const job = claimDownloadJob("dl-hb")!;
+    const claim = claimRef("download", job);
+    const stop = startClaimHeartbeat("download", job.id, claim, undefined, TICK_MS);
+    releaseClaimedJob("download", job.id, claim, "download_status = 'pending'");
+    await Bun.sleep(4 * TICK_MS);
+    stop();
+    expect(getJob("hb3").download_heartbeat_at).toBeNull();
+    expect(heartbeatClaim("download", job.id, claim)).toBe(false);
   });
 });

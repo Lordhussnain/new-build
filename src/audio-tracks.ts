@@ -15,7 +15,7 @@
 // are pure and unit-tested; `probeAudioTracks` is the only function that
 // spawns yt-dlp (one `-J` metadata call per job).
 
-import { cookiesArgs, ytDlp } from "./tools";
+import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
 import type { MultiAudioMode } from "./config";
 
 export interface AudioTrack {
@@ -176,33 +176,67 @@ export function multiAudioFormatSelector(
  * One cheap yt-dlp metadata call listing the video's audio tracks. Throws on
  * any failure — callers decide whether that is fatal (it never is for the
  * download worker: we just fall back to single-audio).
+ *
+ * Hard-capped at `PROBE_TIMEOUT_MS`: this runs inside the download worker (one
+ * slot blocked) and behind the dashboard's probe button, so a wedged network
+ * call must surface as a probe error, not a hang. The cap is overridable so
+ * the timeout path can be exercised without a 90-second test.
  */
+export const PROBE_TIMEOUT_MS = 90_000;
+
+/**
+ * The watchdog actually used: `PROBE_TIMEOUT_MS`, unless the environment
+ * overrides it. The override exists so the worker's timeout → single-audio
+ * fallback can be exercised end to end without a 90-second test; production
+ * never sets it.
+ */
+function probeTimeoutMs(): number {
+  const override = Number(process.env.YTA_AUDIO_PROBE_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : PROBE_TIMEOUT_MS;
+}
+
 export async function probeAudioTracks(
   url: string,
   config: { cookiesFile: string },
+  opts: { timeoutMs?: number } = {},
 ): Promise<AudioTrack[]> {
-  const proc = Bun.spawn(
-    [
-      ytDlp(),
-      url,
-      ...cookiesArgs(config),
-      "--dump-single-json",
-      "--no-playlist",
-      "--no-warnings",
-      "--socket-timeout",
-      "15",
-      "--retries",
-      "3",
-      "--extractor-retries",
-      "3",
-    ],
-    { stdout: "pipe", stderr: "pipe" },
-  );
-  const [out, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
+  const timeoutMs = opts.timeoutMs ?? probeTimeoutMs();
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  let out = "";
+  let stderr = "";
+  let code = -1;
+  try {
+    const proc = Bun.spawn(
+      [
+        ytDlp(),
+        url,
+        ...cookiesArgs(config),
+        ...jsRuntimeArgs(),
+        "--dump-single-json",
+        "--no-playlist",
+        "--no-warnings",
+        "--socket-timeout",
+        "15",
+        "--retries",
+        "3",
+        "--extractor-retries",
+        "3",
+      ],
+      { stdout: "pipe", stderr: "pipe", signal: ctl.signal },
+    );
+    [out, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+  } catch {
+    clearTimeout(timer);
+    if (ctl.signal.aborted) throw new Error("audio-track probe timed out");
+    throw new Error("audio-track probe could not start yt-dlp");
+  }
+  clearTimeout(timer);
+  if (ctl.signal.aborted) throw new Error("audio-track probe timed out");
   if (code !== 0) {
     throw new Error(
       stderr

@@ -1,0 +1,24 @@
+# Dependencies and compiled artifacts
+/node_modules/
+/dist/
+
+# Runtime configuration and credentials
+/config.json
+/config.json.*.tmp
+/cookies.txt
+
+# Runtime database, download archive, logs, and default output tree
+/archive.db*
+/downloaded_videos.txt
+/error.log
+/downloads/
+
+# Interrupted and superseded media generated inside the repository
+*.part
+*.aria2
+*.ytdl
+*.superseded
+
+# OS/editor metadata
+.DS_Store
+Thumbs.db

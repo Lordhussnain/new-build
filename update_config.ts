@@ -9,7 +9,12 @@ import { createInterface } from "node:readline/promises";
 import { existsSync } from "node:fs";
 import { Database } from "bun:sqlite";
 import { CONFIG_PATH, loadConfigSafe, saveConfig, type Config } from "./src/config";
+import { associateExistingJobsWithSource, db, initDatabase, pruneJobsForUnconfiguredSources } from "./src/db";
+import { getPlaylistItems } from "./src/scanner";
+import { resolvedTools } from "./src/tools";
+import { SOURCE_KEYS, sourceIdentity } from "./src/sources";
 import { STALE_CLAIM_THRESHOLDS } from "./src/reconcile";
+import { describeEngineLease, hasLiveLeaseOwner, holdsEngineLease, readEngineLease } from "./src/lease";
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
@@ -288,9 +293,13 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
 
   // Failure handling (circuit breaker + backoff)
   console.log("\n— Failure Handling —");
-  config.maxRetryAttempts = await askNumber("Retries per video before it fails", config.maxRetryAttempts, 1);
+  config.maxRetryAttempts = await askNumber(
+    "No-progress retries per video before cooldown requeue",
+    config.maxRetryAttempts,
+    1,
+  );
   config.maxFailuresPerVideo = await askNumber(
-    "Max failures per video (effective cap = min with retries)",
+    "Max no-progress failures per video per retry window (effective cap = min with retries)",
     config.maxFailuresPerVideo,
     1,
   );
@@ -431,7 +440,7 @@ async function changeReliabilitySettings(config: Config): Promise<Config> {
 
   console.log("\n— Failed-job sweep —");
   config.requeueFailedAfterMinutes = await askNumber(
-    "Re-queue transiently failed jobs after (minutes; 0 = never)",
+    "Re-queue retryable failed jobs after (minutes; 0 = never)",
     config.requeueFailedAfterMinutes,
     0,
   );
@@ -443,14 +452,21 @@ async function changeReliabilitySettings(config: Config): Promise<Config> {
     config.verifyExistingFiles,
   );
 
+  console.log("\n— Network monitor —");
+  config.networkMonitorEnabled = await askYesNo(
+    "Probe YouTube periodically and pause the engine after repeated network failures?",
+    config.networkMonitorEnabled,
+  );
+
   console.log("\n— Self-healing sweeps (run by the engine, not configurable here) —");
   console.log(`   • Crashed jobs resume        on startup`);
+  const staleClaimThresholds = STALE_CLAIM_THRESHOLDS(config);
   console.log(
-    `   • Stale claims reclaimed      every 60s — downloads ${STALE_CLAIM_THRESHOLDS.download.replace("-", "older than ")}, conversions ${STALE_CLAIM_THRESHOLDS.conversion.replace("-", "")}, metadata ${STALE_CLAIM_THRESHOLDS.metadata.replace("-", "")}`,
+    `   • Stale claims reclaimed      every 60s — by lease heartbeat: downloads silent longer than ${staleClaimThresholds.download.replace("-", "")}, conversions ${staleClaimThresholds.conversion.replace("-", "")}, metadata ${staleClaimThresholds.metadata.replace("-", "")}`,
   );
   console.log(`   • Deleted files re-fetched   on startup`);
   console.log(
-    `   • Failed jobs retried         every 60s after a ${config.requeueFailedAfterMinutes} min cooldown` +
+    `   • Retryable failed jobs      fresh window every 60s after a ${config.requeueFailedAfterMinutes} min cooldown` +
       (config.requeueFailedAfterMinutes === 0 ? " (disabled)" : ""),
   );
 
@@ -464,6 +480,12 @@ async function changeFeatureToggles(config: Config): Promise<Config> {
   console.log("🎛️  Feature Toggles\n");
 
   config.downloadSubtitles = await askYesNo("Download & embed subtitles?", config.downloadSubtitles);
+  if (config.downloadSubtitles) {
+    const langsAns = await ask(
+      `   Subtitle languages — comma-separated codes (e.g. en, es, ja), regexes like en.* work, or "all" for every language [current: ${config.subtitleLanguages}]: `,
+    );
+    if (langsAns.trim()) config.subtitleLanguages = langsAns.trim();
+  }
   config.embedMetadata = await askYesNo("Embed metadata, chapters & thumbnail?", config.embedMetadata);
   config.writeInfoJson = await askYesNo("Write .info.json sidecar files?", config.writeInfoJson);
   config.writeDescription = await askYesNo("Write .description sidecar files?", config.writeDescription);
@@ -492,6 +514,10 @@ async function viewConfig(config: Config) {
 // ---- Main Menu -------------------------------------------------------------
 async function mainMenu() {
   let config = await loadConfigSafe(CONFIG_PATH);
+  const originalSources = new Map<string, string>();
+  for (const key of SOURCE_KEYS) {
+    for (const url of config[key]) originalSources.set(sourceIdentity(url), url);
+  }
 
   while (true) {
     console.clear();
@@ -533,11 +559,56 @@ async function mainMenu() {
         await viewConfig(config);
         break;
       case "8":
+        let saved = false;
         try {
           await saveConfig(config, CONFIG_PATH);
+          saved = true;
           console.log("\n✅ Configuration saved to " + CONFIG_PATH);
         } catch (e: any) {
           console.error("\n❌ Failed to save config:", e.message);
+        }
+        if (saved && existsSync("archive.db")) {
+          try {
+            initDatabase("archive.db");
+            // A running engine owns archive.db through the engine lease. Deleting
+            // jobs for removed sources underneath it could remove a row it is
+            // working on (the queue purge's idle guard does not apply here), so
+            // the cleanup is skipped and the engine's next start applies it —
+            // the same path that catches config.json edited by hand.
+            if (hasLiveLeaseOwner() && !holdsEngineLease()) {
+              console.log(
+                `\n⚠️ An engine is running and owns archive.db (${describeEngineLease(readEngineLease())}).`,
+              );
+              console.log("   Skipping database job cleanup — the next engine start applies it.");
+            } else {
+              const activeSources = new Set(
+                SOURCE_KEYS.flatMap((key) => config[key].map((url) => sourceIdentity(url))),
+              );
+              for (const [identity, sourceUrl] of originalSources) {
+                if (activeSources.has(identity)) continue;
+                const tracked = db
+                  .query("SELECT COUNT(*) AS count FROM job_sources WHERE source_url = ?")
+                  .get(identity) as { count: number };
+                if ((tracked?.count || 0) > 0) continue;
+                try {
+                  if (config.ytDlpPath.trim()) resolvedTools.ytDlp = config.ytDlpPath.trim();
+                  const items = await getPlaylistItems(sourceUrl, config);
+                  associateExistingJobsWithSource(identity, items.map((item) => item.id));
+                } catch (e: any) {
+                  console.warn(`⚠️ Could not backfill old jobs for ${sourceUrl}: ${e?.message || e}`);
+                }
+              }
+              const cleanup = pruneJobsForUnconfiguredSources(activeSources);
+              console.log(
+                `🗑️ Removed ${cleanup.deletedJobs} database job(s) for sources no longer configured.` +
+                  (cleanup.retainedJobs ? ` Kept ${cleanup.retainedJobs} shared job(s).` : ""),
+              );
+            }
+          } catch (e: any) {
+            console.error("\n⚠️ Config saved, but database cleanup failed:", e?.message || e);
+          } finally {
+            try { db?.close(); } catch { /* unopened/already closed */ }
+          }
         }
         rl.close();
         return;

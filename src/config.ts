@@ -4,7 +4,8 @@
 // (batch_playlist_downloader.ts) and the interactive config manager
 // (update_config.ts) can never drift apart again.
 
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { z } from "zod";
 
@@ -55,7 +56,8 @@ export const ConfigSchema = z
     archiveFile: z.string(),
     cookiesFile: z.string(),
     deleteSourceAfterConvert: z.boolean(),
-    videoQuality: z.enum(["highest", "1080p", "720p", "480p", "audio"]),
+        // Every preset in QUALITY_FORMATS is selectable, globally and per job.
+    videoQuality: z.enum(["highest", "4k", "1440p", "1080p", "720p", "480p", "audio"]),
     targetFormat: z.enum(["mp4", "mkv", "webm", "mp3", "m4a"]),
     subtitleFormat: z.enum(["srt", "vtt", "ass", "lrc"]),
     // --- Multi-audio tracks --------------------------------------------------
@@ -67,6 +69,10 @@ export const ConfigSchema = z
     multiAudioMode: z.enum(["off", "all", "languages"]),
     audioTrackLanguages: z.array(z.string()),
     downloadSubtitles: z.boolean(),
+    // Which subtitle languages the metadata worker fetches: a comma-separated
+    // yt-dlp --sub-langs value (e.g. "en,es,ja" — regexes like "en.*" work),
+    // or "all" for every available language including auto-generated ones.
+    subtitleLanguages: z.string(),
     embedMetadata: z.boolean(),
     writeInfoJson: z.boolean(),
     writeDescription: z.boolean(),
@@ -87,7 +93,7 @@ export const ConfigSchema = z
     // engine throws the partial away and restarts that download from scratch.
     maxResumeAttempts: z.number().min(0).max(100),
     // Auto-requeue of failed jobs after a cooldown (0 disables the sweep).
-    // Permanent errors (private/removed/age-gated videos) are never requeued.
+    // Each sweep starts a fresh retry window; permanent video errors are never requeued.
     requeueFailedAfterMinutes: z.number().min(0).max(20_160),
     // On startup, verify that files recorded as downloaded still exist; missing
     // ones are scrubbed from the yt-dlp archive and queued again.
@@ -108,6 +114,9 @@ export const ConfigSchema = z
     rssEnabled: z.boolean(),
     rssPollIntervalMinutes: z.number().min(1),
     rescanIntervalHours: z.number().min(0),
+    // Resilience: network connectivity monitor. When enabled, probes YouTube
+    // periodically and pauses the engine after consecutive failures.
+    networkMonitorEnabled: z.boolean(),
   })
   // Cross-field sanity: the backoff ceiling must be reachable from the base.
   .refine((c) => c.retryBackoffMaxSeconds >= c.retryBackoffBaseSeconds, {
@@ -159,6 +168,7 @@ export const DEFAULT_CONFIG: Config = {
   multiAudioMode: "off",
   audioTrackLanguages: [],
   downloadSubtitles: true,
+  subtitleLanguages: "all",
   embedMetadata: true,
   writeInfoJson: true,
   writeDescription: true,
@@ -190,11 +200,14 @@ export const DEFAULT_CONFIG: Config = {
   rssEnabled: true,
   rssPollIntervalMinutes: 15,
   rescanIntervalHours: 24,
+  networkMonitorEnabled: true,
 };
 
 // yt-dlp format selectors per quality preset.
 export const QUALITY_FORMATS: Record<string, string> = {
   highest: "bv+ba/b",
+  "4k": "bv[height<=2160]+ba/b[height<=2160]",
+  "1440p": "bv[height<=1440]+ba/b[height<=1440]",
   "1080p": "bv[height<=1080]+ba/b[height<=1080]",
   "720p": "bv[height<=720]+ba/b[height<=720]",
   "480p": "bv[height<=480]+ba/b[height<=480]",
@@ -219,7 +232,7 @@ export async function loadConfig(configPath: string = CONFIG_PATH): Promise<Conf
   } catch (err: any) {
     if (err?.code === "ENOENT") {
       console.log("⚠️ config.json not found. Creating default...");
-      await writeFile(configPath, JSON.stringify(DEFAULT_CONFIG, null, 2));
+      await saveConfig(DEFAULT_CONFIG, configPath);
       return { ...DEFAULT_CONFIG };
     }
     console.error("❌ Failed to read config.json:", err?.message || err);
@@ -257,8 +270,27 @@ export async function loadConfigSafe(configPath: string = CONFIG_PATH): Promise<
   }
 }
 
-/** Validate and persist a config object. */
+// All live read/modify/write operations share this queue. In particular, a
+// source added while a settings request is saving must not be overwritten by
+// a stale config snapshot. Callers read getConfig() INSIDE their callback.
+let configWriteQueue: Promise<unknown> = Promise.resolve();
+export function withConfigWriteLock<T>(update: () => Promise<T>): Promise<T> {
+  const task = configWriteQueue.then(update);
+  // A failed write must not poison every later update.
+  configWriteQueue = task.then(() => {}, () => {});
+  return task;
+}
+
+/** Validate, then atomically replace the file (never truncate the live config). */
 export async function saveConfig(config: Config, configPath: string = CONFIG_PATH): Promise<void> {
   const validated = ConfigSchema.parse(config);
-  await writeFile(configPath, JSON.stringify(validated, null, 2));
+  // Same directory/volume so rename is atomic. A crash can leave a .tmp,
+  // but it cannot leave a half-written config.json and erase saved sources.
+  const tempPath = `${configPath}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tempPath, JSON.stringify(validated, null, 2), { flag: "wx", mode: 0o600 });
+    await rename(tempPath, configPath);
+  } finally {
+    await unlink(tempPath).catch(() => {});
+  }
 }

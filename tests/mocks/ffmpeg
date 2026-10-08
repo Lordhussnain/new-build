@@ -4,12 +4,20 @@
 // The engine only uses ffmpeg to transcode (mp3) and remux (mp4), so the mock
 // just produces the output file it was asked to write. `-version` is answered
 // for the dependency probe.
+//
+// Failure injection via environment variables:
+//   FAKE_FFMPEG_FAIL=1   exit 1 with an error message (conversion failure)
+//   FAKE_FFMPEG_HANG=1   hang forever (timeout test)
 
 const argv = process.argv.slice(2);
 
 if (argv[0] === "-version") {
   console.log("ffmpeg version 7.0.2-mock https://example.invalid/ffmpeg");
   process.exit(0);
+}
+
+if (process.env.FAKE_FFMPEG_HANG === "1") {
+  await new Promise(() => {}); // never exits — the watchdog must fire
 }
 
 // Stream probe: `ffmpeg -hide_banner -i <file>` with no output argument — the
@@ -28,6 +36,12 @@ if (argv[0] === "-hide_banner" && argv[1] === "-i") {
   if (input.endsWith(".mkv")) lines.push("  Stream #0:2: Audio: opus, 48000 Hz, stereo, fltp");
   console.error(lines.join("\n"));
   console.error("At least one output file must be specified");
+  process.exit(1);
+}
+
+// Failure injection: simulate ffmpeg returning a non-zero exit code.
+if (process.env.FAKE_FFMPEG_FAIL === "1") {
+  console.error("Error initializing output stream 0:0 -- Error while opening encoder for output stream");
   process.exit(1);
 }
 

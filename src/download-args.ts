@@ -18,7 +18,8 @@
 //     partial-file tracking and `--continue` resume behave identically.
 
 import { join } from "node:path";
-import { cookiesArgs } from "./tools";
+import { cookiesArgs, jsRuntimeArgs, type JsRuntime } from "./tools";
+import { DOWNLOAD_PATH_PREFIX } from "./download-output";
 import { fitBaseFilename, sanitizeFileName } from "./util";
 import { computeDownloadTimeoutMs } from "./retry";
 import { QUALITY_FORMATS, type Config } from "./config";
@@ -30,6 +31,22 @@ export type DownloaderEngine = "aria2c" | "native";
 /** Which engine a download should use, given availability and config. */
 export function resolveDownloaderEngine(config: Config, aria2cAvailable: boolean): DownloaderEngine {
   return config.useAria2c && aria2cAvailable ? "aria2c" : "native";
+}
+
+/** Resolve a job's nullable quality override against the live global setting. */
+export function effectiveVideoQuality(job: { video_quality?: string | null }, config: Config): string {
+  const override = job.video_quality;
+  return override && Object.hasOwn(QUALITY_FORMATS, override) ? override : config.videoQuality;
+}
+
+/** Resolve the requested output container, including the audio-only default. */
+export function effectiveTargetFormat(
+  job: { target_format?: string | null; video_quality?: string | null },
+  config: Config,
+): string {
+  const quality = effectiveVideoQuality(job, config);
+  const stored = typeof job.target_format === "string" ? job.target_format.trim().toLowerCase() : "";
+  return stored || (quality === "audio" ? "mp3" : (config.targetFormat || "mp4").toLowerCase());
 }
 
 /**
@@ -60,22 +77,41 @@ export function buildAria2cArgs(config: Config): string {
 }
 
 /**
- * The per-process bandwidth cap in KB/s.
+ * The per-process bandwidth cap in bytes per second.
  *
- * yt-dlp's `--limit-rate` is per process, so the configured global cap is
- * divided across the slots that are actually allowed to claim work. Floored at
- * 64 KB/s so a large worker count can never throttle a stream to a trickle.
- * Returns null when no cap is configured.
+ * yt-dlp's `--limit-rate` is per process, so the configured cap in KB/s is
+ * divided across the currently active download slots and converted to an
+ * integer byte rate. Do not impose a per-worker minimum: that silently exceeds
+ * small configured caps (e.g. 10 KB/s split across 20 workers must not become
+ * 64 KB/s per worker). Returns null when no cap is configured.
  */
-export function computePerWorkerLimitKBps(config: Config, activeSlots: number): number | null {
+export function computePerWorkerLimitBytesPerSec(config: Config, activeSlots: number): number | null {
   if (config.maxBandwidthKBps <= 0) return null;
   const slots = Math.max(1, Math.floor(activeSlots));
-  return Math.max(64, Math.floor(config.maxBandwidthKBps / slots));
+  return Math.max(1, Math.floor((config.maxBandwidthKBps * 1024) / slots));
 }
 
 /** The on-disk base name for a job's files (no extension). */
 export function jobBaseFilename(job: Pick<Job, "index" | "title" | "id">): string {
   return `${String(job.index).padStart(3, "0")} - ${sanitizeFileName(job.title)}`;
+}
+
+/**
+ * The base name a download ACTUALLY writes: `jobBaseFilename` fitted to the
+ * output directory's path budget (see `fitBaseFilename`).
+ *
+ * Every lookup that hunts for one of a job's files on disk — the partial-path
+ * freeze in reconcile.ts, the worker's fallback scans, the recovery sweeps —
+ * must use this, not the raw `jobBaseFilename`: for a long title (or a deep
+ * output directory) the two differ, and a lookup with the unfitted name
+ * silently finds nothing. That mismatch is how a long-titled video's recorded
+ * `.part` kept its `partial_file_path` empty and its resume state was later
+ * swept as an orphan.
+ */
+export function jobFittedBaseFilename(
+  job: Pick<Job, "id" | "index" | "title" | "output_directory">,
+): string {
+  return fitBaseFilename(job.output_directory, jobBaseFilename(job), job.id);
 }
 
 export interface DownloadPlan {
@@ -84,15 +120,16 @@ export interface DownloadPlan {
   args: string[];
   /** Duration-aware watchdog for this specific video. */
   timeoutMs: number;
-  /** Applied `--limit-rate` value in KB/s, or null when uncapped. */
-  perWorkerLimitKBps: number | null;
+  /** Applied `--limit-rate` value in bytes/second, or null when uncapped. */
+  perWorkerLimitBytesPerSec: number | null;
   /** Output template (`…/base.%(ext)s`) and the base name without extension. */
   baseFilename: string;
   outTemplate: string;
 }
 
 export interface BuildDownloadPlanOptions {
-  job: Pick<Job, "id" | "url" | "title" | "index" | "output_directory" | "duration">;
+  job: Pick<Job, "id" | "url" | "title" | "index" | "output_directory" | "duration"> &
+    Partial<Pick<Job, "target_format" | "video_quality">>;
   config: Config;
   /** Slots currently allowed to claim work (drives the bandwidth split). */
   activeSlots: number;
@@ -114,6 +151,11 @@ export interface BuildDownloadPlanOptions {
    * with `--audio-multistreams` so the audio is switchable in any player.
    */
   audioTracks?: AudioTrack[];
+  /**
+   * JS runtime for YouTube's n-challenge. Production passes whatever
+   * `checkDependencies` found; omit/null to skip the flags (unit tests).
+   */
+  jsRuntime?: JsRuntime | null;
 }
 
 /** Build the complete yt-dlp invocation for one download attempt. */
@@ -121,24 +163,23 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
   const { job, config, activeSlots, aria2cAvailable } = opts;
 
   const engine = resolveDownloaderEngine(config, aria2cAvailable);
-  const format = QUALITY_FORMATS[config.videoQuality] || QUALITY_FORMATS["1080p"];
+  const videoQuality = effectiveVideoQuality(job, config);
+  const targetFormat = effectiveTargetFormat(job, config);
+  const format = QUALITY_FORMATS[videoQuality] || QUALITY_FORMATS["1080p"];
   // Multi-audio: splice the discovered track ids into the quality preset so
   // every wanted language is downloaded (YouTube's "Audio track" menu). The
   // audio-only preset is exempt — an mp3 cannot carry several tracks.
-  const audioTracks = config.videoQuality === "audio" ? [] : opts.audioTracks ?? [];
+  const audioTracks = videoQuality === "audio" ? [] : opts.audioTracks ?? [];
   const effectiveFormat =
     audioTracks.length > 0 ? multiAudioFormatSelector(format, audioTracks) : format;
-  const baseFilename = fitBaseFilename(
-    job.output_directory,
-    jobBaseFilename(job),
-    job.id,
-  );
+  const baseFilename = jobFittedBaseFilename(job);
   const outTemplate = join(job.output_directory, `${baseFilename}.%(ext)s`);
 
   const args: string[] = [
     // argv[0] is filled in by the caller (the resolved yt-dlp path).
     job.url,
     ...cookiesArgs(config),
+    ...jsRuntimeArgs(opts.jsRuntime ?? null),
     "--format",
     effectiveFormat,
     // Parallel fragments for DASH/HLS (native path). Ignored when aria2c is
@@ -153,10 +194,11 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
     "--no-colors",
     "--progress-template",
     "download:PROGRESS:%(progress.percent).1f|%(progress.speed)f|%(progress.eta)f|%(progress.total_bytes)s|%(progress.downloaded_bytes)s",
-    // Print the final path after all post-processing so we can record it.
+    // Mark the final path explicitly: other stdout (including aria2c progress)
+    // must never be probed as a filesystem path.
     // --print implies --simulate, so --no-simulate is required to actually write files.
     "--print",
-    "after_move:%(filepath)s",
+    `after_move:${DOWNLOAD_PATH_PREFIX}%(filepath)s`,
     "--no-simulate",
     "--socket-timeout",
     "15",
@@ -176,9 +218,11 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
 
   // Real bandwidth cap. yt-dlp translates --limit-rate into the external
   // downloader's own rate limit, so this works for both engines.
-  const perWorkerLimitKBps = computePerWorkerLimitKBps(config, activeSlots);
-  if (perWorkerLimitKBps) {
-    args.push("--limit-rate", `${perWorkerLimitKBps}K`);
+  const perWorkerLimitBytesPerSec = computePerWorkerLimitBytesPerSec(config, activeSlots);
+  if (perWorkerLimitBytesPerSec !== null) {
+    // A bare yt-dlp RATE is bytes/second. Use an integer so both yt-dlp and its
+    // aria2c rate-limit bridge get a precise sub-KB share without suffix rounding.
+    args.push("--limit-rate", String(perWorkerLimitBytesPerSec));
   }
 
   // yt-dlp's own idempotence layer: ids already in the archive file are
@@ -190,11 +234,12 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
   if (config.archiveLiveStreams) args.push("--match-filters", "!is_live");
 
   // Several audio tracks in one file: yt-dlp only keeps more than one audio
-  // stream with --audio-multistreams, and MKV is the container that holds any
-  // codec/track combination (with per-track language metadata). One selected
-  // track merges exactly like a classic download.
-  if (audioTracks.length >= 2) {
-    args.push("--audio-multistreams");
+  // stream with --audio-multistreams, and MKV is the safe container for every
+  // codec/track combination. A single-track MKV override can also be muxed
+  // directly; MP4/MP3 are left to the conversion stage so yt-dlp cannot fail
+  // on a source codec that the requested container does not support.
+  if (audioTracks.length >= 2) args.push("--audio-multistreams");
+  if (audioTracks.length >= 2 || targetFormat === "mkv") {
     args.push("--merge-output-format", "mkv");
   }
 
@@ -234,7 +279,7 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
       minMinutes: config.downloadTimeoutMinutes,
       maxMinutes: config.maxDownloadMinutes,
     }),
-    perWorkerLimitKBps,
+    perWorkerLimitBytesPerSec,
     baseFilename,
     outTemplate,
   };

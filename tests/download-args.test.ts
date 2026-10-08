@@ -10,7 +10,7 @@ import { join } from "node:path";
 import {
   buildAria2cArgs,
   buildDownloadPlan,
-  computePerWorkerLimitKBps,
+  computePerWorkerLimitBytesPerSec,
   jobBaseFilename,
   resolveDownloaderEngine,
 } from "../src/download-args";
@@ -80,22 +80,23 @@ describe("buildAria2cArgs", () => {
   });
 });
 
-describe("computePerWorkerLimitKBps", () => {
+describe("computePerWorkerLimitBytesPerSec", () => {
   test("null when no cap is configured", () => {
-    expect(computePerWorkerLimitKBps(cfg({ maxBandwidthKBps: 0 }), 3)).toBeNull();
+    expect(computePerWorkerLimitBytesPerSec(cfg({ maxBandwidthKBps: 0 }), 3)).toBeNull();
   });
 
-  test("splits the global cap across active slots", () => {
-    expect(computePerWorkerLimitKBps(cfg({ maxBandwidthKBps: 3000 }), 3)).toBe(1000);
-    expect(computePerWorkerLimitKBps(cfg({ maxBandwidthKBps: 3000 }), 1)).toBe(3000);
+  test("splits the cap across active slots and returns bytes per second", () => {
+    expect(computePerWorkerLimitBytesPerSec(cfg({ maxBandwidthKBps: 3000 }), 3)).toBe(1_024_000);
+    expect(computePerWorkerLimitBytesPerSec(cfg({ maxBandwidthKBps: 3000 }), 1)).toBe(3_072_000);
   });
 
-  test("floors at 64 KB/s so a big worker count cannot starve a stream", () => {
-    expect(computePerWorkerLimitKBps(cfg({ maxBandwidthKBps: 100 }), 10)).toBe(64);
+  test("honours small caps rather than flooring each worker to 64 KB/s", () => {
+    expect(computePerWorkerLimitBytesPerSec(cfg({ maxBandwidthKBps: 100 }), 10)).toBe(10_240);
+    expect(computePerWorkerLimitBytesPerSec(cfg({ maxBandwidthKBps: 1 }), 20)).toBe(51);
   });
 
   test("never divides by zero", () => {
-    expect(computePerWorkerLimitKBps(cfg({ maxBandwidthKBps: 500 }), 0)).toBe(500);
+    expect(computePerWorkerLimitBytesPerSec(cfg({ maxBandwidthKBps: 500 }), 0)).toBe(512_000);
   });
 });
 
@@ -163,18 +164,24 @@ describe("buildDownloadPlan", () => {
       expect(plan.args).toContain(f);
     }
     expect(flagValue(plan.args, "--progress-template")).toContain("PROGRESS:");
-    expect(flagValue(plan.args, "--print")).toBe("after_move:%(filepath)s");
+    expect(flagValue(plan.args, "--print")).toBe("after_move:FILEPATH:%(filepath)s");
   });
 
-  test("applies the bandwidth cap per slot", () => {
+  test("applies the bandwidth cap per slot as an exact byte rate", () => {
     const plan = build({ maxBandwidthKBps: 3000 }, true, 3);
-    expect(plan.perWorkerLimitKBps).toBe(1000);
-    expect(flagValue(plan.args, "--limit-rate")).toBe("1000K");
+    expect(plan.perWorkerLimitBytesPerSec).toBe(1_024_000);
+    expect(flagValue(plan.args, "--limit-rate")).toBe("1024000");
+  });
+
+  test("small bandwidth caps stay below 64 KB/s per slot", () => {
+    const plan = build({ maxBandwidthKBps: 100 }, true, 10);
+    expect(plan.perWorkerLimitBytesPerSec).toBe(10_240);
+    expect(flagValue(plan.args, "--limit-rate")).toBe("10240");
   });
 
   test("omits --limit-rate when uncapped", () => {
     const plan = build({ maxBandwidthKBps: 0 });
-    expect(plan.perWorkerLimitKBps).toBeNull();
+    expect(plan.perWorkerLimitBytesPerSec).toBeNull();
     expect(plan.args).not.toContain("--limit-rate");
   });
 
@@ -208,6 +215,28 @@ describe("buildDownloadPlan", () => {
   test("uses the format selector for the configured quality", () => {
     expect(flagValue(build({ videoQuality: "720p" }).args, "--format")).toBe("bv[height<=720]+ba/b[height<=720]");
     expect(flagValue(build({ videoQuality: "audio" }).args, "--format")).toBe("ba/bestaudio");
+  });
+
+  test("per-job quality and container overrides take precedence over global settings", () => {
+    const highQuality = buildDownloadPlan({
+      job: { ...job, target_format: "mkv", video_quality: "4k" },
+      config: cfg({ videoQuality: "480p", targetFormat: "mp4" }),
+      activeSlots: 2,
+      aria2cAvailable: false,
+    });
+    expect(flagValue(highQuality.args, "--format")).toBe("bv[height<=2160]+ba/b[height<=2160]");
+    expect(flagValue(highQuality.args, "--merge-output-format")).toBe("mkv");
+
+    const audioOnly = buildDownloadPlan({
+      job: { ...job, target_format: "mp3", video_quality: "audio" },
+      config: cfg({ videoQuality: "1080p", targetFormat: "mp4" }),
+      activeSlots: 1,
+      aria2cAvailable: false,
+      audioTracks: [{ formatId: "251-0", language: "en", label: "English", tbr: 160, acodec: "opus", isDefault: true }],
+    });
+    expect(flagValue(audioOnly.args, "--format")).toBe("ba/bestaudio");
+    expect(audioOnly.args).not.toContain("--audio-multistreams");
+    expect(audioOnly.args).not.toContain("--merge-output-format");
   });
 
   test("scales the watchdog with the video duration", () => {
@@ -251,6 +280,23 @@ describe("buildDownloadPlan", () => {
       expect(a).not.toContain("\n");
       expect(a).not.toContain("\r");
     }
+  });
+
+  test("omits JS-runtime flags unless a runtime was injected", () => {
+    expect(build().args).not.toContain("--js-runtimes");
+    expect(build().args).not.toContain("--remote-components");
+  });
+
+  test("passes an explicit JS runtime path so yt-dlp does not have to rediscover it", () => {
+    const plan = buildDownloadPlan({
+      job,
+      config: cfg(),
+      activeSlots: 3,
+      aria2cAvailable: false,
+      jsRuntime: { name: "deno", path: join("/opt", "deno") },
+    });
+    expect(flagValue(plan.args, "--js-runtimes")).toBe(`deno:${join("/opt", "deno")}`);
+    expect(flagValue(plan.args, "--remote-components")).toBe("ejs:github");
   });
 });
 

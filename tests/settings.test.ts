@@ -7,13 +7,22 @@
 // all-or-nothing behaviour when a patch is invalid.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
-import { getConfig, setConfig } from "../src/state";
+import { activeDownloadJobs, getConfig, setConfig } from "../src/state";
 import { db, initDatabase } from "../src/db";
-import { EDITABLE_SETTINGS, applySettings, isEditableSetting, readSettings } from "../src/settings";
+import {
+  EDITABLE_SETTINGS,
+  NON_EDITABLE_SETTINGS,
+  SETTING_GROUPS,
+  applySettings,
+  isEditableSetting,
+  readSettings,
+  requiresRestart,
+} from "../src/settings";
 import { STALE_CLAIM_THRESHOLDS } from "../src/reconcile";
 import { handleRequest } from "../src/web";
 
@@ -58,9 +67,30 @@ describe("the editable allow-list", () => {
     }
   });
 
-  test("excludes credentials, paths, and the network binding", () => {
-    for (const k of ["webToken", "webBind", "webPort", "playlists", "channels", "cookiesFile", "archiveFile", "outputRoot", "ytDlpPath"]) {
+  test("excludes only credentials and the URL lists, and says why for each", () => {
+    // The panel is the whole of config.json except the keys that genuinely
+    // cannot be a form field: the token (a credential) and the source lists
+    // (managed by the Sources panel, which also knows how to clean up jobs).
+    const deliberatelyOut = ["webToken", "playlists", "channels", "channelPlaylists"];
+    for (const k of deliberatelyOut) {
       expect(isEditableSetting(k)).toBe(false);
+      // Every exclusion carries a reason, so the panel can explain itself.
+      expect(NON_EDITABLE_SETTINGS.find((s) => s.key === k)?.reason.length).toBeGreaterThan(0);
+    }
+  });
+
+  test("covers every config key: editable, or deliberately excluded with a reason", () => {
+    // Regression guard for "there is not all options in the WebUI": a new
+    // config key must be either rendered by the panel or explicitly excluded
+    // — it can never be silently missing from both.
+    const excluded = new Set<string>(NON_EDITABLE_SETTINGS.map((s) => s.key as string));
+    for (const key of Object.keys(DEFAULT_CONFIG)) {
+      expect(isEditableSetting(key) || excluded.has(key)).toBe(true);
+    }
+    // And the excluded list must only name real config keys.
+    for (const entry of NON_EDITABLE_SETTINGS) {
+      expect(Object.hasOwn(DEFAULT_CONFIG, entry.key)).toBe(true);
+      expect(isEditableSetting(entry.key as string)).toBe(false);
     }
   });
 
@@ -68,8 +98,15 @@ describe("the editable allow-list", () => {
     for (const f of EDITABLE_SETTINGS) {
       expect(f.label.length).toBeGreaterThan(0);
       expect(f.help.length).toBeGreaterThan(0);
-      expect(["downloader", "media", "concurrency", "reliability"]).toContain(f.group);
+      expect(SETTING_GROUPS as readonly string[]).toContain(f.group);
     }
+  });
+
+  test("describes maxConcurrentDownloads as the initial slot count, not an autoscale ceiling", () => {
+    const field = EDITABLE_SETTINGS.find((f) => f.key === "maxConcurrentDownloads")!;
+    expect(field.label).toContain("Initial");
+    expect(field.help).toContain("not the autoscaler ceiling");
+    expect(field.help).toContain("maxDownloadWorkers");
   });
 
   test("number fields carry a lower bound, and an upper one where the schema has it", () => {
@@ -83,6 +120,25 @@ describe("the editable allow-list", () => {
     const conns = EDITABLE_SETTINGS.find((f) => f.key === "connectionsPerDownload")!;
     expect(conns.min).toBe(1);
     expect(conns.max).toBe(64);
+  });
+
+  test("settings read by the engine only at startup are marked restartRequired", () => {
+    // The panel must be able to tell an operator that a change needs a restart
+    // instead of implying it is live.
+    for (const key of ["ytDlpPath", "ffmpegPath", "aria2cPath", "maxDownloadWorkers", "webPort", "daemonMode"]) {
+      expect(requiresRestart(key)).toBe(true);
+    }
+    for (const key of [
+      "useAria2c",
+      "connectionsPerDownload",
+      "videoQuality",
+      "autoscaleEnabled",
+      "maxConcurrentDownloads",
+      "minDownloadWorkers",
+      "maxBandwidthKBps",
+    ]) {
+      expect(requiresRestart(key)).toBe(false);
+    }
   });
 });
 
@@ -122,6 +178,53 @@ describe("applySettings", () => {
     const result = await applySettings(baseConfig(), { useAria2c: "false" }, join(dir, "config.json"));
     expect(result.ok).toBe(true);
     expect(getConfig().useAria2c).toBe(false);
+    // Every unambiguous spelling a form control can produce is accepted.
+    for (const [raw, expected] of [
+      ["TRUE", true],
+      ["1", true],
+      ["yes", true],
+      [" on ", true],
+      ["0", false],
+      ["no", false],
+      ["off", false],
+      [true, true],
+    ] as [unknown, boolean][]) {
+      const ok = await applySettings(baseConfig(), { useAria2c: raw }, join(dir, "config.json"));
+      expect(ok.ok).toBe(true);
+      expect(getConfig().useAria2c).toBe(expected);
+    }
+  });
+
+  test("rejects an invalid boolean instead of coercing it to false", async () => {
+    // "maybe" is not false. The old coercion mapped any unrecognised string to
+    // false and reported success — an invalid value silently switched a
+    // setting off, which is exactly what "invalid key/value rejects, change
+    // nothing" promises never happens.
+    const dir = await makeConfigDir();
+    const cfgPath = join(dir, "config.json");
+    const before = baseConfig({ useAria2c: true });
+
+    for (const raw of ["maybe", "", "  ", null, 2, {}, ["true"]]) {
+      const result = await applySettings(before, { useAria2c: raw }, cfgPath);
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("true or false");
+      expect(result.changed).toEqual([]);
+      // Nothing was written and nothing went live.
+      expect(existsSync(cfgPath)).toBe(false);
+      expect(getConfig().useAria2c).toBe(true);
+    }
+  });
+
+  test("rejects an empty or non-numeric number instead of coercing it to 0", async () => {
+    const dir = await makeConfigDir();
+    const cfgPath = join(dir, "config.json");
+    for (const raw of ["", "   ", "many", null]) {
+      const result = await applySettings(baseConfig(), { maxBandwidthKBps: raw }, cfgPath);
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("must be a number");
+      expect(result.changed).toEqual([]);
+      expect(existsSync(cfgPath)).toBe(false);
+    }
   });
 
   test("coerces list fields from comma-separated strings and arrays", async () => {
@@ -161,6 +264,28 @@ describe("applySettings", () => {
     const result = await applySettings(baseConfig(), { concurrentFragments: 16 }, join(dir, "config.json"));
     expect(result.ok).toBe(true);
     expect(result.changed).toEqual([]);
+  });
+
+  test("refuses to expose a token-less dashboard on a network address", async () => {
+    // Binding to the LAN is allowed (webBind is editable) — but not while the
+    // dashboard has no token, which would let anyone on the network purge jobs.
+    const dir = await makeConfigDir();
+    const cfgPath = join(dir, "config.json");
+    const denied = await applySettings(baseConfig({ webBind: "127.0.0.1" }), { webBind: "0.0.0.0" }, cfgPath);
+    expect(denied.ok).toBe(false);
+    expect(denied.error).toContain("webToken");
+    expect(getConfig().webBind).toBe("127.0.0.1");
+    expect(existsSync(cfgPath)).toBe(false);
+
+    // With a token set (hand-edited in config.json, as documented) the same
+    // change goes through.
+    const allowed = await applySettings(
+      baseConfig({ webBind: "127.0.0.1", webToken: "s3cret" }),
+      { webBind: "0.0.0.0" },
+      cfgPath,
+    );
+    expect(allowed.ok).toBe(true);
+    expect(getConfig().webBind).toBe("0.0.0.0");
   });
 
   test("rejects keys outside the allow-list instead of ignoring them", async () => {
@@ -284,10 +409,28 @@ describe("GET /api/reliability — resume + self-healing state", () => {
       download_claimed_by: "dl-2",
       download_claimed_at: "2000-01-01 00:00:00",
     });
+    insertJob("within-configured-window", {
+      download_status: "downloading",
+      download_claimed_by: "dl-4",
+      download_claimed_at: (db.query("SELECT datetime('now', '-25 minutes') AS timestamp").get() as any).timestamp,
+    });
+    insertJob("active-but-old", {
+      download_status: "downloading",
+      download_claimed_by: "dl-3",
+      download_claimed_at: "2000-01-01 00:00:00",
+    });
+    activeDownloadJobs.set(3, "active-but-old");
 
-    const res = await handleRequest(new Request("http://x/api/reliability"), getConfig());
-    const body = await res.json();
-    expect(body.resume.staleClaims).toBe(1);
+    try {
+      const res = await handleRequest(
+        new Request("http://x/api/reliability"),
+        baseConfig({ maxDownloadMinutes: 60 }),
+      );
+      const body = await res.json();
+      expect(body.resume.staleClaims).toBe(1);
+    } finally {
+      activeDownloadJobs.delete(3);
+    }
   });
 
   test("describes all four self-healing sweeps with a pending count", async () => {
@@ -309,9 +452,14 @@ describe("GET /api/reliability — resume + self-healing state", () => {
 
   test("the sweep thresholds match the ones the reaper enforces", async () => {
     // Guards against the dashboard promising recovery the engine never performs.
-    expect(STALE_CLAIM_THRESHOLDS.download).toBe("-20 minutes");
-    expect(STALE_CLAIM_THRESHOLDS.conversion).toBe("-3 hours");
-    expect(STALE_CLAIM_THRESHOLDS.metadata).toBe("-15 minutes");
+    const defaults = STALE_CLAIM_THRESHOLDS(baseConfig());
+    expect(defaults.download).toBe("-180 minutes");
+    expect(defaults.conversion).toBe("-3 hours");
+    expect(defaults.metadata).toBe("-15 minutes");
+    expect(STALE_CLAIM_THRESHOLDS(baseConfig({ maxDownloadMinutes: 45 })).download).toBe("-45 minutes");
+    expect(
+      STALE_CLAIM_THRESHOLDS(baseConfig({ downloadTimeoutMinutes: 5, maxDownloadMinutes: 10 })).download,
+    ).toBe("-20 minutes");
   });
 });
 

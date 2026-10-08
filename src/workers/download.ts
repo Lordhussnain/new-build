@@ -8,14 +8,49 @@
 
 import { stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { claimDownloadJob, db, perVideoCap, type Job } from "../db";
+import {
+  claimDownloadJob,
+  claimRef,
+  db,
+  ownsClaim,
+  perVideoCap,
+  releaseClaimedJob,
+  startClaimHeartbeat,
+  updateClaimedJob,
+  type ClaimRef,
+  type Job,
+} from "../db";
 import { activeDlSlots, autoscaler } from "../autoscale";
-import { aria2cPath, ytDlp } from "../tools";
+import { aria2cPath, jsRuntime, ytDlp } from "../tools";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
-import { findPartialFile, recordJobPartial, removePartialFiles } from "../reconcile";
+import {
+  dropSupersededFile,
+  findPartialFile,
+  recordJobPartial,
+  removePartialFiles,
+  restoreSupersededFile,
+} from "../reconcile";
 import { removeFromArchive } from "../archive";
-import { computeBackoffMs, isDownloaderArgsError, isTransientDownloadError } from "../retry";
-import { buildDownloadPlan, jobBaseFilename } from "../download-args";
+import {
+  classifyTerminalDownloadError,
+  computeBackoffMs,
+  formatSwitchMessage,
+  formatTerminalErrorMessage,
+  GENERIC_TERMINAL_INFO,
+  isDiskFullError,
+  isDownloaderArgsError,
+  isFormatAvailabilityError,
+  isNChallengeError,
+  isPermanentDownloadError,
+  isSignatureChallengeError,
+  isTransientDownloadError,
+  isUnrecoverableResumeError,
+  nextFormatFallback,
+  progressAwareRetryState,
+  type TerminalErrorInfo,
+} from "../retry";
+import { buildDownloadPlan, effectiveVideoQuality, jobFittedBaseFilename } from "../download-args";
+import { parseAria2cReadout, parseDownloadPath, readProcessOutput } from "../download-output";
 import {
   parseSelectionJson,
   parseTracksJson,
@@ -25,11 +60,61 @@ import {
 } from "../audio-tracks";
 import { findDownloadedFile, formatBytesPerSec, parseSpeedToBytesPerSec } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
-import { abortController, activeProcs, getConfig, isPaused, stats, workerStatuses } from "../state";
+import {
+  abortController,
+  activeDownloadJobs,
+  activeProcs,
+  getConfig,
+  isJobCancelled,
+  isPaused,
+  stats,
+  workerStatuses,
+} from "../state";
 import { logError } from "../logger";
 import type { Config } from "../config";
 
 export const aliveDownloadWorkers = new Set<number>();
+
+/**
+ * The claim this worker holds on `job`, as the CAS primitives expect it.
+ *
+ * The claim snapshot comes straight from `claimDownloadJob`, so it always
+ * carries the token minted for THIS claim — never a worker id that another
+ * process could reuse.
+ */
+function downloadClaim(job: Job): ClaimRef {
+  return claimRef("download", job);
+}
+
+/**
+ * Write a download-state change that only the claim's current owner may make.
+ *
+ * Every progress/success/failure/release update goes through here (or through
+ * `updateClaimedJob` for updates that keep the claim). The WHERE clause carries
+ * the claim token, so a worker whose claim was reaped — or taken over by a
+ * second engine — gets 0 changed rows and must not touch job state: it returns
+ * false and the caller leaves the row to its new owner.
+ */
+function releaseOwned(
+  job: Job,
+  what: string,
+  setClause: string,
+  params: unknown[] = [],
+  extraCondition?: string,
+): boolean {
+  const changes = releaseClaimedJob("download", job.id, downloadClaim(job), setClause, params, extraCondition);
+  if (changes === 1) return true;
+  // A row that no longer exists was deleted on purpose (dashboard delete /
+  // purge / source removal). That is a normal outcome, not a lost race — the
+  // job is gone, so there is nothing to write and nothing to warn about.
+  const row = db.query("SELECT download_claim_token FROM jobs WHERE id = ?").get(job.id) as
+    | { download_claim_token: string | null }
+    | null;
+  if (row) {
+    logError("download", `${job.id} ${job.title}: lost the download claim while ${what} — job state left untouched`);
+  }
+  return false;
+}
 
 export async function downloadWorker(id: number, config: Config): Promise<void> {
   const workerId = `dl-${id}`;
@@ -62,12 +147,32 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
       await Bun.sleep(500);
       continue;
     }
+    activeDownloadJobs.set(id, job.id);
+    // The claim is a lease: heartbeat it for as long as this worker is on the
+    // job, so a long transfer with no progress lines is never mistaken for a
+    // dead worker by the reaper (progress updates renew it too).
+    //
+    // Losing the lease mid-transfer (reaped as stale, or superseded by another
+    // engine) also stops the child: a downloader we no longer own must not keep
+    // writing into the video's folder — that is how a deleted job used to end
+    // up as an untracked file on disk.
+    const stopHeartbeat = startClaimHeartbeat("download", job.id, claimRef("download", job), () => {
+      logError("download", `${job.id} ${job.title}: download claim lost — the next update will not land`);
+      const doomed = activeProcs.get(id);
+      if (doomed && doomed.exitCode === null) {
+        try {
+          doomed.kill("SIGINT");
+        } catch {}
+      }
+    });
 
     try {
       await runDownload(id, job, config);
     } catch (err: any) {
       await handleDownloadFailure(id, job, config, err);
     } finally {
+      stopHeartbeat();
+      activeDownloadJobs.delete(id);
       activeProcs.delete(id);
       autoscaler.clearWorker(id);
     }
@@ -99,77 +204,112 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     aria2cAvailable: !!aria2cPath(),
     aria2cBinary: aria2cPath(),
     audioTracks,
+    jsRuntime: jsRuntime(),
   });
-  const { baseFilename, outTemplate, timeoutMs } = plan;
+  const { baseFilename, timeoutMs } = plan;
   const engineTag = plan.engine === "aria2c" ? `aria2c×${config.connectionsPerDownload}` : "native";
   const audioTag = audioTracks.length > 0 ? `, ${audioTracks.length} audio track(s)` : "";
+
+  // The audio probe above is a network round-trip; the job can be paused,
+  // deleted, or purged while it runs. Spawning yt-dlp for a claim we no longer
+  // own is exactly how a cancelled job used to keep downloading in the
+  // terminal, so ownership is re-checked immediately before the spawn.
+  if (isJobCancelled(job.id) || !ownsClaim("download", job.id, downloadClaim(job))) {
+    updateWorkerLine(id, `⏹️ Cancelled before starting | ${job.title}`, config);
+    return;
+  }
 
   updateWorkerLine(id, `⬇️ Starting [${engineTag}${audioTag}]... | ${job.title}`, config);
   const args = [ytDlp(), ...plan.args];
 
   let timedOut = false;
   const downloadCtl = new AbortController();
-  const downloadTimer = setTimeout(() => {
-    timedOut = true;
-    downloadCtl.abort();
-  }, timeoutMs);
   const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: downloadCtl.signal });
-  activeProcs.set(id, proc);
-  // Drain stderr immediately so a chatty yt-dlp cannot deadlock on a full pipe buffer.
-  const stderrPromise = new Response(proc.stderr).text();
-
-  let buffer = "";
-  let finalFilePath: string | null = null;
+  let downloadTimer: ReturnType<typeof setTimeout> | undefined;
+  let finalFilePath = "";
   let lastProgressUpdate = 0;
+  let output: [string, string, number];
+  try {
+    // Keep registration, timer setup, stream construction, and draining in the
+    // same protected region: any throw after spawn must stop the child before
+    // the worker can release the job claim and retry it.
+    activeProcs.set(id, proc);
+    // The dashboard can delete/purge this job between the check above and this
+    // spawn (both are synchronous, but the probe before them is not). Now that
+    // the child is registered, verify ownership once more: if the row is gone
+    // or the claim moved on, the `finally` below reaps the child and nothing is
+    // recorded for a job that no longer exists.
+    if (isJobCancelled(job.id) || !ownsClaim("download", job.id, downloadClaim(job))) {
+      updateWorkerLine(id, `⏹️ Cancelled at start | ${job.title}`, config);
+      return;
+    }
+    downloadTimer = setTimeout(() => {
+      timedOut = true;
+      downloadCtl.abort();
+    }, timeoutMs);
 
-  const reader = proc.stdout.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += new TextDecoder().decode(value);
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+    // Every downloader engine funnels through this one writer: the native
+    // engine via yt-dlp's --progress-template, aria2c via its console readout
+    // (same stdout — yt-dlp lets the child inherit it and fires no progress
+    // hook of its own for an external downloader). One writer keeps the
+    // dashboard's progress/speed/ETA columns identical on both paths.
+    const reportProgress = (pctNum: number, bps: number, etaNum: number, totalBytes: number | null) => {
+      if (bps > 0) autoscaler.recordSpeed(id, bps);
+      if (Number.isNaN(pctNum) || pctNum < 0 || Date.now() - lastProgressUpdate <= 500) return;
+      // Backfill file_size from progress so the global ETA has a total to work with.
+      // best_progress is the high-water mark of this job's attempts: it is what
+      // lets the retry budget forgive repeated failures at increasing
+      // completion percentages (see handleDownloadFailure).
+      updateJobProgress(job.id, downloadClaim(job), pctNum, bps, etaNum, totalBytes);
+      const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
+      const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
+      updateWorkerLine(id, `⬇️ ${pctNum.toFixed(1)}% @ ${speedTxt}${etaTxt} | ${job.title}`, config);
+      lastProgressUpdate = Date.now();
+    };
 
-    for (const line of lines) {
+    const stdoutPromise = readProcessOutput(proc.stdout, (line) => {
       if (line.startsWith("PROGRESS:")) {
         const parts = line.replace("PROGRESS:", "").split("|");
-        const bps = parseSpeedToBytesPerSec(parts[1]);
-        if (bps > 0) autoscaler.recordSpeed(id, bps);
         const sizeNum = parseInt(parts[3], 10);
         const dlNum = parseInt(parts[4], 10);
         let pctNum = parseFloat(parts[0]);
         if (Number.isNaN(pctNum) && dlNum > 0 && sizeNum > 0) pctNum = (dlNum / sizeNum) * 100;
-        if (!Number.isNaN(pctNum) && pctNum >= 0 && Date.now() - lastProgressUpdate > 500) {
-          // Backfill file_size from progress so the global ETA has a total to work with.
-          const totalBytes = Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : null;
-          // best_progress is the high-water mark of this job's attempts: it is
-          // what lets the retry budget forgive repeated failures at increasing
-          // completion percentages (see handleDownloadFailure).
-          updateJobProgress(job.id, pctNum, bps, parseFloat(parts[2]) || 0, totalBytes);
-          const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
-          const etaNum = parseFloat(parts[2]);
-          const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
-          updateWorkerLine(id, `⬇️ ${pctNum.toFixed(1)}% @ ${speedTxt}${etaTxt} | ${job.title}`, config);
-          lastProgressUpdate = Date.now();
-        }
+        reportProgress(
+          pctNum,
+          parseSpeedToBytesPerSec(parts[1]),
+          parseFloat(parts[2]) || 0,
+          Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : null,
+        );
       } else {
-        const trimmed = line.trim();
-        if (trimmed && existsSync(trimmed)) {
-          finalFilePath = trimmed;
+        const path = parseDownloadPath(line);
+        if (path) {
+          finalFilePath = path;
         } else {
-          // Capture paths embedded in yt-dlp status lines (merger output, etc.).
-          const m = trimmed.match(/Merged formats into "(.+)"$/) || trimmed.match(/Destination: (.+)$/);
-          if (m && existsSync(m[1])) finalFilePath = m[1];
+          // Not our FILEPATH record: on the aria2c path this is where the
+          // transfer's only live progress signal arrives.
+          const readout = parseAria2cReadout(line);
+          if (readout) {
+            reportProgress(
+              readout.percent,
+              readout.speedBps,
+              readout.etaSeconds,
+              readout.totalBytes > 0 ? readout.totalBytes : null,
+            );
+          }
         }
       }
-    }
+    });
+
+    // Drain both pipes concurrently, with bounded tails for error reporting.
+    // A native Bun panic cannot be caught in JS, so no arbitrary stdout string
+    // reaches existsSync: only a size/control-checked FILEPATH record below.
+    output = await Promise.all([stdoutPromise, readProcessOutput(proc.stderr), proc.exited]);
+  } finally {
+    await cleanupDownloadProcess(id, proc, downloadTimer);
   }
+  const [stdoutText, stderrText, code] = output;
 
-  const [stderrText, code] = await Promise.all([stderrPromise, proc.exited]);
-  clearTimeout(downloadTimer);
-  activeProcs.delete(id);
-
-  if (isPaused()) {
+  if (isPaused() && !isUserPaused(job.id)) {
     parkPaused(job);
     updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
     return;
@@ -178,29 +318,35 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
   if (timedOut) throw new Error(`Process timed out (${Math.round(timeoutMs / 60000)}m)`);
 
   if (code === 0) {
-    let filePath =
-      finalFilePath ||
-      buffer
-        .split("\n")
-        .reverse()
-        .find((l) => l.trim() && existsSync(l.trim()))
-        ?.trim() ||
-      "";
+    let filePath = finalFilePath && existsSync(finalFilePath) ? finalFilePath : "";
     if (!filePath) filePath = await findDownloadedFile(job.output_directory, baseFilename);
     if (!filePath) {
       logError("download", `${job.id} exited 0 but the output file could not be located: ${job.title}`);
       throw new Error("Download finished but output file could not be located");
     }
     const fileSize = (await stat(filePath)).size;
-    recordSuccess(job.id, filePath, fileSize);
+    const recorded = recordSuccess(job, filePath, fileSize);
+    if (recorded.lostClaim) {
+      updateWorkerLine(id, `⚠️ Claim lost — output belongs to another worker | ${job.title}`, config);
+      return;
+    }
+    if (recorded.stayedPaused) {
+      updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
+      return;
+    }
+    // This attempt replaces a previously downloaded file (dashboard retry):
+    // the new file is in place, so the stashed backup can finally go. Until
+    // this moment the engine never deletes work that has already been done.
+    dropSupersededFile(job.id);
     stats.downloaded++;
     notePipelineSuccess("dl");
     updateWorkerLine(id, `✅ Downloaded | ${job.title}`, config);
   } else {
-    const tail = [stderrText, buffer]
+    // Prefer stderr at the end so stdout progress cannot hide the real error.
+    const tail = [stdoutText, stderrText]
       .filter(Boolean)
       .join("\n")
-      .split("\n")
+      .split(/[\r\n]+/)
       .filter((l) => l.trim())
       .slice(-4)
       .join(" ");
@@ -208,37 +354,265 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
   }
 }
 
+const DOWNLOAD_PROCESS_CLEANUP_GRACE_MS = 2_000;
+
+/**
+ * How long the dashboard keeps showing "Format X not available — switched to Y".
+ *
+ * The fallback itself is instant; this pause exists purely so the one message
+ * that explains a silent-looking quality downgrade is actually readable.
+ */
+const FORMAT_SWITCH_NOTICE_MS = 1_500;
+
+/** Upper bound for yt-dlp's networked self-update command. */
+export const YTDLP_UPDATE_TIMEOUT_MS = 120_000;
+const YTDLP_UPDATE_COOLDOWN_MS = 60 * 60_000;
+
+export interface YtDlpUpdateResult {
+  ok: boolean;
+  timedOut: boolean;
+  exitCode: number | null;
+  detail: string;
+}
+
+let lastYtDlpUpdateAttemptAt: number | null = null;
+let ytDlpUpdateInFlight: Promise<YtDlpUpdateResult> | null = null;
+
+/**
+ * Run `yt-dlp -U` with both pipes drained, bounded diagnostic tails, and a hard
+ * timeout. Exposed so the subprocess contract can be tested without running a
+ * full download worker.
+ */
+export async function runYtDlpSelfUpdate(
+  opts: { binary?: string; timeoutMs?: number } = {},
+): Promise<YtDlpUpdateResult> {
+  const timeoutMs = Math.max(1, opts.timeoutMs ?? YTDLP_UPDATE_TIMEOUT_MS);
+  const ctl = new AbortController();
+  let proc: Bun.Subprocess | null = null;
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    timer = setTimeout(() => {
+      timedOut = true;
+      ctl.abort();
+      if (proc && proc.exitCode === null) {
+        try {
+          proc.kill("SIGKILL");
+        } catch {}
+      }
+    }, timeoutMs);
+    const updater = Bun.spawn([opts.binary || ytDlp(), "-U"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      signal: ctl.signal,
+    });
+    proc = updater;
+    const [stdout, stderr, exitCode] = await Promise.all([
+      readProcessOutput(updater.stdout),
+      readProcessOutput(updater.stderr),
+      updater.exited,
+    ]);
+    const detail = [stderr, stdout]
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(-800);
+    return { ok: !timedOut && exitCode === 0, timedOut, exitCode, detail };
+  } catch (error) {
+    const detail = timedOut
+      ? `self-update exceeded ${timeoutMs}ms`
+      : error instanceof Error
+        ? error.message
+        : String(error);
+    return { ok: false, timedOut, exitCode: proc?.exitCode ?? null, detail: detail.slice(-800) };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (proc) await stopYtDlpUpdateProcess(proc);
+  }
+}
+
+async function stopYtDlpUpdateProcess(proc: Bun.Subprocess): Promise<void> {
+  if (proc.exitCode === null) {
+    try {
+      proc.kill("SIGINT");
+    } catch {
+      // The process may have exited between the check and the signal.
+    }
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    let exited = false;
+    try {
+      exited = await Promise.race([
+        proc.exited.then(() => true, () => true),
+        new Promise<boolean>((resolve) => {
+          graceTimer = setTimeout(() => resolve(false), DOWNLOAD_PROCESS_CLEANUP_GRACE_MS);
+        }),
+      ]);
+    } finally {
+      if (graceTimer !== undefined) clearTimeout(graceTimer);
+    }
+    if (!exited && proc.exitCode === null) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+  }
+  await proc.exited.catch(() => {});
+}
+
+async function requestSignatureUpdate(): Promise<{ attempted: boolean; result: YtDlpUpdateResult | null }> {
+  if (ytDlpUpdateInFlight) return { attempted: true, result: await ytDlpUpdateInFlight };
+  if (
+    lastYtDlpUpdateAttemptAt !== null &&
+    Date.now() - lastYtDlpUpdateAttemptAt < YTDLP_UPDATE_COOLDOWN_MS
+  ) {
+    return { attempted: false, result: null };
+  }
+  lastYtDlpUpdateAttemptAt = Date.now();
+  const update = runYtDlpSelfUpdate();
+  ytDlpUpdateInFlight = update;
+  try {
+    return { attempted: true, result: await update };
+  } finally {
+    if (ytDlpUpdateInFlight === update) ytDlpUpdateInFlight = null;
+  }
+}
+
+/**
+ * Stop and reap a spawned downloader on every exit path. SIGINT gives yt-dlp a
+ * chance to stop its external downloader (aria2c) cleanly; SIGKILL is the
+ * bounded fallback if it does not exit. Tracking is removed even if waiting
+ * for the subprocess itself fails.
+ */
+export async function cleanupDownloadProcess(
+  id: number,
+  proc: Bun.Subprocess,
+  timer?: ReturnType<typeof setTimeout>,
+): Promise<void> {
+  try {
+    if (timer !== undefined) clearTimeout(timer);
+    if (proc.exitCode === null) {
+      if (!proc.killed) {
+        try {
+          proc.kill("SIGINT");
+        } catch {
+          // It may have exited between the exitCode check and kill().
+        }
+      }
+
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      let exited: boolean;
+      try {
+        exited = await Promise.race([
+          proc.exited.then(
+            () => true,
+            () => true,
+          ),
+          new Promise<boolean>((resolve) => {
+            graceTimer = setTimeout(() => resolve(false), DOWNLOAD_PROCESS_CLEANUP_GRACE_MS);
+          }),
+        ]);
+      } finally {
+        if (graceTimer !== undefined) clearTimeout(graceTimer);
+      }
+
+      if (!exited && proc.exitCode === null) {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // The subprocess may have exited just before the force-kill.
+        }
+      }
+    }
+    await proc.exited;
+  } finally {
+    activeProcs.delete(id);
+  }
+}
+
 /**
  * Central failure handler: classifies the error, decides whether the partial
  * file survives, and computes the next state. The guiding rules:
  *
- *   • transient (network/timeout/5xx)  → requeue with exponential backoff
+ *   • resume refused (HTTP 416 range,  → DISCARD the partial + control file,
+ *     aria2c control-file refusal)         restart from zero: the bytes the
+ *                                        resume asks for no longer exist
  *   • corrupt/incomplete               → delete the partial and resume (bounded
  *                                        by maxResumeAttempts, then restart)
- *   • live stream in "wait for VOD"    → park as waiting_live
- *   • permanent (private/removed/…)    → fail fast, never auto-requeued
+ *   • live / not-yet-premiered stream  → park as waiting_live (a rescan picks
+ *                                        it up once a VOD exists)
+ *   • format not available             → clear stale pinned audio ids, else
+ *                                        step DOWN the quality ladder and retry
+ *                                        with the new selector; a bottomed-out
+ *                                        ladder is terminal
+ *   • permanent (private/removed/…)    → terminal skip: one attempt, no error.log
+ *                                        line, never auto-requeued
+ *   • n-challenge / missing JS runtime → retryable (not a dead video)
  *   • retry budget spent               → park as failed for the sweep
+ *   • transient (network/timeout/5xx)  → requeue with exponential backoff
  */
-async function handleDownloadFailure(id: number, job: Job, config: Config, err: any): Promise<void> {
+export async function handleDownloadFailure(id: number, job: Job, config: Config, err: any): Promise<void> {
+  if (isUserPaused(job.id)) {
+    parkUserPaused(job);
+    updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
+    return;
+  }
   if (isPaused()) {
     parkPaused(job);
     updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
     return;
   }
 
-  const errMsg = String(err?.message || err);
+  let errMsg = String(err?.message || err);
   const lower = errMsg.toLowerCase();
   const base = baseNameOf(job);
 
-  // Signature challenge broke (yt-dlp extractor changed) — self-heal by
-  // updating yt-dlp, then retry immediately with a clean budget.
-  if (lower.includes("signature") || lower.includes("unable to extract")) {
-    console.warn("⚠️ Signature challenge failed. Auto-updating yt-dlp...");
-    const updateProc = Bun.spawn([ytDlp(), "-U"], { stdout: "pipe", stderr: "pipe" });
-    await updateProc.exited;
-    resetForRetry(job.id);
-    updateWorkerLine(id, `🔄 Auto-updated yt-dlp, retrying... | ${job.title}`, config);
+  // Storage exhaustion affects every worker, not just this video. Pause the
+  // engine immediately, preserve any partial, and require an operator to free
+  // space before Resume All rather than spending retry budgets against ENOSPC.
+  if (isDiskFullError(errMsg)) {
+    triggerPause("LOW_DISK_SPACE (download write failed; free space and Resume All)");
+    let partial = job.partial_file_path && existsSync(job.partial_file_path) ? job.partial_file_path : null;
+    if (!partial) {
+      try {
+        partial = await findPartialFile(job.output_directory, base);
+      } catch {
+        // Keep the state/error record even when the directory itself is unreadable.
+      }
+    }
+    const detail = errMsg.replace(/\s+/g, " ").trim().slice(-300);
+    const message = `Storage exhausted during download; free disk space, then resume. yt-dlp: ${detail}`;
+    const parked = releaseOwned(
+      job,
+      "pausing after a disk-full error",
+      `download_status = 'paused', pause_reason = 'interrupted', partial_file_path = ?, last_error = ?`,
+      [partial || null, message.slice(0, 500)],
+    );
+    if (!parked) return;
+    logError("download", `${job.id} ${job.title}: ${message}`);
+    updateWorkerLine(id, `💾 Disk full — engine paused; free space and resume | ${job.title}`, config);
     return;
+  }
+
+  // A genuine signature-decipher failure can be repaired by updating yt-dlp.
+  // Keep the match narrow and bound/coalesce the update process: generic
+  // extractor errors are not fixed by -U, and a broken updater must not reset
+  // the video's retry budget or launch once per worker.
+  if (isSignatureChallengeError(errMsg) && !isNChallengeError(errMsg)) {
+    const update = await requestSignatureUpdate();
+    if (update.result?.ok) {
+      if (!resetForRetry(job)) return;
+      updateWorkerLine(id, `🔄 yt-dlp updated — retrying | ${job.title}`, config);
+      return;
+    }
+    if (update.attempted && update.result) {
+      const outcome = update.result.timedOut
+        ? "timed out"
+        : `exited with code ${update.result.exitCode ?? "unknown"}`;
+      const failure = `yt-dlp auto-update ${outcome}${update.result.detail ? `: ${update.result.detail}` : ""}`;
+      errMsg = `${errMsg} (${failure})`;
+      logError("download", `${job.id} ${job.title}: ${failure.slice(0, 500)}`);
+    }
   }
 
   // aria2c rejected the command line (exit 28 + the option's help block): a
@@ -257,48 +631,287 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
     return;
   }
 
-  // Corrupt/incomplete partial: delete the .part file so yt-dlp restarts that
-  // transfer — but only after the resume budget is spent. Until then we keep
-  // the partial and let --continue resume from it.
+  // Selector-level format problem: the requested FORMAT does not exist for this
+  // video — "Requested format is not available". Not a dead video, and not
+  // something to keep re-running the identical command for. Two recoveries, in
+  // order, and then a terminal skip; this branch must stay before the
+  // permanent-error check, which matches the same message text.
+  //
+  //   1. Pinned multi-audio ids from an earlier `-J` probe went stale (YouTube
+  //      renumbers formats) → forget `audio_tracks` so the next attempt
+  //      re-probes, keeping the per-job language selection. Bounded by the
+  //      no-progress budget, because a re-probe can legitimately pin the same
+  //      stale ids again.
+  //   2. Otherwise the preset itself has nothing to grab → step down the
+  //      quality ladder (4k → … → 480p → highest), persist the lower preset as
+  //      this job's `video_quality` override, and retry immediately: the next
+  //      attempt is a different command, so there is nothing to wait for. The
+  //      ladder is monotonic, so it cannot loop and spends no retry budget.
+  //
+  // When the ladder is exhausted the video really has no usable formats: park
+  // it as terminal (never auto-requeued) with an explicit message instead of
+  // looping through cooldown sweeps.
+  if (isFormatAvailabilityError(errMsg) && !isNChallengeError(errMsg)) {
+    const current = readProgressState(job.id);
+    const retry = progressAwareRetryState(
+      current.retryCount,
+      current.bestProgress,
+      current.progress,
+      perVideoCap(config),
+    );
+
+    // (1) Stale multi-audio probe.
+    if (job.audio_tracks && !retry.exhausted) {
+      const landed = releaseOwned(
+        job,
+        "clearing stale audio formats",
+        `download_status = 'pending', retry_count = ?, best_progress = ?, audio_tracks = NULL, last_error = ?`,
+        [retry.retryCount, retry.bestProgress, errMsg.slice(0, 500)],
+      );
+      if (!landed) return;
+      const backoff = computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
+      updateWorkerLine(id, `🎧 Audio formats went stale — re-probing in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
+      await Bun.sleep(backoff);
+      return;
+    }
+
+    // (2) Quality fallback ladder.
+    const from = effectiveVideoQuality(job, config);
+    const next = nextFormatFallback(from);
+    if (next) {
+      const message = formatSwitchMessage(from, next);
+      // `audio_tracks` goes with the step: the pinned ids were the most likely
+      // cause of a selector miss, and the next attempt re-probes them anyway.
+      const landed = releaseOwned(
+        job,
+        "switching to a fallback format",
+        `download_status = 'pending', video_quality = ?, audio_tracks = NULL, last_error = ?`,
+        [next, message],
+      );
+      if (!landed) return;
+      stats.formatFallbacks++;
+      logError(
+        "download",
+        `${job.id} ${job.title}: ${message} (yt-dlp: ${errMsg.replace(/\s+/g, " ").slice(0, 200)})`,
+      );
+      updateWorkerLine(id, `🎚️ Format ${from} not available — switched to ${next} | ${job.title}`, config);
+      // Hold the line long enough to be read. The recovery is immediate (the
+      // next attempt is a different command), so without this pause the
+      // announcement would be on screen for the few milliseconds it takes the
+      // worker to re-claim the job — and the operator, who is about to receive
+      // a lower-quality file than they asked for, is exactly who needs to see it.
+      await Bun.sleep(FORMAT_SWITCH_NOTICE_MS);
+      return;
+    }
+
+    // (3) Ladder exhausted: the video offers no formats this engine can fetch.
+    const exhaustedPartial =
+      job.partial_file_path && existsSync(job.partial_file_path)
+        ? job.partial_file_path
+        : await findPartialFile(job.output_directory, base);
+    parkTerminal(
+      id,
+      job,
+      config,
+      { code: "format_unavailable", label: `No format available (tried down to ${from})` },
+      errMsg,
+      exhaustedPartial || null,
+    );
+    return;
+  }
+
+  // Unrecoverable resume (the "stuck at 99% forever" bug): an HTTP 416 for the
+  // saved partial's range — or aria2c refusing to touch a file whose control
+  // state is gone — means the resume can NEVER complete, because the remote
+  // stream no longer has the bytes `--continue` is asking for. Retrying with
+  // the same partial repeats the failure identically, so this branch discards
+  // the pair and restarts the transfer. It must run before the corrupt-resume
+  // branch (which spends its budget RESUMING) and before the permanent-error
+  // check: a 416 is about OUR partial, not about the video being unfetchable.
+  if (isUnrecoverableResumeError(errMsg)) {
+    const current = readProgressState(job.id);
+    const retry = progressAwareRetryState(
+      current.retryCount,
+      current.bestProgress,
+      current.progress,
+      perVideoCap(config),
+    );
+    const partial =
+      job.partial_file_path && existsSync(job.partial_file_path)
+        ? job.partial_file_path
+        : await findPartialFile(job.output_directory, base);
+    // The 99% high-water mark was reached with bytes the server no longer serves.
+    // Kept, it turns every later attempt into a "no progress" failure, so a
+    // restart clears progress/best_progress in the same statement that re-queues.
+    const status = retry.exhausted ? "failed" : "pending";
+
+    if (partial) {
+      // Both files, in the one safe order: a `.part` without its `.aria2` (or
+      // the reverse) leaves aria2c unable to resume AND unable to restart.
+      const removal = await removePartialFiles(partial);
+      if (removal.fatal) {
+        // Nothing was deleted and aria2c still refuses to restart, so this can
+        // only wait for the lock (an orphaned aria2c/ffmpeg, an AV scan) to go
+        // away — with its partial still recorded for whoever retries.
+        const msg =
+          `resume state is unusable (HTTP 416) and its partial is locked (${removal.error}). ` +
+          `Close the program holding it — usually an orphaned aria2c/ffmpeg or an antivirus scan on the download folder.`;
+        const parked = releaseOwned(
+          job,
+          "parking a locked 416 partial",
+          `download_status = ?, retry_count = ?, best_progress = ?, partial_file_path = ?, last_error = ?`,
+          [status, retry.retryCount, retry.bestProgress, partial, msg.slice(0, 500)],
+        );
+        logError("download", `${job.id} ${job.title}: ${msg}`);
+        if (!parked) return;
+        if (retry.exhausted) {
+          stats.failed++;
+          notePipelineFailure("dl", config);
+          updateWorkerLine(id, `❌ Retry budget spent — waiting for cooldown | ${job.title}`, config);
+        } else {
+          updateWorkerLine(id, `🔒 416 partial locked — will retry | ${job.title}`, config);
+          await Bun.sleep(computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
+        }
+        return;
+      }
+    }
+
+    const restarted = releaseOwned(
+      job,
+      "restarting after an unrecoverable resume",
+      `download_status = ?, retry_count = ?, resume_count = 0, partial_file_path = NULL,
+       progress = ?, best_progress = ?, speed = 0, eta = 0, last_error = ?`,
+      [
+        status,
+        retry.retryCount,
+        retry.exhausted ? retry.bestProgress : 0,
+        retry.exhausted ? retry.bestProgress : 0,
+        errMsg.slice(0, 500),
+      ],
+    );
+    if (!restarted) return;
+    if (retry.exhausted) {
+      // Budget spent — but the unusable resume state is gone, so the cooldown
+      // sweep's next attempt starts clean instead of straight back into a 416.
+      stats.failed++;
+      notePipelineFailure("dl", config);
+      logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 300)}`);
+      updateWorkerLine(id, `❌ Retry budget spent — partial discarded, cooldown will restart it | ${job.title}`, config);
+      return;
+    }
+    if (partial) {
+      // A fresh attempt still has to survive a genuinely broken stream, so the
+      // no-progress budget is charged (it forgives again as soon as the restart
+      // gets further than the previous attempt did).
+      const backoff = computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
+      updateWorkerLine(id, `🧹 Resume state unusable (HTTP 416) — restarting from scratch in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
+      await Bun.sleep(backoff);
+      return;
+    }
+    // Nothing on disk to resume: a 416 with no partial can only come from stale
+    // media-URL state, and the next attempt re-extracts the formats anyway.
+    // Nothing was deleted, so no work is lost — the budget just bounds the loop.
+    const backoff = computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
+    updateWorkerLine(id, `🧹 Resume refused (HTTP 416), nothing to discard — retrying in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
+    await Bun.sleep(backoff);
+  }
+
+  // Corrupt/incomplete partial: keep resuming up to maxResumeAttempts, then
+  // discard the pair and restart. Every failed attempt still goes through the
+  // progress-aware budget so repeated corruptions cannot loop forever.
   if (lower.includes("unable to resume") || lower.includes("incomplete") || lower.includes("corrupt")) {
     const resumeCount = (job.resume_count || 0) + 1;
     const partial =
       job.partial_file_path && existsSync(job.partial_file_path)
         ? job.partial_file_path
         : await findPartialFile(job.output_directory, base);
-    if (resumeCount >= Math.max(1, config.maxResumeAttempts) || !partial) {
-      // Budget spent (or nothing to resume): throw the partial away and
-      // restart this video from scratch. The aria2c control file goes first —
-      // stranding it makes aria2c refuse to restart (see removePartialFiles).
-      if (partial) {
-        const removal = await removePartialFiles(partial);
-        if (removal.fatal) {
-          // The control file is locked (orphaned aria2c, an antivirus scan).
-          // Deleting only the data file now would wedge this video forever,
-          // so keep both files, surface exactly what is blocking, and let a
-          // later attempt retry once the handle is released.
-          const msg = `partial file locked, cannot restart cleanly (${removal.error}). Close the program holding it — usually an orphaned aria2c/ffmpeg or antivirus scanning the download folder.`;
-          db.run(
-            `UPDATE jobs SET download_status = 'pending', download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-            [msg.slice(0, 500), job.id],
-          );
-          logError("download", `${job.id} ${job.title}: ${msg}`);
+    const current = readProgressState(job.id);
+    const retry = progressAwareRetryState(
+      current.retryCount,
+      current.bestProgress,
+      current.progress,
+      perVideoCap(config),
+    );
+    const restartFromScratch = resumeCount >= Math.max(1, config.maxResumeAttempts) || !partial;
+    let partialRemoved = false;
+
+    if (restartFromScratch && partial) {
+      // The aria2c control file goes first — stranding it makes aria2c refuse
+      // to restart (see removePartialFiles).
+      const removal = await removePartialFiles(partial);
+      if (removal.fatal) {
+        // Keep both files if a process/antivirus holds either one. This is a
+        // retryable failure, but its no-progress attempt still spends budget.
+        const msg = `partial file locked, cannot restart cleanly (${removal.error}). Close the program holding it — usually an orphaned aria2c/ffmpeg or antivirus scanning the download folder.`;
+        const status = retry.exhausted ? "failed" : "pending";
+        const parked = releaseOwned(
+          job,
+          "parking a locked partial",
+          `download_status = ?, retry_count = ?, resume_count = ?, partial_file_path = ?, best_progress = ?, last_error = ?`,
+          [status, retry.retryCount, resumeCount, partial, retry.bestProgress, msg.slice(0, 500)],
+        );
+        logError("download", `${job.id} ${job.title}: ${msg}`);
+        if (!parked) return;
+        if (retry.exhausted) {
+          stats.failed++;
+          notePipelineFailure("dl", config);
+          updateWorkerLine(id, `❌ Retry budget spent — waiting for cooldown | ${job.title}`, config);
+        } else {
           updateWorkerLine(id, `🔒 Partial locked — will retry | ${job.title}`, config);
-          await Bun.sleep(computeBackoffMs(2, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
-          return;
+          await Bun.sleep(computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
         }
+        return;
       }
-      resetForRetry(job.id, { incrementRetry: true, clearPartial: true });
-      updateWorkerLine(id, `🗑️ Restarting from scratch | ${job.title}`, config);
+      partialRemoved = true;
+    }
+
+    if (retry.exhausted) {
+      const keepPartial = partial && !partialRemoved ? partial : null;
+      const failed = releaseOwned(
+        job,
+        "parking an exhausted corrupt resume",
+        `download_status = 'failed', retry_count = ?, resume_count = ?, partial_file_path = ?, best_progress = ?, last_error = ?`,
+        [
+          retry.retryCount,
+          restartFromScratch ? 0 : resumeCount,
+          keepPartial,
+          retry.bestProgress,
+          errMsg.slice(0, 500),
+        ],
+      );
+      if (!failed) return;
+      stats.failed++;
+      notePipelineFailure("dl", config);
+      logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
+      updateWorkerLine(id, `❌ Retry budget spent — waiting for cooldown | ${job.title}`, config);
       return;
     }
-    // Keep the partial, count the resume attempt, and try again shortly.
-    db.run(
-      `UPDATE jobs SET download_status = 'pending', resume_count = ?, download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [resumeCount, errMsg.slice(0, 500), job.id],
+
+    if (restartFromScratch) {
+      const restarted = releaseOwned(
+        job,
+        "restarting from scratch",
+        `download_status = 'pending', retry_count = ?, resume_count = 0, partial_file_path = NULL,
+         progress = 0, best_progress = ?, speed = 0, eta = 0, last_error = ?`,
+        [retry.retryCount, retry.bestProgress, errMsg.slice(0, 500)],
+      );
+      if (!restarted) return;
+      updateWorkerLine(id, `🗑️ Restarting from scratch | ${job.title}`, config);
+      await Bun.sleep(computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
+      return;
+    }
+
+    // Keep and record the partial, count the resume attempt, and try again
+    // shortly. Commit the high-water mark only at this failure boundary.
+    const resumed = releaseOwned(
+      job,
+      "recording a resume attempt",
+      `download_status = 'pending', retry_count = ?, resume_count = ?, partial_file_path = ?, best_progress = ?, last_error = ?`,
+      [retry.retryCount, resumeCount, partial, retry.bestProgress, errMsg.slice(0, 500)],
     );
+    if (!resumed) return;
     updateWorkerLine(id, `⏳ Resuming (attempt ${resumeCount}/${config.maxResumeAttempts}) | ${job.title}`, config);
-    await Bun.sleep(computeBackoffMs(resumeCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
+    await Bun.sleep(computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
     return;
   }
 
@@ -307,59 +920,162 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
   // so yt-dlp will actually download it on the retry.
   if (lower.includes("output file could not be located")) {
     removeFromArchive(config.archiveFile, job.id);
-    resetForRetry(job.id, { incrementRetry: true, clearPartial: true });
-    updateWorkerLine(id, `Re-downloading (archive entry scrubbed) | ${job.title}`, config);
+    const current = readProgressState(job.id);
+    const retry = progressAwareRetryState(
+      current.retryCount,
+      current.bestProgress,
+      current.progress,
+      perVideoCap(config),
+    );
+    const status = retry.exhausted ? "failed" : "pending";
+    const partial = await findPartialFile(job.output_directory, base);
+    const landed = releaseOwned(
+      job,
+      "re-queueing a missing output file",
+      `download_status = ?, retry_count = ?, best_progress = ?, partial_file_path = ?,
+       resume_count = 0, last_error = ?`,
+      [status, retry.retryCount, retry.bestProgress, partial || null, errMsg.slice(0, 500)],
+    );
+    if (!landed) return;
+    if (retry.exhausted) {
+      stats.failed++;
+      notePipelineFailure("dl", config);
+      logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
+      updateWorkerLine(id, `❌ Retry budget spent — waiting for cooldown | ${job.title}`, config);
+    } else {
+      updateWorkerLine(id, `Re-downloading (archive entry scrubbed) | ${job.title}`, config);
+      await Bun.sleep(computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
+    }
     return;
   }
 
   // archiveLiveStreams mode: yt-dlp refused the job because the stream is
-  // live right now. Park it until the next full rescan or a manual retry —
-  // scans flip waiting_live jobs back to pending once a VOD exists.
-  if (lower.includes("does not pass filter") || lower.includes("is live") || lower.includes("live event")) {
-    db.run(
-      `UPDATE jobs SET download_status = 'waiting_live', download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [errMsg.slice(0, 500), job.id],
+  // live (or has not started) right now. Park it until the next full rescan or
+  // a manual retry — scans flip waiting_live jobs back to pending once a VOD
+  // exists. Scheduled premieres/live events answer with "Premieres in 3 hours"
+  // / "This live event will begin in …", which used to fall through to the
+  // retry budget: the job burned attempts against a video that could not exist
+  // yet and spammed error.log until it was parked as failed. They wait here
+  // instead, exactly like a live stream.
+  if (
+    lower.includes("does not pass filter") ||
+    lower.includes("is live") ||
+    lower.includes("live event") ||
+    lower.includes("premieres in") ||
+    lower.includes("will begin in")
+  ) {
+    const parked = releaseOwned(
+      job,
+      "parking a live stream",
+      `download_status = 'waiting_live', last_error = ?`,
+      [errMsg.slice(0, 500)],
     );
-    updateWorkerLine(id, `Live now — waiting for VOD | ${job.title}`, config);
+    if (!parked) return;
+    updateWorkerLine(id, `🕒 Live/premiere — waiting for VOD | ${job.title}`, config);
     return;
   }
 
-  // Transient failure: remember where the .part file is so the next attempt
-  // can resume from it, then requeue with exponential backoff.
-  if (isTransientDownloadError(errMsg)) {
+  // Video-level failures that cannot be fixed by retrying are parked
+  // immediately as TERMINAL skips: the cooldown sweep and every requeue path
+  // treat the recorded marker as permanent, so a private or deleted video is
+  // attempted exactly once. Expected in archival — a playlist of 500 videos
+  // normally contains a few dead ones — so this path deliberately does NOT
+  // write an error.log line, does not spend retry budget, and does not feed the
+  // circuit breaker: it records the reason on the job row and moves on.
+  if (isPermanentDownloadError(errMsg)) {
+    // A deliberate re-download (dashboard retry on an archived video) stashed
+    // the previous file. The re-fetch can never succeed, so put the previous
+    // file back instead of leaving the job empty-handed — the archive keeps
+    // exactly what it had before the retry. The restore is claim-guarded: a
+    // stale worker must not move the previous file over the new owner's work.
+    if (restoreSupersededFile(job.id, `re-download failed permanently: ${errMsg.slice(0, 300)}`, downloadClaim(job))) {
+      logError(
+        "download",
+        `${job.id} ${job.title}: permanent re-download failure, previous file restored: ${errMsg.slice(0, 300)}`,
+      );
+      updateWorkerLine(id, `🚫 Re-download failed permanently — previous file restored | ${job.title}`, config);
+      return;
+    }
     const partial = await findPartialFile(job.output_directory, base);
-    const { retryCount, bestProgress, progress } = readProgressState(job.id);
-    // The retry budget only shrinks when the video makes no forward progress:
-    // a flaky connection that keeps advancing is forgiven, a video stuck at
-    // the same percentage eventually exhausts its budget.
-    const nextRetry = progress > bestProgress ? retryCount : retryCount + 1;
-    db.run(
-      `UPDATE jobs SET download_status = 'pending', retry_count = ?, best_progress = ?, partial_file_path = ?,
-         download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [nextRetry, Math.max(bestProgress, progress), partial || null, errMsg.slice(0, 500), job.id],
-    );
-    const backoff = computeBackoffMs(nextRetry, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
-    updateWorkerLine(id, `🌐 Transient error, retrying in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
-    await Bun.sleep(backoff);
+    parkTerminal(id, job, config, classifyTerminalDownloadError(errMsg) ?? GENERIC_TERMINAL_INFO, errMsg, partial || null);
     return;
   }
 
-  // Permanent or unknown error: spend the retry budget, then park as failed
-  // for the periodic sweep (which skips permanent errors entirely).
-  const { retryCount } = readProgressState(job.id);
-  const cap = perVideoCap(config);
-  const newStatus = retryCount + 1 >= cap ? "failed" : "pending";
-  const partial = newStatus === "failed" ? null : await findPartialFile(job.output_directory, base);
-  db.run(
-    `UPDATE jobs SET download_status = ?, retry_count = ?, partial_file_path = ?, download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [newStatus, retryCount + 1, partial, errMsg.slice(0, 500), job.id],
+  // Both transient and otherwise-unclassified failures use the same
+  // progress-aware budget. A retry only costs budget when this attempt failed
+  // without beating the previous attempt's high-water mark.
+  const partial = await findPartialFile(job.output_directory, base);
+  const current = readProgressState(job.id);
+  const retry = progressAwareRetryState(
+    current.retryCount,
+    current.bestProgress,
+    current.progress,
+    perVideoCap(config),
   );
+  const newStatus = retry.exhausted ? "failed" : "pending";
+  const landed = releaseOwned(
+    job,
+    "re-queueing after a failed attempt",
+    `download_status = ?, retry_count = ?, best_progress = ?, partial_file_path = ?, last_error = ?`,
+    [newStatus, retry.retryCount, retry.bestProgress, partial || null, errMsg.slice(0, 500)],
+  );
+  if (!landed) return;
+
   if (newStatus === "failed") {
     stats.failed++;
     logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
     notePipelineFailure("dl", config);
+    updateWorkerLine(id, `❌ Retry budget spent — waiting for cooldown | ${job.title}`, config);
+    return;
   }
-  updateWorkerLine(id, `❌ Failed | ${job.title}`, config);
+
+  const backoff = computeBackoffMs(retry.retryCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
+  const message = isTransientDownloadError(errMsg) ? "🌐 Transient error" : "⚠️ Download error";
+  updateWorkerLine(id, `${message}, retrying in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
+  await Bun.sleep(backoff);
+}
+
+/**
+ * Park a job that retrying can never fix, as a TERMINAL skip.
+ *
+ * The reason travels in `last_error` behind `TERMINAL_ERROR_MARKER` (see
+ * retry.ts), which is what keeps the cooldown sweep, the dashboard's
+ * "Requeue failed" button and `retryableFailed` on `/api/reliability` from
+ * resurrecting it — while a human can still read *why* the video is missing
+ * and a deliberate `/api/jobs/:id/retry` still works.
+ *
+ * Deliberately quieter than a failure: one dashboard line and the job row, no
+ * `error.log` entry (a private video in a playlist is an expected archival
+ * outcome, not an incident to investigate), no retry budget, no circuit-breaker
+ * note. `stats.unavailable` counts them so the run report can tell "skipped,
+ * cannot exist" apart from "tried and failed".
+ */
+function parkTerminal(
+  id: number,
+  job: Job,
+  config: Config,
+  info: TerminalErrorInfo,
+  errMsg: string,
+  partial: string | null,
+): boolean {
+  const message = formatTerminalErrorMessage(info, errMsg);
+  const parked = releaseOwned(
+    job,
+    "parking a terminal failure",
+    `download_status = 'failed', partial_file_path = ?, last_error = ?`,
+    [partial, message],
+  );
+  if (!parked) return false;
+  stats.failed++;
+  stats.unavailable++;
+  // Only an unclassified permanent error is worth a line in error.log: the
+  // description table knows every expected class, so "not downloadable" means
+  // a message shape nobody has seen yet and an operator should look at it.
+  if (info.code === GENERIC_TERMINAL_INFO.code) {
+    logError("download", `${job.id} ${job.title}: terminal failure (unclassified): ${errMsg.slice(0, 300)}`);
+  }
+  updateWorkerLine(id, `⛔ Skipped — ${info.label} | ${job.title}`, config);
+  return true;
 }
 
 // --- small DB helpers --------------------------------------------------------
@@ -372,16 +1088,17 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
  * the classic single-track plan.
  */
 async function resolveJobAudioTracks(job: Job, config: Config): Promise<AudioTrack[] | null> {
-  if (config.videoQuality === "audio") return null;
+  if (effectiveVideoQuality(job, config) === "audio") return null;
   const known = parseTracksJson(job.audio_tracks);
   if (known) return known;
   const selection = parseSelectionJson(job.audio_selection) || [];
   if (config.multiAudioMode === "off" && selection.length === 0) return null;
   try {
     const tracks = await probeAudioTracks(job.url, config);
-    db.run(`UPDATE jobs SET audio_tracks = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [
+    // Claim-checked: the probe runs inside the claimed download slot, so a
+    // stolen claim must not have its audio state overwritten by the loser.
+    updateClaimedJob("download", job.id, downloadClaim(job), `audio_tracks = ?, updated_at = CURRENT_TIMESTAMP`, [
       JSON.stringify(tracks),
-      job.id,
     ]);
     return tracks;
   } catch (err: any) {
@@ -393,25 +1110,44 @@ async function resolveJobAudioTracks(job: Job, config: Config): Promise<AudioTra
   }
 }
 
-/** The on-disk base name used for a job's files (no extension). */
+/**
+ * The on-disk base name used for a job's files (no extension) — fitted exactly
+ * like `buildDownloadPlan` does, or a lookup for a long title's `.part` misses
+ * the file yt-dlp wrote (see `jobFittedBaseFilename`).
+ */
 function baseNameOf(job: Job): string {
-  return jobBaseFilename(job);
+  return jobFittedBaseFilename(job);
 }
 
-/** Record progress, keeping best_progress as the high-water mark. */
+/**
+ * Record progress, keeping best_progress as the high-water mark.
+ *
+ * Every progress event also renews the claim's lease: a transfer that is
+ * producing output is by definition alive. The update is a claim-token CAS, so
+ * a worker whose claim was reaped cannot keep writing progress over the new
+ * owner's row (the CAS simply changes 0 rows; progress is high-frequency, so
+ * that is not logged here — the outcome paths report the lost claim).
+ */
 function updateJobProgress(
   id: string,
+  claim: ClaimRef,
   pct: number,
   bps: number,
   eta: number,
   totalBytes: number | null,
 ): void {
-  db.run(
-    `UPDATE jobs SET progress = ?, speed = ?, eta = ?,
-       best_progress = MAX(COALESCE(best_progress, 0), ?),
-       file_size = COALESCE(?, file_size)
-     WHERE id = ?`,
-    [pct, bps, eta, pct, totalBytes, id],
+  // Keep the current attempt's progress separate from best_progress. The latter
+  // is committed only when an attempt fails so failure handling can tell whether
+  // this attempt advanced; eagerly taking MAX here would make that comparison
+  // always false.
+  updateClaimedJob(
+    "download",
+    id,
+    claim,
+    `progress = ?, speed = ?, eta = ?, file_size = COALESCE(?, file_size),
+     download_heartbeat_at = CURRENT_TIMESTAMP`,
+    [pct, bps, eta, totalBytes],
+    `download_status = 'downloading'`,
   );
 }
 
@@ -426,40 +1162,86 @@ function readProgressState(id: string): { retryCount: number; bestProgress: numb
   };
 }
 
-function parkPaused(job: Job): void {
-  db.run(
-    `UPDATE jobs SET download_status = 'paused', download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [job.id],
+// `job` is the claim-time snapshot; the DB is authoritative for a later pause request.
+function isUserPaused(id: string): boolean {
+  const row = db.query("SELECT pause_reason FROM jobs WHERE id = ?").get(id) as { pause_reason: string | null } | null;
+  return row?.pause_reason === "user";
+}
+
+function parkUserPaused(job: Job): void {
+  // Only a still-recorded user pause is parked, and only by the claim's owner:
+  // the pause may have been resumed (or the claim reaped) since the worker's
+  // snapshot was taken.
+  const parked = releaseOwned(
+    job,
+    "parking a user pause",
+    `download_status = 'paused', pause_reason = 'user'`,
+    [],
+    `pause_reason = 'user'`,
   );
+  if (parked) recordJobPartial(job);
+}
+
+function parkPaused(job: Job): void {
+  const parked = releaseOwned(job, "parking an interrupted download", `download_status = 'paused', pause_reason = 'interrupted'`);
+  if (!parked) return;
   // Freeze the resume point: the .part is on disk, and without recording it the
   // job is paused with no resumable partial, so the next attempt restarts the
   // video from zero instead of continuing.
   recordJobPartial(job);
 }
 
-function resetForRetry(id: string, opts: { incrementRetry?: boolean; clearPartial?: boolean } = {}): void {
-  const clearPartial = opts.clearPartial ? 1 : 0;
-  if (opts.incrementRetry) {
-    db.run(
-      `UPDATE jobs SET download_status = 'pending', retry_count = retry_count + 1, download_claimed_by = NULL,
-         partial_file_path = CASE WHEN ? THEN NULL ELSE partial_file_path END, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [clearPartial, id],
-    );
-  } else {
-    db.run(
-      `UPDATE jobs SET download_status = 'pending', retry_count = 0, download_claimed_by = NULL,
-         partial_file_path = CASE WHEN ? THEN NULL ELSE partial_file_path END, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [clearPartial, id],
-    );
-  }
+function resetForRetry(job: Job): boolean {
+  return releaseOwned(
+    job,
+    "resetting for an immediate retry",
+    `download_status = 'pending', retry_count = 0, progress = 0, best_progress = 0,
+     speed = 0, eta = 0, resume_count = 0, last_error = NULL`,
+  );
 }
 
-function recordSuccess(id: string, filePath: string, fileSize: number): void {
-  db.run(
-    `UPDATE jobs SET download_status = 'downloaded', file_path = ?, file_size = ?, partial_file_path = NULL,
-       progress = 100, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [filePath, fileSize, id],
+/** What a completed attempt actually managed to do. */
+export interface DownloadSuccessResult {
+  /** False when the claim was no longer ours — no state was written. */
+  ok: boolean;
+  /** True (with `ok`) when the row was user-paused and must stay parked. */
+  stayedPaused: boolean;
+  /** True when the claim was lost: the caller must not touch the job further. */
+  lostClaim: boolean;
+}
+
+/**
+ * Record the finished media file for `job`.
+ *
+ * The write is a claim-token CAS, so a stale worker whose claim was reclaimed
+ * (or taken over by a second engine process) cannot record its output over the
+ * new owner's row — it reports `lostClaim` and walks away.
+ */
+export function recordSuccess(job: Job, filePath: string, fileSize: number): DownloadSuccessResult {
+  const changes = releaseClaimedJob(
+    "download",
+    job.id,
+    downloadClaim(job),
+    `download_status = CASE WHEN pause_reason = 'user' THEN 'paused' ELSE 'downloaded' END,
+     pause_reason = CASE WHEN pause_reason = 'user' THEN 'user' ELSE NULL END,
+     file_path = ?, file_size = ?, partial_file_path = NULL,
+     progress = 100, best_progress = 100, last_error = NULL`,
+    [filePath, fileSize],
   );
+  if (changes !== 1) {
+    // A deleted row is the expected outcome of a dashboard delete/purge: the
+    // file was written on purpose by the (now-cancelled) operation, so only an
+    // existing row with a different owner is worth an error line.
+    const existing = db.query("SELECT id FROM jobs WHERE id = ?").get(job.id);
+    if (existing) {
+      logError("download", `${job.id} ${job.title}: lost the download claim before recording success — not recorded`);
+    }
+    return { ok: false, stayedPaused: false, lostClaim: true };
+  }
+  const row = db.query("SELECT pause_reason FROM jobs WHERE id = ?").get(job.id) as
+    | { pause_reason: string | null }
+    | null;
+  return { ok: true, stayedPaused: row?.pause_reason === "user", lostClaim: false };
 }
 
 function updateWorkerLine(id: number, text: string, _config: Config): void {

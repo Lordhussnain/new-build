@@ -11,8 +11,43 @@ import { statfs } from "node:fs/promises";
 import { resolve } from "node:path";
 import { db } from "./db";
 import { logError } from "./logger";
-import { activeMetadataProcs, activeProcs, abortController, isPaused, getPauseReason, setPaused } from "./state";
+import {
+  activeConvertJobs,
+  activeConvertProcs,
+  activeDownloadJobs,
+  activeMetadataJobs,
+  activeMetadataProcs,
+  activeProcs,
+  abortController,
+  isPaused,
+  getPauseReason,
+  setPaused,
+} from "./state";
 import type { Config } from "./config";
+
+/**
+ * How long an interrupted child gets to exit on SIGINT before SIGKILL. yt-dlp
+ * needs the grace period to stop its own aria2c child cleanly; ffmpeg usually
+ * dies immediately, and a wedged one must never pin a worker.
+ */
+const KILL_GRACE_MS = 2_000;
+
+/** SIGINT a child, escalating to SIGKILL after the grace period. */
+function interruptChild(proc: Bun.Subprocess | undefined): boolean {
+  if (!proc || proc.exitCode !== null) return false;
+  try {
+    proc.kill("SIGINT");
+  } catch {
+    return true; // it exited between the checks; treat as handled
+  }
+  const timer = setTimeout(() => {
+    try {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+    } catch {}
+  }, KILL_GRACE_MS);
+  (timer as unknown as { unref?: () => void }).unref?.();
+  return true;
+}
 
 export function triggerPause(reason: string): void {
   if (isPaused() && getPauseReason() === reason) return;
@@ -25,13 +60,68 @@ export function triggerPause(reason: string): void {
   }
 }
 
+export interface CancelledStages {
+  /** Jobs whose in-flight download process was interrupted. */
+  downloads: string[];
+  /** Jobs whose in-flight ffmpeg conversion was interrupted. */
+  conversions: string[];
+  /** Jobs whose in-flight sidecar fetch was interrupted. */
+  metadata: string[];
+}
+
+function stagesFor(predicate: (jobId: string) => boolean): CancelledStages {
+  const result: CancelledStages = { downloads: [], conversions: [], metadata: [] };
+  for (const [workerId, jobId] of activeDownloadJobs) {
+    if (!predicate(jobId)) continue;
+    result.downloads.push(jobId);
+    interruptChild(activeProcs.get(workerId));
+  }
+  for (const [workerId, jobId] of activeConvertJobs) {
+    if (!predicate(jobId)) continue;
+    result.conversions.push(jobId);
+    interruptChild(activeConvertProcs.get(workerId));
+  }
+  for (const [workerId, jobId] of activeMetadataJobs) {
+    if (!predicate(jobId)) continue;
+    result.metadata.push(jobId);
+    interruptChild(activeMetadataProcs.get(workerId));
+  }
+  return result;
+}
+
+/**
+ * Interrupt every in-flight child (yt-dlp download, ffmpeg conversion, sidecar
+ * fetch) that belongs to one of `jobIds`.
+ *
+ * This is what makes a dashboard Delete / Purge / Remove-source actually stop
+ * the work: without it the job row disappears but the child process keeps
+ * downloading in the terminal and writes a media file nobody tracks. The kill
+ * is deliberately fire-and-forget — the workers reap their own children and
+ * their claim-guarded updates decide what, if anything, is recorded.
+ */
+export function cancelActiveStages(jobIds: Iterable<string>): CancelledStages {
+  const wanted = new Set(jobIds);
+  if (wanted.size === 0) return { downloads: [], conversions: [], metadata: [] };
+  return stagesFor((jobId) => wanted.has(jobId));
+}
+
+/** Interrupt every in-flight child regardless of job (shutdown / pause-all). */
+export function cancelAllActiveStages(): CancelledStages {
+  return stagesFor(() => true);
+}
+
 export function triggerResume(): void {
   setPaused(false, null);
   try {
     // Re-queue ALL paused jobs (global + user-paused) on an explicit Resume All.
-    // In-flight jobs still holding a claim finish naturally in their worker.
+    // In-flight jobs still holding a claim finish naturally in their worker —
+    // the claim's owner and token are left exactly as they are, so the worker's
+    // own release still matches.
     const stmt = db.run(
-      `UPDATE jobs SET download_status = 'pending', pause_reason = NULL, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
+      `UPDATE jobs SET download_status = 'pending', pause_reason = NULL,
+         download_claimed_by = NULL, download_claimed_at = NULL,
+         download_claim_token = NULL, download_heartbeat_at = NULL,
+         updated_at = CURRENT_TIMESTAMP
        WHERE download_status = 'paused' AND download_claimed_by IS NULL`,
     );
     if (stmt.changes > 0) console.log(`▶️ Re-queued ${stmt.changes} paused job(s).`);
@@ -75,13 +165,18 @@ const NETWORK_PROBES = [
   "https://manifest.googlevideo.com/favicon.ico",
 ];
 
-export async function checkInternet(): Promise<boolean> {
+export type NetworkProbe = () => Promise<boolean>;
+
+export async function defaultNetworkProbe(): Promise<boolean> {
   for (const url of NETWORK_PROBES) {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
-      await fetch(url, { signal: controller.signal, method: "HEAD", redirect: "follow" });
-      clearTimeout(timeout);
+      try {
+        await fetch(url, { signal: controller.signal, method: "HEAD", redirect: "follow" });
+      } finally {
+        clearTimeout(timeout);
+      }
       return true;
     } catch {
       // try the next probe
@@ -90,25 +185,78 @@ export async function checkInternet(): Promise<boolean> {
   return false;
 }
 
-export async function networkMonitor(): Promise<void> {
+export async function checkInternet(probe?: NetworkProbe): Promise<boolean> {
+  return (probe ?? defaultNetworkProbe)();
+}
+
+export interface NetworkMonitorDecision {
+  /** Consecutive failure count after this tick. */
+  consecutiveFails: number;
+  /** Whether the engine should be paused (network down). */
+  shouldPause: boolean;
+  /** Whether a network-caused pause should be resumed. */
+  shouldResume: boolean;
+}
+
+/**
+ * Pure decision logic for one network-monitor tick.
+ *
+ * Separated from the async loop so it is unit-testable without timers or the
+ * shared `abortController`.
+ */
+export function networkMonitorTick(
+  consecutiveFails: number,
+  isUp: boolean,
+  currentlyPaused: boolean,
+  currentPauseReason: string | null,
+): NetworkMonitorDecision {
+  if (!isUp) {
+    const next = consecutiveFails + 1;
+    return {
+      consecutiveFails: next,
+      shouldPause: next >= 2 && !currentlyPaused,
+      shouldResume: false,
+    };
+  }
+  return {
+    consecutiveFails: 0,
+    shouldPause: false,
+    shouldResume: consecutiveFails > 0 && currentPauseReason === "NETWORK_DISCONNECTED",
+  };
+}
+
+export interface NetworkMonitorOptions {
+  /** Injectable probe (default: real fetch against YouTube endpoints). */
+  probe?: NetworkProbe;
+  /** Milliseconds between probes (default: 15 000). */
+  intervalMs?: number;
+}
+
+/**
+ * Continuously monitor network reachability.
+ *
+ * Two consecutive failures pause the engine; a successful probe after a
+ * network-caused pause resumes it. User pauses are never cleared by the
+ * monitor (only "NETWORK_DISCONNECTED" is eligible for auto-resume).
+ */
+export async function networkMonitor(opts: NetworkMonitorOptions = {}): Promise<void> {
+  const probe = opts.probe ?? defaultNetworkProbe;
+  const intervalMs = opts.intervalMs ?? 15_000;
   let consecutiveFails = 0;
   console.log("🌐 Network monitor started.");
   while (!abortController.signal.aborted) {
-    const isUp = await checkInternet();
-    if (!isUp) {
-      consecutiveFails++;
-      if (consecutiveFails >= 2 && !isPaused()) {
-        triggerPause("NETWORK_DISCONNECTED");
-        console.log("🌐 Network down detected. Pausing engine gracefully.");
-      }
-    } else {
-      if (consecutiveFails > 0) {
-        console.log("🌐 Network restored!");
-        consecutiveFails = 0;
-        if (getPauseReason() === "NETWORK_DISCONNECTED") triggerResume();
-      }
+    const isUp = await checkInternet(probe);
+    const decision = networkMonitorTick(consecutiveFails, isUp, isPaused(), getPauseReason());
+    consecutiveFails = decision.consecutiveFails;
+    if (decision.shouldPause) {
+      triggerPause("NETWORK_DISCONNECTED");
+      console.log("🌐 Network down detected. Pausing engine gracefully.");
     }
-    await Bun.sleep(15000);
+    if (decision.shouldResume) {
+      console.log("🌐 Network restored!");
+      triggerResume();
+    }
+    await Bun.sleep(intervalMs);
   }
 }
 
@@ -121,6 +269,26 @@ export interface DiskUsage {
   totalBytes: number;
   /** Why every probe failed, when they all did (for the error log). */
   error?: string;
+}
+
+/**
+ * Injection points for the disk-probe fallback chain. Production callers pass
+ * nothing; the tests use them to force each step of the chain (a build with no
+ * `statfs`, a Windows host, a shell that hangs or answers nonsense) on any
+ * machine — the unsupported-`statfs` and PowerShell branches are otherwise
+ * unreachable off a broken Windows box.
+ */
+export interface DiskProbeOptions {
+  /** statfs implementation. `null` = this Bun build has none (calling it throws). */
+  statfs?: typeof statfs | null;
+  /** Platform gate for the PowerShell fallback. */
+  platform?: NodeJS.Platform;
+  /** Existence gate for the fallback's "nothing on disk to measure" rule. */
+  pathExists?: (path: string) => boolean;
+  /** The bounded PowerShell round-trip; resolves to the shell's stdout, or null. */
+  runPowerShell?: (drive: string) => Promise<string | null>;
+  /** Ceiling for the PowerShell round-trip. */
+  timeoutMs?: number;
 }
 
 /**
@@ -139,12 +307,16 @@ export interface DiskUsage {
  * here, on every platform: the shell fallback deliberately refuses to answer
  * for a drive when there is nothing on it to measure.
  */
-export async function diskUsage(path: string): Promise<DiskUsage> {
+export async function diskUsage(path: string, opts: DiskProbeOptions = {}): Promise<DiskUsage> {
+  const statfsFn = opts.statfs === undefined ? statfs : opts.statfs;
   try {
-    const stats = await statfs(path);
+    // Exactly what an unimplemented Bun build does: the call itself throws a
+    // TypeError, before any promise exists to catch.
+    if (!statfsFn) throw new TypeError("statfs is not a function");
+    const stats = await statfsFn(path);
     return { freeBytes: stats.bavail * stats.bsize, totalBytes: stats.blocks * stats.bsize };
   } catch (e: any) {
-    const fallback = await windowsDiskUsage(path);
+    const fallback = await windowsDiskUsage(path, opts);
     if (fallback) return fallback;
     return { freeBytes: -1, totalBytes: -1, error: String(e?.code || e?.message || e) };
   }
@@ -156,23 +328,45 @@ const POWERSHELL_TIMEOUT_MS = 8000;
 const POWERSHELL_MEMO_TTL_MS = 15000;
 const driveMemo = new Map<string, { at: number; usage: DiskUsage }>();
 
+/**
+ * The drive letter a path explicitly names (`D:\…`, `c:/…`), or "" when it
+ * names none.
+ *
+ * The test is deliberately syntactic: only a `X:` prefix answers. Resolving
+ * first would make the answer depend on the HOST rather than on the path — on
+ * win32 `resolve("/tmp/videos")` and `resolve("./downloads")` both land on the
+ * current directory's drive, so every relative path (and every POSIX-style
+ * absolute one) would come back as "C". That is a guessed volume, and "no
+ * drive, nothing to measure" is exactly what the PowerShell fallback needs to
+ * be able to say. Callers that do know their run directory resolve the path
+ * before asking — see `windowsDiskUsage`.
+ */
+export function driveLetterOf(path: string): string {
+  const drive = /^([A-Za-z]):/.exec(path.trim());
+  return drive ? drive[1] : "";
+}
+
 /** Get-PSDrive probe for win32; null when it cannot answer. */
-async function windowsDiskUsage(path: string): Promise<DiskUsage | null> {
+async function windowsDiskUsage(path: string, opts: DiskProbeOptions = {}): Promise<DiskUsage | null> {
   try {
-    if (process.platform !== "win32") return null;
-    const root = resolve(path); // e.g. D:\Downloads\YT
+    if ((opts.platform ?? process.platform) !== "win32") return null;
+    const exists = opts.pathExists ?? existsSync;
     // A path that is not on disk has no volume to measure, and the shell would
     // happily answer for the *drive* it sits under — which would silently mask
     // the "unknown" state the dashboard and the low-disk guard exist to surface.
     // Cheaper than the spawn too, which matters: no statfs means every probe
     // here costs a PowerShell start.
-    if (!existsSync(root)) return null;
-    const drive = root.slice(0, 1); // "D"
-    if (!/^[A-Za-z]$/.test(drive)) return null;
+    if (!exists(path)) return null;
+    // A relative output root ("downloads", or the default "./downloads") is
+    // still on a drive, and `driveLetterOf` only answers for an explicit `X:`
+    // prefix — so resolve such a path against the run directory instead of
+    // declaring the volume unknown.
+    const drive = driveLetterOf(path) || driveLetterOf(resolve(path));
+    if (!drive) return null;
     const key = drive.toUpperCase();
     const memo = driveMemo.get(key);
     if (memo && Date.now() - memo.at < POWERSHELL_MEMO_TTL_MS) return memo.usage;
-    const usage = await getPSDriveFreeSpace(drive);
+    const usage = await getPSDriveFreeSpace(drive, opts);
     // Only successful answers are memoized; a failure must stay retryable.
     if (usage) driveMemo.set(key, { at: Date.now(), usage });
     return usage;
@@ -182,7 +376,44 @@ async function windowsDiskUsage(path: string): Promise<DiskUsage | null> {
 }
 
 /** One bounded Get-PSDrive round-trip; null on any failure. */
-async function getPSDriveFreeSpace(drive: string): Promise<DiskUsage | null> {
+async function getPSDriveFreeSpace(drive: string, opts: DiskProbeOptions = {}): Promise<DiskUsage | null> {
+  const timeoutMs = opts.timeoutMs ?? POWERSHELL_TIMEOUT_MS;
+  // The outer race bounds the *injected* probe too (and any implementation
+  // that ignores its signal), so a hung shell can never stall a caller even if
+  // the child-process timeout below is bypassed.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutGuard = new Promise<null>((resolveTimeout) => {
+    timer = setTimeout(() => resolveTimeout(null), timeoutMs);
+  });
+  try {
+    const work = opts.runPowerShell ? opts.runPowerShell(drive) : runPSDriveProbe(drive, timeoutMs);
+    const out = await Promise.race<string | null>([work, timeoutGuard]);
+    if (out === null) return null;
+    return parsePSDriveOutput(out);
+  } catch {
+    return null;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * Parse Get-PSDrive's `"<free> <used>"` line. Exported for tests: the shell's
+ * output shapes (bytes, an error banner, an empty string) are the part that
+ * decides degraded vs measured, and they are impossible to produce on demand
+ * from a real shell.
+ */
+export function parsePSDriveOutput(out: string): DiskUsage | null {
+  const [free, used] = out.trim().split(/\s+/).map((n) => parseFloat(n));
+  if (!Number.isFinite(free)) return null;
+  return {
+    freeBytes: free,
+    totalBytes: Number.isFinite(used) ? free + used : -1,
+  };
+}
+
+/** Spawn `powershell … Get-PSDrive`, hard-killed at `timeoutMs`; stdout or null. */
+async function runPSDriveProbe(drive: string, timeoutMs: number): Promise<string | null> {
   const proc = Bun.spawn(
     [
       "powershell",
@@ -201,19 +432,13 @@ async function getPSDriveFreeSpace(drive: string): Promise<DiskUsage | null> {
           proc.kill("SIGKILL");
         } catch {}
         resolveTimeout(null);
-      }, POWERSHELL_TIMEOUT_MS);
+      }, timeoutMs);
     });
     const reading = Promise.all([new Response(proc.stdout).text(), proc.exited]);
     const result = await Promise.race<[string, number] | null>([reading, timedOut]);
     if (!result) return null; // shell never answered
     const [out, code] = result;
-    if (code !== 0) return null;
-    const [free, used] = out.trim().split(/\s+/).map((n) => parseFloat(n));
-    if (!Number.isFinite(free)) return null;
-    return {
-      freeBytes: free,
-      totalBytes: Number.isFinite(used) ? free + used : -1,
-    };
+    return code === 0 ? out : null;
   } catch {
     return null;
   } finally {
@@ -224,8 +449,9 @@ async function getPSDriveFreeSpace(drive: string): Promise<DiskUsage | null> {
 export async function checkDiskSpace(
   path: string,
   minGB: number,
+  opts: DiskProbeOptions = {},
 ): Promise<{ free: number; ok: boolean }> {
-  const usage = await diskUsage(path);
+  const usage = await diskUsage(path, opts);
   if (usage.freeBytes < 0) {
     // Degraded mode: never permanently brick the engine over a failed probe —
     // log once and allow (yt-dlp will still surface a real disk-full error).
@@ -247,6 +473,11 @@ export async function checkDiskSpace(
 // Kill in-flight children on shutdown; called by the lifecycle module.
 export function killActiveChildren(): void {
   for (const [, proc] of activeProcs) {
+    try {
+      proc.kill("SIGINT");
+    } catch {}
+  }
+  for (const [, proc] of activeConvertProcs) {
     try {
       proc.kill("SIGINT");
     } catch {}

@@ -1,7 +1,7 @@
 // tests/config.test.ts — shared config schema: defaults, validation, loading.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -57,7 +57,9 @@ describe("parseConfig", () => {
 
   test("rejects out-of-range values", () => {
     expect(() => parseConfig({ webPort: 99999 })).toThrow();
-    expect(() => parseConfig({ videoQuality: "4k" })).toThrow();
+    // "4k" is one of the seven presets the dashboard can set; "8k" is not.
+    expect(() => parseConfig({ videoQuality: "4k" })).not.toThrow();
+    expect(() => parseConfig({ videoQuality: "8k" })).toThrow();
     expect(() => parseConfig({ targetFormat: "avi" })).toThrow();
     expect(() => parseConfig({ subtitleFormat: "txt" })).toThrow();
     expect(() => parseConfig({ maxConcurrentDownloads: 0 })).toThrow();
@@ -121,13 +123,21 @@ describe("saveConfig", () => {
     const loaded = await loadConfigSafe(path);
     expect(loaded.webPort).toBe(5555);
     expect(loaded.maxResumeAttempts).toBe(2);
+    // Replacing an existing config is supported; no temp-file litter remains.
+    await saveConfig({ ...config, playlists: ["https://youtube.com/playlist?list=PL_saved"] }, path);
+    expect((await loadConfig(path)).playlists).toHaveLength(1);
+    expect(await readdir(dir)).toEqual(["config.json"]);
   });
 
   test("rejects an invalid config before writing", async () => {
     const dir = await mkdtemp(join(tmpdir(), "yta-config-"));
     dirs.push(dir);
     const path = join(dir, "config.json");
+    await saveConfig({ ...DEFAULT_CONFIG, playlists: ["keep-me"] }, path);
+    const before = await readFile(path, "utf8");
     await expect(saveConfig({ ...DEFAULT_CONFIG, webPort: 0 }, path)).rejects.toThrow();
+    expect(await readFile(path, "utf8")).toBe(before);
+    expect(await readdir(dir)).toEqual(["config.json"]);
   });
 });
 

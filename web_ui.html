@@ -312,6 +312,39 @@
       outline: none;
       border-color: var(--accent);
     }
+
+    .source-manager {
+      background: var(--bg-card);
+      padding: 18px 20px;
+      border-radius: 12px;
+      margin-bottom: 20px;
+      border: 1px solid var(--border);
+    }
+    .source-manager-heading {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .source-manager-heading h3 { font-size: 0.95rem; }
+    .source-list { display: grid; gap: 8px; margin-top: 12px; }
+    .source-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-width: 0;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-secondary);
+    }
+    .source-info { min-width: 0; }
+    .source-url { overflow-wrap: anywhere; font-size: 0.82rem; }
+    .source-kind { color: var(--text-secondary); font-size: 0.72rem; margin-top: 2px; }
+    .source-empty { color: var(--text-secondary); font-size: 0.82rem; padding: 10px 0; }
+    .source-remove { flex: 0 0 auto; padding: 6px 10px; font-size: 0.75rem; }
     
     .log-viewer {
       background: var(--bg-secondary);
@@ -587,6 +620,13 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 0.72rem;
     }
+    .override-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; }
+    .override-field { display: flex; flex-direction: column; gap: 5px; font-size: 0.73rem; color: var(--text-secondary); }
+    .override-field select {
+      width: 100%; padding: 7px 8px; border-radius: 7px; border: 1px solid var(--border);
+      background: var(--bg-secondary); color: var(--text-primary); font-size: 0.76rem;
+    }
+    @media (max-width: 420px) { .override-fields { grid-template-columns: 1fr; } }
     .jobs-table tbody tr { cursor: pointer; }
     .jobs-table tbody tr:hover { background: rgba(255, 255, 255, 0.03); }
     .jobs-table tbody tr.selected { background: rgba(59, 130, 246, 0.12); }
@@ -723,10 +763,20 @@
   <div class="workers-strip" id="workersStrip" title="Live worker status — download (DL), metadata (MD) and conversion (CV) workers"></div>
   
   <div class="add-url-section">
-    <h3 style="margin-bottom: 10px;">➕ Add New Playlist/Channel</h3>
-    <input type="text" id="newUrlInput" placeholder="Paste YouTube playlist or channel URL here..." />
-    <input type="text" id="folderOverride" placeholder="Optional: Custom folder name" />
-    <button class="btn btn-primary" onclick="scanUrl()">📡 Scan & Add to Queue</button>
+    <h3 style="margin-bottom: 10px;">➕ Save a Playlist, Channel or Video</h3>
+    <input type="text" id="newUrlInput" placeholder="Paste a full YouTube playlist, channel or video URL..." />
+    <input type="text" id="folderOverride" placeholder="Optional: Custom folder for this scan" />
+    <button class="btn btn-primary" id="scanUrlButton" onclick="scanUrl()">📡 Save &amp; Scan</button>
+    <p class="stat-sub" style="margin-top: 8px;">Sources are saved to config.json for future runs. Re-scanning skips videos already in the archive.</p>
+  </div>
+
+  <div class="source-manager">
+    <div class="source-manager-heading">
+      <h3>📚 Saved sources</h3>
+      <button class="btn btn-secondary" style="padding: 5px 10px; font-size: 0.75rem;" onclick="loadSources()">🔄 Refresh</button>
+    </div>
+    <p class="stat-sub">Removing a source deletes it from config.json and removes its exclusively owned jobs from the database. Jobs also used by another saved source stay queued. Already-downloaded files are not deleted.</p>
+    <div id="savedSources" class="source-list"><div class="source-empty">Loading sources...</div></div>
   </div>
   
   <div class="reliability-panel">
@@ -922,6 +972,7 @@
 
     let selectedJobs = new Set();
     let lastFailedCount = 0;
+    let lastUnavailableCount = 0;
     let wasPaused = false;
     let lastRefreshAt = 0;
 
@@ -1187,11 +1238,23 @@
         if (data.isPaused && !wasPaused) {
           showNotification(`⏸️ Downloads paused${data.pauseReason ? ` (${data.pauseReason})` : ''}`, 'warning');
         }
-        if ((data.stats?.failed || 0) > lastFailedCount) {
-          showNotification(`❌ ${(data.stats?.failed || 0) - lastFailedCount} download(s) failed`, 'error');
+        // Terminal skips are counted in `failed` (the video was not archived)
+        // but are not failures to worry about: "private video" is a permanent
+        // fact, not an incident. Report them separately so a playlist full of
+        // dead entries does not read as a broken engine.
+        const failedNow = data.stats?.failed || 0;
+        const unavailableNow = data.stats?.unavailable || 0;
+        const unavailableDelta = Math.max(0, unavailableNow - lastUnavailableCount);
+        const failedDelta = failedNow - lastFailedCount - unavailableDelta;
+        if (unavailableDelta > 0) {
+          showNotification(`⛔ ${unavailableDelta} video(s) skipped — unavailable, never retried`, 'warning');
+        }
+        if (failedDelta > 0) {
+          showNotification(`❌ ${failedDelta} download(s) failed`, 'error');
         }
 
-        lastFailedCount = data.stats?.failed || 0;
+        lastFailedCount = failedNow;
+        lastUnavailableCount = unavailableNow;
         wasPaused = data.isPaused || false;
 
         lastJobs = jobsData.jobs || [];
@@ -1241,9 +1304,10 @@
         engineEl.innerHTML = d.engine === 'aria2c'
           ? `<span class="pill ok">aria2c ×${d.connectionsPerDownload ?? '?'}</span>`
           : '<span class="pill">yt-dlp native</span>';
+        const js = d.jsRuntime ? `${d.jsRuntime.name} n-challenge solver` : 'no JS runtime (YouTube n-challenge will fail)';
         engineEl.title = d.engine === 'aria2c'
-          ? `aria2c at ${d.path || 'PATH'} — ${d.connectionsPerDownload ?? '?'} connections per download, ${d.maxBandwidthKBps ? d.maxBandwidthKBps + ' KB/s cap' : 'uncapped'}`
-          : 'yt-dlp built-in downloader (install aria2c for multi-connection speed)';
+          ? `aria2c at ${d.path || 'PATH'} — ${d.connectionsPerDownload ?? '?'} connections per download, ${d.maxBandwidthKBps ? d.maxBandwidthKBps + ' KB/s cap' : 'uncapped'}; ${js}`
+          : `yt-dlp built-in downloader (install aria2c for multi-connection speed); ${js}`;
       }
       setText('relConnections', d.engine === 'aria2c' ? `${d.connectionsPerDownload ?? '?'} / download` : 'n/a (native)');
       setText('relFragments', `${d.concurrentFragments ?? '?'} parallel`);
@@ -1350,8 +1414,10 @@
         const resumeNote = willResume
           ? `<div class="job-subnote"><span class="pill ok" title="${escapeHtml(job.partial_file_path)}\naria2c control: ${escapeHtml(`${job.partial_file_path}.aria2`)}">⏸️ partial · will resume</span></div>`
           : '';
+        const errorText = formatLastError(job.last_error);
+        const errorIcon = errorText.startsWith('⛔') ? '' : '⚠️ ';
         const errorNote = job.last_error && (status === 'failed' || status === 'paused')
-          ? `<div class="job-subnote" title="${escapeHtml(job.last_error)}">⚠️ ${escapeHtml(job.last_error.slice(0, 90))}</div>`
+          ? `<div class="job-subnote" title="${escapeHtml(errorText)}">${errorIcon}${escapeHtml(errorText.slice(0, 90))}</div>`
           : '';
         const isChecked = selectedJobs.has(job.id) ? 'checked' : '';
         const location = job.file_path || job.output_directory || job.folder || '';
@@ -1362,8 +1428,8 @@
         }[meta] || escapeHtml(meta);
 
         return `
-          <tr data-job-id="${job.id}" onclick="openJobDetailById('${job.id}', event)" title="Click for details">
-            <td><input type="checkbox" class="job-checkbox" data-id="${job.id}" ${isChecked} onchange="toggleJobSelection('${job.id}')" /></td>
+          <tr data-job-id="${escapeHtml(job.id)}" onclick="openJobDetailById(this.dataset.jobId, event)" title="Click for details">
+            <td><input type="checkbox" class="job-checkbox" data-id="${escapeHtml(job.id)}" ${isChecked} onchange="toggleJobSelection(this.dataset.id)" /></td>
             <td>
               ${escapeHtml(job.title || 'Unknown')}
               ${location ? `<div style="font-size: 0.72rem; color: var(--text-secondary); margin-top: 3px; word-break: break-all;" title="${escapeHtml(location)}">📍 ${escapeHtml(location)}</div>` : ''}
@@ -1381,7 +1447,9 @@
             <td><span class="status-badge ${statusClass}">${escapeHtml(badgeText)}</span>${attemptNote}${resumeNote}${errorNote}</td>
             <td style="font-size: 0.78rem;">${metaBadge}</td>
             <td>
-              ${status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>` : '-'}
+              ${status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob(this.closest('[data-job-id]').dataset.jobId)">🔄 Retry</button>` : ''}
+              ${isStoppable(job) ? `<button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" title="Interrupt this job now — the in-flight downloader is stopped, and a kept partial resumes on Retry." onclick="stopJob(this.closest('[data-job-id]').dataset.jobId)">⏹️ Stop</button>` : ''}
+              ${status === 'failed' || isStoppable(job) ? '' : '-'}
             </td>
           </tr>
         `;
@@ -1392,6 +1460,34 @@
       await fetch(`/api/retry/${encodeURIComponent(id)}`, { method: 'POST' });
       showNotification('🔄 Job queued for retry', 'success');
       refreshData();
+    }
+
+    // Show Stop only while something is actually running — the row where "why
+    // is this still going?" is a real question. POST /api/jobs/:id/stop parks a
+    // downloading job as a user pause (keeping its partial, so Retry resumes
+    // it) and releases any conversion/metadata claim. A row that has not
+    // started yet is left alone: holding those is what the selection's
+    // "Pause Selected" is for.
+    function isStoppable(job) {
+      return job.download_status === 'downloading'
+        || job.conversion_status === 'in_progress'
+        || job.metadata_status === 'in_progress';
+    }
+
+    async function stopJob(id) {
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/stop`, { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+          const kept = data.job?.pause_reason === 'user' && data.job?.download_status === 'paused';
+          showNotification(kept ? '⏹️ Stopped — partial kept, Retry resumes it' : '⏹️ Job stopped', 'success');
+          refreshData();
+        } else {
+          showNotification(`❌ ${data.error || 'Stop failed'}`, 'error');
+        }
+      } catch {
+        showNotification('❌ Failed to stop the job', 'error');
+      }
     }
     
     async function togglePause() {
@@ -1416,6 +1512,63 @@
       // fetchStatus() keeps the button in sync with the server from here on.
     }
     
+    async function loadSources() {
+      const container = document.getElementById('savedSources');
+      if (!container) return;
+      container.innerHTML = '<div class="source-empty">Loading sources...</div>';
+      try {
+        const res = await fetch('/api/sources', { cache: 'no-store' });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Unable to load saved sources');
+        const sources = data.sources || [];
+        if (!sources.length) {
+          container.innerHTML = '<div class="source-empty">No saved sources. Add one above to keep it in config.json.</div>';
+          return;
+        }
+        const labels = { playlists: 'Playlist / single video', channels: 'Channel', channelPlaylists: 'Channel playlists' };
+        container.innerHTML = sources.map(source => `
+          <div class="source-row">
+            <div class="source-info">
+              <div class="source-url" title="${escapeHtml(source.url)}">${escapeHtml(source.url)}</div>
+              <div class="source-kind">${escapeHtml(labels[source.key] || source.key)} · ${Number(source.trackedJobs) || 0} tracked database job(s)</div>
+            </div>
+            <button class="btn btn-danger source-remove" data-remove-source data-source-url="${escapeHtml(source.url)}">🗑️ Remove</button>
+          </div>
+        `).join('');
+        container.querySelectorAll('[data-remove-source]').forEach(button => {
+          button.addEventListener('click', () => removeSavedSource(button.dataset.sourceUrl, button));
+        });
+      } catch (error) {
+        container.innerHTML = `<div class="source-empty">Could not load saved sources: ${escapeHtml(error.message || error)}</div>`;
+      }
+    }
+
+    async function removeSavedSource(sourceUrl, button) {
+      if (!sourceUrl) return;
+      if (!confirm(`Remove this saved source from config.json and delete its unshared database jobs?\n\n${sourceUrl}\n\nAlready-downloaded files will remain on disk.`)) return;
+      if (button) button.disabled = true;
+      try {
+        const res = await fetch('/api/sources', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: sourceUrl })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          showNotification(`❌ ${data.error || 'Could not remove source'}`, 'error');
+          return;
+        }
+        const retained = data.retainedJobs ? ` ${data.retainedJobs} shared job(s) remain because another saved source uses them.` : '';
+        showNotification(`✅ Source removed; ${data.deletedJobs || 0} database job(s) deleted.${retained}`, 'success');
+        await loadSources();
+        await fetchStatus();
+      } catch (error) {
+        showNotification('❌ Failed to remove source. Check the connection and try again.', 'error');
+      } finally {
+        if (button) button.disabled = false;
+      }
+    }
+
     async function scanUrl() {
       const url = document.getElementById('newUrlInput').value.trim();
       const folder = document.getElementById('folderOverride').value.trim();
@@ -1425,6 +1578,10 @@
         return;
       }
       
+      const button = document.getElementById('scanUrlButton');
+      if (button.disabled) return;
+      button.disabled = true;
+      button.textContent = '⏳ Saving & scanning...';
       try {
         const res = await fetch('/api/scan', {
           method: 'POST',
@@ -1433,16 +1590,25 @@
         });
         const data = await res.json();
 
-        if (data.ok) {
-          showNotification(`✅ ${data.message || 'URL scanned and added to queue'}`, 'success');
-          document.getElementById('newUrlInput').value = '';
-          document.getElementById('folderOverride').value = '';
+        if (res.ok && data.ok) {
+          showNotification(`✅ ${data.message || 'Source saved to config.json and scanned'}`, 'success');
+          // A scan may take a while; don't erase a new URL typed meanwhile.
+          if (document.getElementById('newUrlInput').value.trim() === url) {
+            document.getElementById('newUrlInput').value = '';
+            if (document.getElementById('folderOverride').value.trim() === folder) {
+              document.getElementById('folderOverride').value = '';
+            }
+          }
           refreshData();
+          loadSources();
         } else {
           showNotification(`❌ ${data.error}`, 'error');
         }
       } catch (err) {
-        showNotification('❌ Failed to scan URL', 'error');
+        showNotification('❌ Save/scan request failed. Check the connection and try again; duplicate sources are skipped.', 'error');
+      } finally {
+        button.disabled = false;
+        button.textContent = '📡 Save & Scan';
       }
     }
     
@@ -1470,18 +1636,23 @@
           return;
         }
         
-        container.innerHTML = data.failed.map(job => `
-          <div class="history-item">
+        container.innerHTML = data.failed.map(job => {
+          const reason = formatLastError(job.last_error) || 'Unknown error';
+          const terminal = reason.startsWith('⛔');
+          const reasonColor = terminal ? 'var(--text-secondary)' : 'var(--danger)';
+          return `
+          <div class="history-item" data-job-id="${escapeHtml(job.id)}">
             <h4>${escapeHtml(job.title)}</h4>
-            <p style="color: var(--danger); margin: 10px 0;">${escapeHtml(job.last_error || 'Unknown error')}</p>
+            <p style="color: ${reasonColor}; margin: 10px 0;">${escapeHtml(reason)}</p>
             <div class="history-meta">
               <span>Folder: ${escapeHtml(job.folder)}</span>
               <span>Retries: ${job.retry_count || 0} · meta: ${job.metadata_retry_count || 0} · convert: ${job.conversion_retry_count || 0}</span>
-              <button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>
-              <button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" onclick="resetFailCount('${job.id}')">🔢 Reset Count</button>
+              <button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob(this.closest('[data-job-id]').dataset.jobId)">🔄 Retry</button>
+              <button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" onclick="resetFailCount(this.closest('[data-job-id]').dataset.jobId)">🔢 Reset Count</button>
             </div>
           </div>
-        `).join('');
+        `;
+        }).join('');
       } catch (err) {
         document.getElementById('failedItems').innerHTML = '<p style="padding: 20px; color: var(--danger);">Failed to load failed items</p>';
       }
@@ -1564,6 +1735,18 @@
       return `${s}s`;
     }
     
+    // The engine records a terminal skip as "[terminal] <reason> — skipped, it
+    // will not be retried automatically. yt-dlp: …" (see src/retry.ts). Show
+    // the reason, not the raw yt-dlp tail: a private video is not an error to
+    // debug, it is a decision the engine already made.
+    function formatLastError(message) {
+      const raw = String(message || '');
+      if (!raw.trimStart().toLowerCase().startsWith('[terminal]')) return raw;
+      const rest = raw.trimStart().slice('[terminal]'.length).trim();
+      const label = (rest.split(' — ')[0] || '').trim() || 'Not downloadable';
+      return `⛔ ${label} — skipped, never auto-retried`;
+    }
+
     function escapeHtml(text) {
       if (!text) return '';
       return text.toString()
@@ -1617,19 +1800,34 @@
       const host = document.getElementById('settingsFields');
       if (!settingsSnapshot) { host.innerHTML = ''; return; }
 
+      // Every group the API sends is rendered, in the server's own order.
+      // A hardcoded list here used to silently DROP every field whose group it
+      // did not name — which is how storage, watching and advanced settings
+      // were missing from this panel even though /api/settings exposed them.
+      const GROUP_TITLES = {
+        downloader: '🚀 Downloader',
+        media: '🎵 Media & audio',
+        concurrency: '⚡ Concurrency',
+        reliability: '🛡️ Reliability & resume',
+        storage: '💾 Storage & disk',
+        watching: '📡 Sources & watching',
+        advanced: '🧪 Advanced',
+      };
+      const order = Object.keys(GROUP_TITLES);
+      const present = [...new Set(settingsSnapshot.fields.map(f => f.group))];
       const groups = [
-        ['downloader', '🚀 Downloader'],
-        ['media', '🎵 Media & audio'],
-        ['concurrency', '⚡ Concurrency'],
-        ['reliability', '🛡️ Reliability & resume'],
+        ...order.filter(g => present.includes(g)),
+        // A group the UI has no title for still renders under its raw name,
+        // so a future field can never vanish from the panel again.
+        ...present.filter(g => !order.includes(g)),
       ];
-      const byGroup = new Map(groups.map(g => [g[0], []]));
+      const byGroup = new Map(groups.map(g => [g, []]));
       for (const f of settingsSnapshot.fields) byGroup.get(f.group)?.push(f);
 
-      host.innerHTML = groups.map(([key, title]) => {
+      host.innerHTML = groups.map(key => {
         const rows = byGroup.get(key) || [];
         if (!rows.length) return '';
-        return `<div class="settings-group"><h4>${title}</h4>${rows.map(renderSettingRow).join('')}</div>`;
+        return `<div class="settings-group"><h4>${GROUP_TITLES[key] || escapeHtml(key)}</h4>${rows.map(renderSettingRow).join('')}</div>`;
       }).join('');
       updateSaveButton();
     }
@@ -1638,6 +1836,11 @@
       const value = settingsDraft[f.key] !== undefined ? settingsDraft[f.key] : settingsSnapshot.values[f.key];
       const dirty = settingsDraft[f.key] !== undefined ? ' is-dirty' : '';
       const unit = f.unit ? `<span class="unit">${escapeHtml(f.unit)}</span>` : '';
+      // The engine reads these once at launch, so the saved value is not live.
+      // Saying so on the row beats the old behaviour of silently ignoring it.
+      const restart = f.restartRequired
+        ? `<span class="pill warn" title="Read once at startup — the saved value applies after the engine restarts.">restart</span>`
+        : '';
       let control = '';
 
       if (f.type === 'boolean') {
@@ -1666,7 +1869,7 @@
 
       return `<div class="setting-row${dirty}" data-key="${f.key}">
           <div class="desc">
-            <div class="name">${escapeHtml(f.label)}</div>
+            <div class="name">${escapeHtml(f.label)}${restart}</div>
             <div class="help">${escapeHtml(f.help)}</div>
           </div>
           <div>${control}</div>
@@ -1734,6 +1937,9 @@
     // Per-job detail drawer.
     // ---------------------------------------------------------------------
     let lastJobs = [];
+    let audioOverrideDirty = false;
+    let jobQualityDirty = false;
+    let jobTargetFormatDirty = false;
 
     async function openJobDetailById(id, event) {
       if (event && event.target && event.target.closest('input,button,a')) return;
@@ -1757,6 +1963,54 @@
     }
 
     // ------------------------------------------------------------------
+    // Per-video quality / output-container controls. The global settings remain
+    // untouched; the override endpoint can save these and retry atomically.
+    // ------------------------------------------------------------------
+    function renderJobOverrideSection(job) {
+      const qualityOptions = [
+        ['', 'Use global quality'],
+        ['highest', 'Highest available'],
+        ['4k', '4K (up to 2160p)'],
+        ['1440p', '1440p'],
+        ['1080p', '1080p'],
+        ['720p', '720p'],
+        ['480p', '480p'],
+        ['audio', 'Best audio only'],
+      ];
+      const formatOptions = [
+        ['', 'Use global format'],
+        ['mp4', 'MP4'],
+        ['mkv', 'MKV'],
+        ['mp3', 'MP3 (extract audio)'],
+      ];
+      const quality = job.video_quality || '';
+      const targetFormat = job.target_format || '';
+      const active = job.download_status === 'downloading' ||
+        job.conversion_status === 'in_progress' || job.metadata_status === 'in_progress';
+      const qualitySelect = qualityOptions.map(([value, label]) =>
+        `<option value="${value}" ${quality === value ? 'selected' : ''}>${label}</option>`).join('');
+      const formatSelect = formatOptions.map(([value, label]) =>
+        `<option value="${value}" ${targetFormat === value ? 'selected' : ''}>${label}</option>`).join('');
+      const actionLabel = job.download_status === 'downloaded' ? '💾 Save & re-download' : '💾 Save overrides & retry';
+      return `<div class="audio-tracks-box">
+          <div class="k" style="margin-bottom:6px;">Per-video download overrides</div>
+          <div class="override-fields">
+            <label class="override-field">Quality
+              <select id="jobOverrideQuality" onchange="jobQualityDirty = true">${qualitySelect}</select>
+            </label>
+            <label class="override-field">Target format
+              <select id="jobOverrideTargetFormat" onchange="jobTargetFormatDirty = true">${formatSelect}</select>
+            </label>
+          </div>
+          <div style="font-size:0.7rem; color:var(--text-secondary); margin:4px 0 9px; line-height:1.4;">
+            These choices affect only this video. “Use global” follows the current app setting. Audio-track changes below are included if you edit them.
+            ${job.download_status === 'downloaded' ? ' The existing file is kept until the replacement succeeds.' : ''}
+          </div>
+          <button class="btn btn-success" style="padding:6px 10px; font-size:0.74rem;" onclick="saveJobOverride(this.closest('[data-job-id]').dataset.jobId)" ${active ? 'disabled title="Wait for the active job stage to finish"' : ''}>${actionLabel}</button>
+        </div>`;
+    }
+
+    // ------------------------------------------------------------------
     // Audio track picker — YouTube's "Audio track" menu, per downloaded
     // video: original + auto-dubbed tracks, saved per job and applied on
     // the next download attempt.
@@ -1770,7 +2024,7 @@
           <div style="font-size:0.74rem; color: var(--text-secondary); margin-bottom:8px;">
             Not discovered yet. Find what YouTube offers (original + auto-dubbed tracks), then pick which to keep.
           </div>
-          <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks('${job.id}')">🔍 Find audio tracks</button>
+          <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks(this.closest('[data-job-id]').dataset.jobId)">🔍 Find audio tracks</button>
         </div>`;
       }
       const rows = tracks.map((t) => {
@@ -1778,23 +2032,70 @@
         const badge = t.isDefault ? ' <span style="opacity:0.65;">· original</span>' : '';
         const tbr = t.tbr ? ` <span style="opacity:0.55;">· ${Math.round(t.tbr)} kbps</span>` : '';
         return `<label style="display:flex; align-items:center; gap:8px; margin:4px 0; font-size:0.76rem; cursor:pointer;">
-            <input type="checkbox" class="audio-track-check" data-lang="${escapeHtml(t.language)}" ${checked ? 'checked' : ''} />
+            <input type="checkbox" class="audio-track-check" data-lang="${escapeHtml(t.language)}" onchange="audioOverrideDirty = true" ${checked ? 'checked' : ''} />
             <span>${escapeHtml(t.label)} <span class="mono" style="opacity:0.55;">(${escapeHtml(t.language)} · ${escapeHtml(t.formatId)})</span>${badge}${tbr}</span>
           </label>`;
       }).join('');
       const modeNote = sel
         ? 'Per-video selection saved. It is applied on the next download attempt.'
         : 'Following the global multi-audio setting until you save a per-video selection.';
+      const downloaded = job.download_status === 'downloaded';
       return `<div class="audio-tracks-box">
           <div class="k" style="margin-bottom:6px;">Audio tracks (${tracks.length})</div>
           ${rows}
-          <div style="font-size:0.7rem; color: var(--text-secondary); margin:6px 0 8px;">${escapeHtml(modeNote)} Use <b>Retry job</b> to re-download with the saved tracks.</div>
+          <div style="font-size:0.7rem; color: var(--text-secondary); margin:6px 0 8px;">${escapeHtml(modeNote)}${downloaded ? ' This video is already downloaded — saving &amp; re-downloading replaces it (the previous file is kept until the new download succeeds).' : ''}</div>
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveAudioSelection('${job.id}')">💾 Save selection</button>
-            ${sel ? `<button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="resetAudioSelection('${job.id}')">↩️ Use global setting</button>` : ''}
-            <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks('${job.id}')">🔄 Re-scan</button>
+            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveAudioSelection(this.closest('[data-job-id]').dataset.jobId, ${downloaded})">💾 ${downloaded ? 'Save &amp; re-download' : 'Save selection'}</button>
+            ${sel ? `<button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="resetAudioSelection(this.closest('[data-job-id]').dataset.jobId)">↩️ Use global setting</button>` : ''}
+            <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks(this.closest('[data-job-id]').dataset.jobId)">🔄 Re-scan</button>
           </div>
         </div>`;
+    }
+
+    function jobOverridePayload(audioTracks, retry) {
+      const quality = document.getElementById('jobOverrideQuality')?.value || '';
+      const targetFormat = document.getElementById('jobOverrideTargetFormat')?.value || '';
+      const payload = { retry };
+      if (jobQualityDirty) payload.videoQuality = quality || null;
+      if (jobTargetFormatDirty) payload.targetFormat = targetFormat || null;
+      if (audioTracks !== undefined) payload.audioTracks = audioTracks;
+      return payload;
+    }
+
+    async function submitJobOverride(id, audioTracks, retry, successText) {
+      const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/override`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(jobOverridePayload(audioTracks, retry)),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Could not save the per-video override');
+      audioOverrideDirty = false;
+      jobQualityDirty = false;
+      jobTargetFormatDirty = false;
+      showNotification(successText, 'success');
+      const fresh = await fetchJob(id);
+      if (fresh) openJobDetail(fresh);
+      refreshData();
+      return data;
+    }
+
+    async function saveJobOverride(id) {
+      const boxes = document.querySelectorAll('#drawerBody .audio-track-check');
+      const tracks = audioOverrideDirty && boxes.length
+        ? [...boxes].filter(b => b.checked).map(b => b.dataset.lang)
+        : undefined;
+      try {
+        await submitJobOverride(
+          id,
+          tracks,
+          true,
+          '🎬 Saved per-video settings and queued a fresh download',
+        );
+      } catch (err) {
+        showNotification(`❌ ${err.message}`, 'error');
+        refreshData();
+      }
     }
 
     async function probeJobAudioTracks(id) {
@@ -1811,37 +2112,50 @@
       }
     }
 
-    async function saveAudioSelection(id) {
-      const boxes = document.querySelectorAll('.audio-track-check');
+    async function saveAudioSelection(id, andRedownload) {
+      // Scope to the drawer: only this job's checkboxes count. The quality and
+      // target-format controls are included too, so this button is one atomic
+      // save/re-download action rather than a second save followed by retry.
+      const boxes = document.querySelectorAll('#drawerBody .audio-track-check');
       const tracks = [...boxes].filter(b => b.checked).map(b => b.dataset.lang);
       try {
-        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/audio-tracks`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tracks }),
-        });
-        const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || 'Save failed');
-        const job = lastJobs.find(j => j.id === id);
-        if (job) { job.audio_selection = data.audio_selection; openJobDetail(job); }
-        showNotification(`🎧 Saved ${tracks.length} audio track(s) for the next download`, 'success');
-        refreshData();
+        await submitJobOverride(
+          id,
+          tracks,
+          !!andRedownload,
+          andRedownload
+            ? `🎧 Re-downloading with ${tracks.length} selected audio track(s)`
+            : `🎧 Saved ${tracks.length} audio track(s) for the next download`,
+        );
       } catch (err) {
         showNotification(`❌ ${err.message}`, 'error');
+        refreshData();
+      }
+    }
+
+    async function fetchJob(id) {
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}`, { cache: 'no-store' });
+        if (!res.ok) return null;
+        const data = await res.json();
+        return data.ok && data.job ? data.job : null;
+      } catch {
+        return null;
       }
     }
 
     async function resetAudioSelection(id) {
       try {
-        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/audio-tracks`, {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/override`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tracks: null }),
+          body: JSON.stringify({ audioTracks: null }),
         });
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Reset failed');
-        const job = lastJobs.find(j => j.id === id);
-        if (job) { job.audio_selection = null; openJobDetail(job); }
+        audioOverrideDirty = false;
+        const fresh = await fetchJob(id);
+        if (fresh) openJobDetail(fresh);
         showNotification('🎧 Following the global multi-audio setting', 'success');
         refreshData();
       } catch (err) {
@@ -1849,7 +2163,64 @@
       }
     }
 
+    // ------------------------------------------------------------------
+    // Sidecar files — subtitles, thumbnail, description. Set per video at
+    // ingest time from the global config, editable here per job; enabling a
+    // flag on a finished download fetches the files right away.
+    // ------------------------------------------------------------------
+    function renderSidecarSection(job) {
+      const flags = [
+        ['subtitles', '📝 Subtitles', 'want_subtitles'],
+        ['thumbnail', '🖼️ Thumbnail', 'want_thumbnail'],
+        ['description', '📄 Description', 'want_description'],
+      ];
+      const rows = flags.map(([key, label, col]) =>
+        `<label style="display:flex; align-items:center; gap:8px; margin:4px 0; font-size:0.76rem; cursor:pointer;">
+           <input type="checkbox" class="sidecar-check" data-key="${key}" ${job[col] ? 'checked' : ''} />
+           <span>${label}</span>
+         </label>`).join('');
+      const sidecars = Array.isArray(job.metadata_files) && job.metadata_files.length
+        ? `<div style="font-size:0.7rem; color: var(--text-secondary); margin-top:6px;">Fetched so far: <span class="mono">${escapeHtml(job.metadata_files.join(', '))}</span></div>`
+        : '';
+      const note = job.download_status === 'downloaded'
+        ? 'Changes are fetched right away against the downloaded file.'
+        : 'Changes apply to the metadata pass after this video downloads.';
+      return `<div class="audio-tracks-box">
+          <div class="k" style="margin-bottom:6px;">Sidecar files</div>
+          ${rows}
+          ${sidecars}
+          <div style="font-size:0.7rem; color: var(--text-secondary); margin:6px 0 8px;">${note} Subtitle languages follow the “Subtitle languages” setting.</div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveSidecarSelection(this.closest('[data-job-id]').dataset.jobId)">💾 Save${job.download_status === 'downloaded' ? ' &amp; fetch' : ''}</button>
+          </div>
+        </div>`;
+    }
+
+    async function saveSidecarSelection(id) {
+      const checks = document.querySelectorAll('#drawerBody .sidecar-check');
+      const body = {};
+      for (const c of checks) body[c.dataset.key] = c.checked;
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/sidecars`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Save failed');
+        showNotification(`📎 Sidecar settings saved${data.metadata_status === 'pending' ? ' — fetching now' : ''}`, 'success');
+        const fresh = await fetchJob(id);
+        if (fresh) openJobDetail(fresh);
+        refreshData();
+      } catch (err) {
+        showNotification(`❌ ${err.message}`, 'error');
+      }
+    }
+
     function openJobDetail(job) {
+      audioOverrideDirty = false;
+      jobQualityDirty = false;
+      jobTargetFormatDirty = false;
       document.getElementById('drawerTitle').textContent = job.title || 'Job';
       const parts = job.partial_file_path || '';
       // aria2c keeps a control file beside the partial; show it so the resume
@@ -1857,13 +2228,16 @@
       const control = parts ? `${parts}.aria2` : '';
       const body = document.getElementById('drawerBody');
 
-      body.innerHTML = `<div class="detail-grid">
+      body.innerHTML = `<div data-job-id="${escapeHtml(job.id)}">
+        <div class="detail-grid">
           ${detailRow('Video ID', job.id, true)}
           ${detailRow('URL', job.url, true)}
           ${detailRow('Folder', job.folder)}
           ${detailRow('Output dir', job.output_directory, true)}
           ${detailRow('Download', job.download_status)}
           ${detailRow('Conversion', job.conversion_status)}
+          ${detailRow('Quality override', job.video_quality || 'Global setting')}
+          ${detailRow('Target format', job.target_format || 'Global setting')}
           ${detailRow('Metadata', job.metadata_status)}
           ${detailRow('File', job.file_path, true)}
           ${detailRow('Size', job.file_size ? formatBytes(job.file_size) : null)}
@@ -1874,15 +2248,21 @@
           ${detailRow('Resumes', job.resume_count || 0)}
           ${detailRow('Kept partial', parts, true)}
           ${detailRow('aria2c control', control, true)}
-          ${detailRow('Last error', job.last_error)}
+          ${detailRow('Last error', formatLastError(job.last_error))}
         </div>
+        ${job.video_quality ? `<div style="margin-top:10px; font-size:0.74rem; color: var(--text-secondary); line-height:1.4;">🎚️ A quality override is either your own choice or one the engine applied automatically because the requested format was not available for this video. Every skipped video records its reason above and is never retried on its own.</div>` : ''}
+        ${renderJobOverrideSection(job)}
         ${renderAudioTrackSection(job)}
+        ${renderSidecarSection(job)}
+        ${job.superseded_file ? `<div style="margin-top:12px; padding:8px 10px; border-radius:8px; background:rgba(59,130,246,0.10); font-size:0.73rem; color: var(--text-secondary);">🔁 Re-download in progress — the previous file is kept as <span class="mono">${escapeHtml(job.superseded_file)}</span> until the new download succeeds, and restored automatically if the re-download fails permanently.</div>` : ''}
         ${job.last_error ? `<div style="margin-top:14px; font-size:0.74rem; color: var(--text-secondary); line-height:1.4;">A kept partial means the next attempt resumes from it. Permanent failures (private / removed / age-gated / geo-blocked) are never retried automatically.</div>` : ''}
         <div style="margin-top:16px; display:flex; gap:8px; flex-wrap:wrap;">
-          <button class="btn btn-success" style="padding:6px 12px; font-size:0.75rem;" onclick="retryJob('${job.id}'); closeJobDetail();">🔄 Retry job</button>
-          <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.75rem;" onclick="openJobDetailById('${job.id}')">🔄 Refresh</button>
+          <button class="btn btn-success" style="padding:6px 12px; font-size:0.75rem;" onclick="retryJob(this.closest('[data-job-id]').dataset.jobId); closeJobDetail();">🔄 Retry job</button>
+          ${isStoppable(job) ? `<button class="btn btn-warning" style="padding:6px 12px; font-size:0.75rem;" onclick="stopJob(this.closest('[data-job-id]').dataset.jobId); closeJobDetail();">⏹️ Stop job</button>` : ''}
+          <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.75rem;" onclick="openJobDetailById(this.closest('[data-job-id]').dataset.jobId)">🔄 Refresh</button>
           <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.75rem;" onclick="closeJobDetail()">Close</button>
-        </div>`;
+        </div>
+      </div>`;
 
       document.getElementById('jobDrawer').classList.add('open');
       document.getElementById('drawerBackdrop').classList.add('open');
@@ -1931,6 +2311,7 @@
     // skips the fetch entirely (browsers throttle its timers anyway) and
     // refreshes once the moment it becomes visible again.
     refreshData();
+    loadSources();
     setInterval(() => { if (!document.hidden) fetchStatus(); }, 5000);
     document.addEventListener('visibilitychange', () => { if (!document.hidden) fetchStatus(); });
   </script>
