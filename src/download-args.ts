@@ -86,11 +86,26 @@ export function buildAria2cArgs(config: Config): string {
   const parts = [`-x ${x}`, `-s ${n}`, `-j ${n}`];
   const split = (config.minSplitSize || "").trim();
   const bytes = split ? parseAria2cSplitSizeBytes(split) : null;
-  // aria2c rejects --min-split-size below 1M (exit 28). yt-dlp's own default is 1M,
-  // so we safely omit the flag when empty, invalid, or <= 1M.
-  if (bytes !== null && bytes > ARIA2C_MIN_SPLIT_SIZE_BYTES) {
+  if (split && bytes === null) {
+    // Not a size at all ("banana", "5X", "1 MB"): hand the value to aria2c
+    // verbatim instead of dropping it. aria2c validates every option before it
+    // transfers a byte and answers an unusable `--min-split-size` with exit 28
+    // plus the option's help block, which the worker turns into the actionable
+    // BAD_DOWNLOADER_ARGS pause — the whole batch stops once, with the reason,
+    // instead of looking like a healthy run that quietly ignores the setting.
+    // Dropping it here would be a silent coercion: the operator asked for a
+    // different split threshold and would never learn their typo was ignored
+    // (the same rule the offline switch follows — an unparsable value is
+    // surfaced, never guessed at).
+    parts.push(`--min-split-size ${split}`);
+  } else if (bytes !== null && bytes > ARIA2C_MIN_SPLIT_SIZE_BYTES) {
+    // A well-formed size above aria2c's 1M floor: yt-dlp's own default is 1M,
+    // so this is the only case that changes anything.
     parts.push(`--min-split-size ${split}`);
   }
+  // A well-formed size at or below the floor is deliberately omitted: yt-dlp's
+  // default (1M) is the closest satisfiable value and there is no typo to
+  // surface, so pausing the run over "512K" would be hostile.
   return parts.join(" ");
 }
 

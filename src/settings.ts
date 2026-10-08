@@ -165,7 +165,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     label: "Minimum split size",
     type: "text",
     group: "downloader",
-    help: "Smallest file aria2c will split across connections (e.g. 1M). Must be an aria2c size like 512K or 1M — a value aria2c rejects pauses the engine (BAD_DOWNLOADER_ARGS) instead of failing every video.",
+    help: "Smallest file aria2c will split across connections (e.g. 1M). A size at or below 1M is clamped to yt-dlp's 1M default; anything that is not a size (e.g. \"banana\") is handed to aria2c, whose rejection pauses the engine (BAD_DOWNLOADER_ARGS) instead of failing every video.",
   },
   {
     key: "concurrentFragments",

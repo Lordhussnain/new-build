@@ -68,6 +68,21 @@ describe("buildAria2cArgs", () => {
     expect(buildAria2cArgs(cfg({ minSplitSize: "4M" }))).toBe("-x 16 -s 16 -j 16 --min-split-size 4M");
   });
 
+  test("hands an unparsable size to aria2c instead of dropping it silently", () => {
+    // aria2c validates options before transferring: an unusable value is exit 28
+    // + the option's help block, which the worker turns into the actionable
+    // BAD_DOWNLOADER_ARGS pause. Dropping the value here would leave the
+    // operator believing a setting was in effect that never was.
+    expect(buildAria2cArgs(cfg({ minSplitSize: "banana" }))).toBe(
+      "-x 16 -s 16 -j 16 --min-split-size banana",
+    );
+    expect(buildAria2cArgs(cfg({ minSplitSize: " 5X " }))).toBe("-x 16 -s 16 -j 16 --min-split-size 5X");
+    // "1 MB" is not junk: the parser accepts whitespace between number and unit,
+    // and the value equals the 1M floor — the satisfiable case, so it is omitted
+    // rather than handed over (nothing for aria2c to reject).
+    expect(buildAria2cArgs(cfg({ minSplitSize: "1 MB" }))).not.toContain("--min-split-size");
+  });
+
   test("clamps nonsensical values", () => {
     expect(buildAria2cArgs(cfg({ connectionsPerDownload: 0 }))).toBe("-x 1 -s 1 -j 1");
     expect(buildAria2cArgs(cfg({ connectionsPerDownload: -5 }))).toBe("-x 1 -s 1 -j 1");

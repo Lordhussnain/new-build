@@ -470,7 +470,9 @@ there, not in the worker. What it emits today:
   installed and `useAria2c` is true. The complete `aria2c:...` value is passed as
   ONE argv element with no inner quotes; yt-dlp shlex-parses the text after the
   prefix. yt-dlp's own baseline is `-x16 -s16 -j16 --min-split-size 1M`, so
-  `minSplitSize` is only emitted when it differs from `1M`.
+  `minSplitSize` is emitted whenever it differs from `1M` — and *also* when it is
+  not a size at all, because a value aria2c rejects must reach aria2c and surface
+  as the `BAD_DOWNLOADER_ARGS` pause instead of being dropped silently.
 - `--limit-rate N` as an integer byte/second value when a cap is configured.
   The configured KB/s cap is divided by the current active slot count and
   converted to bytes/second; there is no per-worker minimum (a minimum would

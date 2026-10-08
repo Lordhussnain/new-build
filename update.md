@@ -492,26 +492,42 @@ cases), the two offline integration scenarios in `tests/integration.test.ts`
 leaves `config.json` unmodified), and the settings sweep-id expectation extended
 with `relocate`.
 
-**Known failures, not from this work (pre-existing).** `bun test` reports four
-failures on this branch (581 pass, 2 skip, 4 fail). All four reproduce on the
-base commit (`c2fd2b7`) with this work unapplied — verified in a clean worktree —
-so none of them is caused by offline mode or the relocation pass:
+### N3 aria2c option validation — RESTORED
 
-1. `integration: aria2c option validation > a malformed downloader option pauses
-   the engine instead of burning the playlist` and
-2. `mock contract: aria2c > rejected arguments: engine pauses with
-   BAD_DOWNLOADER_ARGS and no job is failed`
+The two aria2c scenarios that had been failing on the base commit now pass, and
+no test was weakened to get there. `buildAria2cArgs()` used to *drop*
+`--min-split-size` whenever the value was not a parseable size, so a typo
+(`minSplitSize: "banana"`) was silently ignored: the run downloaded happily with
+yt-dlp's 1M default while the operator believed their setting was in effect, and
+the mock aria2c never saw the flag (no exit 28 → no pause → the two integration
+tests timed out after 33 s). The documented contract — `settings.ts` help,
+`README.md`, `AGENTS.md` §7.1 and `retry.ts isDownloaderArgsError` all say a
+rejected value pauses the engine — is now what the code does:
 
-   Both hang until their 33 s `waitFor`. Root cause: `buildAria2cArgs()` *omits*
-   `--min-split-size` whenever the value is not a parseable size (the `banana`
-   the two tests pass), so the mock aria2c never sees the malformed flag, never
-   exits 28, and the engine never pauses. The tests still assert the old
-   pass-through behaviour. Fix is a product call: either let unparsable values
-   reach aria2c so its rejection surfaces as the actionable
-   `BAD_DOWNLOADER_ARGS` pause, or update the two tests to the current
-   sanitizing behaviour.
+- an **unparsable** value is passed to aria2c verbatim; aria2c validates options
+  before transferring a byte and answers with exit 28 + the option's help block,
+  which the worker turns into the actionable `BAD_DOWNLOADER_ARGS` pause (the
+  queue is parked, never failed). This is the same rule the offline switch
+  follows: an unparsable value is surfaced, never guessed at.
+- a **well-formed size at or below** the 1M floor stays clamped to yt-dlp's 1M
+  default (`512K` is not a typo, and there is no satisfiable lower value for
+  aria2c to use).
 
-3. `update_config.ts covers the config schema > prompts for every non-URL-list
+**Tests:** the new unit case in `tests/download-args.test.ts` ("hands an
+unparsable size to aria2c instead of dropping it silently") pins both halves, and
+the two integration scenarios — `integration: aria2c option validation > a
+malformed downloader option pauses the engine instead of burning the playlist`
+and `mock contract: aria2c > rejected arguments: engine pauses with
+BAD_DOWNLOADER_ARGS and no job is failed` — now complete in ~3.4 s each instead
+of hanging to their timeout.
+
+**Known failures, not from this work (pre-existing).** With the aria2c pair fixed
+(see N3), `bun test` reports **584 pass, 2 skip, 2 fail**. Both failures
+reproduce on the base commit (`c2fd2b7`) with this work unapplied — verified in a
+clean worktree — so neither is caused by offline mode, the relocation pass, or
+the aria2c fix:
+
+1. `update_config.ts covers the config schema > prompts for every non-URL-list
    key` fails with `missing === ["denoPath"]`.
 
    Root cause: `denoPath` is a schema/`DEFAULT_CONFIG` key (the JS runtime for
@@ -521,7 +537,7 @@ so none of them is caused by offline mode or the relocation pass:
    `denoPath` prompt or `denoPath` added to the auto-discovered keys that test
    exempts.
 
-4. `integration: dashboard cancellation > stop, delete, and remove-source all
+2. `integration: dashboard cancellation > stop, delete, and remove-source all
    interrupt the running downloader` times out after 63 s waiting for "the mock
    to record its second SIGINT" (step 1, the stop, passes).
 
