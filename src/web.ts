@@ -828,6 +828,9 @@ const ROUTES: Route[] = [
           : saveJobOverrideById(params.id, config, parsed.value);
         if (changed === "in-progress") return jobInProgressResponse();
         if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+        if (retry && isPaused() && getPauseReason()?.startsWith("BAD_DOWNLOADER_ARGS")) {
+          triggerResume();
+        }
         const saved = db.query("SELECT target_format, video_quality, audio_selection FROM jobs WHERE id = ?").get(params.id) as any;
         return Response.json({
           ok: true,
@@ -849,6 +852,9 @@ const ROUTES: Route[] = [
         const changed = retryJobById(params.id, config);
         if (changed === "in-progress") return jobInProgressResponse();
         if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+        if (isPaused() && getPauseReason()?.startsWith("BAD_DOWNLOADER_ARGS")) {
+          triggerResume();
+        }
         return Response.json({ ok: true });
       } catch (e: any) {
         return Response.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
@@ -1131,6 +1137,9 @@ const ROUTES: Route[] = [
         const changed = retryJobById(params.id, config);
         if (changed === "in-progress") return jobInProgressResponse();
         if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+        if (isPaused() && getPauseReason()?.startsWith("BAD_DOWNLOADER_ARGS")) {
+          triggerResume();
+        }
         return Response.json({ ok: true });
       } catch (e: any) {
         return Response.json({ ok: false, error: String(e?.message || e) }, { status: 500 });

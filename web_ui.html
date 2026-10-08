@@ -2198,7 +2198,10 @@
             These choices affect only this video. “Use global” follows the current app setting. Audio-track changes below are included if you edit them.
             ${job.download_status === 'downloaded' ? ' The existing file is kept until the replacement succeeds.' : ''}
           </div>
-          <button class="btn btn-success" style="padding:6px 10px; font-size:0.74rem;" onclick="saveJobOverride(this.closest('[data-job-id]').dataset.jobId)" ${active ? 'disabled title="Wait for the active job stage to finish"' : ''}>${actionLabel}</button>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn btn-success" data-job-id="${escapeHtml(job.id)}" style="padding:6px 10px; font-size:0.74rem;" onclick="saveJobOverride(this.dataset.jobId || this.closest('[data-job-id]')?.dataset.jobId, true)" ${active ? 'disabled title="Wait for the active job stage to finish"' : ''}>${actionLabel}</button>
+            <button class="btn btn-secondary" data-job-id="${escapeHtml(job.id)}" style="padding:6px 10px; font-size:0.74rem;" onclick="saveJobOverride(this.dataset.jobId || this.closest('[data-job-id]')?.dataset.jobId, false)" ${active ? 'disabled title="Wait for the active job stage to finish"' : ''}>💾 Save only</button>
+          </div>
         </div>`;
     }
 
@@ -2244,21 +2247,21 @@
         </div>`;
     }
 
-    function jobOverridePayload(audioTracks, retry) {
+    function jobOverridePayload(audioTracks, retry, includeAllOverrides = false) {
       const quality = document.getElementById('jobOverrideQuality')?.value || '';
       const targetFormat = document.getElementById('jobOverrideTargetFormat')?.value || '';
       const payload = { retry };
-      if (jobQualityDirty) payload.videoQuality = quality || null;
-      if (jobTargetFormatDirty) payload.targetFormat = targetFormat || null;
+      if (includeAllOverrides || jobQualityDirty) payload.videoQuality = quality || null;
+      if (includeAllOverrides || jobTargetFormatDirty) payload.targetFormat = targetFormat || null;
       if (audioTracks !== undefined) payload.audioTracks = audioTracks;
       return payload;
     }
 
-    async function submitJobOverride(id, audioTracks, retry, successText) {
+    async function submitJobOverride(id, audioTracks, retry, successText, includeAllOverrides = false) {
       const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/override`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(jobOverridePayload(audioTracks, retry)),
+        body: JSON.stringify(jobOverridePayload(audioTracks, retry, includeAllOverrides)),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.ok) throw new Error(data.error || 'Could not save the per-video override');
@@ -2272,7 +2275,11 @@
       return data;
     }
 
-    async function saveJobOverride(id) {
+    async function saveJobOverride(id, retry = true) {
+      if (!id) {
+        showNotification('❌ Could not identify job', 'error');
+        return;
+      }
       const boxes = document.querySelectorAll('#drawerBody .audio-track-check');
       const tracks = audioOverrideDirty && boxes.length
         ? [...boxes].filter(b => b.checked).map(b => b.dataset.lang)
@@ -2281,8 +2288,11 @@
         await submitJobOverride(
           id,
           tracks,
-          true,
-          '🎬 Saved per-video settings and queued a fresh download',
+          !!retry,
+          retry
+            ? '🎬 Saved per-video settings and queued a fresh download'
+            : '💾 Saved per-video settings',
+          true
         );
       } catch (err) {
         showNotification(`❌ ${err.message}`, 'error');
