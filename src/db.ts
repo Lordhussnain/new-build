@@ -106,10 +106,31 @@ function ensureColumn(table: string, column: string, ddl: string): void {
   if (!cols.some((c) => c.name === column)) db.run(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
 }
 
+// Switching a database into WAL needs an exclusive lock, so it can fail with
+// SQLITE_BUSY while a leftover connection still holds the file: an engine that
+// died without releasing its lease (src/lease.ts), the seeding script of a test
+// run, or — on Windows — a file handle that outlives close() by a few hundred
+// milliseconds. A momentary lock is waited out rather than obeyed by skipping
+// the switch: the journal mode is load-bearing, it is what lets the claiming
+// workers and the Web UI read and write the same archive at the same time.
+const WAL_SWITCH_ATTEMPTS = 3;
+const WAL_SWITCH_BACKOFF_MS = 100;
+
 export function initDatabase(path: string = "archive.db"): void {
   db = new Database(path);
-  db.run("PRAGMA journal_mode = WAL;");
+  // Order matters: the busy timeout has to exist before the first statement
+  // that can block. With the previous order the WAL switch ran with SQLite's
+  // default zero timeout, so a momentary lock aborted startup instantly.
   db.run("PRAGMA busy_timeout = 5000;");
+  for (let attempt = 0; ; attempt++) {
+    try {
+      db.run("PRAGMA journal_mode = WAL;");
+      break;
+    } catch (error) {
+      if (attempt >= WAL_SWITCH_ATTEMPTS - 1) throw error;
+      Bun.sleepSync(WAL_SWITCH_BACKOFF_MS * (attempt + 1));
+    }
+  }
   db.run("PRAGMA foreign_keys = ON;");
   db.run(
     `CREATE TABLE IF NOT EXISTS jobs (

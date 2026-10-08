@@ -156,6 +156,74 @@ describe("schema & migrations", () => {
     }
   });
 
+  test(
+    "waits for an archive another process is still holding instead of aborting",
+    async () => {
+      // Opening the archive routinely races a lock: the engine that just died
+      // releases archive.db a beat after its process is gone, and a seeding
+      // script (or, on Windows, the OS) takes even longer to hand the file back.
+      // Switching to WAL needs an exclusive lock, so the busy timeout has to
+      // exist BEFORE that pragma — with the opposite order SQLite answered
+      // SQLITE_BUSY on the first attempt and the engine aborted at startup with
+      // "database is locked" instead of waiting the lock out.
+      const dir = await makeTmpDir();
+      const dbPath = join(dir, "locked.db");
+      const lockFile = join(dir, "holder.lock");
+      const holderScriptPath = join(dir, "lock-holder.ts");
+      // Deliberately not created through initDatabase: the file the holder is
+      // locking must still be in the journal mode a recovering archive is in,
+      // because switching an already-WAL database is a no-op that needs no lock
+      // and would prove nothing.
+
+      // A separate process, because two handles in one process share SQLite's
+      // locks and would prove nothing. The holder script is a file, not `-e`
+      // source: a multi-line argument survives CreateProcess quoting badly.
+      await writeFile(
+        holderScriptPath,
+        [
+          `const { Database } = await import("bun:sqlite");`,
+          `const held = new Database(${JSON.stringify(dbPath)});`,
+          `held.run("BEGIN EXCLUSIVE");`,
+          `await Bun.write(${JSON.stringify(lockFile)}, "locked");`,
+          `await new Promise((resolve) => setTimeout(resolve, 1_500));`,
+          `held.run("COMMIT");`,
+          `held.close();`,
+        ].join("\n") + "\n",
+        "utf8",
+      );
+      const holder = Bun.spawn([process.execPath, "run", holderScriptPath], {
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      try {
+        // Asserting only once the holder says it owns the table lock keeps this
+        // a test of the wait rather than a race with the child's startup.
+        const deadline = Date.now() + 15_000;
+        while (!existsSync(lockFile) && Date.now() < deadline) await Bun.sleep(25);
+        if (!existsSync(lockFile)) {
+          const detail = await new Response(holder.stderr).text();
+          throw new Error(`the lock holder never took the lock: ${detail || `exit ${holder.exitCode}`}`);
+        }
+
+        initDatabase(dbPath);
+        const mode = db.query("PRAGMA journal_mode").get() as { journal_mode?: string } | null;
+        expect(mode?.journal_mode).toBe("wal");
+      } finally {
+        try {
+          holder.kill();
+        } catch {}
+        await holder.exited.catch(() => {});
+        // Same reason as the legacy-schema test above: close the file handle this
+        // test owns before the temp dir goes away, or Windows fails the cleanup.
+        try {
+          db.close();
+        } catch {}
+        initDatabase(":memory:");
+      }
+    },
+    30_000,
+  );
+
   test("creates the status indexes used by the claim queries", () => {
     const indexes = db
       .query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'jobs'")

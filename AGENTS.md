@@ -710,7 +710,7 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/util.test.ts` | formatters, Windows filename hardening, `fitBaseFilename`, hashing |
 | `tests/config.test.ts` | defaults, validation, cross-field refinements, atomic load/save |
 | `tests/sources.test.ts` | URL classification, canonicalization, persisted source lists, dedup, concurrent saves/settings, validation/auth/write failures |
-| `tests/db.test.ts` | schema + legacy migration, atomic claims, the pipeline claim exclusions, all reconcile/requeue sweeps, ingestion dedupe |
+| `tests/db.test.ts` | schema + legacy migration, atomic claims, the pipeline claim exclusions, all reconcile/requeue sweeps, ingestion dedupe, and the busy-wait on an archive another process still holds |
 | `tests/engine-lease.test.ts` | the database-level engine lease: acquisition/refusal, takeover of an expired lease and of one whose owning process is gone, renewal failure after a takeover, the heartbeat's lost-lease signal, release + clean restart (fencing survives), and that the startup/reaper sweeps refuse to run without the lease. Uses file-backed databases and a real second process (`tests/fixtures/claim-worker.ts`) |
 | `tests/claim-races.test.ts` | claim ownership across SEPARATE connections and PROCESSES: two handles cannot claim the same job twice, three processes draining 40 jobs never double-claim (unique token per row), a crashed owner reclaimed only after its lease lapses, a stale worker's progress/release refused after its claim was taken, a long-running heartbeating conversion never reaped (and reaped once the heartbeat stops), metadata reaped on its heartbeat rather than `updated_at`, and two reapers racing one expired claim where exactly one CAS wins |
 | `tests/cookies.test.ts` | `cookiesArgs`/`cookiesState` on a missing/empty/present file, the appeared/updated/disappeared transitions, and `cookiesWatch`'s credential-blocked count |
@@ -719,7 +719,9 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/report.test.ts` | run report contents |
 | `tests/download-args.test.ts` | downloader-engine selection, aria2c args, bandwidth split, fragment/chunk/buffer flags, watchdog scaling, multi-audio selector/multistream flags |
 | `tests/download-output.test.ts` | bounded CR/LF pipe parsing, split UTF-8, oversized-record discard, validated final-path markers |
-| `tests/download-process.test.ts` | a progress-callback failure kills/reaps the downloader and clears active process tracking |
+| `tests/download-process.test.ts` | a progress-callback failure kills/reaps the downloader and clears active process tracking; the orphan check that needs `pgrep` is POSIX-only (9.5) |
+| `tests/scanner.test.ts` | `getPlaylistItems` against a fake yt-dlp: parsed flat-playlist output, a genuine empty answer, a non-zero exit reported instead of swallowed, and the hung-scan kill |
+| `tests/yt-dlp-update.test.ts` | the bounded `yt-dlp -U`: output drained and reported, a failed update's diagnostic, and the hard kill of an updater that hangs |
 | `tests/download-pause.test.ts` | user pause state survives download failure and successful file recording |
 | `tests/download-resume-416.test.ts` | the unrecoverable-resume branch: an HTTP 416 (or aria2c's control-file refusal) discards the `.part` WITH its `.aria2`, zeroes progress/best_progress and re-queues for a fresh transfer; the budget still bounds it; a lost claim writes nothing over the new owner's row; a plain corrupt error still KEEPS the partial |
 | `tests/audio-tracks.test.ts` | track parsing (variant collapse, drc drop, ordering), selection policy incl. per-job override, selector splicing, JSON column round-trips, and `probeAudioTracks` failures against a real child process (non-zero exit, unparsable JSON, and the abort at the timeout — every path the worker's single-audio fallback depends on) |
@@ -870,6 +872,36 @@ open('/tmp/inline.js','w').write('\n;\n'.join(re.findall(r'<script>(.*?)</script
 PY
 node --check /tmp/inline.js   # syntax gate before committing UI changes
 ```
+
+### 9.5 Fixtures that spawn a process (POSIX vs Windows)
+
+`tests/scanner.test.ts` and `tests/yt-dlp-update.test.ts` drive a fake tool binary,
+and four rules there exist because the same suite passed on Linux and failed on
+Windows — an environment assumption is still a broken test:
+
+- **Build the fixture once, in `beforeAll`.** win32 cannot launch a shebang script
+  at all, so the fixture is compiled with `bun build --compile`; the compile costs
+  seconds and the freshly written `.exe` costs more on its first launch
+  (antivirus). Doing it per test overran Bun's 5 s default per-test budget, and
+  the failure that came back was `exit 143` — the harness' own SIGTERM to the
+  dangling fixture, not anything the tool did. Those tests carry an explicit
+  budget (`WIN ? 30_000 : 10_000`) while every bound the test is *about* stays as
+  tight as it was: the 250 ms scan timeout, the 200 ms updater kill.
+- **Configure the fixture with a file, never `process.env`.** `bun test` snapshots
+  the environment, so a variable assigned by a test never reaches a child it
+  spawns — on any platform. The fixture reads `mode.txt` from its own temp dir.
+- **A process-tree probe is POSIX-only.** `pgrep`, `ps`, a `bash` job: wrap the
+  test in `test.skipIf(WIN)` rather than inventing a Windows equivalent, and name
+  in the comment what covers the same guarantee there (`taskkill /t` in
+  `killProcessTree`, and the aria2c scenarios in 9.3 — see gotcha 23). An
+  assertion that cannot tell "no orphans" from "no pgrep binary" is worse than a
+  skip, and an exit code like 130 ("128 + SIGINT") is a shell convention, not a
+  fact about the kill.
+- **Removing a fixture's temp dir must retry.** A child killed moments ago still
+  holds its cwd and executable, so `rm` fails with `EPERM` and surfaces as an
+  "unhandled error between tests". Retry on `EPERM`/`EBUSY`/`ENOTEMPTY` and let
+  the last failure pass quietly: a stray temp dir is noise. Close any database
+  handle the test opened first, or the same lock is what blocks the removal.
 
 ---
 
@@ -1156,6 +1188,17 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     the page's real script against `handleRequest` and fails on a blank table,
     an `undefined` card, or a `/api/…` path the route table no longer has;
     keep it green when adding a dashboard field.
+42. **`PRAGMA busy_timeout` has to precede every statement that can block.**
+    `initDatabase` switches the archive to WAL, and that needs an exclusive lock —
+    held for a moment by an engine that died before releasing its lease,
+    by a harness that seeded the file a beat ago, or on Windows by a handle that
+    outlives `close()`. SQLite's default busy timeout is zero, so with the pragma
+    in the other order the switch answered `SQLITE_BUSY` immediately and the run
+    aborted with "database is locked": a startup failure that reads like a corrupt
+    archive. Set the timeout first and retry the switch, but never skip it —
+    WAL is what lets the claiming workers and the Web UI share one archive.
+    `tests/db.test.ts` holds the file from a second process and fails if the open
+    gives up instead of waiting it out.
 
 ---
 

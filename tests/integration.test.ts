@@ -3032,6 +3032,12 @@ async function seedOfflineArchive(dir: string, mediaPath: string): Promise<void>
     mediaPath,
     12,
   );
+  // Finalize before closing: sqlite3_close_v2 (what bun:sqlite calls) defers the
+  // close while a statement it prepared is still alive, so a `close()` that
+  // leaves `insert` in scope returns without ever releasing the file lock. The
+  // engine then starts against a database it cannot switch to WAL, which is what
+  // killed this scenario on Windows.
+  insert.finalize();
   seedDb.close();
 }
 

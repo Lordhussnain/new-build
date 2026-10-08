@@ -610,3 +610,49 @@ pre-fix page that file fails 8 of its 9 tests (blank table, `undefined` cards,
 three 404 paths); against the fixed page all 9 pass. `bun run check` →
 **595 pass, 2 skip, 0 fail** (the skips are the opt-in real-binary
 compatibility tests), typecheck clean.
+
+### N6 `bun run check` passed on Linux and failed on Windows — FIXED (2026-10-08)
+
+The dashboard fix landed in a Windows run of the suite that reported 7 failures
+and 3 errors — none of them about the dashboard. They were the tests (plus one
+startup path one of them exposed) assuming a POSIX machine, so each is fixed at
+the cause rather than by relaxing an assertion.
+
+- **The engine aborted at startup with `database is locked`.** `initDatabase`
+  switched the archive to WAL *before* setting `busy_timeout`, so the exclusive
+  lock that switch needs was refused on the first attempt whenever another
+  connection still held the file. The offline-mode scenario seeds `archive.db`
+  from the test process a moment before starting the engine, and on Windows the
+  handle outlives `close()` by longer than zero. The timeout is now set first and
+  the switch retried (3 attempts) before it fails loudly; the harness also
+  finalizes its prepared statement before closing, because `sqlite3_close_v2`
+  defers a close while a statement it prepared is still alive — that is what held
+  the lock.
+- **Fixture startup, not the code under test, was timing tests out.**
+  `tests/scanner.test.ts` and `tests/yt-dlp-update.test.ts` compiled their fake
+  binary per test (win32 cannot launch a shebang script), which overran Bun's 5 s
+  per-test default; the run then reported `exit 143` — the harness killing its own
+  dangling fixture — and `timedOut: true` for a self-update whose executable had
+  merely not finished launching. Each file now builds one fixture in `beforeAll`,
+  selects its behaviour from a `mode.txt` (a `process.env` assignment made by a
+  test never reaches a child it spawns under `bun test`), and widens only the
+  launch budget: the 250 ms scan timeout and the 200 ms updater kill are as tight
+  as they were.
+- **Two assertions encoded POSIX.** Exit code 130 is the shell's "128 + SIGINT",
+  and Windows delivers no signals, so that test asserts "not a clean exit" there
+  and the exact code on POSIX. The orphan check (a `bash` job plus `pgrep`) is now
+  skipped on win32 with a note on what covers the same guarantee there —
+  `taskkill /t` in `killProcessTree`, end to end in the aria2c scenarios — instead
+  of reporting a missing binary as a surviving orphan.
+- **`EPERM` from temp-dir cleanup between tests.** A just-killed child holds its
+  cwd and its executable, so `rm` now retries while the lock drains, and a
+  directory that still survives is left unreported rather than raised as an error
+  no test caused.
+
+**Tests:** `tests/db.test.ts` gained *waits for an archive another process is
+still holding instead of aborting*, which locks the file from a second process and
+asserts the open waits it out — flipping the pragma order back reproduces the
+user's exact failure (`SQLiteError: database is locked`, `SQLITE_BUSY`,
+`initDatabase`) in 30 ms, so the guard is real. `bun run check` on Linux →
+**596 pass, 2 skip, 0 fail**, typecheck clean. AGENTS.md gained 9.5 (the fixture
+rules) and gotcha 42 (the pragma order).

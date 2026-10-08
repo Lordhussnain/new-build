@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,72 +6,152 @@ import { DEFAULT_CONFIG } from "../src/config";
 import { getPlaylistItems } from "../src/scanner";
 import { resolvedTools } from "../src/tools";
 
+const WIN = process.platform === "win32";
+
+/**
+ * Every test here launches a real process, and on Windows it is the launch —
+ * not the code under test — that takes seconds: a freshly written .exe has to be
+ * released by its writer and scanned by Defender before CreateProcess will run
+ * it. So the fixture is compiled once for the whole file instead of once per
+ * test, and each test's budget is sized for a launch rather than left at Bun's
+ * five-second default, which the suite used to blow through on Windows and then
+ * report `exit 143` — the harness' own SIGTERM to the dangling fixture, not
+ * something yt-dlp did.
+ */
+const TEST_TIMEOUT_MS = WIN ? 30_000 : 10_000;
+
+type FakeMode = "ok" | "empty" | "fail" | "hang";
+
 const originalYtDlp = resolvedTools.ytDlp;
-const tempDirs: string[] = [];
+let fixtureDir = "";
+let fakeYtDlp = "";
 
-afterEach(async () => {
-  resolvedTools.ytDlp = originalYtDlp;
-  while (tempDirs.length) {
-    const dir = tempDirs.pop();
-    if (dir) await rm(dir, { recursive: true, force: true });
-  }
-});
-
-async function useScanner(mode: "ok" | "empty" | "fail" | "hang"): Promise<void> {
-  const dir = await mkdtemp(join(tmpdir(), "yta-scanner-"));
-  tempDirs.push(dir);
-  const win = process.platform === "win32";
-  const source = join(dir, win ? "fake-yt-dlp.ts" : "fake-yt-dlp");
-  const content = `#!/usr/bin/env bun\nconst mode = ${JSON.stringify(mode)};\nif (mode === "hang") await new Promise(() => {});\nif (mode === "fail") { console.error("ERROR: Failed to extract playlist: scanner test error"); process.exit(7); }\nif (mode === "ok") console.log("Mock Playlist|||scan001|||First Video|||120\\nMock Playlist|||scan002|||Second Video|||NaN");\n`;
-  await writeFile(source, content, "utf8");
-  if (!win) {
-    await chmod(source, 0o755);
-    resolvedTools.ytDlp = source;
-    return;
-  }
-
-  // Bun does not read shebangs on Windows, so compile this fixture into a
-  // native executable just like the integration harness does for its mocks.
-  const executable = join(dir, "fake-yt-dlp.exe");
-  const compiler = Bun.spawn(
-    [process.execPath, "build", "--compile", source, "--outfile", executable],
-    { stdout: "pipe", stderr: "pipe" },
-  );
-  const [, stderr, code] = await Promise.all([
-    new Response(compiler.stdout).text(),
-    new Response(compiler.stderr).text(),
-    compiler.exited,
-  ]);
-  if (code !== 0) throw new Error(`Could not compile scanner fixture: ${stderr}`);
-  resolvedTools.ytDlp = executable;
+/**
+ * Which listing the fake yt-dlp prints, read from a file rather than the
+ * environment: `bun test` snapshots `process.env` at startup, so a variable set
+ * later by a test never reaches a child it spawns — on any platform.
+ */
+async function useScanner(mode: FakeMode): Promise<void> {
+  await writeFile(join(fixtureDir, "mode.txt"), mode, "utf8");
+  resolvedTools.ytDlp = fakeYtDlp;
 }
 
-describe("getPlaylistItems", () => {
-  test("parses successful flat-playlist output", async () => {
-    await useScanner("ok");
-    const items = await getPlaylistItems("https://www.youtube.com/playlist?list=abc", DEFAULT_CONFIG);
-    expect(items).toEqual([
-      { playlist: "Mock Playlist", id: "scan001", title: "First Video", duration: 120 },
-      { playlist: "Mock Playlist", id: "scan002", title: "Second Video", duration: Number.NaN },
-    ]);
-  });
+/**
+ * Remove the temp dir, retrying while Windows still holds it. A child that was
+ * just killed can keep its working directory (or the executable) open for a
+ * moment, and `rm` in that window fails with EPERM. A dir that survives is noise
+ * in the OS temp folder, not a broken test, so the last failure is left
+ * unreported instead of surfacing as an error between tests.
+ */
+async function removeTempDir(dir: string): Promise<void> {
+  for (let attempt = 0; attempt < 15; attempt++) {
+    try {
+      await rm(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EPERM" && code !== "EBUSY" && code !== "ENOTEMPTY") break;
+      await Bun.sleep(200);
+    }
+  }
+}
 
-  test("preserves a valid empty listing", async () => {
-    await useScanner("empty");
-    expect(await getPlaylistItems("https://www.youtube.com/playlist?list=abc", DEFAULT_CONFIG)).toEqual([]);
-  });
+beforeAll(async () => {
+  fixtureDir = await mkdtemp(join(tmpdir(), "yta-scanner-"));
+  await writeFile(
+    join(fixtureDir, "mode.txt"),
+    "empty",
+    "utf8",
+  );
+  const source = join(fixtureDir, WIN ? "fake-yt-dlp.ts" : "fake-yt-dlp");
+  await writeFile(
+    source,
+    [
+      "#!/usr/bin/env bun",
+      `import { readFileSync } from "node:fs";`,
+      `const mode = readFileSync(${JSON.stringify(join(fixtureDir, "mode.txt"))}, "utf8").trim();`,
+      `if (mode === "hang") await new Promise(() => {});`,
+      `if (mode === "fail") { console.error("ERROR: Failed to extract playlist: scanner test error"); process.exit(7); }`,
+      `if (mode === "ok") console.log("Mock Playlist|||scan001|||First Video|||120\\nMock Playlist|||scan002|||Second Video|||NaN");`,
+    ].join("\n") + "\n",
+    "utf8",
+  );
 
-  test("surfaces yt-dlp failure instead of treating it as an empty playlist", async () => {
-    await useScanner("fail");
-    await expect(getPlaylistItems("https://www.youtube.com/playlist?list=abc", DEFAULT_CONFIG)).rejects.toThrow(
-      "yt-dlp playlist scan failed (exit 7): ERROR: Failed to extract playlist: scanner test error",
+  if (!WIN) {
+    await chmod(source, 0o755);
+    fakeYtDlp = source;
+  } else {
+    // Bun does not read shebangs on Windows, so compile the fixture into a
+    // native executable just like the integration harness does for its mocks.
+    const executable = join(fixtureDir, "fake-yt-dlp.exe");
+    const compiler = Bun.spawn(
+      [process.execPath, "build", "--compile", source, "--outfile", executable],
+      { stdout: "pipe", stderr: "pipe" },
     );
-  });
+    const [, stderr, code] = await Promise.all([
+      new Response(compiler.stdout).text(),
+      new Response(compiler.stderr).text(),
+      compiler.exited,
+    ]);
+    if (code !== 0) throw new Error(`Could not compile scanner fixture: ${stderr}`);
+    fakeYtDlp = executable;
+  }
+}, TEST_TIMEOUT_MS);
 
-  test("times out and terminates a hung yt-dlp scan", async () => {
-    await useScanner("hang");
-    await expect(
-      getPlaylistItems("https://www.youtube.com/playlist?list=abc", DEFAULT_CONFIG, { timeoutMs: 250 }),
-    ).rejects.toThrow("yt-dlp playlist scan timed out after 250ms");
-  });
+afterEach(() => {
+  // resolvedTools is module state the whole test process shares, so the override
+  // is dropped as soon as a test is done with it — otherwise the next test file in
+  // the run would spawn this fixture by accident.
+  resolvedTools.ytDlp = originalYtDlp;
+});
+
+afterAll(async () => {
+  resolvedTools.ytDlp = originalYtDlp;
+  if (fixtureDir) await removeTempDir(fixtureDir);
+});
+
+describe("getPlaylistItems", () => {
+  test(
+    "parses successful flat-playlist output",
+    async () => {
+      await useScanner("ok");
+      const items = await getPlaylistItems("https://www.youtube.com/playlist?list=abc", DEFAULT_CONFIG);
+      expect(items).toEqual([
+        { playlist: "Mock Playlist", id: "scan001", title: "First Video", duration: 120 },
+        { playlist: "Mock Playlist", id: "scan002", title: "Second Video", duration: Number.NaN },
+      ]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "preserves a valid empty listing",
+    async () => {
+      await useScanner("empty");
+      expect(await getPlaylistItems("https://www.youtube.com/playlist?list=abc", DEFAULT_CONFIG)).toEqual([]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "surfaces yt-dlp failure instead of treating it as an empty playlist",
+    async () => {
+      await useScanner("fail");
+      await expect(getPlaylistItems("https://www.youtube.com/playlist?list=abc", DEFAULT_CONFIG)).rejects.toThrow(
+        "yt-dlp playlist scan failed (exit 7): ERROR: Failed to extract playlist: scanner test error",
+      );
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "times out and terminates a hung yt-dlp scan",
+    async () => {
+      await useScanner("hang");
+      await expect(
+        getPlaylistItems("https://www.youtube.com/playlist?list=abc", DEFAULT_CONFIG, { timeoutMs: 250 }),
+      ).rejects.toThrow("yt-dlp playlist scan timed out after 250ms");
+    },
+    TEST_TIMEOUT_MS,
+  );
 });
