@@ -197,7 +197,7 @@ function probeTimeoutMs(): number {
 
 export async function probeAudioTracks(
   url: string,
-  config: { cookiesFile: string },
+  config: { cookiesFile: string; userAgent?: string },
   opts: { timeoutMs?: number } = {},
 ): Promise<AudioTrack[]> {
   const timeoutMs = opts.timeoutMs ?? probeTimeoutMs();
@@ -213,6 +213,7 @@ export async function probeAudioTracks(
         url,
         ...cookiesArgs(config),
         ...jsRuntimeArgs(),
+        ...(config.userAgent ? ["--user-agent", config.userAgent] : []),
         "--dump-single-json",
         "--no-playlist",
         "--no-warnings",

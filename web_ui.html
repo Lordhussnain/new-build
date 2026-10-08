@@ -2219,7 +2219,7 @@
           <div style="font-size:0.74rem; color: var(--text-secondary); margin-bottom:8px;">
             Not discovered yet. Find what YouTube offers (original + auto-dubbed tracks), then pick which to keep.
           </div>
-          <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks(this.closest('[data-job-id]').dataset.jobId)">🔍 Find audio tracks</button>
+          <button class="btn btn-secondary" data-job-id="${escapeHtml(job.id)}" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks(this.dataset.jobId || this.closest('[data-job-id]')?.dataset.jobId, this)">🔍 Find audio tracks</button>
         </div>`;
       }
       const rows = tracks.map((t) => {
@@ -2242,7 +2242,7 @@
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
             <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveAudioSelection(this.closest('[data-job-id]').dataset.jobId, ${downloaded})">💾 ${downloaded ? 'Save &amp; re-download' : 'Save selection'}</button>
             ${sel ? `<button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="resetAudioSelection(this.closest('[data-job-id]').dataset.jobId)">↩️ Use global setting</button>` : ''}
-            <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks(this.closest('[data-job-id]').dataset.jobId)">🔄 Re-scan</button>
+            <button class="btn btn-secondary" data-job-id="${escapeHtml(job.id)}" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks(this.dataset.jobId || this.closest('[data-job-id]')?.dataset.jobId, this)">🔄 Re-scan</button>
           </div>
         </div>`;
     }
@@ -2300,17 +2300,35 @@
       }
     }
 
-    async function probeJobAudioTracks(id) {
+    async function probeJobAudioTracks(id, btn) {
+      if (!id) {
+        showNotification('❌ Could not identify job', 'error');
+        return;
+      }
+      const origText = btn ? btn.innerHTML : '';
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '⏳ Scanning YouTube...';
+      }
+      showNotification('🔍 Querying YouTube for available audio tracks...', 'info');
       try {
         const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/audio-probe`, { method: 'POST' });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         if (!res.ok || !data.ok) throw new Error(data.error || 'Audio-track scan failed');
-        const job = lastJobs.find(j => j.id === id);
-        if (job) { job.audio_tracks = data.tracks; openJobDetail(job); }
-        showNotification(`🎧 Found ${data.tracks.length} audio track(s)`, 'success');
-        refreshData();
+        const count = Array.isArray(data.tracks) ? data.tracks.length : 0;
+        showNotification(`🎧 Found ${count} audio track${count === 1 ? '' : 's'}`, 'success');
+        const fresh = await fetchJob(id);
+        if (fresh) {
+          openJobDetail(fresh);
+        } else {
+          refreshData();
+        }
       } catch (err) {
         showNotification(`❌ ${err.message}`, 'error');
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = origText || '🔍 Find audio tracks';
+        }
       }
     }
 
