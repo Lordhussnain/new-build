@@ -72,6 +72,13 @@ export interface Job {
    * download succeeds; restored if the re-download fails permanently.
    */
   superseded_file: string | null;
+  /**
+   * The secondary-storage ROOT this job's media was moved under, or null while
+   * it still lives in the output tree. Compared against the configured
+   * `secondaryStoragePath`, so changing that path makes every file relocated
+   * elsewhere eligible again (see src/relocate.ts).
+   */
+  relocated_to: string | null;
   folder: string;
   index: number;
   duration: number | null;
@@ -218,6 +225,14 @@ export function initDatabase(path: string = "archive.db"): void {
   // Re-download safety net: the previous media file, moved aside while a
   // manual retry re-fetches the video (see reconcile.ts superseded helpers).
   ensureColumn("jobs", "superseded_file", "superseded_file TEXT");
+  // Secondary-storage relocation: the secondary-storage ROOT the finished media
+  // was moved under (NULL = still in the output tree, or never moved). Storing
+  // the root rather than a boolean keeps the pass honest when the operator
+  // points `secondaryStoragePath` at a different location: every job whose
+  // `relocated_to` differs from the current root becomes eligible again, and
+  // jobs already sitting under the configured root are never moved onto
+  // themselves (see src/relocate.ts).
+  ensureColumn("jobs", "relocated_to", "relocated_to TEXT");
   // Claim leases: a random token plus a heartbeat timestamp per stage. Rows
   // claimed by an older engine version have neither (token/claimed_by NULL),
   // which the CAS updates treat as a legacy claim — the reaper may still take
@@ -560,6 +575,95 @@ export function perVideoCap(config: Config): number {
 
 export function isVideoInDb(videoId: string): boolean {
   return !!db.query("SELECT id FROM jobs WHERE id = ?").get(videoId);
+}
+
+// ---------------------------------------------------------------------------
+// Secondary-storage relocation
+// ---------------------------------------------------------------------------
+//
+// A job's finished media can be in the output tree even though no conversion
+// will ever claim it again: it was converted by an earlier version, its
+// conversion finished before secondary storage was configured, or the engine
+// crashed between the copy and the database update. These helpers are the
+// single source of truth for "does this file still need to move?".
+//
+// `relocated_to` stores the secondary-storage ROOT (not a boolean), so a job
+// relocated to the old root becomes eligible again when the operator points
+// `secondaryStoragePath` somewhere new — while a file that already sits under
+// the configured root is never moved onto itself.
+
+/** One relocation candidate, as the pass needs it. */
+export interface RelocationRow {
+  id: string;
+  title: string;
+  folder: string;
+  file_path: string;
+  relocated_to: string | null;
+}
+
+/**
+ * The SQL predicate behind every relocation check: a finished, converted
+ * download whose media is not (yet) recorded under the given root.
+ *
+ * `metadata_status = 'in_progress'` is excluded on purpose — the sidecar pass
+ * writes files next to the media, and moving it out from under that writer
+ * would leave the sidecars behind in the output tree.
+ */
+const RELOCATION_WHERE = `
+  download_status = 'downloaded'
+  AND file_path IS NOT NULL AND file_path != ''
+  AND conversion_status IN ('done', 'not_needed')
+  AND COALESCE(metadata_status, 'not_needed') != 'in_progress'
+  AND (relocated_to IS NULL OR relocated_to != ?)`;
+
+/** Every job whose media still has to reach secondary storage, oldest first. */
+export function listJobsAwaitingRelocation(secondaryStoragePath: string): RelocationRow[] {
+  return db
+    .query(
+      `SELECT id, title, folder, file_path, relocated_to FROM jobs
+        WHERE ${RELOCATION_WHERE}
+        ORDER BY created_at, rowid`,
+    )
+    .all(secondaryStoragePath) as RelocationRow[];
+}
+
+/** How many files are still waiting to move (dashboard / startup status). */
+export function countJobsAwaitingRelocation(secondaryStoragePath: string): number {
+  const row = db
+    .query(`SELECT COUNT(*) as n FROM jobs WHERE ${RELOCATION_WHERE}`)
+    .get(secondaryStoragePath) as { n: number } | null;
+  return row?.n ?? 0;
+}
+
+/** Does this one job still need its file relocated? (re-checked mid-move) */
+export function jobAwaitingRelocation(jobId: string, secondaryStoragePath: string): boolean {
+  return !!db
+    .query(`SELECT 1 FROM jobs WHERE id = ? AND ${RELOCATION_WHERE} LIMIT 1`)
+    .get(jobId, secondaryStoragePath);
+}
+
+/**
+ * Record where a job's media now lives. Compare-and-swaps on the OLD path so a
+ * job whose `file_path` changed meanwhile (re-downloaded, manually retried,
+ * deleted) is never pointed at a file this pass did not put there.
+ *
+ * Used both for the move and for crash-window adoption: a file that already
+ * sits in secondary storage because the previous run died between the copy and
+ * this update is adopted with the same call.
+ *
+ * Returns the number of rows changed (0 = somebody else owns this row now).
+ */
+export function recordRelocatedFile(
+  jobId: string,
+  previousPath: string,
+  newPath: string,
+  relocatedTo: string,
+): number {
+  return db.run(
+    `UPDATE jobs SET file_path = ?, relocated_to = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND file_path = ?`,
+    [newPath, relocatedTo, jobId, previousPath],
+  ).changes;
 }
 
 /** Backfill legacy jobs from a source listing before that source is removed. */

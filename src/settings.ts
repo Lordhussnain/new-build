@@ -23,6 +23,7 @@ export type SettingType = "number" | "boolean" | "text" | "select" | "list";
 
 /** Panel groups, in the order the dashboard renders them. */
 export const SETTING_GROUPS = [
+  "offline",
   "downloader",
   "media",
   "concurrency",
@@ -118,6 +119,15 @@ export const DOWNLOAD_SPEED_PROFILES = {
  * reject — but the schema is still the authority and re-validates on save.
  */
 export const EDITABLE_SETTINGS: SettingField[] = [
+  // --- offline --------------------------------------------------------------
+  {
+    key: "offlineMode",
+    label: "📴 Offline mode (no downloads)",
+    type: "boolean",
+    group: "offline",
+    help:
+      "Stops every download: scans, RSS watching and sidecar fetches are off too, so nothing touches the network. The engine keeps doing local work — converting files that still need conversion and moving finished files to secondary storage — and queued downloads wait, untouched, until the mode is turned off. Applies live; also settable with --offline / YTA_OFFLINE=1 for a single run.",
+  },
   // --- downloader -----------------------------------------------------------
   {
     key: "videoQuality",

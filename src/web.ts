@@ -17,6 +17,7 @@ import { parseSourceUrl, removeSource, saveSource, SOURCE_KEYS, sourceIdentity, 
 import { cancelActiveStages, diskUsage, triggerPause, triggerResume, type CancelledStages } from "./resilience";
 import { removeFromArchive } from "./archive";
 import { requeueFailedJobs, stashDownloadedFile, staleClaimCondition, STALE_CLAIM_THRESHOLDS } from "./reconcile";
+import { relocationPendingCount } from "./relocate";
 import { holdsEngineLease, isLeaseExpired, readEngineLease } from "./lease";
 import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
@@ -307,7 +308,7 @@ const JOB_COLUMNS = `id, url, title, folder, output_directory, file_path, target
                 download_status, conversion_status, metadata_status, pause_reason, metadata_files,
                 retry_count, conversion_retry_count, resume_count, best_progress, last_error,
                 file_size, progress, speed, eta, duration, partial_file_path,
-                audio_tracks, audio_selection, superseded_file,
+                audio_tracks, audio_selection, superseded_file, relocated_to,
                 want_subtitles, want_thumbnail, want_description`;
 
 /** JSON-valued columns in SQLite; hand the dashboard real arrays/nulls. */
@@ -784,6 +785,15 @@ const ROUTES: Route[] = [
         workers,
         isPaused: isPaused(),
         pauseReason: getPauseReason(),
+        // Offline mode: the dashboard shows this instead of letting the operator
+        // wonder why the queue has stopped moving (src/engine.ts).
+        offlineMode: !!config.offlineMode,
+        // Finished files still waiting to reach secondary storage (0 when no
+        // secondary storage is configured).
+        relocation: {
+          path: config.secondaryStoragePath || null,
+          pending: relocationPendingCount(config),
+        },
         diskSpace: { free: diskLabel, percent: parseFloat(diskPercent) },
         system: {
           cpu: "--",
@@ -914,6 +924,13 @@ const ROUTES: Route[] = [
         | { id: string; url: string }
         | null;
       if (!job) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+      // The probe is a live yt-dlp -J call against YouTube.
+      if (config.offlineMode) {
+        return Response.json(
+          { ok: false, error: "Offline mode: probing audio tracks needs the network." },
+          { status: 409 },
+        );
+      }
       try {
         const tracks = await probeAudioTracks(job.url, config);
         db.run(`UPDATE jobs SET audio_tracks = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [
@@ -1269,8 +1286,23 @@ const ROUTES: Route[] = [
           error: `Could not save URL to config.json; no scan was started. ${e?.message || e}`,
         }, { status: 500 });
       }
+      // Offline mode: saving the source is local work and stays useful (it is
+      // queued and scanned at the next online start), but scanning itself is a
+      // network round-trip. Answering with the reason beats a yt-dlp error.
+      const liveConfig = getConfig();
+      if (liveConfig.offlineMode) {
+        return Response.json({
+          ok: true,
+          saved: true,
+          source: savedSource,
+          found: 0,
+          added: 0,
+          skipped: 0,
+          message: `Saved to config.json (${savedSource.key}). Offline mode is on, so scanning is skipped — this source is scanned at the next online start.`,
+        });
+      }
       try {
-        const result = await scanAndIngest(source.url, getConfig(), body.folder?.trim() || undefined);
+        const result = await scanAndIngest(source.url, liveConfig, body.folder?.trim() || undefined);
         const summary = result.found === 0
           ? `No videos found at ${source.url} (check the URL, network, or cookies)`
           : `Scanned ${result.found} video(s): ${result.added} added, ${result.skipped} skipped`;
@@ -1558,6 +1590,14 @@ function reliabilityHandler(config: Config): Response {
       cadence: "every 60s",
       detail: "Failed jobs retry after a cooldown; permanent failures never do.",
       pending: resumableFailed,
+    },
+    {
+      id: "relocate",
+      label: "Moved to secondary storage",
+      cadence: "every 60s",
+      detail:
+        "Finished files that need no conversion are moved into secondary storage (sidecars included). A file already there is adopted, never copied twice.",
+      pending: relocationPendingCount(config),
     },
   ];
 

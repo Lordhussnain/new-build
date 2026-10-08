@@ -397,6 +397,13 @@ export async function checkDependencies(
     ffmpegPath: string;
     aria2cPath?: string;
     useAria2c?: boolean;
+    /**
+     * Offline mode never spawns yt-dlp (no scanning, no downloads, no sidecar
+     * fetches), so a missing yt-dlp is a note there — not the fatal install
+     * hint it is for a normal run. ffmpeg stays required: conversion is the
+     * whole point of an offline pass.
+     */
+    offlineMode?: boolean;
     denoPath?: string;
   },
   search: ToolSearchEnv = {},
@@ -427,6 +434,8 @@ export async function checkDependencies(
     console.log(
       `  ✅ yt-dlp: ${ytdlp.version || "ok"}${ytdlp.path.includes("/") || ytdlp.path.includes("\\") ? `  [${ytdlp.path}]` : "  [PATH]"}`,
     );
+  } else if (config.offlineMode) {
+    console.log("  ⚪ yt-dlp: not found — offline mode only converts and moves existing files");
   } else {
     console.error("  ❌ yt-dlp: not found (PATH, app folder, winget/scoop/chocolatey, ytDlpPath)");
     missing.push(

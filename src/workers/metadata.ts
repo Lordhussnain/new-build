@@ -67,6 +67,21 @@ export async function metadataWorker(id: number, config: Config): Promise<void> 
       await Bun.sleep(2000);
       continue;
     }
+    // Offline mode: every sidecar (subtitles, thumbnail, description,
+    // info.json) is a network fetch, so the pass is skipped entirely. Jobs keep
+    // whatever metadata_status they have — 'pending' ones are fetched, unchanged,
+    // the next time the engine runs online.
+    //
+    // Note the deliberate asymmetry with conversion: a job whose metadata is
+    // still pending stays out of the converter's reach (its claim requires
+    // metadata to be terminal), which is the ordering the operator asked for —
+    // offline mode finishes files that only need local work, and leaves the
+    // rest of the pipeline exactly as it found it.
+    if (config.offlineMode) {
+      updateMetadataWorkerLine(id, "📴 Offline mode — sidecars need network", config);
+      await Bun.sleep(3000);
+      continue;
+    }
     const job = claimMetadataJob(workerId);
     if (!job) {
       await Bun.sleep(2000);

@@ -32,6 +32,8 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Multi-audio tracks** — YouTube's multi-language audio (the player's *Audio track* menu: original + auto-dubbed tracks). Keep every track, or just the languages you want, muxed into one MKV whose audio is switchable in any player — plus a per-video track picker in the dashboard
 - Compatible with authenticated downloads (`--cookies`) and YouTube's n-challenge (a JS runtime — Deno, Node, or Bun — is discovered at startup and passed to yt-dlp)
 - **cookies.txt is watched while the engine runs** — export it from your browser after startup (or replace it when it expires) and the next download attempt uses it; the engine logs the switch and tells you how many credential-blocked jobs it may rescue
+- **Offline mode** — one switch (`offlineMode`, the dashboard's 📴 toggle, `--offline`, or `YTA_OFFLINE=1`) stops every download, scan, RSS watch and sidecar fetch, and leaves the engine doing the work that needs no network: converting files that still need conversion and moving finished files to secondary storage. Queued downloads wait untouched and start when the mode ends
+- **Files that need no conversion still reach secondary storage** — a relocation pass moves finished media (sidecars included) whose conversion is already done, adopts a file a crashed run copied but never recorded, and re-relocates everything when `secondaryStoragePath` points somewhere new. It never copies a file onto itself and never overwrites a job that was re-downloaded meanwhile
 - **Web dashboard** with live job status, bulk actions, failed-job recovery, a reliability panel, per-job detail, and an in-browser settings editor for the downloader
 
 ## Tech Stack
@@ -93,6 +95,7 @@ For example (omitted keys use their defaults):
   "playlists": ["https://www.youtube.com/playlist?list=..."],
   "channels": ["https://www.youtube.com/@SomeChannel"],
   "channelPlaylists": ["https://www.youtube.com/@SomeChannel/playlists"],
+  "offlineMode": false,
   "outputRoot": "D:/Downloads/YT",
   "targetFormat": "mp4",
   "downloadSubtitles": true,
@@ -104,6 +107,40 @@ For example (omitted keys use their defaults):
 Keep `config.json` private: it can contain source URLs and a `webToken`.
 `cookies.txt` contains authentication credentials and must also stay local; do
 not commit either file.
+
+### Offline mode (no downloads)
+
+`offlineMode: true` turns the engine into a local post-processor: **nothing is
+downloaded**, and the only work left is the work that needs no network.
+
+| Stage | Offline mode |
+| --- | --- |
+| Scans, RSS watching, daemon rescans | **off** — nothing touches YouTube |
+| Downloads (yt-dlp / aria2c) | **off** — queued jobs stay `pending`, unclaimed, with their `.part` files intact |
+| Metadata sidecars (subs/thumbnail/description/info.json) | **off** — every sidecar is a network fetch; `pending` stays `pending` |
+| Conversion (ffmpeg) | **on** — files that still need conversion are converted |
+| Secondary-storage move | **on** — finished files are moved, sidecars included |
+| Cookie validation, network monitor | **off** — a disconnected network must not pause the run |
+
+Queued downloads are *left exactly as they are*: they are not skipped, failed,
+or paused, so turning offline mode off resumes the queue where it stood. The
+file that gets converted or moved is finished for real — a converted file is
+recorded, and a moved file's new path is recorded, both with the same
+crash-safe updates a normal run uses.
+
+Turn it on from the dashboard (**⚙️ Settings → 📴 Offline mode**, applied live,
+no restart), from `config.json`, from `bun run config`, or for a single run
+without touching `config.json`:
+
+```bash
+bun run start --offline        # this run only; config.json is not modified
+bun run start --offline=false  # override a machine-wide YTA_OFFLINE=1
+YTA_OFFLINE=1 bun run start    # same as --offline (scheduled tasks, shortcuts)
+```
+
+The dashboard shows a blue **📴 Offline mode** banner while it is on, with how
+many finished files are still waiting to move to secondary storage, and the
+Reliability panel lists that relocation pass like the other sweeps.
 
 ### Adding sources from the Web UI
 
@@ -261,8 +298,8 @@ media — no re-download; flipping one off never deletes files already fetched.
 
 ### Tuning from the dashboard
 
-The **⚙️ Settings** button opens an editor for the downloader, media format,
-concurrency, and reliability settings. Changes are validated against the same
+The **⚙️ Settings** button opens an editor for offline mode, the downloader,
+media format, concurrency, storage, and reliability settings. Changes are validated against the same
 Zod schema the engine uses, atomically saved to `config.json`, and applied to the
 running engine; workers pick them up without a restart. The editor is limited to
 an explicit allow-list: source URLs, cookie credentials, the web token, and the
@@ -298,9 +335,11 @@ not a static list of settings:
   the sweep.
 - **Engine lease** — the owner token, fencing generation and expiry of the
   database-level lock, and whether the dashboard's own process holds it.
-- **Self-healing sweeps** — the four sweeps with their cadence and a pending
-  count. Deleted-files is `startup`-only and stats every recorded file, so its
-  count is reported as unknown rather than guessed.
+- **Self-healing sweeps** — each sweep with its cadence and a pending count:
+  crashed jobs, stale claims, deleted files, failed jobs, and the
+  secondary-storage relocation pass (`every 60s`, the count of finished files
+  still waiting to move). Deleted-files is `startup`-only and stats every
+  recorded file, so its count is reported as unknown rather than guessed.
 
 Every count comes from `GET /api/reliability`, which reads the live config (not
 a startup snapshot) and the job table.

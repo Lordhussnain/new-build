@@ -469,11 +469,13 @@ describe("GET /api/reliability — resume + self-healing state", () => {
     }
   });
 
-  test("describes all four self-healing sweeps with a pending count", async () => {
+  test("describes every self-healing sweep with a pending count", async () => {
     const res = await handleRequest(new Request("http://x/api/reliability"), getConfig());
     const body = await res.json();
     const ids = body.sweeps.map((s: any) => s.id);
-    expect(ids).toEqual(["crashed", "staleClaims", "missingFiles", "requeueFailed"]);
+    // The four resume/retry sweeps, plus the secondary-storage relocation pass
+    // (offline mode's other half: files that need no conversion still move).
+    expect(ids).toEqual(["crashed", "staleClaims", "missingFiles", "requeueFailed", "relocate"]);
     for (const s of body.sweeps) {
       expect(s.label.length).toBeGreaterThan(0);
       expect(s.cadence.length).toBeGreaterThan(0);

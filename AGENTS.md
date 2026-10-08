@@ -111,6 +111,7 @@ src/
   retry.ts       PURE retry policy: backoff, watchdog, error classification
   resilience.ts  pause/resume, circuit breaker, network + disk guards (diskUsage = the only statfs caller)
   reconcile.ts   self-healing sweeps (crashes, stale claims, missing files, failed jobs) + partial-file housekeeping
+  relocate.ts    secondary-storage relocation pass (finished files that need no conversion still move)
   sources.ts     Web UI URL validation/canonicalization + durable source-list additions
   scanner.ts     playlist/channel listing + deduplicated ingestion
   autoscale.ts   dynamic download-slot management
@@ -140,6 +141,7 @@ db.ts → config                                  │
 lease.ts → db, logger                           │ (the engine lease; db must never import it)
 resilience.ts → config, db, logger, state       │
 reconcile.ts → archive, config, db, download-args, lease, logger, retry, state, tools│
+relocate.ts → config, db, lease, logger, state, util, workers/convert    │ (relocation pass)
 sources.ts → config, state                     │
 scanner.ts → config, db, state, tools, util     │
 autoscale.ts → db, state                        │
@@ -161,8 +163,13 @@ dependency-free — it is the module that breaks every import cycle.
 
 ### Startup order (engine.ts `main()`)
 
-1. `loadConfig()` → `setConfig()` (must be first: dependency search uses paths from it)
-2. `checkDependencies()` — fails fast with install hints
+1. `loadConfig()` → `setConfig()` (must be first: dependency search uses paths from it).
+   `--offline` / `YTA_OFFLINE` override `offlineMode` in memory **here** (never
+   written to config.json), so a one-off offline pass does not change the next
+   normal start — and the dependency probe below sees it.
+2. `checkDependencies()` — fails fast with install hints. In offline mode a
+   missing yt-dlp is a note, not a failure (nothing spawns it); **ffmpeg stays
+   required** — conversion is the point of an offline pass
 3. `initDatabase("archive.db")` — schema + migrations + claim transactions
 4. `acquireEngineLease()` — **before any sweep: the database-level single-instance
    lock**. A live owner (another process, whatever its web port) makes this
@@ -184,12 +191,16 @@ dependency-free — it is the module that breaks every import cycle.
 7. `startRunHistory()` + heartbeat interval
 8. `mkdir(outputRoot)` → `cleanOrphanedFiles()` → `autoscaler.init()`
 9. cookie validation (if enabled)
-10. scan every configured playlist/channel into the jobs table
+10. scan every configured playlist/channel into the jobs table (skipped in offline mode)
 11. `initDashboard()`
-12. `networkMonitor()`, `reapStaleClaims` (60s, lease-gated), `autoscaleTick`
-    (15s), `requeueFailedJobs` (60s), `cookiesWatch` (60s), `startRssPolling()`
-13. supervised worker pools (download × N, metadata × N, convert × N)
-14. `startAutonomousPolling()` if daemon mode
+12. `networkMonitor()` (off in offline mode), `reapStaleClaims` (60s, lease-gated),
+    `autoscaleTick` (15s), `requeueFailedJobs` (60s), `cookiesWatch` (60s, off in
+    offline mode), `startRssPolling()` (off in offline mode), `startRelocation()`
+    (one pass +5s, then every 60s)
+13. supervised worker pools (download × N, metadata × N, convert × N — the download
+    and metadata loops stay idle in offline mode; workers are always started, so a
+    live settings toggle takes effect without a restart)
+14. `startAutonomousPolling()` if daemon mode (off in offline mode)
 
 ---
 
@@ -223,6 +234,7 @@ dependency-free — it is the module that breaks every import cycle.
 | `audio_tracks` | JSON array of discovered audio tracks (null = not probed yet) |
 | `audio_selection` | JSON array of per-job language codes (null = follow the global multi-audio mode) |
 | `superseded_file` | backup path of the previous media file while a deliberate re-download runs (see §7.2) |
+| `relocated_to` | the secondary-storage ROOT this job's media was moved under (NULL = still in the output tree). A root, not a boolean, so pointing `secondaryStoragePath` somewhere new re-offers every file; written by `finalizeConversion` (conversion move), `relocateFinishedJobs` (relocation/adoption) and cleared by `recordSuccess` (a fresh download lands in the output tree) |
 | `progress`, `speed`, `eta` | live values for the dashboard |
 | `last_error` | last failure message (classified by `retry.ts`) |
 
@@ -362,6 +374,8 @@ re-queues a failed sidecar pass on an already-converted job.
 | Missing-file reconciliation | `reconcile.ts reconcileMissingFiles()` | scrubs the yt-dlp archive + re-queues |
 | Failed-job sweep | `reconcile.ts requeueFailedJobs()` | after cooldown, non-permanent failures start a fresh per-video retry window; permanent download errors are skipped; `ignoreCooldown` for the UI button |
 | Partial-file cleanup | `reconcile.ts cleanOrphanedFiles()` | keeps every resume-able partial — `pending`/`downloading`/`paused`/`waiting_live` owners and retryable failures waiting for cooldown are **never** aged out; deletes exhausted partials when auto-requeue is disabled, partials nothing will resume once they are a week old (`PARTIAL_MAX_AGE_MS`), day-old orphans (`ORPHAN_PARTIAL_MAX_AGE_MS`) and unowned `.superseded` backups. Recorded paths and walked paths are compared through `pathKey()` (absolute + case-folded), because the DB stores absolute paths while the walk is relative to `outputRoot`. Returns `{removed, locked}`: a partial whose control file is locked keeps BOTH files, is counted as `locked`, logged, and retried by a later sweep — never counted as removed |
+| Offline mode | `config.ts offlineMode` + `offlineOverrideFromRuntime()` → loop guards in `workers/download.ts`, `workers/metadata.ts` | No download, no scan, no RSS, no sidecar fetch, no cookie validation, no network monitor: every one of those is a network round-trip. The download and metadata loops idle (workers are still started, so flipping the setting live works), queued jobs keep their status and `.part` files, and conversion + relocation keep running. Conversion deliberately keeps its ordering rule (`claimConvertJob` still requires terminal metadata), so a job waiting on sidecars waits — the mode finishes local work, it does not reorder the pipeline. `--offline`/`YTA_OFFLINE` set it for one run only; the stored setting is untouched |
+| Secondary-storage relocation | `relocate.ts relocateFinishedJobs()` (driven by `startRelocation()`) | Moves finished media (sidecars first, `moveToSecondaryStorage`) whose conversion is already `done`/`not_needed`, adopts a file a crashed run copied but never recorded, and re-offers every file when `secondaryStoragePath` changes (that is what `relocated_to` stores — the ROOT, not a boolean). Claim-free by design: one engine per `archive.db` (lease) + one pass in flight per process + idempotent steps + a CAS on the old path. It never moves a job that is downloading/converting/mid-sidecar, a file already under the root, or a job deleted mid-move |
 | Superseded-file recovery | `reconcile.ts reconcileSupersededFiles()` | startup heal of the deliberate-re-download hand-off: rolls back a stash whose rename never ran (`file_path` not yet recorded), restores a backup whose retry never became claimable, drops a backup whose re-download already finished, and adopts a legacy rename-first backup instead of letting the missing-file sweep re-queue the video |
 | Archive scrubbing | `archive.ts removeFromArchive()` | needed whenever a file disappears, else yt-dlp skips it forever |
 | Signature self-heal | `workers/download.ts` | auto-runs `yt-dlp -U` and retries with a clean budget |
@@ -421,6 +435,19 @@ toggles. Its reliability menu should use `STALE_CLAIM_THRESHOLDS` for sweep
 values. If changing its resume-state display, ensure it opens `archive.db`:
 `config.archiveFile` is yt-dlp's plain-text history file, not the SQLite job
 database.
+
+Offline key: `offlineMode` (boolean, default false) — no downloads at all; the
+engine only converts files that need conversion and moves finished files to
+secondary storage, leaving queued jobs untouched. It is the one setting whose
+runtime override (`--offline` / `YTA_OFFLINE=1`, parsed by
+`offlineOverrideFromRuntime()`) is applied to the in-memory config only, before
+`checkDependencies()`; `config.json` is never rewritten by it. In offline mode a
+missing yt-dlp is a note instead of a fatal install hint, `ffmpeg` remains
+required, and the relocation pass (below) keeps the archive tidy.
+
+Relocation key: `secondaryStoragePath` pairs with the jobs table's
+`relocated_to` column — the secondary-storage root each file was moved under.
+NULL means "still in the output tree".
 
 Reliability keys: `maxResumeAttempts`, `retryBackoffBaseSeconds`,
 `retryBackoffMaxSeconds`, `requeueFailedAfterMinutes`, `verifyExistingFiles`,
@@ -693,6 +720,7 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/web-routes.test.ts` | the `ROUTES` table: canonical per-job routes, the legacy aliases, JSON 404/405 + `Allow`, trailing-slash collapse, active-stage 409 guards across retry/delete/pause/purge, retry-as-re-download (archive scrub + `.superseded` stash), per-job format/quality/audio overrides, and sidecars |
 | `tests/settings.test.ts` | the dashboard settings allow-list, type coercion (including every accepted boolean spelling and the rejection of `"maybe"`/empty — an invalid value must never coerce to `false`), Zod + cross-field validation, persistence, live-config propagation, and auth |
 | `tests/config-manager.test.ts` | every schema key is reachable from `update_config.ts`; the manager reads the sweep thresholds from `STALE_CLAIM_THRESHOLDS` and counts partials with the engine's predicate |
+| `tests/offline-mode.test.ts` | the run-level switch (`--offline`/`YTA_OFFLINE`, last flag wins, argv beats env, unparsable ≠ false), the settings round-trip (live + persisted), `isPathInside` (siblings sharing a prefix are NOT inside), and `relocateFinishedJobs`: move + sidecar + recorded path, idempotence, no-op without `secondaryStoragePath`, crash-window adoption, "already under the root", a non-candidate table (downloading / needs conversion / mid-metadata / failed), a failed move that keeps the only copy, and the stale-path CAS |
 | `tests/dashboard.test.ts` | `formatHeaderLine` counters, and the `Res:n` field appearing only when partials are held |
 | `tests/integration.test.ts` | **end-to-end engine runs** (see 9.3) |
 
@@ -1077,6 +1105,26 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     stage drains stdout/stderr concurrently and kills/reaps a child if reading
     fails or the 10-minute watchdog fires; a child must not outlive a released
     claim. Preserve those bounded-process guarantees when adding a new stage.
+39. **Offline mode gates at CLAIM time, never by rewriting job state.**
+    `workers/download.ts` and `workers/metadata.ts` return to idle BEFORE
+    `claimDownloadJob`/`claimMetadataJob` — no status is written, so a queued job
+    resumes exactly where it stood when the mode ends. Never "solve" offline mode
+    by pausing, skipping or failing the queue (that is work the operator cannot
+    get back), and never let a new network call bypass the guard: scans, RSS,
+    rescans, cookie validation, the network monitor and the audio-track probe all
+    check `config.offlineMode` too.
+40. **The relocation pass has no claim token because it must not need one.**
+    Three things make that safe, and all three are load-bearing: the engine lease
+    (one engine per `archive.db`), `passInFlight` in `relocate.ts` (one pass per
+    process — `relocationTick` also refuses to run while paused or without the
+    lease), and stepwise idempotence (`isPathInside` → nothing to do;
+    `jobAwaitingRelocation()` re-checked before EVERY destructive step; the final
+    update CAS'd on the old `file_path`). Anything that adds a second mover — a
+    worker pool, an unguarded interval, a bypass that skips the re-check — breaks
+    the assumption and can double-copy onto one destination. Anything that resets
+    `file_path` to a file in the output tree (a re-download: see `recordSuccess`)
+    must clear `relocated_to` in the same statement, or the pass will never
+    revisit it.
 
 ---
 
@@ -1091,6 +1139,8 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 | Change claim semantics | `src/db.ts` claim transactions + claim-lease primitives (`updateClaimedJob` / `releaseClaimedJob` / `heartbeatClaim`) → `tests/db.test.ts` (atomicity) + `tests/claim-races.test.ts` (two connections / two processes) |
 | Change engine ownership | `src/lease.ts` (acquisition/renewal/release/fencing) → `tests/engine-lease.test.ts` → the same-database integration scenario in `tests/integration.test.ts` |
 | Add a sweep | `src/reconcile.ts` (pure-ish, take `Config`) → register interval in `src/engine.ts` |
+| Change offline mode | `src/config.ts` (`offlineMode` + `offlineOverrideFromRuntime`) → guards in `src/engine.ts` / `workers/download.ts` / `workers/metadata.ts` → `tests/offline-mode.test.ts` + the offline scenario in `tests/integration.test.ts` |
+| Change relocation | `src/relocate.ts` (+ the `RELOCATION_WHERE` predicate and `relocated_to` in `src/db.ts`, written by `workers/convert.ts finalizeConversion` and `workers/download.ts recordSuccess`) → `tests/offline-mode.test.ts` |
 | Add a worker | `src/workers/<name>.ts` → claim fn in `db.ts` → `supervise()` in `engine.ts` → TUI line in `dashboard.ts` |
 | Support a new site/URL shape | `src/sources.ts parseSourceUrl()` (Web UI validation/source identity) + `src/scanner.ts normalizeVideoUrl()` (job URL canonicalization) |
 | Probe the OS (disk space, …) | `src/resilience.ts diskUsage()` — statfs + PowerShell fallback + degraded mode in one place; never call `statfs` directly (gotcha 22) |

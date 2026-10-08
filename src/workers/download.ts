@@ -128,6 +128,18 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
       await Bun.sleep(2000);
       continue;
     }
+    // Offline mode: NO video is ever downloaded. The loop stays alive (so the
+    // dashboard keeps showing its slots, and flipping the switch back takes
+    // effect on the next iteration) but it never claims a job — queued
+    // downloads are left exactly as they are, and start the moment the mode
+    // ends. The guard is also ahead of the disk check: with nothing to
+    // download, a full output drive is the converter's business, not a reason
+    // to pause the whole engine.
+    if (config.offlineMode) {
+      updateWorkerLine(id, "📴 Offline mode — downloads disabled", config);
+      await Bun.sleep(2000);
+      continue;
+    }
     // Autoscaling gate: a scaled-down slot's worker idles here instead of
     // claiming work (a job already in flight always runs to completion).
     if (!activeDlSlots.has(id)) {
@@ -1228,7 +1240,11 @@ export function recordSuccess(job: Job, filePath: string, fileSize: number): Dow
     `download_status = CASE WHEN pause_reason = 'user' THEN 'paused' ELSE 'downloaded' END,
      pause_reason = CASE WHEN pause_reason = 'user' THEN 'user' ELSE NULL END,
      file_path = ?, file_size = ?, partial_file_path = NULL,
-     progress = 100, best_progress = 100, last_error = NULL`,
+     progress = 100, best_progress = 100, last_error = NULL,
+     -- A fresh download writes into the output tree, so the media is no longer
+     -- in secondary storage: the relocation pass must be allowed to move it
+     -- again once conversion finishes (src/relocate.ts).
+     relocated_to = NULL`,
     [filePath, fileSize],
   );
   if (changes !== 1) {

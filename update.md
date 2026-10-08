@@ -445,3 +445,62 @@ size signal instead of logging noise.
 **Tests:** `tests/cookies.test.ts` — same-bytes rewrite (5× touch) stays quiet, same-size/different-bytes
 is reported, an empty file stays "absent" without noise.
 
+
+---
+
+## Feature log — 2026-10-08 (branch `arena/a22d6b7b-new-build`)
+
+### N1 Offline mode — ADDED
+
+`config.json` gains `offlineMode` (boolean, default `false`), editable live from
+the dashboard (**⚙️ Settings → 📴 Offline mode**) and overridable for a single
+run with `--offline` / `YTA_OFFLINE=1` / `--offline=false` (in-memory only;
+`config.json` is never rewritten by the flag, so a one-off pass does not change
+the next normal start). While it is on, **nothing is downloaded**: the download
+and metadata loops return to idle *before* their claim calls, so queued jobs
+keep `pending` and their `.part` files and simply resume when the mode ends.
+Every other network touch-point checks the same flag — source scans, RSS, daemon
+rescans, cookie validation, the network monitor, the per-job audio-track probe —
+and a missing `yt-dlp` downgrades from a fatal install hint to a note (`ffmpeg`
+stays required: conversion is the point of an offline pass). Conversion keeps
+its existing ordering rule (`claimConvertJob` still requires terminal metadata:
+`done` / `not_needed` / `failed`), so the mode finishes local work without
+reordering the pipeline.
+
+### N2 Secondary-storage relocation — ADDED
+
+New `src/relocate.ts` covers the half the converter never revisited:
+`moveToSecondaryStorage()` only ran at conversion finish, so a finished file
+that was already in the target format never left `outputRoot`. The relocation
+pass (`startRelocation()`; one pass 5 s after startup, then every 60 s) moves
+finished media whose conversion is `done`/`not_needed`, adopts a file a crashed
+run copied but never recorded, and re-offers every file when
+`secondaryStoragePath` points somewhere new — `jobs.relocated_to` stores the
+ROOT, not a boolean. It refuses to move a job that is downloading, converting or
+mid-sidecar, a file already under the root, or a job deleted mid-move. It is
+claim-free by design: the engine lease, a single in-flight pass per process, and
+stepwise idempotence (`jobAwaitingRelocation()` re-checked before every
+destructive step, final update CAS'd on the old `file_path`) are all
+load-bearing. `/api/status` reports `offlineMode` + `relocation`, the
+reliability panel lists the pass as a fifth sweep, and the job drawer shows the
+secondary root a file moved to.
+
+**Tests:** `tests/offline-mode.test.ts` (22: switch parsing, settings
+round-trip, `isPathInside`, and relocation move/idempotence/adoption/CAS
+cases), the two offline integration scenarios in `tests/integration.test.ts`
+(queued job untouched, no scan log, conversion + move end-to-end; `--offline`
+leaves `config.json` unmodified), and the settings sweep-id expectation extended
+with `relocate`.
+
+**Known failures, not from this work (pre-existing).** `bun test` still reports
+`integration: aria2c option validation > a malformed downloader option pauses
+the engine instead of burning the playlist` and
+`mock contract: aria2c > rejected arguments: engine pauses with
+BAD_DOWNLOADER_ARGS and no job is failed`; both hang until their 30 s
+`waitFor`. Root cause: `buildAria2cArgs()` *omits* `--min-split-size` whenever
+the value is not a parseable size (the `banana` the two tests pass), so the mock
+aria2c never sees the malformed flag, never exits 28, and the engine never
+pauses. The tests still assert the old pass-through behaviour. Fix is a product
+call: either let unparsable values reach aria2c so its rejection surfaces as the
+actionable `BAD_DOWNLOADER_ARGS` pause, or update the two tests to the current
+sanitizing behaviour.

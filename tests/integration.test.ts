@@ -37,6 +37,9 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import type { Subprocess } from "bun";
 import { existsSync } from "node:fs";
+// Seeding an archive before the engine starts (offline-mode scenario) goes
+// through the engine's own schema, so the seed can never drift from it.
+import { db as seedDb, initDatabase as initSeedDatabase } from "../src/db";
 
 const REPO_ROOT = resolve(import.meta.dir, "..");
 const MOCKS = join(REPO_ROOT, "tests", "mocks");
@@ -135,6 +138,7 @@ async function startEngine(
   config: Record<string, unknown>,
   env: Record<string, string> = {},
   mocksDir: string = MOCKS,
+  extraArgs: string[] = [],
 ): Promise<EngineHandle> {
   const toolsDir = await toolsDirFor(mocksDir);
   const mockTool = (name: string) => join(toolsDir, WIN ? `${name}.exe` : name);
@@ -169,7 +173,7 @@ async function startEngine(
   // spawns it as a bare name by default).
   if (existsSync(mockTool("aria2c"))) childEnv.FAKE_ARIA2C_BIN = mockTool("aria2c");
 
-  const proc = Bun.spawn([process.execPath, "run", GUARD_ENTRY], {
+  const proc = Bun.spawn([process.execPath, "run", GUARD_ENTRY, ...extraArgs], {
     cwd: dir,
     env: { ...childEnv, YTA_EGRESS_GUARD: "1", ...env },
     stdout: "pipe",
@@ -2955,6 +2959,174 @@ describe("integration: format fallback", () => {
     } finally {
       await engine.stop();
     }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
+// Offline mode: the two jobs an archive box with no connection can still do —
+// convert files that need conversion, and move finished files to secondary
+// storage — while nothing at all is downloaded.
+// ---------------------------------------------------------------------------
+
+/**
+ * Seed an archive the way a previous online run would have left it: one video
+ * still waiting for its download, and one whose media is already in the output
+ * tree in a container that still needs conversion. Written through the real
+ * schema, then closed before the engine starts.
+ */
+async function seedOfflineArchive(dir: string, mediaPath: string): Promise<void> {
+  // `db` is a live binding reassigned by initDatabase: importing it is what lets
+  // this seed the exact schema the engine will open.
+  initSeedDatabase(join(dir, "archive.db"));
+  const insert = seedDb.prepare(
+    `INSERT INTO jobs (id, url, title, output_directory, folder, "index", target_format,
+       download_status, conversion_status, metadata_status, progress, best_progress, file_path, file_size)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  insert.run(
+    "offlinequeued1",
+    "https://www.youtube.com/watch?v=offlinequeued1",
+    "001 - Waiting For A Connection",
+    join(dir, "downloads"),
+    "Mock Playlist",
+    1,
+    "mp4",
+    "pending",
+    "pending",
+    "not_needed",
+    0,
+    0,
+    null,
+    0,
+  );
+  insert.run(
+    "offlineconvert1",
+    "https://www.youtube.com/watch?v=offlineconvert1",
+    "001 - Already Here",
+    join(dir, "downloads"),
+    "Mock Playlist",
+    2,
+    "mp4",
+    "downloaded",
+    "pending",
+    "not_needed",
+    100,
+    100,
+    mediaPath,
+    12,
+  );
+  seedDb.close();
+}
+
+describe("integration: offline mode", () => {
+  test("downloads nothing, yet converts and relocates the files that need it", async () => {
+    const dir = await makeRunDir();
+    const nas = join(dir, "nas");
+    const folder = join(dir, "downloads", "Mock Playlist");
+    const scanLog = join(dir, "scan.log");
+    const media = join(folder, "001 - Already Here.webm");
+    const sidecar = join(folder, "001 - Already Here.info.json");
+    await mkdir(folder, { recursive: true });
+    await writeFile(media, "downloaded-before-offline-mode");
+    await writeFile(sidecar, "{}");
+    await seedOfflineArchive(dir, media);
+
+    const engine = await startEngine(
+      dir,
+      4013,
+      BASE_CONFIG(4013, {
+        offlineMode: true,
+        targetFormat: "mp4",
+        secondaryStoragePath: nas,
+        // Conversion is the point of the run; keep it from being blocked by a
+        // metadata stage that cannot run offline anyway.
+        downloadSubtitles: false,
+        writeThumbnail: false,
+        writeDescription: false,
+        writeInfoJson: false,
+        verifyIntegrity: false,
+      }),
+      // The mock records every URL it is asked to scan: offline mode must not
+      // produce a single entry.
+      { FAKE_SCAN_LOG: scanLog },
+    );
+
+    try {
+      // 1) Nothing is downloaded. The queued job is left exactly as it was —
+      //    not claimed, not failed, not paused — and no media appears for it.
+      await Bun.sleep(4_000);
+      const queued = (await getJobs(engine)).find((j) => j.id === "offlinequeued1") as any;
+      expect(queued.download_status).toBe("pending");
+      expect(queued.last_error).toBeNull();
+      expect(queued.file_path).toBeNull();
+      expect(await readdir(folder)).not.toContain("001 - Waiting For A Connection.mp4");
+      // No scan either: the source list is untouched and the mock never ran.
+      expect(existsSync(scanLog)).toBe(false);
+      expect(engine.stdout()).toContain("OFFLINE MODE");
+      expect(engine.stdout()).toContain("Source scan skipped (offline mode)");
+
+      // 2) The file that needed conversion is converted…
+      await waitFor("the offline conversion to finish", async () => {
+        const j = (await getJobs(engine)).find((r) => r.id === "offlineconvert1") as any;
+        return !!j && j.conversion_status === "done" && String(j.file_path || "").endsWith(".mp4");
+      }, 60_000);
+
+      // … and moved to secondary storage, with its sidecar, source removed.
+      await waitFor("the file to reach secondary storage", async () => {
+        const j = (await getJobs(engine)).find((r) => r.id === "offlineconvert1") as any;
+        const path = String(j.file_path || "");
+        return !!j && j.relocated_to === nas && path.startsWith(nas) && existsSync(path);
+      }, 60_000);
+
+      const converted = (await getJobs(engine)).find((j) => j.id === "offlineconvert1") as any;
+      expect(converted.relocated_to).toBe(nas);
+      expect(existsSync(join(nas, "Mock Playlist", "001 - Already Here.mp4"))).toBe(true);
+      expect(existsSync(join(nas, "Mock Playlist", "001 - Already Here.info.json"))).toBe(true);
+      expect(existsSync(media)).toBe(false);
+      expect(existsSync(join(folder, "001 - Already Here.mp4"))).toBe(false);
+
+      // 3) The dashboard reports the mode, so the frozen queue is explained.
+      const status = await engine.api("/api/status");
+      expect(status.offlineMode).toBe(true);
+      expect(status.relocation.path).toBe(nas);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("--offline disables downloads for one run without rewriting config.json", async () => {
+    // The one-off pass: an operator converts/relocates a backlog offline and
+    // wants the next ordinary start to download again. The flag must not leak
+    // into the stored setting.
+    const dir = await makeRunDir();
+    const folder = join(dir, "downloads", "Mock Playlist");
+    await mkdir(folder, { recursive: true });
+    await seedOfflineArchive(dir, join(folder, "001 - Already Here.webm"));
+
+    const engine = await startEngine(
+      dir,
+      4014,
+      BASE_CONFIG(4014, { targetFormat: "mp4" }), // offlineMode stays false in config.json
+      {},
+      MOCKS,
+      ["--offline"],
+    );
+
+    try {
+      await Bun.sleep(3_000);
+      expect(engine.stdout()).toContain("Offline mode forced for this run");
+      expect(engine.stdout()).toContain("OFFLINE MODE");
+      const queued = (await getJobs(engine)).find((j) => j.id === "offlinequeued1") as any;
+      expect(queued.download_status).toBe("pending");
+      expect((await engine.api("/api/status")).offlineMode).toBe(true);
+    } finally {
+      await engine.stop();
+    }
+
+    // config.json is untouched — the key the flag forced was never written, so
+    // the next ordinary start downloads again.
+    const saved = JSON.parse(await Bun.file(join(dir, "config.json")).text());
+    expect("offlineMode" in saved).toBe(false);
   }, TEST_TIMEOUT);
 });
 

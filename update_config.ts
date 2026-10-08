@@ -182,6 +182,19 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   console.clear();
   console.log("⚙️  Download Settings\n");
 
+  // Offline mode first: it is the one switch that changes what the engine does
+  // at all. The dashboard and `--offline` can toggle it too; this is the same
+  // `offlineMode` key in config.json.
+  console.log("— Offline mode —");
+  console.log("   No downloads. The engine only converts files that need conversion and moves");
+  console.log("   finished files to secondary storage. Queued downloads wait, untouched.");
+  config.offlineMode = await askYesNo("Enable offline mode (no downloads)?", config.offlineMode);
+  console.log(
+    config.offlineMode
+      ? "   📴 Offline mode ON — yt-dlp is not needed; the dashboard can still switch it off live."
+      : "   🌐 Normal mode — scanning and downloads enabled.",
+  );
+
   // Quality & Target Format
   config.videoQuality = (await askChoice(
     "Video Quality:",

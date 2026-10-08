@@ -174,6 +174,34 @@
       word-break: break-all;
     }
 
+    /* --- Offline Mode Banner ---------------------------------------------- */
+    /* Offline mode: downloads are off by design, so this is informational —
+       the accent tone keeps it distinct from the amber "engine paused" bar. */
+    .offline-banner {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 12px 18px;
+      margin-bottom: 22px;
+      border-radius: var(--radius-md);
+      background: rgba(59, 130, 246, 0.12);
+      border: 1px solid rgba(59, 130, 246, 0.4);
+      color: var(--accent);
+      font-size: 0.86rem;
+      box-shadow: 0 4px 16px rgba(59, 130, 246, 0.1);
+    }
+    .offline-banner.show { display: flex; }
+    .offline-banner-content { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .offline-banner .reason {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.8rem;
+      padding: 2px 8px;
+      border-radius: var(--radius-sm);
+      background: rgba(59, 130, 246, 0.15);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+    }
+
     /* --- Top Stat Cards --------------------------------------------------- */
     .stats-grid {
       display: grid;
@@ -1185,6 +1213,13 @@
     </div>
     <button class="btn btn-warning btn-sm" onclick="togglePause()">▶️ Resume Engine</button>
   </div>
+
+  <div class="offline-banner" id="offlineBanner">
+    <div class="offline-banner-content">
+      <span>📴 <strong>Offline mode — no downloads</strong></span>
+      <span class="reason" id="offlineReason"></span>
+    </div>
+  </div>
   
   <div class="stats-grid">
     <div class="stat-card card-downloading">
@@ -1544,6 +1579,28 @@
       }).join('');
     }
 
+    // Offline mode banner (from /api/status). Downloads, scans and sidecar
+    // fetches are off by design, so the queue not moving is expected — say so,
+    // and show the local work that is left (files still to move to secondary
+    // storage) instead of leaving the operator to guess.
+    let offlineModeActive = false;
+    function setOfflineBanner(data) {
+      offlineModeActive = !!(data && data.offlineMode);
+      const el = document.getElementById('offlineBanner');
+      const scanBtn = document.getElementById('scanUrlButton');
+      if (scanBtn) scanBtn.title = offlineModeActive ? 'Offline mode: the source is saved now and scanned at the next online start' : '';
+      if (!el) return;
+      if (!offlineModeActive) {
+        el.classList.remove('show');
+        return;
+      }
+      const pending = (data.relocation && data.relocation.pending) || 0;
+      const parts = ['converting files that need conversion, and moving finished files to secondary storage'];
+      parts.push(pending > 0 ? `${pending} file(s) still to move` : 'queued downloads wait, untouched');
+      document.getElementById('offlineReason').textContent = parts.join(' · ');
+      el.classList.add('show');
+    }
+
     async function checkNetworkStatus() {
       const dot = document.getElementById('networkDot');
       const text = document.getElementById('networkText');
@@ -1553,9 +1610,16 @@
         const res = await fetch('/api/status', { method: 'HEAD', cache: 'no-store' });
         const latency = Date.now() - start;
         if (res.ok) {
-          dot.className = latency > 500 ? 'status-dot degraded' : 'status-dot';
-          text.textContent = 'Connected';
-          latencyEl.textContent = `${latency}ms`;
+          if (offlineModeActive) {
+            // Reachable, but deliberately not talking to YouTube.
+            dot.className = 'status-dot degraded';
+            text.textContent = 'Offline mode';
+            latencyEl.textContent = '';
+          } else {
+            dot.className = latency > 500 ? 'status-dot degraded' : 'status-dot';
+            text.textContent = 'Connected';
+            latencyEl.textContent = `${latency}ms`;
+          }
         } else {
           dot.className = 'status-dot disconnected';
           text.textContent = `HTTP ${res.status}`;
@@ -1741,6 +1805,7 @@
         }
 
         renderWorkers(data.workers);
+        setOfflineBanner(data);
 
         const runtimeEl = document.getElementById('runtimeBadge');
         if (runtimeEl) {
@@ -2267,6 +2332,7 @@
     let settingsSearchQuery = '';
 
     const GROUP_TITLES = {
+      offline: '📴 Offline mode',
       downloader: '🚀 Downloader',
       media: '🎵 Media & Audio',
       concurrency: '⚡ Concurrency',
@@ -2944,6 +3010,7 @@
           ${detailRow('ETA', isDL && job.eta ? formatETA(job.eta) : '')}
           ${detailRow('Partial file', job.partial_file_path, true)}
           ${detailRow('Final file', job.file_path, true)}
+          ${detailRow('Secondary storage', job.relocated_to ? `moved → ${job.relocated_to}` : null, true)}
           ${detailRow('Output folder', job.output_directory || job.folder, true)}
           ${detailRow('File size', job.file_size ? formatBytes(job.file_size) : '')}
           ${detailRow('Duration', job.duration ? formatETA(job.duration) : '')}

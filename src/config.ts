@@ -17,6 +17,12 @@ export const ConfigSchema = z
     playlists: z.array(z.string()),
     channels: z.array(z.string()),
     channelPlaylists: z.array(z.string()),
+    // --- Offline mode --------------------------------------------------------
+    // No video is ever fetched while this is on. The engine only finishes work
+    // that needs no network: converting files that still need conversion and
+    // moving finished files into secondary storage. Jobs waiting to download
+    // are left exactly as they are and start again the moment the mode ends.
+    offlineMode: z.boolean(),
     // --- Concurrency ---------------------------------------------------------
     maxConcurrentDownloads: z.number().min(1).max(20),
     maxConcurrentConverts: z.number().min(1).max(10),
@@ -145,6 +151,7 @@ export const DEFAULT_CONFIG: Config = {
   playlists: [],
   channels: [],
   channelPlaylists: [],
+  offlineMode: false,
   maxConcurrentDownloads: 3,
   maxConcurrentConverts: 2,
   maxDownloadWorkers: 5,
@@ -301,4 +308,66 @@ export async function saveConfig(config: Config, configPath: string = CONFIG_PAT
   } finally {
     await unlink(tempPath).catch(() => {});
   }
+}
+
+// ---------------------------------------------------------------------------
+// Offline mode: `--offline` / YTA_OFFLINE
+// ---------------------------------------------------------------------------
+
+const OFFLINE_TRUE = new Set(["true", "1", "yes", "on"]);
+const OFFLINE_FALSE = new Set(["false", "0", "no", "off"]);
+
+/**
+ * Parse one offline switch value. An empty value (`--offline=`, or a bare
+ * `--offline` handed in as "") means the switch is simply ON, since that is
+ * what a flag without an argument means everywhere else. Anything else that is
+ * neither a known true nor a known false form is `null` — deliberately not a
+ * silent `false`, so a typo cannot turn downloads back on behind the
+ * operator's back.
+ */
+export function parseOfflineSwitch(raw: string): boolean | null {
+  const value = (raw ?? "").trim().toLowerCase();
+  if (value === "" || OFFLINE_TRUE.has(value)) return true;
+  if (OFFLINE_FALSE.has(value)) return false;
+  return null;
+}
+
+/**
+ * The offline mode requested by this RUN, independent of config.json:
+ *
+ *   `--offline`            downloads disabled for this run
+ *   `--offline=false`      downloads enabled for this run
+ *   `YTA_OFFLINE=1`        same as `--offline` (scheduled task / shortcut)
+ *   `YTA_OFFLINE=false`    same as `--offline=false`
+ *
+ * Returns `null` when neither source says anything, in which case the stored
+ * `offlineMode` setting stands. The command line wins over the environment (so
+ * a machine-wide `YTA_OFFLINE=1` can be neutralised for one run) and the LAST
+ * flag wins among several (so a wrapper can append `--offline=false`).
+ *
+ * Pure on purpose: the engine applies the result to the in-memory config only.
+ * A one-off offline pass never rewrites config.json, so the next normal start
+ * downloads exactly what it would have before.
+ */
+export function offlineOverrideFromRuntime(
+  argv: readonly string[] = process.argv.slice(2),
+  env: Record<string, string | undefined> = process.env,
+): boolean | null {
+  let fromArgv: boolean | null = null;
+  for (const raw of argv) {
+    const arg = String(raw).trim().toLowerCase();
+    if (arg === "--offline") {
+      fromArgv = true;
+    } else if (arg.startsWith("--offline=")) {
+      const parsed = parseOfflineSwitch(arg.slice("--offline=".length));
+      // An unparsable value is ignored rather than guessed at; a valid one
+      // overrides every earlier flag.
+      if (parsed !== null) fromArgv = parsed;
+    }
+  }
+  if (fromArgv !== null) return fromArgv;
+  if (env.YTA_OFFLINE !== undefined && env.YTA_OFFLINE !== null) {
+    return parseOfflineSwitch(String(env.YTA_OFFLINE));
+  }
+  return null;
 }

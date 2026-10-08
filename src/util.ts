@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 // Media container/codec extensions the engine can produce or move around.
 export const MEDIA_EXTENSIONS = new Set([
@@ -93,6 +93,29 @@ export function hashFile(filePath: string): Promise<string> {
     stream.on("end", () => resolve(hash.digest("hex")));
     stream.on("error", reject);
   });
+}
+
+/**
+ * Is `childPath` inside `rootPath` (or the same path)?
+ *
+ * Both sides are resolved first, so `D:/NAS/file.mp4` and `D:\NAS\file.mp4`
+ * compare equal, and the case-insensitive comparison Windows needs is applied
+ * there too (NTFS may hand back either spelling for one file). Used by the
+ * relocation pass to recognise a file that already lives in secondary storage
+ * rather than moving it onto itself.
+ *
+ * `relative` — not a string prefix — is what makes this correct for siblings
+ * that merely share a prefix: `/data/downloads2/x.mp4` is NOT inside
+ * `/data/downloads`.
+ */
+export function isPathInside(childPath: string, rootPath: string): boolean {
+  if (!childPath || !rootPath) return false;
+  const normalize = (p: string) => (process.platform === "win32" ? resolve(p).toLowerCase() : resolve(p));
+  const child = normalize(childPath);
+  const root = normalize(rootPath);
+  if (child === root) return true;
+  const rel = relative(root, child);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
 /**

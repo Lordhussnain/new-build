@@ -6,7 +6,7 @@
 
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { loadConfig } from "./config";
+import { loadConfig, offlineOverrideFromRuntime } from "./config";
 import { aria2cPath, checkDependencies, validateCookies } from "./tools";
 import { initDatabase, pruneJobsForUnconfiguredSources } from "./db";
 import {
@@ -34,6 +34,7 @@ import { startRssPolling } from "./rss";
 import { startAutonomousPolling } from "./polling";
 import { startRunHistory, heartbeatRunHistory } from "./history";
 import { handleShutdown, supervise } from "./lifecycle";
+import { startRelocation } from "./relocate";
 import { downloadWorker } from "./workers/download";
 import { metadataWorker } from "./workers/metadata";
 import { converterWorker } from "./workers/convert";
@@ -62,12 +63,36 @@ export async function main(): Promise<void> {
 
   // 1) Load configuration first (dependency search may use ytDlpPath/ffmpegPath
   //    from it), then verify external tools before touching the database.
-  const config = await loadConfig();
+  let config = await loadConfig();
+  // `--offline` / YTA_OFFLINE override the stored setting for THIS run only (no
+  // config.json write), so a one-off post-processing pass never changes what
+  // the next normal start does. The override happens before setConfig() and
+  // before the dependency probe: offline mode relaxes the yt-dlp requirement.
+  const offlineOverride = offlineOverrideFromRuntime();
+  if (offlineOverride !== null && offlineOverride !== config.offlineMode) {
+    config = { ...config, offlineMode: offlineOverride };
+    console.log(
+      `📴 Offline mode forced for this run by --offline / YTA_OFFLINE: ${offlineOverride ? "ON" : "OFF"} (config.json is left unchanged).`,
+    );
+  }
   setConfig(config);
   await checkDependencies(config);
 
-  // 1b) Report which downloader engine the downloads will actually use.
-  if (config.useAria2c && aria2cPath()) {
+  // 1b) Report what this run will actually do. Offline mode is announced first
+  //     and loudly: with downloads disabled an operator must never be left
+  //     wondering why the queue is not moving.
+  if (config.offlineMode) {
+    console.log("");
+    console.log("📴 OFFLINE MODE — no videos will be downloaded.");
+    console.log("   Converting files that need conversion, and moving finished files to secondary storage.");
+    console.log("   Queued downloads are left untouched and start when offline mode ends.");
+    console.log("");
+  }
+
+  // 1c) Report which downloader engine the downloads will actually use.
+  if (config.offlineMode) {
+    console.log("⏸️ Download engine: not used (offline mode)");
+  } else if (config.useAria2c && aria2cPath()) {
     console.log(
       `🚀 Download engine: aria2c (${config.connectionsPerDownload} connections/download, ${config.maxBandwidthKBps > 0 ? `cap ${config.maxBandwidthKBps} KB/s split across slots` : "uncapped"})`,
     );
@@ -166,26 +191,39 @@ export async function main(): Promise<void> {
   // Establish the cookies baseline, then keep watching for the whole run: a
   // cookies.txt exported from the browser *after* startup must be picked up
   // without a restart (cookiesWatch runs on an interval below).
-  cookiesWatch(config);
-  if (config.validateCookiesOnStart && existsSync(config.cookiesFile)) {
-    const valid = await validateCookies(config.cookiesFile);
-    if (!valid) console.warn("⚠️ Cookies may be invalid or expired.");
-    else console.log("✅ Cookies validated.");
-  } else if (!existsSync(config.cookiesFile)) {
-    console.log(
-      `ℹ️ No ${config.cookiesFile} yet — downloads run anonymously. Drop the file in while the engine runs and it is picked up within a minute.`,
-    );
+  //
+  // Offline mode skips both: nothing fetches, so a credential change can rescue
+  // nothing, and validating cookies is a network round-trip to YouTube.
+  if (config.offlineMode) {
+    console.log("🍪 Cookies: not used (offline mode).");
+  } else {
+    cookiesWatch(config);
+    if (config.validateCookiesOnStart && existsSync(config.cookiesFile)) {
+      const valid = await validateCookies(config.cookiesFile);
+      if (!valid) console.warn("⚠️ Cookies may be invalid or expired.");
+      else console.log("✅ Cookies validated.");
+    } else if (!existsSync(config.cookiesFile)) {
+      console.log(
+        `ℹ️ No ${config.cookiesFile} yet — downloads run anonymously. Drop the file in while the engine runs and it is picked up within a minute.`,
+      );
+    }
   }
 
   // 3) Load every link from config.json, fetch video details, store in DB.
+  //    Scanning is a network round-trip per source, so offline mode skips it
+  //    entirely: nothing can be discovered, and the queued jobs are untouched.
   const allLinks = [...config.playlists, ...config.channels, ...config.channelPlaylists];
-  for (const url of allLinks) {
-    try {
-      const r = await scanAndIngest(url, config);
-      console.log(`📥 ${url} → found ${r.found}, added ${r.added}, skipped ${r.skipped}`);
-    } catch (e: any) {
-      logError("scan", `${url}: ${e?.message || e}`);
-      console.error(`❌ Failed to scan ${url}:`, e?.message || e);
+  if (config.offlineMode) {
+    console.log(`📡 Source scan skipped (offline mode) — ${allLinks.length} configured source(s) unchanged.`);
+  } else {
+    for (const url of allLinks) {
+      try {
+        const r = await scanAndIngest(url, config);
+        console.log(`📥 ${url} → found ${r.found}, added ${r.added}, skipped ${r.skipped}`);
+      } catch (e: any) {
+        logError("scan", `${url}: ${e?.message || e}`);
+        console.error(`❌ Failed to scan ${url}:`, e?.message || e);
+      }
     }
   }
 
@@ -195,7 +233,21 @@ export async function main(): Promise<void> {
     `Web UI: http://${uiHost}:${config.webPort}${config.webToken ? "  (token required)" : ""}${config.webBind === "0.0.0.0" ? "  — listening on ALL interfaces" : ""}`,
   );
 
-  if (config.networkMonitorEnabled) {
+  // Cheap new-upload watcher (no-op when rssEnabled=false or no channels) and
+  // the daemon-mode rescan loop. Both parse live YouTube pages, so offline mode
+  // leaves them off: the queue is frozen on purpose, not stale by accident.
+  if (config.offlineMode) {
+    console.log("📡 RSS watcher and rescans disabled (offline mode).");
+  } else {
+    startRssPolling(config);
+  }
+
+  if (config.offlineMode) {
+    // The monitor probes YouTube and pauses the engine after consecutive
+    // failures. Offline that is guaranteed: it would pause the very run whose
+    // purpose is local work, and nothing would ever convert.
+    console.log("🌐 Network monitor disabled (offline mode).");
+  } else if (config.networkMonitorEnabled) {
     networkMonitor();
   } else {
     console.log("🌐 Network monitor disabled (networkMonitorEnabled=false).");
@@ -208,12 +260,16 @@ export async function main(): Promise<void> {
   }, 60_000);
   // Dynamic download-slot autoscaling (no-op when autoscaleEnabled=false).
   setInterval(autoscaleTick, 15_000);
-  // Failed-job sweep: re-queue transient failures after their cooldown.
+  // Failed-job sweep: re-queue transient failures after their cooldown. It also
+  // re-queues failed CONVERSIONS, which is exactly what offline mode wants, so
+  // the sweep keeps running; download re-queues simply wait for the mode to end.
   setInterval(() => requeueFailedJobs(getConfig()), 60_000);
-  // Cookies sweep: notice cookies.txt appearing / changing / vanishing mid-run.
-  setInterval(() => cookiesWatch(getConfig()), 60_000);
-  // Cheap new-upload watcher (no-op when rssEnabled=false or no channels).
-  startRssPolling(config);
+  // Cookies sweep: notice cookies.txt appearing / changing / vanishing mid-run
+  // (meaningless while offline — nothing fetches).
+  if (!config.offlineMode) setInterval(() => cookiesWatch(getConfig()), 60_000);
+  // Secondary-storage relocation: files that need no conversion still have to
+  // reach secondary storage (src/relocate.ts).
+  startRelocation();
 
   // 4) Pipeline workers (each supervised — crashed loops restart automatically):
   //    download → metadata → converter, all driven by job status in the DB.
@@ -227,8 +283,13 @@ export async function main(): Promise<void> {
     supervise(`converter-worker-${i}`, () => converterWorker(i, config));
   }
 
-  if (config.daemonMode) startAutonomousPolling(config);
+  // Daemon-mode full rescans are also network work.
+  if (config.daemonMode && !config.offlineMode) startAutonomousPolling(config);
 
   setInterval(renderDashboard, 2000);
-  console.log("🚀 Engine started. Resilient, autonomous, proxy-free.");
+  console.log(
+    config.offlineMode
+      ? "🚀 Engine started in OFFLINE MODE. Converting and relocating local files only."
+      : "🚀 Engine started. Resilient, autonomous, proxy-free.",
+  );
 }

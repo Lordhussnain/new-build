@@ -205,6 +205,12 @@ async function finalizeConversion(
     logError("conversion", `${job.id} ${job.title}: conversion claim lost mid-job — not finalizing`);
     return;
   }
+  // `relocated_to` mirrors the move: the secondary-storage root the media was
+  // moved under, or NULL while it stays in the output tree. The relocation pass
+  // (src/relocate.ts) treats both cases consistently — a converted file that
+  // already reached secondary storage must never be listed as "still to move",
+  // and a file that did not must not claim otherwise.
+  let relocatedTo: string | null = null;
   if (config.secondaryStoragePath) {
     const moved = await moveToSecondaryStorage(job, config.secondaryStoragePath, finalPath, () =>
       stillOwnsConversion(job),
@@ -216,6 +222,7 @@ async function finalizeConversion(
       return;
     }
     finalPath = moved.path;
+    relocatedTo = config.secondaryStoragePath;
   }
   let integrity: string | null = null;
   if (config.verifyIntegrity) {
@@ -228,8 +235,8 @@ async function finalizeConversion(
     "conversion",
     job.id,
     claimRef("conversion", job),
-    `conversion_status = 'done', file_path = ?, integrity = ?`,
-    [finalPath, integrity],
+    `conversion_status = 'done', file_path = ?, integrity = ?, relocated_to = ?`,
+    [finalPath, integrity, relocatedTo],
     `conversion_status = 'in_progress'`,
   );
   if (claimed === 0) {
