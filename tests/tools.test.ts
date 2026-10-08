@@ -163,6 +163,38 @@ describe("resolveJsRuntime: empty search space", () => {
     });
     expect(found).toEqual({ name: "bun", path: "/opt/bun" });
   });
+
+  test.skipIf(WIN)("uses explicitly configured denoPath when provided", async () => {
+    const dir = await makeDir("yta-jsrt-custom-deno-");
+    const customDeno = await writeVersionShim(dir, "my-deno", "deno 2.1.0");
+    const found = await resolveJsRuntime({
+      cwd: dir,
+      exeDir: dir,
+      platform: "linux",
+      env: { PATH: dir },
+      denoPath: customDeno,
+    });
+    expect(found).toEqual({ name: "deno", path: customDeno });
+    expect(jsRuntimeArgs(found)).toEqual([
+      "--js-runtimes",
+      `deno:${customDeno}`,
+      "--remote-components",
+      "ejs:github",
+    ]);
+  });
+
+  test("skips deno when denoPath is 'none'", async () => {
+    const empty = await makeDir("yta-jsrt-none-");
+    const found = await resolveJsRuntime({
+      cwd: empty,
+      exeDir: empty,
+      platform: "linux",
+      env: NO_ENV,
+      denoPath: "none",
+      bunInterpreter: "/opt/bun",
+    });
+    expect(found).toEqual({ name: "bun", path: "/opt/bun" });
+  });
 });
 
 afterAll(async () => {

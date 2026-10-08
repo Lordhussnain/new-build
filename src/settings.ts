@@ -582,6 +582,14 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     help: "Explicit aria2c executable, or \"none\" to force the native downloader even when aria2c is installed. Takes effect after a restart.",
   },
   {
+    key: "denoPath",
+    label: "Deno path",
+    type: "text",
+    group: "advanced",
+    restartRequired: true,
+    help: "Explicit Deno executable path (blank = auto-discover on PATH) for yt-dlp's YouTube n-challenge JS runtime (--js-runtimes \"deno:<path>\"). Takes effect after a restart.",
+  },
+  {
     key: "validateCookiesOnStart",
     label: "Validate cookies on start",
     type: "boolean",

@@ -332,6 +332,17 @@ describe("buildDownloadPlan", () => {
     expect(flagValue(plan.args, "--js-runtimes")).toBe(`deno:${join("/opt", "deno")}`);
     expect(flagValue(plan.args, "--remote-components")).toBe("ejs:github");
   });
+
+  test("formats explicit deno path as deno:/path/to/deno for yt-dlp", () => {
+    const plan = buildDownloadPlan({
+      job,
+      config: cfg({ denoPath: "/custom/bin/deno" }),
+      activeSlots: 1,
+      aria2cAvailable: false,
+      jsRuntime: { name: "deno", path: "/custom/bin/deno" },
+    });
+    expect(flagValue(plan.args, "--js-runtimes")).toBe("deno:/custom/bin/deno");
+  });
 });
 
 // --- multi-audio tracks -------------------------------------------------------

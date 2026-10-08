@@ -127,7 +127,7 @@ describe("the editable allow-list", () => {
   test("settings read by the engine only at startup are marked restartRequired", () => {
     // The panel must be able to tell an operator that a change needs a restart
     // instead of implying it is live.
-    for (const key of ["ytDlpPath", "ffmpegPath", "aria2cPath", "maxDownloadWorkers", "webPort", "daemonMode"]) {
+    for (const key of ["ytDlpPath", "ffmpegPath", "aria2cPath", "denoPath", "maxDownloadWorkers", "webPort", "daemonMode"]) {
       expect(requiresRestart(key)).toBe(true);
     }
     for (const key of [

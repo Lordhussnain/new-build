@@ -53,6 +53,9 @@ export const ConfigSchema = z
     // force-disables aria2c even when a binary is present on PATH — the
     // engine then always downloads through yt-dlp's native downloader.
     aria2cPath: z.string(),
+    // Deno executable location for yt-dlp's JS runtime (--js-runtimes "deno:<path>");
+    // blank = auto-detect. The special value "none" skips Deno.
+    denoPath: z.string(),
     validateCookiesOnStart: z.boolean(),
     // --- Output --------------------------------------------------------------
     outputRoot: z.string(),
@@ -161,6 +164,7 @@ export const DEFAULT_CONFIG: Config = {
   ytDlpPath: "",
   ffmpegPath: "",
   aria2cPath: "",
+  denoPath: "",
   validateCookiesOnStart: true,
   outputRoot: "./downloads",
   archiveFile: "downloaded_videos.txt",
