@@ -32,17 +32,100 @@ import type { Config } from "./config";
  */
 const KILL_GRACE_MS = 2_000;
 
-/** SIGINT a child, escalating to SIGKILL after the grace period. */
-function interruptChild(proc: Bun.Subprocess | undefined): boolean {
-  if (!proc || proc.exitCode !== null) return false;
-  try {
-    proc.kill("SIGINT");
-  } catch {
-    return true; // it exited between the checks; treat as handled
+/** Recursively discover all descendant process IDs before a parent process is killed. */
+export function findDescendantPids(pid: number): number[] {
+  if (process.platform === "win32" || !pid || pid <= 1) return [];
+  const descendants: number[] = [];
+  const queue = [pid];
+  const visited = new Set<number>([pid]);
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    try {
+      const res = Bun.spawnSync(["pgrep", "-P", String(current)]);
+      const out = res.stdout.toString().trim();
+      if (out) {
+        for (const line of out.split(/\s+/)) {
+          const cpid = parseInt(line, 10);
+          if (cpid && Number.isFinite(cpid) && cpid > 1 && !visited.has(cpid)) {
+            visited.add(cpid);
+            descendants.push(cpid);
+            queue.push(cpid);
+          }
+        }
+      }
+    } catch {}
   }
+  return descendants;
+}
+
+/**
+ * Signal a process and all its descendant children (e.g. aria2c spawned under yt-dlp).
+ * Returns the list of descendant PIDs that were discovered and signaled.
+ */
+export function killProcessTree(
+  proc: Bun.Subprocess | { pid: number } | undefined,
+  signal: "SIGINT" | "SIGTERM" | "SIGKILL" = "SIGINT",
+): number[] {
+  if (!proc) return [];
+  const pid = proc.pid;
+  if (!pid || pid <= 1) return [];
+
+  try {
+    if (process.platform === "win32") {
+      try {
+        Bun.spawnSync(["taskkill", "/pid", String(pid), "/t", "/f"]);
+      } catch {}
+      return [];
+    }
+
+    // Crucial: discover all descendants BEFORE signaling the parent, because once the
+    // parent terminates, children get adopted by PID 1 (init) and `pgrep -P <pid>` is empty!
+    const children = findDescendantPids(pid);
+
+    // Try killing process group first if pgid == pid
+    try {
+      process.kill(-pid, signal);
+    } catch {}
+
+    // Kill all descendants with SIGTERM (and signal) so background tools (like aria2c) exit gracefully
+    for (const cpid of children) {
+      try {
+        process.kill(cpid, signal === "SIGKILL" ? "SIGKILL" : "SIGTERM");
+      } catch {}
+      if (signal !== "SIGTERM") {
+        try {
+          process.kill(cpid, signal);
+        } catch {}
+      }
+    }
+
+    // Signal the root process itself
+    try {
+      (proc as Bun.Subprocess).kill?.(signal);
+    } catch {}
+    try {
+      process.kill(pid, signal);
+    } catch {}
+
+    return children;
+  } catch {
+    return [];
+  }
+}
+
+/** SIGINT a child and all its descendants (aria2c/ffmpeg), escalating to SIGKILL after the grace period. */
+export function interruptChild(proc: Bun.Subprocess | undefined): boolean {
+  if (!proc || proc.exitCode !== null) return false;
+  const children = killProcessTree(proc, "SIGINT");
   const timer = setTimeout(() => {
     try {
-      if (proc.exitCode === null) proc.kill("SIGKILL");
+      killProcessTree(proc, "SIGKILL");
+      for (const cpid of children) {
+        try {
+          process.kill(cpid, "SIGKILL");
+        } catch {}
+      }
     } catch {}
   }, KILL_GRACE_MS);
   (timer as unknown as { unref?: () => void }).unref?.();
@@ -55,7 +138,7 @@ export function triggerPause(reason: string): void {
   console.log(`⏸️ Triggering pause: ${reason}`);
   for (const [, proc] of activeProcs.entries()) {
     try {
-      proc.kill("SIGINT");
+      interruptChild(proc);
     } catch {}
   }
 }
