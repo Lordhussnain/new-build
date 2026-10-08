@@ -404,6 +404,13 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
     `   aria2c path (blank = auto-detect, "none" = force the native downloader) [current: ${config.aria2cPath || "auto"}]: `,
   );
   if (ariaAns.trim()) config.aria2cPath = ariaAns.trim();
+  // yt-dlp needs a JS runtime to solve YouTube's n-challenge; the engine
+  // auto-discovers Deno, then Node, then Bun when this is blank, and the special
+  // value "none" skips Deno entirely. Same contract as aria2cPath above.
+  const denoAns = await ask(
+    `   Deno path for yt-dlp's JS runtime (blank = auto-detect, "none" = skip Deno) [current: ${config.denoPath || "auto"}]: `,
+  );
+  if (denoAns.trim()) config.denoPath = denoAns.trim();
 
   await ask("\n✅ Settings updated. Press Enter to return...");
   return config;

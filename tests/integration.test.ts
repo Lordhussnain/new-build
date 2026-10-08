@@ -40,6 +40,9 @@ import { existsSync } from "node:fs";
 // Seeding an archive before the engine starts (offline-mode scenario) goes
 // through the engine's own schema, so the seed can never drift from it.
 import { db as seedDb, initDatabase as initSeedDatabase } from "../src/db";
+// The cancellation scenario matches a job's on-disk file by the same sanitizer
+// the engine uses to build the name, so the two cannot drift apart.
+import { sanitizeFileName } from "../src/util";
 
 const REPO_ROOT = resolve(import.meta.dir, "..");
 const MOCKS = join(REPO_ROOT, "tests", "mocks");
@@ -1726,15 +1729,29 @@ describe("integration: dashboard cancellation", () => {
       const folder = join(dir, "downloads", "Mock Playlist");
       const signalled = async () => (await readdir(folder).catch(() => [] as string[])).filter((f) => f.endsWith(".hang-signalled")).length;
 
-      /** Wait until one job is downloading and its mock child has started. */
+      /**
+       * Wait until one job is downloading and ITS mock child has started.
+       *
+       * The check must be tied to the job's own file. A generic "any
+       * `.ytdlp-args` exists" test is satisfied by a leftover from the previous
+       * step — the mock writes one per attempt and never removes it — while the
+       * next job's row is already `downloading`, which `claimDownloadJob` flips
+       * BEFORE the spawn. An API call in that window cancels the job pre-spawn
+       * (the worker's own `isJobCancelled` re-check refuses to start it, which is
+       * correct), so no SIGINT is ever sent and the step that waits for a
+       * `.hang-signalled` marker times out. The mock names the file after the
+       * engine's own base name (`<index> - <sanitized title>`), so matching the
+       * sanitized title is the same file the child wrote for this job.
+       */
       const waitForInFlight = async (): Promise<JobRow> => {
         let active: JobRow | undefined;
         await waitFor("a hung download in flight", async () => {
           const jobs = await getJobs(engine);
           active = jobs.find((j) => j.download_status === "downloading");
           if (!active) return false;
+          const marker = sanitizeFileName(active.title).toLowerCase();
           const files = await readdir(folder).catch(() => [] as string[]);
-          return files.some((f) => f.endsWith(".ytdlp-args"));
+          return files.some((f) => f.endsWith(".ytdlp-args") && f.toLowerCase().includes(marker));
         });
         return active!;
       };

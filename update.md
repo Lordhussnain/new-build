@@ -521,36 +521,36 @@ and `mock contract: aria2c > rejected arguments: engine pauses with
 BAD_DOWNLOADER_ARGS and no job is failed` — now complete in ~3.4 s each instead
 of hanging to their timeout.
 
-**Known failures, not from this work (pre-existing).** With the aria2c pair fixed
-(see N3), `bun test` reports **584 pass, 2 skip, 2 fail**. Both failures
-reproduce on the base commit (`c2fd2b7`) with this work unapplied — verified in a
-clean worktree — so neither is caused by offline mode, the relocation pass, or
-the aria2c fix:
+### N4 Two pre-existing suite failures — FIXED
 
-1. `update_config.ts covers the config schema > prompts for every non-URL-list
-   key` fails with `missing === ["denoPath"]`.
+Both failures reproduced on the base commit (`c2fd2b7`, verified in a clean
+worktree), so neither was caused by offline mode or the relocation pass. Both
+are now fixed in the product/test where the defect actually was — no assertion
+was weakened:
 
-   Root cause: `denoPath` is a schema/`DEFAULT_CONFIG` key (the JS runtime for
-   YouTube's n-challenge, auto-discovered by `resolveJsRuntime()` when empty) but
-   no prompt in `update_config.ts` sets `config.denoPath`. The test asserts every
-   non-URL-list key is reachable from the manager, so it needs either a
-   `denoPath` prompt or `denoPath` added to the auto-discovered keys that test
-   exempts.
+- **`update_config.ts covers the config schema > prompts for every non-URL-list
+  key`** failed with `missing === ["denoPath"]`. `denoPath` is a real schema key
+  (`checkDependencies()`/`resolveJsRuntime()` honour it, and `"none"` skips Deno
+  the same way `aria2cPath: "none"` forces the native downloader), but no prompt
+  set it — the exact "a setting the user can only edit by hand-editing JSON"
+  case that test file exists to catch. The External Tools section of
+  `update_config.ts` now asks for it next to `ytDlpPath`/`ffmpegPath`/`aria2cPath`
+  (blank = auto-detect, `"none"` = skip Deno).
 
-2. `integration: dashboard cancellation > stop, delete, and remove-source all
-   interrupt the running downloader` times out after 63 s waiting for "the mock
-   to record its second SIGINT" (step 1, the stop, passes).
+- **`integration: dashboard cancellation > stop, delete, and remove-source all
+  interrupt the running downloader`** timed out after 63 s waiting for the mock's
+  second SIGINT. The readiness predicate was stale, not the engine:
+  `waitForInFlight()` accepted *any* `.ytdlp-args` file, and the mock writes one
+  per attempt and never removes it — so from step 2 on, the leftover from step 1
+  satisfied the wait while the next job's row was already `downloading`.
+  `claimDownloadJob` flips that row *before* the spawn, so the DELETE cancelled
+  the job pre-spawn (the worker's own `isJobCancelled` re-check refused to start
+  it — correct behaviour), no SIGINT was sent, and no marker was written. The
+  predicate now matches the job's own file, named with the engine's
+  `sanitizeFileName(title)` so the test and the mock cannot drift apart. Step 1's
+  behaviour is unchanged; steps 2 and 3 exercise the pre-spawn cancellation path
+  only when the child really exists.
 
-   Root cause: the test's readiness predicate is stale, not the engine.
-   `waitForInFlight()` returns as soon as *any* file in the job folder ends in
-   `.ytdlp-args`, and the mock writes `${base}.ytdlp-args` once per attempt and
-   never deletes it. Step 1 therefore leaves `001 - …ytdlp-args` behind, so from
-   step 2 onward the predicate is satisfied the moment the next job's row flips
-   to `downloading` — which `claimDownloadJob` does at claim time, *before* the
-   audio probe and the `Bun.spawn`, i.e. before a child is registered in
-   `resilience.ts`. The DELETE then cancels the job pre-spawn (the worker's
-   `isJobCancelled` re-check refuses to start it — correct behaviour), so no
-   SIGINT is ever sent and no `.hang-signalled` marker is written. Fix: make the
-   predicate job-specific (match that job's own `.ytdlp-args` basename, e.g.
-   `001 - First Mock Video.ytdlp-args`) or count `.hang-signalled` markers per
-   job id.
+**Tests:** the suite is green on this branch — `bun test` → **586 pass, 2 skip,
+0 fail** (the two skips are the opt-in real-binary compatibility tests). The
+cancellation scenario completes in ~3.6 s instead of timing out at 63 s.
