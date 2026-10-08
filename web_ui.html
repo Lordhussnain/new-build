@@ -168,6 +168,17 @@
     }
     
     .btn-secondary:hover { background: var(--bg-secondary); }
+
+    .btn-turbo-active {
+      background: linear-gradient(135deg, #f59e0b, #ef4444) !important;
+      color: white !important;
+      border: 1px solid rgba(255, 255, 255, 0.25) !important;
+      font-weight: 700 !important;
+      box-shadow: 0 0 12px rgba(245, 158, 11, 0.45);
+    }
+    .btn-turbo-active:hover {
+      background: linear-gradient(135deg, #d97706, #dc2626) !important;
+    }
     
     .tabs {
       display: flex;
@@ -887,6 +898,7 @@
   
   <div class="controls">
     <button class="btn btn-warning" id="pauseBtn" onclick="togglePause()">⏸️ Pause All</button>
+    <button class="btn btn-secondary" id="turboBtn" onclick="toggleTurboMode()" title="Toggle Aggressive IDM Mode (32 connections, 64 fragments, 10M chunk, 64K buffer, uncapped)">⚡ Turbo IDM: OFF</button>
     <button class="btn btn-success" onclick="refreshData()">🔄 Refresh</button>
     <button class="btn btn-secondary" onclick="openSettings()">⚙️ Settings</button>
     <button class="btn btn-danger" onclick="purgeQueue()">🗑️ Purge Queue</button>
@@ -912,6 +924,7 @@
   <div class="shortcut-hint">
     <span><span class="kbd">/</span> search</span>
     <span><span class="kbd">s</span> settings</span>
+    <span><span class="kbd">t</span> turbo IDM</span>
     <span><span class="kbd">p</span> pause / resume</span>
     <span><span class="kbd">r</span> refresh</span>
     <span><span class="kbd">Esc</span> close</span>
@@ -1828,6 +1841,7 @@
         settingsSnapshot = data;
         settingsDraft = {};
         renderSettings();
+        updateTurboButton();
         document.getElementById('settingsStatus').textContent = '';
       } catch (err) {
         document.getElementById('settingsStatus').textContent = `❌ ${err.message}`;
@@ -1837,6 +1851,91 @@
     function closeSettings() {
       document.getElementById('settingsModal').classList.remove('open');
       settingsDraft = {};
+      updateTurboButton();
+    }
+
+    function isTurboActive() {
+      if (!settingsSnapshot || !settingsSnapshot.speedProfiles || !settingsSnapshot.speedProfiles.aggressive) return false;
+      const values = { ...settingsSnapshot.values, ...settingsDraft };
+      const aggValues = settingsSnapshot.speedProfiles.aggressive.values;
+      return Object.entries(aggValues).every(([field, expected]) =>
+        JSON.stringify(values[field]) === JSON.stringify(expected)
+      );
+    }
+
+    function updateTurboButton() {
+      const btn = document.getElementById('turboBtn');
+      if (!btn) return;
+      const active = isTurboActive();
+      if (active) {
+        btn.textContent = '⚡ Turbo IDM: ON';
+        btn.classList.add('btn-turbo-active');
+        btn.classList.remove('btn-secondary');
+        btn.title = 'Aggressive IDM mode is ACTIVE (Click to restore Standard speed)';
+      } else {
+        btn.textContent = '⚡ Turbo IDM: OFF';
+        btn.classList.remove('btn-turbo-active');
+        btn.classList.add('btn-secondary');
+        btn.title = 'Click to activate Aggressive IDM speed (32 connections, 64 fragments, 10M chunk, 64K buffer, uncapped)';
+      }
+    }
+
+    async function toggleTurboMode() {
+      const btn = document.getElementById('turboBtn');
+      if (btn) btn.disabled = true;
+      try {
+        if (!settingsSnapshot) {
+          const res = await fetch('/api/settings');
+          const data = await res.json();
+          if (res.ok && data.ok) settingsSnapshot = data;
+        }
+        if (!settingsSnapshot || !settingsSnapshot.speedProfiles) {
+          throw new Error('Speed profiles are not available');
+        }
+        const isTurbo = isTurboActive();
+        const targetProfileKey = isTurbo ? 'standard' : 'aggressive';
+        const profile = settingsSnapshot.speedProfiles[targetProfileKey];
+        if (!profile) throw new Error(`Profile ${targetProfileKey} not found`);
+
+        const saveRes = await fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(profile.values),
+        });
+        const data = await saveRes.json();
+        if (!saveRes.ok || !data.ok) throw new Error(data.error || 'Failed to update settings');
+        settingsSnapshot = {
+          fields: data.fields,
+          values: data.values,
+          nonDefault: data.nonDefault,
+          speedProfiles: data.speedProfiles,
+        };
+        settingsDraft = {};
+        renderSettings();
+        updateTurboButton();
+        showNotification(
+          isTurbo
+            ? 'Standard speed profile restored'
+            : '⚡ Turbo IDM mode activated! (32 connections, 64 fragments, 10M chunk, 64K buffer, uncapped)',
+          'success'
+        );
+        fetchStatus();
+      } catch (err) {
+        showNotification(`Failed to toggle Turbo mode: ${err.message}`, 'error');
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    async function fetchSettingsSnapshot() {
+      try {
+        const res = await fetch('/api/settings');
+        const data = await res.json();
+        if (res.ok && data.ok) {
+          settingsSnapshot = data;
+          updateTurboButton();
+        }
+      } catch {}
     }
 
     function selectedDownloadSpeedProfile() {
@@ -1878,6 +1977,7 @@
       if (!profile) return;
       for (const [key, value] of Object.entries(profile.values || {})) settingsDraft[key] = value;
       renderSettings();
+      updateTurboButton();
       document.getElementById('settingsStatus').textContent = `${profile.label} preset staged — Save Changes to apply it to the next download.`;
     }
 
@@ -2008,6 +2108,7 @@
         };
         settingsDraft = {};
         renderSettings();
+        updateTurboButton();
         const changed = (data.changed || []).length;
         status.textContent = changed > 0
           ? `✅ Applied ${changed} change${changed === 1 ? '' : 's'} to running downloads`
@@ -2391,6 +2492,9 @@
         case 's':
           e.preventDefault(); openSettings();
           break;
+        case 't':
+          e.preventDefault(); toggleTurboMode();
+          break;
         case '/':
           e.preventDefault();
           document.getElementById('searchInput').focus();
@@ -2403,6 +2507,7 @@
     // refreshes once the moment it becomes visible again.
     refreshData();
     loadSources();
+    fetchSettingsSnapshot();
     setInterval(() => { if (!document.hidden) fetchStatus(); }, 5000);
     document.addEventListener('visibilitychange', () => { if (!document.hidden) fetchStatus(); });
   </script>

@@ -95,6 +95,20 @@ export const DOWNLOAD_SPEED_PROFILES = {
       maxBandwidthKBps: 0,
     },
   },
+  aggressive: {
+    label: "Aggressive (IDM)",
+    description: "Ultra-fast IDM-style downloads: aria2c ×32 (split 512K), 64 native fragments, 10M HTTP chunks, 64K buffer, and uncapped bandwidth.",
+    values: {
+      useAria2c: true,
+      connectionsPerDownload: 32,
+      minSplitSize: "512K",
+      concurrentFragments: 64,
+      httpChunkSize: "10M",
+      bufferSize: "64K",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+      maxBandwidthKBps: 0,
+    },
+  },
 } satisfies Record<string, { label: string; description: string; values: Partial<Config> }>;
 
 /**

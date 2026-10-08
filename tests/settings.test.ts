@@ -174,6 +174,16 @@ describe("readSettings", () => {
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
       maxBandwidthKBps: 0,
     });
+    expect(DOWNLOAD_SPEED_PROFILES.aggressive.values).toMatchObject({
+      useAria2c: true,
+      connectionsPerDownload: 32,
+      minSplitSize: "512K",
+      concurrentFragments: 64,
+      httpChunkSize: "10M",
+      bufferSize: "64K",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+      maxBandwidthKBps: 0,
+    });
   });
 });
 

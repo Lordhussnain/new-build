@@ -217,6 +217,21 @@ describe("buildDownloadPlan", () => {
     expect(plan.args).not.toContain("--limit-rate");
   });
 
+  test("aggressive IDM speed preset creates the intended multi-connection and fragment invocation", () => {
+    const planNative = build(DOWNLOAD_SPEED_PROFILES.aggressive.values, false);
+    expect(planNative.engine).toBe("native");
+    expect(flagValue(planNative.args, "--concurrent-fragments")).toBe("64");
+    expect(flagValue(planNative.args, "--http-chunk-size")).toBe("10M");
+    expect(flagValue(planNative.args, "--buffer-size")).toBe("64K");
+    expect(flagValue(planNative.args, "--user-agent")).toBe(DOWNLOAD_SPEED_PROFILES.aggressive.values.userAgent);
+    expect(planNative.args).not.toContain("--limit-rate");
+
+    const planAria2 = build(DOWNLOAD_SPEED_PROFILES.aggressive.values, true);
+    expect(planAria2.engine).toBe("aria2c");
+    expect(planAria2.args).toContain("--downloader-args");
+    expect(flagValue(planAria2.args, "--downloader-args")).toBe("aria2c:-x 16 -s 32 -j 32 --min-split-size 512K");
+  });
+
   test("adds the download archive and live filter only when enabled", () => {
     expect(flagValue(build().args, "--download-archive")).toBe(DEFAULT_CONFIG.archiveFile);
     expect(build().args).not.toContain("--match-filters");
