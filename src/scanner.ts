@@ -40,8 +40,15 @@ export function normalizeVideoUrl(url: string): string {
   }
 }
 
+/** Maximum time a flat-playlist listing may keep its pipes and worker occupied. */
+export const PLAYLIST_SCAN_TIMEOUT_MS = 10 * 60 * 1000;
+
 /** Fetch a flat listing of a playlist/channel URL via yt-dlp. */
-export async function getPlaylistItems(url: string, config: Config): Promise<ListingItem[]> {
+export async function getPlaylistItems(
+  url: string,
+  config: Config,
+  opts: { timeoutMs?: number } = {},
+): Promise<ListingItem[]> {
   const args = [
     ytDlp(),
     ...cookiesArgs(config),
@@ -51,13 +58,54 @@ export async function getPlaylistItems(url: string, config: Config): Promise<Lis
     "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s",
     url,
   ];
-  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
-  const [out, , code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  if (code !== 0) return [];
+  const ctl = new AbortController();
+  const timeoutMs = opts.timeoutMs ?? PLAYLIST_SCAN_TIMEOUT_MS;
+  let proc: Bun.Subprocess | null = null;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctl.abort();
+    // Do not leave a stubborn yt-dlp process or open output pipes behind.
+    if (proc && proc.exitCode === null) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+  }, timeoutMs);
+  let out = "";
+  let stderr = "";
+  let code = -1;
+  try {
+    const child = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: ctl.signal });
+    proc = child;
+    [out, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+  } catch (error) {
+    if (proc && proc.exitCode === null) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+      await proc.exited.catch(() => {});
+    }
+    if (timedOut) throw new Error(`yt-dlp playlist scan timed out after ${timeoutMs}ms`);
+    throw new Error(`Could not start yt-dlp playlist scan: ${error instanceof Error ? error.message : error}`);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (timedOut) throw new Error(`yt-dlp playlist scan timed out after ${timeoutMs}ms`);
+  if (code !== 0) {
+    const detail = stderr
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(-3)
+      .join(" ")
+      .slice(-500);
+    throw new Error(`yt-dlp playlist scan failed (exit ${code})${detail ? `: ${detail}` : ""}`);
+  }
   return out
     .split("\n")
     .filter((l) => l.trim())

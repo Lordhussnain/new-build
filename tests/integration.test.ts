@@ -461,6 +461,81 @@ describe("integration: transient failures and resume", () => {
     }
   }, TEST_TIMEOUT);
 
+  test("runs one bounded self-update for concurrent signature failures and then completes", async () => {
+    const dir = await makeRunDir();
+    const updateLog = join(dir, "yt-dlp-update.log");
+    const engine = await startEngine(
+      dir,
+      4001,
+      BASE_CONFIG(4001, {
+        retryBackoffBaseSeconds: 1,
+        retryBackoffMaxSeconds: 2,
+        maxRetryAttempts: 3,
+        maxFailuresPerVideo: 3,
+        maxFailures: 50,
+      }),
+      {
+        FAKE_FAIL_TIMES: "1",
+        FAKE_FAIL_MODE: "signature",
+        FAKE_UPDATE_LOG: updateLog,
+        FAKE_DELAY_MS: "20",
+      },
+    );
+
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+      for (const job of jobs) expect(job.retry_count).toBe(0);
+      expect(await Bun.file(updateLog).text()).toBe("update\n");
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("does not reset retry budgets when yt-dlp self-update fails", async () => {
+    const dir = await makeRunDir();
+    const updateLog = join(dir, "yt-dlp-update.log");
+    const engine = await startEngine(
+      dir,
+      4003,
+      BASE_CONFIG(4003, {
+        maxConcurrentDownloads: 1,
+        maxRetryAttempts: 1,
+        maxFailuresPerVideo: 1,
+        maxFailures: 50,
+      }),
+      {
+        FAKE_FAIL_TIMES: "99",
+        FAKE_FAIL_MODE: "signature",
+        FAKE_UPDATE_FAIL: "1",
+        FAKE_UPDATE_LOG: updateLog,
+        FAKE_DELAY_MS: "20",
+      },
+    );
+
+    try {
+      await waitFor("all signature failures to exhaust their retry budgets", async () => {
+        const jobs = await getJobs(engine);
+        return jobs.length === 3 && jobs.every((job) => job.download_status === "failed");
+      });
+      const jobs = await getJobs(engine);
+      for (const job of jobs) {
+        expect(job.retry_count).toBe(1);
+        expect(job.last_error).toContain("Signature extraction failed");
+      }
+      // The first job owns the failed update attempt; subsequent signature
+      // errors observe the cooldown and keep their original diagnostic.
+      expect(jobs.some((job) => job.last_error?.includes("auto-update exited with code 17"))).toBe(true);
+      expect(jobs.some((job) => job.last_error?.includes("mock yt-dlp self-update failed"))).toBe(true);
+      expect(await Bun.file(updateLog).text()).toBe("update\n");
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
   test("forgives failed attempts that keep advancing the partial download", async () => {
     const dir = await makeRunDir();
     const engine = await startEngine(
@@ -643,8 +718,8 @@ describe("integration: aria2c multi-connection downloads", () => {
         videoQuality: "audio",
         useAria2c: true,
         connectionsPerDownload: 8,
-        // A single download slot makes the split deterministic, so the
-        // recorded cap must equal the configured one verbatim.
+        // A single download slot makes the split deterministic: the configured
+        // KB/s cap is forwarded as an exact integer byte/second rate.
         maxConcurrentDownloads: 1,
         maxDownloadWorkers: 1,
         maxBandwidthKBps: 2048,
@@ -683,7 +758,7 @@ describe("integration: aria2c multi-connection downloads", () => {
         expect(args).toContain("-s");
         expect(args).toContain("-j");
         expect(args).toContain("--max-overall-download-limit");
-        expect(args).toContain("2048K");
+        expect(args).toContain("2097152");
         expect(args).toContain("--out");
       }
 

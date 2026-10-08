@@ -104,6 +104,36 @@ export function isNChallengeError(message: string | null | undefined): boolean {
 }
 
 /**
+ * True for yt-dlp's legacy signature decipher/extraction failures. Keep this
+ * narrow: generic "unable to extract" messages include network and extractor
+ * failures that `yt-dlp -U` cannot repair.
+ */
+export function isSignatureChallengeError(message: string | null | undefined): boolean {
+  if (!message) return false;
+  return [
+    /signature extraction failed/i,
+    /nsig extraction failed/i,
+    /unable to extract (?:the )?(?:signature|nsig)(?: function)?/i,
+    /failed to extract (?:the )?(?:signature|nsig)(?: function)?/i,
+    /(?:signature|nsig) decipher(?:ing)? failed/i,
+    /could not find (?:the )?(?:signature|nsig) function/i,
+  ].some((pattern) => pattern.test(message));
+}
+
+/** Disk exhaustion is an engine-wide resource condition, not a video failure. */
+export function isDiskFullError(message: string | null | undefined): boolean {
+  if (!message) return false;
+  return [
+    /\b(?:enospc|error_disk_full)\b/i,
+    /no space left on (?:the )?(?:device|disk|filesystem)/i,
+    /(?:disk|storage) quota exceeded/i,
+    /\b(?:disk|drive|storage|volume)\s+(?:is\s+)?full\b/i,
+    /not enough (?:free )?space (?:on|in) (?:the )?(?:disk|drive|device|filesystem)/i,
+    /winerror\s*112\b/i,
+  ].some((pattern) => pattern.test(message));
+}
+
+/**
  * True when a download error is permanent (the video can never be fetched) and
  * retrying is pointless.
  */
@@ -384,21 +414,30 @@ export function progressAwareRetryState(
  * and an immediate-ish retry is worthwhile.
  */
 export function isTransientDownloadError(message: string): boolean {
-  if (isNChallengeError(message)) return true;
+  if (isDiskFullError(message)) return false;
+  if (isNChallengeError(message) || isSignatureChallengeError(message)) return true;
   const m = message.toLowerCase();
   return [
     "unable to download",
     "connection reset",
+    "connection refused",
     "timeout",
     "timed out",
     "network is unreachable",
     "err_connection",
     "temporary failure",
+    "temporarily unavailable",
     "could not connect",
-    "sigabrt",
-    "aborted",
+    "too many requests",
+    "rate limit",
+    "rate-limit",
+    "http error 408",
+    "http error 425",
     "http error 429",
     "http error 5",
+    "service unavailable",
+    "sigabrt",
+    "aborted",
     "ssl",
     "eof",
     "broken pipe",

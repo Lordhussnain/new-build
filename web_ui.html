@@ -1428,8 +1428,8 @@
         }[meta] || escapeHtml(meta);
 
         return `
-          <tr data-job-id="${job.id}" onclick="openJobDetailById('${job.id}', event)" title="Click for details">
-            <td><input type="checkbox" class="job-checkbox" data-id="${job.id}" ${isChecked} onchange="toggleJobSelection('${job.id}')" /></td>
+          <tr data-job-id="${escapeHtml(job.id)}" onclick="openJobDetailById(this.dataset.jobId, event)" title="Click for details">
+            <td><input type="checkbox" class="job-checkbox" data-id="${escapeHtml(job.id)}" ${isChecked} onchange="toggleJobSelection(this.dataset.id)" /></td>
             <td>
               ${escapeHtml(job.title || 'Unknown')}
               ${location ? `<div style="font-size: 0.72rem; color: var(--text-secondary); margin-top: 3px; word-break: break-all;" title="${escapeHtml(location)}">📍 ${escapeHtml(location)}</div>` : ''}
@@ -1447,8 +1447,8 @@
             <td><span class="status-badge ${statusClass}">${escapeHtml(badgeText)}</span>${attemptNote}${resumeNote}${errorNote}</td>
             <td style="font-size: 0.78rem;">${metaBadge}</td>
             <td>
-              ${status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>` : ''}
-              ${isStoppable(job) ? `<button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" title="Interrupt this job now — the in-flight downloader is stopped, and a kept partial resumes on Retry." onclick="stopJob('${job.id}')">⏹️ Stop</button>` : ''}
+              ${status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob(this.closest('[data-job-id]').dataset.jobId)">🔄 Retry</button>` : ''}
+              ${isStoppable(job) ? `<button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" title="Interrupt this job now — the in-flight downloader is stopped, and a kept partial resumes on Retry." onclick="stopJob(this.closest('[data-job-id]').dataset.jobId)">⏹️ Stop</button>` : ''}
               ${status === 'failed' || isStoppable(job) ? '' : '-'}
             </td>
           </tr>
@@ -1641,14 +1641,14 @@
           const terminal = reason.startsWith('⛔');
           const reasonColor = terminal ? 'var(--text-secondary)' : 'var(--danger)';
           return `
-          <div class="history-item">
+          <div class="history-item" data-job-id="${escapeHtml(job.id)}">
             <h4>${escapeHtml(job.title)}</h4>
             <p style="color: ${reasonColor}; margin: 10px 0;">${escapeHtml(reason)}</p>
             <div class="history-meta">
               <span>Folder: ${escapeHtml(job.folder)}</span>
               <span>Retries: ${job.retry_count || 0} · meta: ${job.metadata_retry_count || 0} · convert: ${job.conversion_retry_count || 0}</span>
-              <button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>
-              <button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" onclick="resetFailCount('${job.id}')">🔢 Reset Count</button>
+              <button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob(this.closest('[data-job-id]').dataset.jobId)">🔄 Retry</button>
+              <button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" onclick="resetFailCount(this.closest('[data-job-id]').dataset.jobId)">🔢 Reset Count</button>
             </div>
           </div>
         `;
@@ -2006,7 +2006,7 @@
             These choices affect only this video. “Use global” follows the current app setting. Audio-track changes below are included if you edit them.
             ${job.download_status === 'downloaded' ? ' The existing file is kept until the replacement succeeds.' : ''}
           </div>
-          <button class="btn btn-success" style="padding:6px 10px; font-size:0.74rem;" onclick="saveJobOverride('${job.id}')" ${active ? 'disabled title="Wait for the active job stage to finish"' : ''}>${actionLabel}</button>
+          <button class="btn btn-success" style="padding:6px 10px; font-size:0.74rem;" onclick="saveJobOverride(this.closest('[data-job-id]').dataset.jobId)" ${active ? 'disabled title="Wait for the active job stage to finish"' : ''}>${actionLabel}</button>
         </div>`;
     }
 
@@ -2024,7 +2024,7 @@
           <div style="font-size:0.74rem; color: var(--text-secondary); margin-bottom:8px;">
             Not discovered yet. Find what YouTube offers (original + auto-dubbed tracks), then pick which to keep.
           </div>
-          <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks('${job.id}')">🔍 Find audio tracks</button>
+          <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks(this.closest('[data-job-id]').dataset.jobId)">🔍 Find audio tracks</button>
         </div>`;
       }
       const rows = tracks.map((t) => {
@@ -2045,9 +2045,9 @@
           ${rows}
           <div style="font-size:0.7rem; color: var(--text-secondary); margin:6px 0 8px;">${escapeHtml(modeNote)}${downloaded ? ' This video is already downloaded — saving &amp; re-downloading replaces it (the previous file is kept until the new download succeeds).' : ''}</div>
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveAudioSelection('${job.id}', ${downloaded})">💾 ${downloaded ? 'Save &amp; re-download' : 'Save selection'}</button>
-            ${sel ? `<button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="resetAudioSelection('${job.id}')">↩️ Use global setting</button>` : ''}
-            <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks('${job.id}')">🔄 Re-scan</button>
+            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveAudioSelection(this.closest('[data-job-id]').dataset.jobId, ${downloaded})">💾 ${downloaded ? 'Save &amp; re-download' : 'Save selection'}</button>
+            ${sel ? `<button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="resetAudioSelection(this.closest('[data-job-id]').dataset.jobId)">↩️ Use global setting</button>` : ''}
+            <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks(this.closest('[data-job-id]').dataset.jobId)">🔄 Re-scan</button>
           </div>
         </div>`;
     }
@@ -2191,7 +2191,7 @@
           ${sidecars}
           <div style="font-size:0.7rem; color: var(--text-secondary); margin:6px 0 8px;">${note} Subtitle languages follow the “Subtitle languages” setting.</div>
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveSidecarSelection('${job.id}')">💾 Save${job.download_status === 'downloaded' ? ' &amp; fetch' : ''}</button>
+            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveSidecarSelection(this.closest('[data-job-id]').dataset.jobId)">💾 Save${job.download_status === 'downloaded' ? ' &amp; fetch' : ''}</button>
           </div>
         </div>`;
     }
@@ -2228,7 +2228,8 @@
       const control = parts ? `${parts}.aria2` : '';
       const body = document.getElementById('drawerBody');
 
-      body.innerHTML = `<div class="detail-grid">
+      body.innerHTML = `<div data-job-id="${escapeHtml(job.id)}">
+        <div class="detail-grid">
           ${detailRow('Video ID', job.id, true)}
           ${detailRow('URL', job.url, true)}
           ${detailRow('Folder', job.folder)}
@@ -2256,11 +2257,12 @@
         ${job.superseded_file ? `<div style="margin-top:12px; padding:8px 10px; border-radius:8px; background:rgba(59,130,246,0.10); font-size:0.73rem; color: var(--text-secondary);">🔁 Re-download in progress — the previous file is kept as <span class="mono">${escapeHtml(job.superseded_file)}</span> until the new download succeeds, and restored automatically if the re-download fails permanently.</div>` : ''}
         ${job.last_error ? `<div style="margin-top:14px; font-size:0.74rem; color: var(--text-secondary); line-height:1.4;">A kept partial means the next attempt resumes from it. Permanent failures (private / removed / age-gated / geo-blocked) are never retried automatically.</div>` : ''}
         <div style="margin-top:16px; display:flex; gap:8px; flex-wrap:wrap;">
-          <button class="btn btn-success" style="padding:6px 12px; font-size:0.75rem;" onclick="retryJob('${job.id}'); closeJobDetail();">🔄 Retry job</button>
-          ${isStoppable(job) ? `<button class="btn btn-warning" style="padding:6px 12px; font-size:0.75rem;" onclick="stopJob('${job.id}'); closeJobDetail();">⏹️ Stop job</button>` : ''}
-          <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.75rem;" onclick="openJobDetailById('${job.id}')">🔄 Refresh</button>
+          <button class="btn btn-success" style="padding:6px 12px; font-size:0.75rem;" onclick="retryJob(this.closest('[data-job-id]').dataset.jobId); closeJobDetail();">🔄 Retry job</button>
+          ${isStoppable(job) ? `<button class="btn btn-warning" style="padding:6px 12px; font-size:0.75rem;" onclick="stopJob(this.closest('[data-job-id]').dataset.jobId); closeJobDetail();">⏹️ Stop job</button>` : ''}
+          <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.75rem;" onclick="openJobDetailById(this.closest('[data-job-id]').dataset.jobId)">🔄 Refresh</button>
           <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.75rem;" onclick="closeJobDetail()">Close</button>
-        </div>`;
+        </div>
+      </div>`;
 
       document.getElementById('jobDrawer').classList.add('open');
       document.getElementById('drawerBackdrop').classList.add('open');

@@ -1,10 +1,10 @@
 // src/web.ts — dashboard web server + JSON API.
 //
-// Security model: loopback-only by default (webBind), and every request — UI
-// and API — is gated behind the optional shared-secret token (cookie,
-// Authorization: Bearer, X-Web-Token header, or ?token= query param), with
-// timing-safe comparison. The destructive routes (purge, delete) are behind
-// the same gate.
+// Security model: loopback-only by default (webBind); every UI/API request
+// except the POST /api/auth sign-in exchange is gated by the optional shared
+// secret (HttpOnly cookie, Authorization: Bearer, X-Web-Token, or the legacy
+// ?token= path), with timing-safe comparison. Unsafe browser methods also pass
+// a same-origin check, including when token auth is disabled.
 
 import { existsSync, readFileSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
@@ -29,20 +29,31 @@ import { errorLogPath, logError } from "./logger";
 import { QUALITY_FORMATS, withConfigWriteLock, type Config } from "./config";
 
 // --- Web UI auth (optional shared-secret token) ------------------------------
-// When webToken is set, every request must present it — as a cookie (set after
-// the first successful sign-in), an Authorization: Bearer header, an
-// X-Web-Token header, or a ?token= query parameter. Comparison is timing-safe.
-export function extractWebToken(req: Request, url: URL): string | null {
+// When webToken is set, every request except POST /api/auth must present it —
+// as a cookie (set after sign-in), Authorization: Bearer, X-Web-Token, or the
+// legacy ?token= query parameter. Comparison is timing-safe.
+function presentedWebTokens(req: Request, url: URL): string[] {
+  const tokens: string[] = [];
   const auth = req.headers.get("authorization") || "";
-  if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
+  if (auth.toLowerCase().startsWith("bearer ")) tokens.push(auth.slice(7).trim());
   const header = req.headers.get("x-web-token");
-  if (header) return header.trim();
-  const query = url.searchParams.get("token");
-  if (query) return query.trim();
+  if (header) tokens.push(header.trim());
   const cookie = req.headers.get("cookie") || "";
   const match = cookie.match(/(?:^|;\s*)yta_token=([^;]+)/);
-  if (match) return decodeURIComponent(match[1]).trim();
-  return null;
+  if (match) {
+    try {
+      tokens.push(decodeURIComponent(match[1]).trim());
+    } catch {
+      // A malformed cookie is just an invalid credential, not a server error.
+    }
+  }
+  const query = url.searchParams.get("token");
+  if (query) tokens.push(query.trim());
+  return tokens.filter(Boolean);
+}
+
+export function extractWebToken(req: Request, url: URL): string | null {
+  return presentedWebTokens(req, url)[0] ?? null;
 }
 
 export function timingSafeEq(a: string, b: string): boolean {
@@ -53,14 +64,63 @@ export function timingSafeEq(a: string, b: string): boolean {
 }
 
 export function isAuthorized(req: Request, url: URL, config: Config): boolean {
-  if (!config.webToken) return true;
-  const presented = extractWebToken(req, url);
-  return !!presented && timingSafeEq(presented, config.webToken);
+  const expected = config.webToken;
+  if (!expected) return true;
+  return presentedWebTokens(req, url).some((presented) => timingSafeEq(presented, expected));
 }
 
-// Minimal sign-in page: submits the token as ?token=..., the server validates
-// it, sets an HttpOnly cookie, and serves the real UI — so the stock dashboard
-// JS (plain fetch, no token logic) keeps working unchanged.
+const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+/**
+ * Cookie authentication must not turn the local control API into a CSRF target.
+ * Browser mutations carry an Origin header; reject a cross-origin value and
+ * the Fetch Metadata cross-site signal. Non-browser clients without these
+ * headers remain supported (they still need the token when one is configured).
+ */
+export function isSameOriginMutation(req: Request, url: URL): boolean {
+  if (!MUTATION_METHODS.has(req.method.toUpperCase())) return true;
+  if (req.headers.get("sec-fetch-site")?.toLowerCase() === "cross-site") return false;
+  const origin = req.headers.get("origin");
+  if (!origin) return true;
+  try {
+    return new URL(origin).origin === url.origin;
+  } catch {
+    return false;
+  }
+}
+
+function tokenCookie(token: string, url: URL): string {
+  const secure = url.protocol === "https:" ? "; Secure" : "";
+  return `yta_token=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000${secure}`;
+}
+
+async function exchangeToken(req: Request, config: Config, url: URL): Promise<Response> {
+  const expected = config.webToken;
+  if (!expected) return Response.json({ ok: false, error: "Token authentication is not configured" }, { status: 404 });
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return Response.json({ ok: false, error: "Expected a JSON body" }, { status: 400 });
+  }
+  const token = body && typeof body === "object" && typeof (body as { token?: unknown }).token === "string"
+    ? (body as { token: string }).token.trim()
+    : "";
+  if (!token || !timingSafeEq(token, expected)) {
+    return Response.json(
+      { ok: false, error: "Invalid token" },
+      { status: 401, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+  return Response.json(
+    { ok: true },
+    { headers: { "Set-Cookie": tokenCookie(token, url), "Cache-Control": "no-store" } },
+  );
+}
+
+// The sign-in page posts the token to the same-origin auth endpoint. It never
+// puts credentials in the address bar or browser history; after exchange the
+// HttpOnly cookie lets the stock dashboard JS (plain fetch, no token logic) work.
 const LOGIN_PAGE = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Archive — Sign in</title>
@@ -74,17 +134,37 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 </style></head>
 <body><div class="card">
   <h1>Archive Web UI — sign in</h1>
-  <form onsubmit="return go()">
-    <input id="token" type="password" placeholder="Access token" autofocus>
-    <button type="submit">Sign in</button>
+  <form onsubmit="return go(event)">
+    <input id="token" type="password" placeholder="Access token" autocomplete="current-password" autofocus>
+    <button id="submit" type="submit">Sign in</button>
     <div class="err" id="err"></div>
   </form>
 </div>
 <script>
-  function go() {
-    const t = document.getElementById('token').value.trim();
-    if (!t) return false;
-    location.href = '/?token=' + encodeURIComponent(t);
+  async function go(event) {
+    event.preventDefault();
+    const input = document.getElementById('token');
+    const button = document.getElementById('submit');
+    const err = document.getElementById('err');
+    const token = input.value.trim();
+    if (!token) return false;
+    button.disabled = true;
+    err.textContent = '';
+    try {
+      const response = await fetch('/api/auth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+        body: JSON.stringify({ token })
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.error || 'Invalid token');
+      location.replace('/');
+    } catch (error) {
+      err.textContent = error.message || 'Sign in failed — try again.';
+      button.disabled = false;
+      input.focus();
+    }
     return false;
   }
   if (new URLSearchParams(location.search).has('token')) {
@@ -118,25 +198,48 @@ export function startWebServer(port: number, config: Config) {
 export async function handleRequest(req: Request, config: Config): Promise<Response> {
   const url = new URL(req.url);
 
+  if (!isSameOriginMutation(req, url)) {
+    return Response.json({ ok: false, error: "Cross-origin mutations are not allowed" }, { status: 403 });
+  }
+
   if (url.pathname === "/") {
     const queryToken = url.searchParams.get("token");
-    if (config.webToken && !isAuthorized(req, url, config)) {
+    const expected = config.webToken;
+    const validQueryToken = !!queryToken && !!expected && timingSafeEq(queryToken.trim(), expected);
+    if (expected && !isAuthorized(req, url, config)) {
       // Missing/wrong token → the sign-in page (401 so browsers don't treat it
-      // as the real app). A *valid* query token falls through, gets served the
-      // app, and receives an HttpOnly cookie for subsequent requests.
+      // as the real app). Sign-in itself exchanges credentials via POST and
+      // never puts the token in the address bar.
       return new Response(LOGIN_PAGE, {
         status: 401,
-        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store",
+          "Referrer-Policy": "no-referrer",
+        },
       });
     }
     if (existsSync("./web_ui.html")) {
-      const headers: Record<string, string> = { "Content-Type": "text/html" };
-      if (config.webToken && queryToken) {
-        headers["Set-Cookie"] = `yta_token=${encodeURIComponent(queryToken)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`;
-      }
+      const headers: Record<string, string> = {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
+      };
+      // Keep the documented query-token compatibility path, but only a query
+      // token that actually matches the configured secret may replace a cookie.
+      if (validQueryToken) headers["Set-Cookie"] = tokenCookie(queryToken!.trim(), url);
       return new Response(Bun.file("./web_ui.html"), { headers });
     }
     return new Response("web_ui.html not found. Please create it.", { status: 500 });
+  }
+
+  // Sign-in exchange is the only unauthenticated mutation endpoint. All other
+  // API routes (pause/resume, purge, delete, ...) remain behind the auth gate.
+  if (url.pathname === "/api/auth") {
+    if (req.method !== "POST") {
+      return Response.json({ ok: false, error: "Method not allowed" }, { status: 405, headers: { Allow: "POST" } });
+    }
+    return exchangeToken(req, config, url);
   }
 
   // Every API route (status, scan, pause/resume, purge, delete, ...) is gated
@@ -185,7 +288,12 @@ function matchRoute(pattern: string, segments: string[]): RouteParams | null {
     const p = parts[i];
     if (p.startsWith(":")) {
       if (!segments[i]) return null; // never bind an empty param
-      params[p.slice(1)] = decodeURIComponent(segments[i]);
+      try {
+        params[p.slice(1)] = decodeURIComponent(segments[i]);
+      } catch {
+        // A malformed percent escape is an invalid path, not a handler crash.
+        return null;
+      }
     } else if (p !== segments[i]) {
       return null;
     }

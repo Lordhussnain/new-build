@@ -100,6 +100,36 @@ export async function metadataWorker(id: number, config: Config): Promise<void> 
   }
 }
 
+async function stopMetadataProcess(proc: Bun.Subprocess): Promise<void> {
+  if (proc.exitCode === null) {
+    try {
+      proc.kill("SIGINT");
+    } catch {
+      // It may have exited between the check and the signal.
+    }
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    let exited: boolean;
+    try {
+      exited = await Promise.race([
+        proc.exited.then(() => true, () => true),
+        new Promise<boolean>((resolve) => {
+          graceTimer = setTimeout(() => resolve(false), 2_000);
+        }),
+      ]);
+    } finally {
+      if (graceTimer !== undefined) clearTimeout(graceTimer);
+    }
+    if (!exited && proc.exitCode === null) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // The child may have exited just before the force-kill.
+      }
+    }
+  }
+  await proc.exited.catch(() => {});
+}
+
 async function runMetadataJob(job: Job, config: Config, id: number): Promise<void> {
   updateMetadataWorkerLine(id, `📎 Metadata | ${job.title}`, config);
 
@@ -136,15 +166,35 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
   if (config.writeInfoJson) args.push("--write-info-json");
 
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), 10 * 60 * 1000);
-  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: ctl.signal });
-  activeMetadataProcs.set(id, proc);
-  // Drain both pipes concurrently to avoid deadlock.
-  const stdoutPromise = new Response(proc.stdout).text().catch(() => "");
-  const stderrPromise = new Response(proc.stderr).text();
-  const [stdoutText, stderrText, code] = await Promise.all([stdoutPromise, stderrPromise, proc.exited]);
-  clearTimeout(timer);
-  activeMetadataProcs.delete(id);
+  let proc: Bun.Subprocess | null = null;
+  const timer = setTimeout(() => {
+    ctl.abort();
+    // Abort normally terminates the child. Force-kill as a bounded fallback so
+    // a tool that ignores SIGTERM cannot pin this worker forever.
+    if (proc && proc.exitCode === null) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+  }, 10 * 60 * 1000);
+  let stdoutText = "";
+  let stderrText = "";
+  let code = -1;
+  try {
+    const child = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: ctl.signal });
+    proc = child;
+    activeMetadataProcs.set(id, child);
+    // Drain both pipes concurrently to avoid deadlock.
+    const stdoutPromise = new Response(child.stdout).text();
+    const stderrPromise = new Response(child.stderr).text();
+    [stdoutText, stderrText, code] = await Promise.all([stdoutPromise, stderrPromise, child.exited]);
+  } finally {
+    clearTimeout(timer);
+    activeMetadataProcs.delete(id);
+    // If pipe setup/reading fails before proc.exited settles, do not leave an
+    // untracked yt-dlp child running against a job whose claim will be released.
+    if (proc) await stopMetadataProcess(proc);
+  }
 
   if (isPaused()) {
     releaseClaimedJob("metadata", job.id, metadataClaim(job), `metadata_status = 'pending'`);

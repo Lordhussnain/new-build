@@ -13,13 +13,16 @@
 //
 // Failure injection via environment variables:
 //   FAKE_FAIL_TIMES=2        fail the first N download attempts (leaves a .part)
-//   FAKE_FAIL_MODE=transient|permanent|corrupt|private|unavailable|format
+//   FAKE_FAIL_MODE=transient|permanent|corrupt|private|unavailable|format|signature
 //                            what the failure looks like ("private"/"unavailable"
 //                            are the wordings YouTube actually emits, which the
-//                            engine must skip terminally; "format" is yt-dlp's
-//                            selector failure that triggers the quality ladder)
+//                            engine must skip terminally; "format" is a selector
+//                            failure; "signature" exercises the bounded -U path)
 //   FAKE_FAIL_MESSAGE=…      override the failure text (unique markers let a
 //                            test assert where the message did and did not land)
+//   FAKE_UPDATE_FAIL=1       make `yt-dlp -U` fail with a diagnostic
+//   FAKE_UPDATE_HANG=1       make `yt-dlp -U` hang until the engine kills it
+//   FAKE_UPDATE_LOG=path     append each `-U` call (cooldown/coalescing tests)
 //   FAKE_FORMAT_FAILS_SELECTOR='height<=1080'
 //                            fail with "Requested format is not available" only
 //                            while --format contains the substring, so the
@@ -75,6 +78,12 @@ if (flag("--version")) {
 }
 
 if (flag("-U")) {
+  if (process.env.FAKE_UPDATE_LOG) await appendFile(process.env.FAKE_UPDATE_LOG, "update\n");
+  if (process.env.FAKE_UPDATE_HANG === "1") await new Promise(() => {});
+  if (process.env.FAKE_UPDATE_FAIL === "1") {
+    console.error("mock yt-dlp self-update failed");
+    process.exit(17);
+  }
   console.log("yt-dlp is up to date (mock)");
   process.exit(0);
 }
@@ -258,7 +267,9 @@ if (failTimes > 0 && attempts <= failTimes) {
           ? "ERROR: [youtube] mockvid001: This video is unavailable"
           : failMode === "format"
             ? "ERROR: [youtube] mockvid001: Requested format is not available"
-            : failMode === "corrupt"
+            : failMode === "signature"
+              ? "ERROR: [youtube] mockvid001: Signature extraction failed: Some formats may be missing"
+              : failMode === "corrupt"
               ? "ERROR: unable to resume download, incomplete or corrupt data"
               : "ERROR: Unable to download webpage: Connection reset by peer (transient mock failure)");
   console.error(msg);

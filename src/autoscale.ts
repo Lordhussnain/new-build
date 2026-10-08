@@ -11,6 +11,8 @@ import { getConfig } from "./state";
 export const autoscaler = {
   enabled: true,
   targetWorkers: 3,
+  /** Last configured initial/fixed slot count, used to apply live setting edits. */
+  initialWorkers: 3,
   minWorkers: 1,
   maxWorkers: 5,
   /**
@@ -38,6 +40,7 @@ export const autoscaler = {
     this.poolSize = c.maxDownloadWorkers;
     this.maxBandwidthKBps = c.maxBandwidthKBps;
     this.rampStep = Math.max(1, Math.floor(c.autoscaleRampStep));
+    this.initialWorkers = c.maxConcurrentDownloads;
     this.targetWorkers = Math.max(this.minWorkers, Math.min(c.maxConcurrentDownloads, this.maxWorkers));
     setActiveSlots(this.targetWorkers);
   },
@@ -68,12 +71,13 @@ export function setActiveSlots(target: number): void {
 // Autoscale tick (every 15s when autoscaleEnabled): grow toward
 // maxDownloadWorkers while the queue has backlog and bandwidth headroom, shed
 // slots when the aggregate speed saturates the configured cap, and fall back
-// to minDownloadWorkers when there is nothing to do. With autoscaling
-// disabled the slot count stays pinned to maxConcurrentDownloads.
+// to minDownloadWorkers when there is nothing to do. maxConcurrentDownloads is
+// the initial target (and live reset value); with autoscaling disabled it is
+// the fixed slot count.
 export function autoscaleTick(): void {
-  // Read everything from the live config: toggling autoscaling, the ramp step,
-  // or the worker floor/ceiling from the dashboard applies on the next tick
-  // without a restart (the ceiling is clamped to the supervised pool size).
+  // Read everything from the live config: toggling autoscaling, the starting
+  // slot count, ramp step, and worker floor/ceiling from the dashboard apply on
+  // the next tick (the ceiling is clamped to the supervised pool size).
   const config = getConfig();
   const minWorkers = Math.max(1, Math.min(20, Math.floor(config.minDownloadWorkers)));
   const maxWorkers = Math.max(minWorkers, Math.min(20, autoscaler.poolSize, Math.floor(config.maxDownloadWorkers)));
@@ -81,11 +85,15 @@ export function autoscaleTick(): void {
   autoscaler.maxWorkers = maxWorkers;
   autoscaler.rampStep = Math.max(1, Math.floor(config.autoscaleRampStep));
   autoscaler.enabled = config.autoscaleEnabled;
+  const initialChanged = config.maxConcurrentDownloads !== autoscaler.initialWorkers;
+  autoscaler.initialWorkers = config.maxConcurrentDownloads;
+  const initialSlots = Math.max(minWorkers, Math.min(config.maxConcurrentDownloads, maxWorkers));
   if (!autoscaler.enabled) {
-    setActiveSlots(Math.max(minWorkers, Math.min(config.maxConcurrentDownloads, maxWorkers)));
+    setActiveSlots(initialSlots);
     autoscaler.targetWorkers = activeDlSlots.size;
     return;
   }
+  if (initialChanged) setActiveSlots(initialSlots);
   try {
     const q = db
       .query(
@@ -98,7 +106,8 @@ export function autoscaleTick(): void {
     const backlog = q?.backlog || 0;
     const aggBps = autoscaler.getAggregateSpeed();
     const capBps = config.maxBandwidthKBps * 1024;
-    let target = activeDlSlots.size;
+    // Enforce changed floor/ceiling immediately, even under backlog pressure.
+    let target = Math.min(maxWorkers, Math.max(minWorkers, activeDlSlots.size));
     if (backlog === 0) {
       target = minWorkers;
     } else if (capBps > 0 && aggBps > capBps * 0.9 && target > minWorkers) {

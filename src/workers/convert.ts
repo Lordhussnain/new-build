@@ -65,9 +65,9 @@ export async function runFfmpeg(
 
 /**
  * How many audio streams a media file carries (ffprobe-style via ffmpeg's
- * banner). Used to recognise multi-audio archives, which must keep their
- * container instead of being remuxed to mp4. 0 on any probe failure — the
- * caller then behaves exactly like before multi-audio support.
+ * banner). Used to identify multi-audio archives while honoring the requested
+ * target container: the conversion command maps every audio stream, and MP4
+ * re-encodes each one as AAC. 0 on any probe failure.
  */
 export async function countAudioStreams(path: string, workerId?: number): Promise<number> {
   try {
@@ -398,12 +398,12 @@ async function convertJob(job: Job, config: Config, id: number): Promise<void> {
     updateClaimedJob("conversion", job.id, claimRef("conversion", job), `file_path = ?`, [finalPath]);
     await deleteConvertedSource(job, config, sourcePath);
   } else if (!wantsMp3 && !sourcePath.endsWith(`.${targetFmt}`)) {
-    // Multi-audio archives land as MKV holding every selected track. MP4
-    // cannot carry them without re-encoding each dub, so a file with more
-    // than one audio stream is kept exactly as yt-dlp muxed it.
+    // Multi-audio archives land as MKV holding every selected track. If an
+    // explicit output-format setting requests conversion, map every stream;
+    // MP4 re-encodes each audio track to AAC instead of dropping the dubs.
     const audioStreams = await countAudioStreams(sourcePath, id);
     if (audioStreams >= 2) {
-      updateConvertWorkerLine(id, `🎧 Remuxing ${audioStreams} audio tracks | ${job.title}`, config);
+      updateConvertWorkerLine(id, `🎧 Preserving ${audioStreams} audio tracks | ${job.title}`, config);
     }
     const targetPath = sourcePath.replace(/\.[^.]+$/, `.${targetFmt}`);
     const ffmpegArgs =

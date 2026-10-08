@@ -10,7 +10,7 @@ import { join } from "node:path";
 import {
   buildAria2cArgs,
   buildDownloadPlan,
-  computePerWorkerLimitKBps,
+  computePerWorkerLimitBytesPerSec,
   jobBaseFilename,
   resolveDownloaderEngine,
 } from "../src/download-args";
@@ -80,22 +80,23 @@ describe("buildAria2cArgs", () => {
   });
 });
 
-describe("computePerWorkerLimitKBps", () => {
+describe("computePerWorkerLimitBytesPerSec", () => {
   test("null when no cap is configured", () => {
-    expect(computePerWorkerLimitKBps(cfg({ maxBandwidthKBps: 0 }), 3)).toBeNull();
+    expect(computePerWorkerLimitBytesPerSec(cfg({ maxBandwidthKBps: 0 }), 3)).toBeNull();
   });
 
-  test("splits the global cap across active slots", () => {
-    expect(computePerWorkerLimitKBps(cfg({ maxBandwidthKBps: 3000 }), 3)).toBe(1000);
-    expect(computePerWorkerLimitKBps(cfg({ maxBandwidthKBps: 3000 }), 1)).toBe(3000);
+  test("splits the cap across active slots and returns bytes per second", () => {
+    expect(computePerWorkerLimitBytesPerSec(cfg({ maxBandwidthKBps: 3000 }), 3)).toBe(1_024_000);
+    expect(computePerWorkerLimitBytesPerSec(cfg({ maxBandwidthKBps: 3000 }), 1)).toBe(3_072_000);
   });
 
-  test("floors at 64 KB/s so a big worker count cannot starve a stream", () => {
-    expect(computePerWorkerLimitKBps(cfg({ maxBandwidthKBps: 100 }), 10)).toBe(64);
+  test("honours small caps rather than flooring each worker to 64 KB/s", () => {
+    expect(computePerWorkerLimitBytesPerSec(cfg({ maxBandwidthKBps: 100 }), 10)).toBe(10_240);
+    expect(computePerWorkerLimitBytesPerSec(cfg({ maxBandwidthKBps: 1 }), 20)).toBe(51);
   });
 
   test("never divides by zero", () => {
-    expect(computePerWorkerLimitKBps(cfg({ maxBandwidthKBps: 500 }), 0)).toBe(500);
+    expect(computePerWorkerLimitBytesPerSec(cfg({ maxBandwidthKBps: 500 }), 0)).toBe(512_000);
   });
 });
 
@@ -166,15 +167,21 @@ describe("buildDownloadPlan", () => {
     expect(flagValue(plan.args, "--print")).toBe("after_move:FILEPATH:%(filepath)s");
   });
 
-  test("applies the bandwidth cap per slot", () => {
+  test("applies the bandwidth cap per slot as an exact byte rate", () => {
     const plan = build({ maxBandwidthKBps: 3000 }, true, 3);
-    expect(plan.perWorkerLimitKBps).toBe(1000);
-    expect(flagValue(plan.args, "--limit-rate")).toBe("1000K");
+    expect(plan.perWorkerLimitBytesPerSec).toBe(1_024_000);
+    expect(flagValue(plan.args, "--limit-rate")).toBe("1024000");
+  });
+
+  test("small bandwidth caps stay below 64 KB/s per slot", () => {
+    const plan = build({ maxBandwidthKBps: 100 }, true, 10);
+    expect(plan.perWorkerLimitBytesPerSec).toBe(10_240);
+    expect(flagValue(plan.args, "--limit-rate")).toBe("10240");
   });
 
   test("omits --limit-rate when uncapped", () => {
     const plan = build({ maxBandwidthKBps: 0 });
-    expect(plan.perWorkerLimitKBps).toBeNull();
+    expect(plan.perWorkerLimitBytesPerSec).toBeNull();
     expect(plan.args).not.toContain("--limit-rate");
   });
 

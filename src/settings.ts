@@ -144,7 +144,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     min: 0,
     unit: "KB/s",
     group: "downloader",
-    help: "Global cap, split across active download slots. 0 = unlimited.",
+    help: "Per-download rate cap split across active slots. Existing transfers keep their starting rate as slots change, so the aggregate is best-effort during autoscaling. 0 = unlimited.",
   },
   {
     key: "autoscaleRampStep",
@@ -275,12 +275,12 @@ export const EDITABLE_SETTINGS: SettingField[] = [
   // --- concurrency ----------------------------------------------------------
   {
     key: "maxConcurrentDownloads",
-    label: "Download slots",
+    label: "Initial download slots",
     type: "number",
     min: 1,
     max: 20,
     group: "concurrency",
-    help: "Slots allowed to claim downloads. Autoscaling tunes within this ceiling.",
+    help: "Starting slot count, not the autoscaler ceiling. Changing it while running resets the active pool on the next tick. With autoscaling enabled the pool can then grow toward maxDownloadWorkers and shrink to minDownloadWorkers; with it disabled this remains the fixed slot count.",
   },
   {
     key: "minDownloadWorkers",

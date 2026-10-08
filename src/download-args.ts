@@ -77,17 +77,18 @@ export function buildAria2cArgs(config: Config): string {
 }
 
 /**
- * The per-process bandwidth cap in KB/s.
+ * The per-process bandwidth cap in bytes per second.
  *
- * yt-dlp's `--limit-rate` is per process, so the configured global cap is
- * divided across the slots that are actually allowed to claim work. Floored at
- * 64 KB/s so a large worker count can never throttle a stream to a trickle.
- * Returns null when no cap is configured.
+ * yt-dlp's `--limit-rate` is per process, so the configured cap in KB/s is
+ * divided across the currently active download slots and converted to an
+ * integer byte rate. Do not impose a per-worker minimum: that silently exceeds
+ * small configured caps (e.g. 10 KB/s split across 20 workers must not become
+ * 64 KB/s per worker). Returns null when no cap is configured.
  */
-export function computePerWorkerLimitKBps(config: Config, activeSlots: number): number | null {
+export function computePerWorkerLimitBytesPerSec(config: Config, activeSlots: number): number | null {
   if (config.maxBandwidthKBps <= 0) return null;
   const slots = Math.max(1, Math.floor(activeSlots));
-  return Math.max(64, Math.floor(config.maxBandwidthKBps / slots));
+  return Math.max(1, Math.floor((config.maxBandwidthKBps * 1024) / slots));
 }
 
 /** The on-disk base name for a job's files (no extension). */
@@ -119,8 +120,8 @@ export interface DownloadPlan {
   args: string[];
   /** Duration-aware watchdog for this specific video. */
   timeoutMs: number;
-  /** Applied `--limit-rate` value in KB/s, or null when uncapped. */
-  perWorkerLimitKBps: number | null;
+  /** Applied `--limit-rate` value in bytes/second, or null when uncapped. */
+  perWorkerLimitBytesPerSec: number | null;
   /** Output template (`…/base.%(ext)s`) and the base name without extension. */
   baseFilename: string;
   outTemplate: string;
@@ -217,9 +218,11 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
 
   // Real bandwidth cap. yt-dlp translates --limit-rate into the external
   // downloader's own rate limit, so this works for both engines.
-  const perWorkerLimitKBps = computePerWorkerLimitKBps(config, activeSlots);
-  if (perWorkerLimitKBps) {
-    args.push("--limit-rate", `${perWorkerLimitKBps}K`);
+  const perWorkerLimitBytesPerSec = computePerWorkerLimitBytesPerSec(config, activeSlots);
+  if (perWorkerLimitBytesPerSec !== null) {
+    // A bare yt-dlp RATE is bytes/second. Use an integer so both yt-dlp and its
+    // aria2c rate-limit bridge get a precise sub-KB share without suffix rounding.
+    args.push("--limit-rate", String(perWorkerLimitBytesPerSec));
   }
 
   // yt-dlp's own idempotence layer: ids already in the archive file are
@@ -276,7 +279,7 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
       minMinutes: config.downloadTimeoutMinutes,
       maxMinutes: config.maxDownloadMinutes,
     }),
-    perWorkerLimitKBps,
+    perWorkerLimitBytesPerSec,
     baseFilename,
     outTemplate,
   };

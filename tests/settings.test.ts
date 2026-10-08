@@ -102,6 +102,13 @@ describe("the editable allow-list", () => {
     }
   });
 
+  test("describes maxConcurrentDownloads as the initial slot count, not an autoscale ceiling", () => {
+    const field = EDITABLE_SETTINGS.find((f) => f.key === "maxConcurrentDownloads")!;
+    expect(field.label).toContain("Initial");
+    expect(field.help).toContain("not the autoscaler ceiling");
+    expect(field.help).toContain("maxDownloadWorkers");
+  });
+
   test("number fields carry a lower bound, and an upper one where the schema has it", () => {
     for (const f of EDITABLE_SETTINGS.filter((x) => x.type === "number")) {
       expect(f.min).toBeDefined();
@@ -121,7 +128,15 @@ describe("the editable allow-list", () => {
     for (const key of ["ytDlpPath", "ffmpegPath", "aria2cPath", "maxDownloadWorkers", "webPort", "daemonMode"]) {
       expect(requiresRestart(key)).toBe(true);
     }
-    for (const key of ["useAria2c", "connectionsPerDownload", "videoQuality", "autoscaleEnabled"]) {
+    for (const key of [
+      "useAria2c",
+      "connectionsPerDownload",
+      "videoQuality",
+      "autoscaleEnabled",
+      "maxConcurrentDownloads",
+      "minDownloadWorkers",
+      "maxBandwidthKBps",
+    ]) {
       expect(requiresRestart(key)).toBe(false);
     }
   });

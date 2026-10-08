@@ -37,6 +37,8 @@ single most important thing to understand before changing failure-handling code.
 
 ```bash
 bun install            # zod (+ dev: typescript, @types/bun)
+# Alternative reproducible dependency install when using npm:
+npm ci                  # installs from package-lock.json; Bun is still the runtime
 bun run start          # run the engine (reads ./config.json, creates it if absent)
 bun run config         # interactive config manager (TTY)
 bun run typecheck      # tsc --noEmit
@@ -424,9 +426,12 @@ Reliability keys: `maxResumeAttempts`, `retryBackoffBaseSeconds`,
 `retryBackoffMaxSeconds`, `requeueFailedAfterMinutes`, `verifyExistingFiles`,
 `downloadTimeoutMinutes`, `maxDownloadMinutes`.
 
-Performance keys: `useAria2c`, `connectionsPerDownload`, `minSplitSize`,
-`concurrentFragments`, `fragmentRetries`, `httpChunkSize`, `bufferSize`,
-`autoscaleRampStep`. See section 7.1 for how they reach yt-dlp.
+Performance/concurrency keys: `useAria2c`, `connectionsPerDownload`,
+`minSplitSize`, `concurrentFragments`, `fragmentRetries`, `httpChunkSize`,
+`bufferSize`, `autoscaleEnabled`, `maxConcurrentDownloads`,
+`minDownloadWorkers`, `maxDownloadWorkers`, `autoscaleRampStep`, and
+`maxBandwidthKBps`. See section 7.1 for downloader flags and the distinction
+between initial/fixed slots and the autoscaler floor/ceiling.
 
 ### 7.1 How downloads actually reach yt-dlp (`src/download-args.ts`)
 
@@ -434,15 +439,18 @@ Performance keys: `useAria2c`, `connectionsPerDownload`, `minSplitSize`,
 place that builds the yt-dlp argv. It is pure and unit-tested — add new flags
 there, not in the worker. What it emits today:
 
-- `--downloader aria2c --downloader-args aria2c:"-x N -s N -j N"` when aria2c is
-  installed and `useAria2c` is true. yt-dlp's own baseline is
-  `-x16 -s16 -j16 --min-split-size 1M`, so `minSplitSize` is only emitted when
-  it differs from `1M`. The value is shlex-parsed by yt-dlp, so the whole list
-  is quoted and passed as ONE argv element.
-- `--limit-rate NK` when a cap is configured. yt-dlp maps this onto the external
-  downloader's own rate-limit flag (`aria2c --max-overall-download-limit`), so
-  the cap works on both engines. The value is the global cap divided by the
-  active slot count, floored at 64 KB/s.
+- `--downloader aria2c --downloader-args aria2c:-x N -s N -j N` when aria2c is
+  installed and `useAria2c` is true. The complete `aria2c:...` value is passed as
+  ONE argv element with no inner quotes; yt-dlp shlex-parses the text after the
+  prefix. yt-dlp's own baseline is `-x16 -s16 -j16 --min-split-size 1M`, so
+  `minSplitSize` is only emitted when it differs from `1M`.
+- `--limit-rate N` as an integer byte/second value when a cap is configured.
+  The configured KB/s cap is divided by the current active slot count and
+  converted to bytes/second; there is no per-worker minimum (a minimum would
+  violate small caps). yt-dlp maps this onto the external downloader's rate
+  limit (`aria2c --max-overall-download-limit`). Because active downloads keep
+  the rate they started with, the aggregate is best-effort during autoscaling;
+  new download attempts use the latest slot count.
 - Native tuning (`--concurrent-fragments`, `--fragment-retries`, and the opt-in
   `--http-chunk-size` / `--buffer-size`) applies to DASH/HLS fragments and the
   fallback path.
@@ -489,8 +497,11 @@ Dynamic Range Compression duplicates. `src/audio-tracks.ts` owns this:
   worker runs it once per job (only when a mode/selection will consume it),
   caches the result in `jobs.audio_tracks`, and a probe failure logs and
   falls back to single audio — it never fails a download.
-- `workers/convert.ts countAudioStreams()` keeps files with 2+ audio streams in
-  their container (remuxing an MKV to mp4 would drop/re-encode the dubs).
+- The default MP4 path marks a multi-track download as `not_needed`, so yt-dlp's
+  MKV is retained. If a per-job/global target format explicitly requests
+  conversion, `workers/convert.ts` maps every audio stream; MP4 re-encodes each
+  stream as AAC. `countAudioStreams()` drives that choice/logging — it does not
+  bypass a requested container conversion.
 
 Dashboard: `/api/jobs` returns `audio_tracks` / `audio_selection` as parsed
 arrays; `POST /api/jobs/<id>/audio-probe` refreshes the list;
@@ -1037,6 +1048,35 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     retained tail. Keep the one-shot when adding a stage, and never write job
     state from an `onLost` callback: the lease is gone, so the row belongs to
     somebody else.
+34. **Job ids are untrusted when rendered into `web_ui.html`.** Keep ids in
+    escaped `data-job-id`/`data-id` attributes and read them with `dataset` from
+    static inline handlers; never interpolate an id into JavaScript source or
+    an HTML attribute unescaped. Encode ids with `encodeURIComponent()` in URL
+    paths. `matchRoute()` must treat malformed percent-escapes as a 404, not a
+    thrown request-handler error.
+35. **Cookie-authenticated mutations need same-origin checks.** `isSameOriginMutation`
+    rejects cross-origin `Origin` and `Sec-Fetch-Site: cross-site` for POST/PUT/
+    PATCH/DELETE before every route, but deliberately permits requests with no
+    Origin and no cross-site Fetch Metadata signal so CLI/scripts keep working.
+    The browser login exchanges the secret with same-origin POST `/api/auth`; do
+    not put tokens in URLs. `?token=` is
+    retained only for compatibility. Keep `tests/webauth.test.ts` and
+    `tests/web-routes.test.ts` aligned with this policy.
+36. **A successful empty scan is not a failed scan.** `getPlaylistItems()` returns
+    `[]` only when yt-dlp exits 0 with no entries; nonzero exits include bounded
+    stderr context and throw, and a flat scan is killed after its timeout. This
+    distinction keeps `/api/scan` from reporting a network/auth/tool failure as
+    "No videos found". Drain both child pipes concurrently and reap timed-out
+    subprocesses.
+37. **Fatal process events must end in nonzero shutdown.** `unhandledRejection`
+    and `uncaughtException` log the fatal detail, call `handleShutdown(..., 1)`,
+    stop workers/processes, preserve resumable state only while holding the
+    engine lease, and finally exit nonzero. Keep cleanup in `finally`; the
+    signal path still exits 0 on a clean shutdown.
+38. **Use process timeouts and cleanup on every external-tool path.** The metadata
+    stage drains stdout/stderr concurrently and kills/reaps a child if reading
+    fails or the 10-minute watchdog fires; a child must not outlive a released
+    claim. Preserve those bounded-process guarantees when adding a new stage.
 
 ---
 

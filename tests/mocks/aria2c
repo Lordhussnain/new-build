@@ -4,7 +4,7 @@
 // yt-dlp invokes it as an external downloader:
 //   aria2c --no-conf -x16 -s16 -j16 -k 1M --min-split-size 1M \
 //          --file-allocation=none --remove-control-file=true \
-//          [--max-overall-download-limit 1024K] --out <tmpfilename> <url>
+//          [--max-overall-download-limit 1048576] --out <tmpfilename> <url>
 //
 // The mock answers --version (so the engine's dependency probe accepts it) and
 // reproduces the real binary's control-file lifecycle — which is what makes

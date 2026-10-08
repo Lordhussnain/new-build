@@ -10,10 +10,12 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Batch downloads** from a list of YouTube playlist or video URLs defined in `config.json`
 - **Concurrent worker pools** for downloading, metadata fetching, and format conversion, all driven by job state in a central SQLite database
 - **aria2c multi-connection downloads** — files split across up to 64 streams (16 by default) with automatic fallback to yt-dlp's native downloader when aria2c is not installed or for HLS/live streams. aria2c's own per-server connection cap (16) is clamped automatically, and a downloader argument aria2c rejects (exit 28) pauses the engine with a `BAD_DOWNLOADER_ARGS` reason instead of failing every video in the batch
-- **Bandwidth-aware scaling** — an optional global cap is split across the active download slots, and the autoscaler grows the pool while the queue has backlog and bandwidth headroom
+- **Bandwidth-aware scaling** — an optional per-download rate limit is divided across active download slots; the autoscaler grows the pool while the queue has backlog and reported bandwidth headroom. Because yt-dlp limits each process independently, a slot change does not retune transfers already running, so the aggregate is best-effort during scale changes
 - **Resilient by design** — interrupted downloads keep their `.part` file and resume exactly where they stopped; the retry budget only shrinks while a video makes no forward progress
 - **A resume that can never finish is discarded, not retried** — when the saved partial no longer matches what the server will serve (`HTTP Error 416: Requested range not satisfiable`, or aria2c refusing a file whose control state is gone), resuming repeats the failure forever and the video sits at 99.0%. The engine deletes the `.part` **and** its `.aria2` control file, resets progress, and restarts that video from zero
 - **Automatic retries** with exponential backoff + jitter on transient failures (network drops, throttling, timeouts)
+- **Signature-extraction failures self-heal once** — only yt-dlp's signature/nsig decipher errors trigger `yt-dlp -U`; updater output is bounded, it has a hard timeout, concurrent requests share one update, and a failed update leaves the normal retry budget intact
+- **Disk-full failures pause the engine** — ENOSPC and common Windows/POSIX “disk full” errors preserve the partial and pause all workers for operator action instead of burning retries against an unwritable drive
 - **Unavailable videos are skipped, not retried** — private, deleted, members-only, age-gated, paid or geo-blocked videos are attempted **once**, classified with a plain-language reason (`Private video`, `Video unavailable`, `Not available in your region`, …), and parked as a terminal skip: no retry budget, no cooldown requeue, no `error.log` line per dead video, and no circuit-breaker trip for a whole playlist of them. The rest of the playlist keeps downloading, and the reason stays readable in the dashboard, the Failed tab, `/api/failed` and the run report
 - **An unavailable format is switched, not retried** — when yt-dlp answers `Requested format is not available`, the engine steps the quality down one rung (`4k → 1440p → 1080p → 720p → 480p → highest`), persists it as that job's quality override, and says so: `🎚️ Format 1080p not available — switched to 720p`. The ladder only ever moves down, so it cannot loop, and a stale multi-audio probe is cleared and re-probed first. Only a job that fails at every rung — a video with no usable formats — is parked, with `No format available` recorded as its reason
 - **Self-healing sweeps** — crashed jobs resume, stale claims are reclaimed, deleted downloads are re-fetched, and failed jobs are retried after a cooldown. With aria2c these sweeps resume from the download's `.aria2` control file, and a discarded partial always takes its control file with it
@@ -58,6 +60,12 @@ bun run typecheck   # tsc --noEmit
 bun test            # unit + end-to-end suite (mocked yt-dlp/ffmpeg, no network needed)
 bun run check       # both
 ```
+
+The checked-in `package-lock.json` also supports reproducible npm dependency
+installation with `npm ci`; Bun is still required to run the app and test suite.
+Runtime data (`config.json`, `cookies.txt`, `archive.db`, logs, and the default
+`downloads/` tree) is ignored by Git. Review `.gitignore` before adding any new
+runtime output path.
 
 The end-to-end tests (`tests/integration.test.ts`) run the real engine against
 the mock binaries in `tests/mocks/`, covering the happy path, transient-failure
@@ -109,9 +117,11 @@ duplicate sources or duplicate jobs, even if all videos were already queued.
 - The response confirms **Saved to config.json**; a failed write is shown as
   an error and does not start a scan. Writes replace the file atomically, and
   concurrent source/settings updates cannot overwrite each other.
-- An empty/temporarily unavailable source stays saved for future scans. If
-  scanning fails after saving, the UI says the source was saved separately
-  from the scan failure.
+- An empty/temporarily unavailable source stays saved for future scans. A valid
+  empty listing is distinct from a yt-dlp failure: nonzero exits and scans that
+  exceed the 10-minute watchdog are shown as scan failures, not reported as
+  "No videos found." If scanning fails after saving, the UI says the source was
+  saved separately from the scan failure.
 - Saved sources are scanned again at startup. With `daemonMode: true` and
   `rescanIntervalHours > 0`, full rescans include **all three lists**, including
   playlists added while running. Enabled RSS polling also picks up new channel
@@ -158,13 +168,14 @@ Edit these interactively with `bun run config` → **Change Reliability & Resume
 
 | Key | Default | Options | What it controls |
 | --- | --- | --- | --- |
-| `videoQuality` | `"1080p"` | `highest`, `1080p`, `720p`, `480p`, `audio` | Selects the stream quality. `audio` downloads audio only and produces MP3 output. |
+| `videoQuality` | `"1080p"` | `highest`, `4k`, `1440p`, `1080p`, `720p`, `480p`, `audio` | Selects the stream quality. `audio` downloads audio only and produces MP3 output. |
 | `targetFormat` | `"mp4"` | `mp4`, `mkv`, `webm`, `mp3`, `m4a` | Final media container for newly queued jobs. The selected value is stored on each job; changing it does not rewrite existing jobs or files. |
 
-Use `bun run config` → **Change Download Settings** to edit both values. The
-dashboard Settings editor exposes `targetFormat`, but not `videoQuality`.
-Multi-audio downloads with multiple tracks are kept as MKV so the tracks remain
-switchable.
+Use `bun run config` → **Change Download Settings** or the dashboard's global
+Settings editor to change the defaults. The per-video detail drawer can override
+both values for an individual job. Multi-audio jobs on the default MP4 path
+remain MKV so their tracks stay switchable; see the multi-audio section below
+for explicit format overrides.
 
 ### Download performance settings
 
@@ -178,8 +189,11 @@ switchable.
 | `fragmentRetries` | `10` | Retries per fragment before a download fails. |
 | `httpChunkSize` | `""` | Range-based chunked downloading on the native path (e.g. `"10M"`). Off by default — some CDNs mishandle `Range` requests. |
 | `bufferSize` | `""` | yt-dlp socket buffer size (e.g. `"16K"`); blank uses yt-dlp's default. |
+| `autoscaleEnabled` | `true` | Grow the download pool toward `maxDownloadWorkers` while work is queued; shrink to `minDownloadWorkers` when idle. |
+| `maxConcurrentDownloads` | `3` | Initial slot count when autoscaling is enabled; changing it while running resets the active pool on the next tick. When autoscaling is disabled it is the fixed slot count. It is not the autoscaler ceiling. |
+| `minDownloadWorkers` / `maxDownloadWorkers` | `1` / `5` | Autoscaler floor and ceiling. `maxDownloadWorkers` is the ceiling; raising it above the already-started worker pool requires a restart, while lowering the ceiling applies live. |
 | `autoscaleRampStep` | `2` | Download slots added per autoscale tick while the queue has backlog. |
-| `maxBandwidthKBps` | `0` | Global bandwidth cap; split across the active download slots and forwarded to aria2c as `--max-overall-download-limit`. |
+| `maxBandwidthKBps` | `0` | Per-download yt-dlp rate limit, divided across active slots and forwarded to aria2c. `0` = unlimited. Downloads already running keep the share they started with, so autoscaling can temporarily make the aggregate rate exceed the configured cap; new attempts use the current slot count. |
 
 ### Multi-audio tracks (YouTube multi-language audio)
 
@@ -196,10 +210,13 @@ How it works: before a download the worker asks yt-dlp which audio tracks the
 video offers (one cheap metadata pass, cached per job), picks the best stream of
 each wanted track (DRC duplicates are ignored), and hands the selection to
 yt-dlp as `bv…+<track1>+<track2>… --audio-multistreams --merge-output-format mkv`.
-The result is one MKV whose audio tracks you switch in VLC/mpv/Plex just like on
-YouTube. Multi-track files are never remuxed to mp4 (that would drop the dubs);
-a single selected track merges exactly like a classic download. `videoQuality:
-"audio"` (mp3) always stays single-track.
+The default result is one MKV whose audio tracks you switch in VLC/mpv/Plex
+just like on YouTube. The normal MP4 path skips post-conversion for a multi-track
+download, leaving that MKV intact. If you explicitly request another per-job or
+global output format, the converter maps every audio stream; MP4 output re-encodes
+each stream to AAC, while unsupported target codecs may still make conversion
+fail. A single selected track merges like a classic download. `videoQuality:
+"audio"` (MP3) always stays single-track.
 
 Per-video override: open a job in the dashboard and use the **Audio tracks**
 section — *Find audio tracks* lists what YouTube offers (original + dubs, with
@@ -283,13 +300,18 @@ The dashboard (`web_ui.html`, served at `/`) shows live stats, a workers strip
 sortable/filterable job table, a per-job detail drawer, failed-job and run-history
 tabs, and the log viewer. It polls only while the tab is visible.
 
-All endpoints answer `{ ok: true|false, … }`, unknown API paths are a JSON 404,
+API responses use `{ ok: true|false, … }`; unknown API paths are a JSON 404,
 and a known path with the wrong method is a JSON 405 (+ `Allow`). When
-`webToken` is set, every route requires the token (cookie, `Authorization:
-Bearer`, `X-Web-Token`, or `?token=`).
+`webToken` is set, every route except the sign-in exchange requires the token
+(cookie, `Authorization: Bearer`, `X-Web-Token`, or the legacy `?token=` path).
+Browser mutations are checked against `Origin`/Fetch Metadata; cross-origin
+POST/PUT/PATCH/DELETE requests are rejected even when auth is off. Requests with
+neither `Origin` nor a cross-site Fetch Metadata header remain supported for
+CLI/API clients.
 
 | Method & path | What it does |
 | --- | --- |
+| `POST /api/auth` | `{ "token" }` → validate the sign-in secret and set an `HttpOnly` cookie (same-origin only; 404 when token auth is not configured). |
 | `GET /api/ping` | Liveness probe (also answers `HEAD`). |
 | `GET /api/version` | Engine/runtime info (Bun version, platform, uptime). |
 | `GET /api/status` | Stats, aggregate speed, workers, pause state, disk/RAM, ETA. |
@@ -427,16 +449,26 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
   API accept requests without a login. Before binding to `0.0.0.0`, set a strong,
   private token; without one, anyone who can reach the port can control the
   queue. With a token configured, requests must present it via the login cookie,
-  `Authorization: Bearer`, `X-Web-Token`, or `?token=`. The login page sets an
-  `HttpOnly` cookie after sign-in, and token comparisons are timing-safe.
+  `Authorization: Bearer`, `X-Web-Token`, or the legacy `?token=` compatibility
+  path. The sign-in page exchanges the token with a same-origin POST and sets an
+  `HttpOnly` cookie; it does not place the secret in the URL. Avoid the query
+  path for manual use because URLs can be retained in browser history and logs.
+  Token comparisons are timing-safe.
+- **Browser mutations are same-origin checked** — cross-origin POST/PUT/PATCH/
+  DELETE requests are rejected using `Origin` and Fetch Metadata headers, which
+  protects the unauthenticated loopback default from ordinary cross-site request
+  forgery. Non-browser API clients without an `Origin` header still work; use a
+  token whenever the server is reachable beyond your own machine.
 - **HTTP is not encrypted** — the built-in server does not provide TLS. Do not
   expose it on an untrusted network; use a trusted LAN or put it behind a TLS
   reverse proxy.
 - **Keep operational data private** — do not commit `config.json`, `cookies.txt`,
   the SQLite database, download archive, logs, or downloaded media. In
   particular, `cookies.txt` can grant access to your YouTube account.
-- **Real bandwidth cap** — `maxBandwidthKBps` maps to yt-dlp `--limit-rate`,
-  split across the active download slots.
+- **Per-download bandwidth shaping** — `maxBandwidthKBps` maps to yt-dlp
+  `--limit-rate` as an integer byte/second share divided across active slots.
+  It is a best-effort aggregate during autoscaling because existing yt-dlp
+  processes keep the rate set when they started.
 - **Worker autoscaling** — with `autoscaleEnabled` the engine grows download
   slots toward `maxDownloadWorkers` while a backlog exists and bandwidth
   headroom remains, sheds slots when the cap saturates, and returns to

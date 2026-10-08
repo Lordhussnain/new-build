@@ -37,6 +37,7 @@ beforeEach(() => {
   initDatabase(":memory:");
   configWith();
   autoscaler.enabled = true;
+  autoscaler.initialWorkers = 20;
   autoscaler.minWorkers = 1;
   autoscaler.maxWorkers = 20;
   autoscaler.maxBandwidthKBps = 0;
@@ -92,6 +93,29 @@ describe("autoscaleTick", () => {
     activeDlSlots.add(1);
     autoscaleTick();
     expect(activeDlSlots.size).toBe(6);
+  });
+
+  test("maxConcurrentDownloads is a starting point, not the autoscaler ceiling", () => {
+    seedBacklog(20);
+    configWith({ maxConcurrentDownloads: 4 });
+    activeDlSlots.add(1);
+    autoscaleTick();
+    expect(activeDlSlots.size).toBe(6); // reset to 4, then ramp toward maxDownloadWorkers
+    expect(activeDlSlots.size).toBeGreaterThan(4);
+  });
+
+  test("applies a changed autoscaler floor and lowered ceiling on the next tick", () => {
+    seedBacklog(20);
+    configWith({ minDownloadWorkers: 4, maxDownloadWorkers: 6, maxBandwidthKBps: 1000 });
+    autoscaler.poolSize = 20;
+    autoscaler.workerSpeeds.set(1, 1_000_000); // cap is saturated; no growth above the floor
+    activeDlSlots.add(1);
+    autoscaleTick();
+    expect(activeDlSlots.size).toBe(4);
+
+    configWith({ minDownloadWorkers: 1, maxDownloadWorkers: 2, maxBandwidthKBps: 0 });
+    autoscaleTick();
+    expect(activeDlSlots.size).toBe(2); // live ceiling clamps the active count
   });
 
   test("never grows past the backlog", () => {

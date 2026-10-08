@@ -37,10 +37,12 @@ import {
   formatSwitchMessage,
   formatTerminalErrorMessage,
   GENERIC_TERMINAL_INFO,
+  isDiskFullError,
   isDownloaderArgsError,
   isFormatAvailabilityError,
   isNChallengeError,
   isPermanentDownloadError,
+  isSignatureChallengeError,
   isTransientDownloadError,
   isUnrecoverableResumeError,
   nextFormatFallback,
@@ -362,6 +364,120 @@ const DOWNLOAD_PROCESS_CLEANUP_GRACE_MS = 2_000;
  */
 const FORMAT_SWITCH_NOTICE_MS = 1_500;
 
+/** Upper bound for yt-dlp's networked self-update command. */
+export const YTDLP_UPDATE_TIMEOUT_MS = 120_000;
+const YTDLP_UPDATE_COOLDOWN_MS = 60 * 60_000;
+
+export interface YtDlpUpdateResult {
+  ok: boolean;
+  timedOut: boolean;
+  exitCode: number | null;
+  detail: string;
+}
+
+let lastYtDlpUpdateAttemptAt: number | null = null;
+let ytDlpUpdateInFlight: Promise<YtDlpUpdateResult> | null = null;
+
+/**
+ * Run `yt-dlp -U` with both pipes drained, bounded diagnostic tails, and a hard
+ * timeout. Exposed so the subprocess contract can be tested without running a
+ * full download worker.
+ */
+export async function runYtDlpSelfUpdate(
+  opts: { binary?: string; timeoutMs?: number } = {},
+): Promise<YtDlpUpdateResult> {
+  const timeoutMs = Math.max(1, opts.timeoutMs ?? YTDLP_UPDATE_TIMEOUT_MS);
+  const ctl = new AbortController();
+  let proc: Bun.Subprocess | null = null;
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    timer = setTimeout(() => {
+      timedOut = true;
+      ctl.abort();
+      if (proc && proc.exitCode === null) {
+        try {
+          proc.kill("SIGKILL");
+        } catch {}
+      }
+    }, timeoutMs);
+    const updater = Bun.spawn([opts.binary || ytDlp(), "-U"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      signal: ctl.signal,
+    });
+    proc = updater;
+    const [stdout, stderr, exitCode] = await Promise.all([
+      readProcessOutput(updater.stdout),
+      readProcessOutput(updater.stderr),
+      updater.exited,
+    ]);
+    const detail = [stderr, stdout]
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(-800);
+    return { ok: !timedOut && exitCode === 0, timedOut, exitCode, detail };
+  } catch (error) {
+    const detail = timedOut
+      ? `self-update exceeded ${timeoutMs}ms`
+      : error instanceof Error
+        ? error.message
+        : String(error);
+    return { ok: false, timedOut, exitCode: proc?.exitCode ?? null, detail: detail.slice(-800) };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (proc) await stopYtDlpUpdateProcess(proc);
+  }
+}
+
+async function stopYtDlpUpdateProcess(proc: Bun.Subprocess): Promise<void> {
+  if (proc.exitCode === null) {
+    try {
+      proc.kill("SIGINT");
+    } catch {
+      // The process may have exited between the check and the signal.
+    }
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    let exited = false;
+    try {
+      exited = await Promise.race([
+        proc.exited.then(() => true, () => true),
+        new Promise<boolean>((resolve) => {
+          graceTimer = setTimeout(() => resolve(false), DOWNLOAD_PROCESS_CLEANUP_GRACE_MS);
+        }),
+      ]);
+    } finally {
+      if (graceTimer !== undefined) clearTimeout(graceTimer);
+    }
+    if (!exited && proc.exitCode === null) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+  }
+  await proc.exited.catch(() => {});
+}
+
+async function requestSignatureUpdate(): Promise<{ attempted: boolean; result: YtDlpUpdateResult | null }> {
+  if (ytDlpUpdateInFlight) return { attempted: true, result: await ytDlpUpdateInFlight };
+  if (
+    lastYtDlpUpdateAttemptAt !== null &&
+    Date.now() - lastYtDlpUpdateAttemptAt < YTDLP_UPDATE_COOLDOWN_MS
+  ) {
+    return { attempted: false, result: null };
+  }
+  lastYtDlpUpdateAttemptAt = Date.now();
+  const update = runYtDlpSelfUpdate();
+  ytDlpUpdateInFlight = update;
+  try {
+    return { attempted: true, result: await update };
+  } finally {
+    if (ytDlpUpdateInFlight === update) ytDlpUpdateInFlight = null;
+  }
+}
+
 /**
  * Stop and reap a spawned downloader on every exit path. SIGINT gives yt-dlp a
  * chance to stop its external downloader (aria2c) cleanly; SIGKILL is the
@@ -447,19 +563,56 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
     return;
   }
 
-  const errMsg = String(err?.message || err);
+  let errMsg = String(err?.message || err);
   const lower = errMsg.toLowerCase();
   const base = baseNameOf(job);
 
-  // Signature challenge broke (yt-dlp extractor changed) — self-heal by
-  // updating yt-dlp, then retry immediately with a clean budget.
-  if (lower.includes("signature") || lower.includes("unable to extract")) {
-    console.warn("⚠️ Signature challenge failed. Auto-updating yt-dlp...");
-    const updateProc = Bun.spawn([ytDlp(), "-U"], { stdout: "pipe", stderr: "pipe" });
-    await updateProc.exited;
-    resetForRetry(job);
-    updateWorkerLine(id, `🔄 Auto-updated yt-dlp, retrying... | ${job.title}`, config);
+  // Storage exhaustion affects every worker, not just this video. Pause the
+  // engine immediately, preserve any partial, and require an operator to free
+  // space before Resume All rather than spending retry budgets against ENOSPC.
+  if (isDiskFullError(errMsg)) {
+    triggerPause("LOW_DISK_SPACE (download write failed; free space and Resume All)");
+    let partial = job.partial_file_path && existsSync(job.partial_file_path) ? job.partial_file_path : null;
+    if (!partial) {
+      try {
+        partial = await findPartialFile(job.output_directory, base);
+      } catch {
+        // Keep the state/error record even when the directory itself is unreadable.
+      }
+    }
+    const detail = errMsg.replace(/\s+/g, " ").trim().slice(-300);
+    const message = `Storage exhausted during download; free disk space, then resume. yt-dlp: ${detail}`;
+    const parked = releaseOwned(
+      job,
+      "pausing after a disk-full error",
+      `download_status = 'paused', pause_reason = 'interrupted', partial_file_path = ?, last_error = ?`,
+      [partial || null, message.slice(0, 500)],
+    );
+    if (!parked) return;
+    logError("download", `${job.id} ${job.title}: ${message}`);
+    updateWorkerLine(id, `💾 Disk full — engine paused; free space and resume | ${job.title}`, config);
     return;
+  }
+
+  // A genuine signature-decipher failure can be repaired by updating yt-dlp.
+  // Keep the match narrow and bound/coalesce the update process: generic
+  // extractor errors are not fixed by -U, and a broken updater must not reset
+  // the video's retry budget or launch once per worker.
+  if (isSignatureChallengeError(errMsg) && !isNChallengeError(errMsg)) {
+    const update = await requestSignatureUpdate();
+    if (update.result?.ok) {
+      if (!resetForRetry(job)) return;
+      updateWorkerLine(id, `🔄 yt-dlp updated — retrying | ${job.title}`, config);
+      return;
+    }
+    if (update.attempted && update.result) {
+      const outcome = update.result.timedOut
+        ? "timed out"
+        : `exited with code ${update.result.exitCode ?? "unknown"}`;
+      const failure = `yt-dlp auto-update ${outcome}${update.result.detail ? `: ${update.result.detail}` : ""}`;
+      errMsg = `${errMsg} (${failure})`;
+      logError("download", `${job.id} ${job.title}: ${failure.slice(0, 500)}`);
+    }
   }
 
   // aria2c rejected the command line (exit 28 + the option's help block): a
@@ -1038,12 +1191,12 @@ function parkPaused(job: Job): void {
   recordJobPartial(job);
 }
 
-function resetForRetry(job: Job): void {
-  releaseOwned(
+function resetForRetry(job: Job): boolean {
+  return releaseOwned(
     job,
     "resetting for an immediate retry",
     `download_status = 'pending', retry_count = 0, progress = 0, best_progress = 0,
-     speed = 0, eta = 0, resume_count = 0`,
+     speed = 0, eta = 0, resume_count = 0, last_error = NULL`,
   );
 }
 

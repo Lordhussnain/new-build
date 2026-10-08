@@ -8,10 +8,12 @@ import {
   FORMAT_FALLBACK_LADDER,
   formatSwitchMessage,
   formatTerminalErrorMessage,
+  isDiskFullError,
   isDownloaderArgsError,
   isFormatAvailabilityError,
   isNChallengeError,
   isPermanentDownloadError,
+  isSignatureChallengeError,
   isTerminalErrorMessage,
   isTransientDownloadError,
   isUnrecoverableResumeError,
@@ -150,6 +152,47 @@ describe("isNChallengeError", () => {
   });
 });
 
+describe("isSignatureChallengeError", () => {
+  test("matches signature/nsig decipher failures", () => {
+    for (const message of [
+      "ERROR: [youtube] abc: Signature extraction failed: Some formats may be missing",
+      "WARNING: [youtube] abc: nsig extraction failed: Some formats may be missing",
+      "ERROR: unable to extract signature function",
+      "ERROR: failed to extract nsig",
+      "ERROR: could not find the signature function",
+    ]) {
+      expect(isSignatureChallengeError(message)).toBe(true);
+    }
+  });
+
+  test("does not classify generic extractor or n-challenge failures as signature updates", () => {
+    expect(isSignatureChallengeError("Unable to extract webpage: Connection reset by peer")).toBe(false);
+    expect(isSignatureChallengeError("n challenge solving failed")).toBe(false);
+    expect(isSignatureChallengeError(null)).toBe(false);
+  });
+});
+
+describe("isDiskFullError", () => {
+  test("recognizes common POSIX and Windows storage exhaustion messages", () => {
+    for (const message of [
+      "[Errno 28] No space left on device",
+      "write failed: ENOSPC",
+      "There is not enough space on the disk",
+      "Disk quota exceeded",
+      "ERROR_DISK_FULL (WinError 112)",
+    ]) {
+      expect(isDiskFullError(message)).toBe(true);
+      expect(isTransientDownloadError(message)).toBe(false);
+    }
+  });
+
+  test("does not classify unrelated I/O errors as disk exhaustion", () => {
+    expect(isDiskFullError("Permission denied while opening output file")).toBe(false);
+    expect(isDiskFullError("Connection reset by peer")).toBe(false);
+    expect(isDiskFullError(null)).toBe(false);
+  });
+});
+
 describe("progressAwareRetryState", () => {
   test("does not spend the retry budget when progress advances", () => {
     expect(progressAwareRetryState(2, 20, 35, 4)).toEqual({
@@ -199,6 +242,10 @@ describe("isTransientDownloadError", () => {
     expect(isTransientDownloadError("HTTP Error 429: Too Many Requests")).toBe(true);
     expect(isTransientDownloadError("HTTP Error 503: Service Unavailable")).toBe(true);
     expect(isTransientDownloadError("network is unreachable")).toBe(true);
+    expect(isTransientDownloadError("HTTP Error 408: Request Timeout")).toBe(true);
+    expect(isTransientDownloadError("Too many requests; rate limit exceeded")).toBe(true);
+    expect(isTransientDownloadError("Signature extraction failed")).toBe(true);
+    expect(isTransientDownloadError("Download process aborted (SIGABRT)")).toBe(true);
   });
 
   test("does not flag permanent failures", () => {

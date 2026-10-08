@@ -49,11 +49,15 @@ export async function main(): Promise<void> {
   // Windows: Ctrl+Break / console close events surface as SIGBREAK.
   process.on("SIGBREAK", () => handleShutdown("SIGBREAK", webServer));
   process.on("unhandledRejection", (reason) => {
-    logError("process", `unhandledRejection: ${reason instanceof Error ? reason.stack || String(reason) : String(reason)}`);
+    const detail = reason instanceof Error ? reason.stack || String(reason) : String(reason);
+    logError("process", `fatal unhandledRejection: ${detail}`);
+    console.error("‼️ Unhandled rejection — stopping safely:", reason);
+    void handleShutdown("unhandledRejection", webServer, 1);
   });
   process.on("uncaughtException", (err) => {
-    logError("process", `uncaughtException: ${err?.stack || err}`);
-    console.error("‼️ Uncaught exception (engine continues):", err);
+    logError("process", `fatal uncaughtException: ${err?.stack || err}`);
+    console.error("‼️ Uncaught exception — stopping safely:", err);
+    void handleShutdown("uncaughtException", webServer, 1);
   });
 
   // 1) Load configuration first (dependency search may use ytDlpPath/ffmpegPath

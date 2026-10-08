@@ -55,6 +55,31 @@ afterEach(() => {
 let triggerPauseTestOnlyWasUsed = false;
 
 describe("the route table", () => {
+  test("rejects cross-origin mutations but permits same-origin and non-browser requests", async () => {
+    insertJob("csrf01");
+    const crossOrigin = await handleRequest(
+      req("/api/jobs", {
+        method: "DELETE",
+        headers: { origin: "https://attacker.example", "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: ["csrf01"] }),
+      }),
+      baseConfig(),
+    );
+    expect(crossOrigin.status).toBe(403);
+    expect(getJob("csrf01")).toBeTruthy();
+
+    const sameOrigin = await handleRequest(
+      req("/api/jobs", {
+        method: "DELETE",
+        headers: { origin: "http://localhost", "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: ["csrf01"] }),
+      }),
+      baseConfig(),
+    );
+    expect(sameOrigin.status).toBe(200);
+    expect(getJob("csrf01")).toBeFalsy();
+  });
+
   test("GET /api/jobs/:id returns one job with parsed audio columns", async () => {
     insertJob("route01", { audio_tracks: JSON.stringify([{ formatId: "251", language: "en" }]) });
     const res = await api("/api/jobs/route01");
@@ -66,12 +91,16 @@ describe("the route table", () => {
     expect(data.job.audio_tracks[0].formatId).toBe("251");
   });
 
-  test("GET /api/jobs/:id answers 404 as JSON for an unknown id", async () => {
-    const res = await api("/api/jobs/nope999");
-    expect(res.status).toBe(404);
-    const data = await res.json();
+  test("GET /api/jobs/:id answers 404 as JSON for an unknown or malformed id", async () => {
+    const unknown = await api("/api/jobs/nope999");
+    expect(unknown.status).toBe(404);
+    const data = await unknown.json();
     expect(data.ok).toBe(false);
     expect(data.error).toContain("not found");
+
+    const malformed = await api("/api/jobs/%E0%A4%A");
+    expect(malformed.status).toBe(404);
+    expect(await malformed.json()).toMatchObject({ ok: false });
   });
 
   test("POST /api/jobs/:id/retry re-queues a failed job with fresh budgets", async () => {
