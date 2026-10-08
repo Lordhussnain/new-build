@@ -40,6 +40,9 @@ export const ConfigSchema = z
     fragmentRetries: z.number().min(1).max(50),
     httpChunkSize: z.string(),
     bufferSize: z.string(),
+    // Optional yt-dlp request header override. Keep it single-line and bounded
+    // because it is passed as one argv value to an external process.
+    userAgent: z.string().max(512).regex(/^[^\x00-\x1f\x7f]*$/, "userAgent must be a single-line string"),
     // How many download slots the autoscaler may add per tick when the queue
     // has a backlog (1 = the original slow ramp, one slot per 15s).
     autoscaleRampStep: z.number().min(1).max(10),
@@ -154,6 +157,7 @@ export const DEFAULT_CONFIG: Config = {
   fragmentRetries: 10,
   httpChunkSize: "",
   bufferSize: "",
+  userAgent: "",
   ytDlpPath: "",
   ffmpegPath: "",
   aria2cPath: "",

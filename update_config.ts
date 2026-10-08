@@ -281,6 +281,11 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   config.httpChunkSize = chunkAns.trim();
   const bufAns = await ask(`   Download buffer size (blank = yt-dlp default 1024, e.g. 16K) [current: ${config.bufferSize || "default"}]: `);
   config.bufferSize = bufAns.trim();
+  const userAgentAns = await ask(
+    `   User-Agent override (type "default" to use yt-dlp's default) [current: ${config.userAgent || "default"}]: `,
+  );
+  if (userAgentAns.trim().toLowerCase() === "default") config.userAgent = "";
+  else if (userAgentAns.trim()) config.userAgent = userAgentAns.trim();
 
   // Autoscaling ramp
   console.log("\n— Autoscaling Ramp —");

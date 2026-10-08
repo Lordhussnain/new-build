@@ -15,6 +15,7 @@ import {
   resolveDownloaderEngine,
 } from "../src/download-args";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
+import { DOWNLOAD_SPEED_PROFILES } from "../src/settings";
 
 const cfg = (overrides: Partial<Config> = {}): Config => ({ ...DEFAULT_CONFIG, ...overrides });
 
@@ -197,6 +198,23 @@ describe("buildDownloadPlan", () => {
     const plan = build({ httpChunkSize: "10M", bufferSize: "16K" });
     expect(flagValue(plan.args, "--http-chunk-size")).toBe("10M");
     expect(flagValue(plan.args, "--buffer-size")).toBe("16K");
+  });
+
+  test("adds a configured User-Agent as a single argv value", () => {
+    const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36";
+    expect(build().args).not.toContain("--user-agent");
+    const plan = build({ userAgent: ua });
+    expect(flagValue(plan.args, "--user-agent")).toBe(ua);
+  });
+
+  test("maximum-speed preset creates the intended uncapped native invocation", () => {
+    const plan = build(DOWNLOAD_SPEED_PROFILES.maximum.values, false);
+    expect(plan.engine).toBe("native");
+    expect(flagValue(plan.args, "--concurrent-fragments")).toBe("32");
+    expect(flagValue(plan.args, "--http-chunk-size")).toBe("10M");
+    expect(flagValue(plan.args, "--buffer-size")).toBe("16K");
+    expect(flagValue(plan.args, "--user-agent")).toBe(DOWNLOAD_SPEED_PROFILES.maximum.values.userAgent);
+    expect(plan.args).not.toContain("--limit-rate");
   });
 
   test("adds the download archive and live filter only when enabled", () => {

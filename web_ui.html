@@ -478,6 +478,39 @@
       padding: 14px 18px;
       border-top: 1px solid var(--border);
     }
+    .speed-profile-card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin: 12px 0 8px;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--bg-secondary);
+    }
+    .speed-profile-copy { min-width: 0; }
+    .speed-profile-title { font-size: 0.86rem; font-weight: 700; }
+    .speed-profile-state { margin-top: 2px; color: var(--text-secondary); font-size: 0.72rem; }
+    .speed-profile-options { display: flex; flex: 0 0 auto; gap: 6px; }
+    .speed-profile-button {
+      padding: 7px 10px;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      background: var(--bg-card);
+      color: var(--text-primary);
+      font: inherit;
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .speed-profile-button:hover { border-color: var(--accent); }
+    .speed-profile-button.active {
+      border-color: var(--accent);
+      background: rgba(59, 130, 246, 0.18);
+      color: #bfdbfe;
+    }
+    .speed-profile-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .settings-group { margin-top: 16px; }
     .settings-group > h4 {
       font-size: 0.72rem;
@@ -673,6 +706,9 @@
 
     @media (max-width: 768px) {
       .setting-row { grid-template-columns: 1fr; gap: 6px; }
+      .speed-profile-card { align-items: stretch; flex-direction: column; gap: 10px; }
+      .speed-profile-options { width: 100%; }
+      .speed-profile-button { flex: 1; }
       .drawer { max-width: 100%; }
       .stats-grid { grid-template-columns: repeat(2, 1fr); }
       .controls { flex-direction: column; }
@@ -939,6 +975,13 @@
       <div class="modal-body" id="settingsBody">
         <div class="shortcut-hint">
           <span>Changes apply to the next download — no restart needed.</span>
+        </div>
+        <div class="speed-profile-card">
+          <div class="speed-profile-copy">
+            <div class="speed-profile-title">🚀 Download speed profile</div>
+            <div id="downloadSpeedProfileState" class="speed-profile-state">Loading presets…</div>
+          </div>
+          <div id="downloadSpeedProfileOptions" class="speed-profile-options" role="group" aria-label="Download speed profile"></div>
         </div>
         <div id="settingsFields"></div>
       </div>
@@ -1768,7 +1811,7 @@
     // The server owns the allow-list of editable keys and re-validates the
     // whole config on save, so this panel is a thin form over that contract.
     // ---------------------------------------------------------------------
-    let settingsSnapshot = null;   // { fields, values, nonDefault }
+    let settingsSnapshot = null;   // { fields, values, nonDefault, speedProfiles }
     let settingsDraft = {};        // key -> edited value
     let settingsSaving = false;
 
@@ -1796,9 +1839,52 @@
       settingsDraft = {};
     }
 
+    function selectedDownloadSpeedProfile() {
+      if (!settingsSnapshot || !settingsSnapshot.speedProfiles) return 'custom';
+      const values = { ...settingsSnapshot.values, ...settingsDraft };
+      for (const [key, profile] of Object.entries(settingsSnapshot.speedProfiles)) {
+        const matches = Object.entries(profile.values || {}).every(([field, expected]) =>
+          JSON.stringify(values[field]) === JSON.stringify(expected)
+        );
+        if (matches) return key;
+      }
+      return 'custom';
+    }
+
+    function renderDownloadSpeedProfilePicker() {
+      const host = document.getElementById('downloadSpeedProfileOptions');
+      const state = document.getElementById('downloadSpeedProfileState');
+      if (!host || !state) return;
+      const profiles = settingsSnapshot && settingsSnapshot.speedProfiles;
+      if (!profiles) {
+        host.innerHTML = '';
+        state.textContent = 'Speed presets are unavailable.';
+        return;
+      }
+      const selected = selectedDownloadSpeedProfile();
+      host.innerHTML = Object.entries(profiles).map(([key, profile]) =>
+        `<button type="button" class="speed-profile-button${selected === key ? ' active' : ''}"
+                aria-pressed="${selected === key ? 'true' : 'false'}"
+                title="${escapeHtml(profile.description)}"
+                onclick="applyDownloadSpeedProfile('${escapeHtml(key)}')">${escapeHtml(profile.label)}</button>`
+      ).join('');
+      state.textContent = selected === 'custom'
+        ? 'Custom tuning — no preset matches. Choose a profile to stage its values.'
+        : `${profiles[selected].label}: ${profiles[selected].description}`;
+    }
+
+    function applyDownloadSpeedProfile(name) {
+      const profile = settingsSnapshot && settingsSnapshot.speedProfiles && settingsSnapshot.speedProfiles[name];
+      if (!profile) return;
+      for (const [key, value] of Object.entries(profile.values || {})) settingsDraft[key] = value;
+      renderSettings();
+      document.getElementById('settingsStatus').textContent = `${profile.label} preset staged — Save Changes to apply it to the next download.`;
+    }
+
     function renderSettings() {
       const host = document.getElementById('settingsFields');
-      if (!settingsSnapshot) { host.innerHTML = ''; return; }
+      if (!settingsSnapshot) { host.innerHTML = ''; renderDownloadSpeedProfilePicker(); return; }
+      renderDownloadSpeedProfilePicker();
 
       // Every group the API sends is rendered, in the server's own order.
       // A hardcoded list here used to silently DROP every field whose group it
@@ -1914,7 +2000,12 @@
         });
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Save failed');
-        settingsSnapshot = { fields: data.fields, values: data.values, nonDefault: data.nonDefault };
+        settingsSnapshot = {
+          fields: data.fields,
+          values: data.values,
+          nonDefault: data.nonDefault,
+          speedProfiles: data.speedProfiles,
+        };
         settingsDraft = {};
         renderSettings();
         const changed = (data.changed || []).length;

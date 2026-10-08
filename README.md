@@ -10,6 +10,7 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Batch downloads** from a list of YouTube playlist or video URLs defined in `config.json`
 - **Concurrent worker pools** for downloading, metadata fetching, and format conversion, all driven by job state in a central SQLite database
 - **aria2c multi-connection downloads** — files split across up to 64 streams (16 by default) with automatic fallback to yt-dlp's native downloader when aria2c is not installed or for HLS/live streams. aria2c's own per-server connection cap (16) is clamped automatically, and a downloader argument aria2c rejects (exit 28) pauses the engine with a `BAD_DOWNLOADER_ARGS` reason instead of failing every video in the batch
+- **Dashboard download-speed profiles** — one-click **Standard** and **Maximum speed** presets stage the aria2c, fragment, chunk, buffer, User-Agent and bandwidth settings in Downloader Settings. Maximum speed uses 32 native fragments, 10M HTTP chunks, a 16K buffer, and no rate cap; every value remains individually editable, and the custom User-Agent is only a request-header override (it cannot guarantee bypassing server throttling)
 - **Bandwidth-aware scaling** — an optional per-download rate limit is divided across active download slots; the autoscaler grows the pool while the queue has backlog and reported bandwidth headroom. Because yt-dlp limits each process independently, a slot change does not retune transfers already running, so the aggregate is best-effort during scale changes
 - **Resilient by design** — interrupted downloads keep their `.part` file and resume exactly where they stopped; the retry budget only shrinks while a video makes no forward progress
 - **A resume that can never finish is discarded, not retried** — when the saved partial no longer matches what the server will serve (`HTTP Error 416: Requested range not satisfiable`, or aria2c refusing a file whose control state is gone), resuming repeats the failure forever and the video sits at 99.0%. The engine deletes the `.part` **and** its `.aria2` control file, resets progress, and restarts that video from zero
@@ -189,11 +190,21 @@ for explicit format overrides.
 | `fragmentRetries` | `10` | Retries per fragment before a download fails. |
 | `httpChunkSize` | `""` | Range-based chunked downloading on the native path (e.g. `"10M"`). Off by default — some CDNs mishandle `Range` requests. |
 | `bufferSize` | `""` | yt-dlp socket buffer size (e.g. `"16K"`); blank uses yt-dlp's default. |
+| `userAgent` | `""` | Optional single-line User-Agent passed to yt-dlp. Blank keeps yt-dlp's own default. |
 | `autoscaleEnabled` | `true` | Grow the download pool toward `maxDownloadWorkers` while work is queued; shrink to `minDownloadWorkers` when idle. |
 | `maxConcurrentDownloads` | `3` | Initial slot count when autoscaling is enabled; changing it while running resets the active pool on the next tick. When autoscaling is disabled it is the fixed slot count. It is not the autoscaler ceiling. |
 | `minDownloadWorkers` / `maxDownloadWorkers` | `1` / `5` | Autoscaler floor and ceiling. `maxDownloadWorkers` is the ceiling; raising it above the already-started worker pool requires a restart, while lowering the ceiling applies live. |
 | `autoscaleRampStep` | `2` | Download slots added per autoscale tick while the queue has backlog. |
 | `maxBandwidthKBps` | `0` | Per-download yt-dlp rate limit, divided across active slots and forwarded to aria2c. `0` = unlimited. Downloads already running keep the share they started with, so autoscaling can temporarily make the aggregate rate exceed the configured cap; new attempts use the current slot count. |
+
+The dashboard's **Standard** and **Maximum speed** buttons apply these values as
+quick presets; settings remain individually editable. Standard restores the
+current shipped downloader defaults. Maximum speed selects aria2c with 16
+connections, 32 native fragments, 10M HTTP chunks, a 16K buffer, no `--limit-rate`
+argument (unlimited), and the supplied Chrome/120 User-Agent. If you customize
+one of those values, the UI marks the profile as **Custom**. A User-Agent
+override is only a request header and does not guarantee that a service will
+change its throttling behavior.
 
 ### Multi-audio tracks (YouTube multi-language audio)
 

@@ -272,6 +272,11 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
   const buffer = (config.bufferSize || "").trim();
   if (buffer) args.push("--buffer-size", buffer);
 
+  // Optional request identity override. It is an argv value, never interpolated
+  // through a shell; the default profile leaves yt-dlp's own User-Agent intact.
+  const userAgent = (config.userAgent || "").trim();
+  if (userAgent) args.push("--user-agent", userAgent);
+
   return {
     engine,
     args,
