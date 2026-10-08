@@ -181,6 +181,26 @@ switchable.
 | `autoscaleRampStep` | `2` | Download slots added per autoscale tick while the queue has backlog. |
 | `maxBandwidthKBps` | `0` | Global bandwidth cap; split across the active download slots and forwarded to aria2c as `--max-overall-download-limit`. |
 
+### Parallelism — how many videos download at once
+
+Each video is already multi-connection (table above); on a large playlist the
+bigger lever is how many videos download **simultaneously**. Every active slot
+runs its own yt-dlp + aria2c with the full per-file connection budget, so 8
+slots ≈ 128 concurrent server connections — the same trick IDM plays, one file
+at a time, applied to the whole batch.
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `maxConcurrentDownloads` | `8` | Download slots allowed to claim a video. Live-editable — the autoscaler tunes within this ceiling without a restart. |
+| `minDownloadWorkers` | `1` | Autoscaler floor — slots kept alive even with an empty queue. |
+| `maxDownloadWorkers` | `8` | Worker processes started at launch (the autoscaler's hard ceiling). Raising it takes effect after a restart. |
+| `autoscaleEnabled` | `true` | Grow slots toward `maxDownloadWorkers` while the queue has backlog and bandwidth headroom; shed slots when the cap saturates or the queue drains. |
+
+Raise `maxConcurrentDownloads` first (applies live from the dashboard's
+Settings editor); raise `maxDownloadWorkers` to match and restart the engine so
+the extra worker processes exist. Keep `maxBandwidthKBps` at `0` unless you
+actually need to cap traffic — any nonzero value throttles the whole pool.
+
 ### Multi-audio tracks (YouTube multi-language audio)
 
 YouTube now ships many videos with several audio tracks — the original language

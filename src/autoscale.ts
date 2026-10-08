@@ -10,16 +10,16 @@ import { getConfig } from "./state";
 
 export const autoscaler = {
   enabled: true,
-  targetWorkers: 3,
+  targetWorkers: 8,
   minWorkers: 1,
-  maxWorkers: 5,
+  maxWorkers: 8,
   /**
    * How many download worker processes actually exist (supervised at startup).
    * The ceiling can be lowered live, but never raised past the pool: extra
    * slots would have no process to claim work. Raising `maxDownloadWorkers`
    * therefore takes effect after a restart.
    */
-  poolSize: 5,
+  poolSize: 8,
   maxBandwidthKBps: 0,
   // Slots added per tick while a backlog exists (1 = the original slow ramp).
   rampStep: 2,

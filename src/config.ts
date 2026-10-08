@@ -139,9 +139,13 @@ export const DEFAULT_CONFIG: Config = {
   playlists: [],
   channels: [],
   channelPlaylists: [],
-  maxConcurrentDownloads: 3,
+  // Parallel-videos throughput — the biggest speed lever on a large playlist.
+  // 8 simultaneous downloads × 16 aria2c connections each is the IDM-style
+  // sweet spot for a typical home connection; the autoscaler still ramps the
+  // pool back down to minDownloadWorkers whenever the queue drains.
+  maxConcurrentDownloads: 8,
   maxConcurrentConverts: 2,
-  maxDownloadWorkers: 5,
+  maxDownloadWorkers: 8,
   minDownloadWorkers: 1,
   maxMetadataWorkers: 2,
   maxBandwidthKBps: 0,
