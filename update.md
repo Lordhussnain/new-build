@@ -448,7 +448,7 @@ is reported, an empty file stays "absent" without noise.
 
 ---
 
-## Feature log — 2026-10-08 (branch `arena/a22d6b7b-new-build`)
+## Feature log — 2026-10-08 (branch `arena/7e9e1d11-new-build`)
 
 ### N1 Offline mode — ADDED
 
@@ -492,15 +492,49 @@ cases), the two offline integration scenarios in `tests/integration.test.ts`
 leaves `config.json` unmodified), and the settings sweep-id expectation extended
 with `relocate`.
 
-**Known failures, not from this work (pre-existing).** `bun test` still reports
-`integration: aria2c option validation > a malformed downloader option pauses
-the engine instead of burning the playlist` and
-`mock contract: aria2c > rejected arguments: engine pauses with
-BAD_DOWNLOADER_ARGS and no job is failed`; both hang until their 30 s
-`waitFor`. Root cause: `buildAria2cArgs()` *omits* `--min-split-size` whenever
-the value is not a parseable size (the `banana` the two tests pass), so the mock
-aria2c never sees the malformed flag, never exits 28, and the engine never
-pauses. The tests still assert the old pass-through behaviour. Fix is a product
-call: either let unparsable values reach aria2c so its rejection surfaces as the
-actionable `BAD_DOWNLOADER_ARGS` pause, or update the two tests to the current
-sanitizing behaviour.
+**Known failures, not from this work (pre-existing).** `bun test` reports four
+failures on this branch (581 pass, 2 skip, 4 fail). All four reproduce on the
+base commit (`c2fd2b7`) with this work unapplied — verified in a clean worktree —
+so none of them is caused by offline mode or the relocation pass:
+
+1. `integration: aria2c option validation > a malformed downloader option pauses
+   the engine instead of burning the playlist` and
+2. `mock contract: aria2c > rejected arguments: engine pauses with
+   BAD_DOWNLOADER_ARGS and no job is failed`
+
+   Both hang until their 33 s `waitFor`. Root cause: `buildAria2cArgs()` *omits*
+   `--min-split-size` whenever the value is not a parseable size (the `banana`
+   the two tests pass), so the mock aria2c never sees the malformed flag, never
+   exits 28, and the engine never pauses. The tests still assert the old
+   pass-through behaviour. Fix is a product call: either let unparsable values
+   reach aria2c so its rejection surfaces as the actionable
+   `BAD_DOWNLOADER_ARGS` pause, or update the two tests to the current
+   sanitizing behaviour.
+
+3. `update_config.ts covers the config schema > prompts for every non-URL-list
+   key` fails with `missing === ["denoPath"]`.
+
+   Root cause: `denoPath` is a schema/`DEFAULT_CONFIG` key (the JS runtime for
+   YouTube's n-challenge, auto-discovered by `resolveJsRuntime()` when empty) but
+   no prompt in `update_config.ts` sets `config.denoPath`. The test asserts every
+   non-URL-list key is reachable from the manager, so it needs either a
+   `denoPath` prompt or `denoPath` added to the auto-discovered keys that test
+   exempts.
+
+4. `integration: dashboard cancellation > stop, delete, and remove-source all
+   interrupt the running downloader` times out after 63 s waiting for "the mock
+   to record its second SIGINT" (step 1, the stop, passes).
+
+   Root cause: the test's readiness predicate is stale, not the engine.
+   `waitForInFlight()` returns as soon as *any* file in the job folder ends in
+   `.ytdlp-args`, and the mock writes `${base}.ytdlp-args` once per attempt and
+   never deletes it. Step 1 therefore leaves `001 - …ytdlp-args` behind, so from
+   step 2 onward the predicate is satisfied the moment the next job's row flips
+   to `downloading` — which `claimDownloadJob` does at claim time, *before* the
+   audio probe and the `Bun.spawn`, i.e. before a child is registered in
+   `resilience.ts`. The DELETE then cancels the job pre-spawn (the worker's
+   `isJobCancelled` re-check refuses to start it — correct behaviour), so no
+   SIGINT is ever sent and no `.hang-signalled` marker is written. Fix: make the
+   predicate job-specific (match that job's own `.ytdlp-args` basename, e.g.
+   `001 - First Mock Video.ytdlp-args`) or count `.hang-signalled` markers per
+   job id.
