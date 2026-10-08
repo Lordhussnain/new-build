@@ -554,3 +554,59 @@ was weakened:
 **Tests:** the suite is green on this branch — `bun test` → **586 pass, 2 skip,
 0 fail** (the two skips are the opt-in real-binary compatibility tests). The
 cancellation scenario completes in ~3.6 s instead of timing out at 63 s.
+
+### N5 The web dashboard showed an empty job table — FIXED (2026-10-08)
+
+`bun run batch_playlist_downloader.ts` downloaded four videos at once while
+`http://127.0.0.1:3000` listed nothing — no rows, no "Done" counts, an empty
+reliability panel. The engine was never the problem: `web_ui.html` had drifted
+from the API in `src/web.ts`, and because the page has no build step and no
+types, nothing failed loudly.
+
+- **The blank table.** `fetchStatus()` did `lastJobs = await (await
+  fetch('/api/jobs')).json()` and passed the result straight to `renderJobs`.
+  `/api/jobs` answers with the shared `{ ok, jobs }` envelope, so `renderJobs`
+  called `.filter` on an object, threw a `TypeError`, and `fetchStatus`'s `catch`
+  logged one line to a console nobody was watching. `loadFailedItems()` and
+  `loadHistory()` failed the same way (their error text even said so). Fixed by
+  unwrapping the envelope once, in a single `loadJobs()`.
+- **Renamed/missing routes.** The page called `POST /api/purge` (the route is
+  `/api/queue/purge`, and it returns `deleted` + `stopped`, not `purged`),
+  `POST /api/requeue-failed` (`/api/failed/requeue`), and
+  `POST /api/jobs/:id/probe-audio` (`/audio-probe`) — every one of them a 404 —
+  plus `HEAD /api/status` for the connection dot, which answers 405 because
+  `/api/status` is GET-only; liveness is `HEAD /api/ping`.
+- **Field names the cards never had.** `/api/status` reports
+  `stats.downloaded/totalQueued/total` with `speed`, `aggregateSpeed`,
+  `globalETA`, `activeWorkers`, `isPaused`, `diskSpace`, `runtime` and `uptime`
+  at the top level; the page read `stats.completed`, `stats.pending`,
+  `stats.total_jobs`, `stats.aggregate_speed`, `stats.disk_free`,
+  `stats.global_eta`, `stats.active_workers`, `data.paused` and
+  `data.reliability` — all `undefined`, which is why the tiles showed nothing.
+  The reliability panel is its own endpoint now (`GET /api/reliability`), and
+  the worker strip was told the real shape (`{ id: 'DL1', type: 'download' }`).
+- **Status values.** `jobStatus()` compared `download_status` against `'done'`;
+  the DB writes `'downloaded'`, and a VOD wait is its own status rather than a
+  pause reason. Finished downloads were therefore listed as "not started" and
+  the History tab stayed empty even after the unwrap was fixed.
+- **Rows that rendered blank.** The drawer read `override_video_quality`,
+  `selected_audio_languages`, `subtitles_downloaded` and `fail_count`, none of
+  which exist; they are `video_quality`/`target_format`, `audio_selection`,
+  `want_*` and the per-stage retry counters. `JOB_COLUMNS` gained
+  `created_at`/`updated_at`/`metadata_retry_count` so the drawer's timestamps
+  and the history line have real values, and `timeAgo()` now pins SQLite's
+  offset-less UTC stamps to UTC instead of reading them as local time.
+- **Bulk actions.** `toggleSelectAll()`/`toggleJobSelection()` ran `Number(id)`
+  over YouTube video ids, so every selection became `NaN` and the bulk bar sent
+  an empty id list. Ids stay strings, and every id is now
+  `encodeURIComponent`-escaped in its URL and kept in an escaped
+  `data-job-id` attribute rather than interpolated into JavaScript (gotcha 34).
+
+**Tests:** `tests/web-ui-contract.test.ts` is new and guards the class, not the
+instance — it asserts every `/api/…` path in `web_ui.html` resolves in the route
+table, and it executes the page's real inline `<script>` in a `node:vm` context
+over a stub DOM whose `fetch` calls `handleRequest` directly. Against the
+pre-fix page that file fails 8 of its 9 tests (blank table, `undefined` cards,
+three 404 paths); against the fixed page all 9 pass. `bun run check` →
+**595 pass, 2 skip, 0 fail** (the skips are the opt-in real-binary
+compatibility tests), typecheck clean.

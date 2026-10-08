@@ -1517,13 +1517,19 @@
       if (btn) btn.textContent = reliabilityDetailsExpanded ? '▲ Hide Details' : '▼ Technical Details';
     }
 
+    // One badge per row, derived from the three stage columns the engine owns:
+    //   download_status   pending | downloading | downloaded | paused | waiting_live | failed
+    //   conversion_status pending | in_progress | done | not_needed | failed
+    //   metadata_status   pending | in_progress | done | not_needed | failed
+    // "downloaded" (not "done") is what the DB writes when a media file lands.
     function jobStatus(job) {
-      if (job.download_status === 'failed' || job.conversion_status === 'failed') return 'failed';
-      if (job.download_status === 'downloading' || job.conversion_status === 'in_progress') return 'downloading';
+      if (job.download_status === 'failed' || job.conversion_status === 'failed' || job.metadata_status === 'failed') return 'failed';
+      if (job.download_status === 'downloading' || job.conversion_status === 'in_progress' || job.metadata_status === 'in_progress') return 'downloading';
+      if (job.download_status === 'waiting_live') return 'waiting_live';
       if (job.download_status === 'paused') {
         return job.pause_reason === 'waiting_live' ? 'waiting_live' : 'paused';
       }
-      if (job.download_status === 'done' && (job.conversion_status === 'done' || job.conversion_status === 'not_needed')) {
+      if (job.download_status === 'downloaded' && (job.conversion_status === 'done' || job.conversion_status === 'not_needed')) {
         return 'done';
       }
       return 'pending';
@@ -1544,9 +1550,22 @@
       renderJobs(lastJobs);
     }
 
+    // SQLite stamps CURRENT_TIMESTAMP in UTC with no offset ("2026-10-08
+    // 16:40:49"), and `new Date()` reads that string as *local* time — a viewer
+    // east of Greenwich is then told a job finished hours ago, and one west of
+    // it gets a negative age that rounds to "just now". Pin naive stamps to UTC.
+    function parseStamp(value) {
+      if (!value) return null;
+      const text = String(value);
+      const naive = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(text);
+      const date = new Date(naive ? text.replace(' ', 'T') + 'Z' : text);
+      return Number.isNaN(date.getTime()) ? null : date;
+    }
+
     function timeAgo(iso) {
-      if (!iso) return '';
-      const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+      const then = parseStamp(iso);
+      if (!then) return '';
+      const s = Math.round((Date.now() - then.getTime()) / 1000);
       if (s < 5) return 'just now';
       if (s < 60) return `${s}s ago`;
       const m = Math.floor(s / 60);
@@ -1569,12 +1588,16 @@
       const container = document.getElementById('workersStrip');
       if (!container) return;
       if (!workers || !workers.length) { container.innerHTML = ''; return; }
+      // /api/status labels workers as { id: 'DL1', type: 'download', status } —
+      // the type is a word, and the id already carries the slot prefix.
+      const ICONS = { download: '⬇️', convert: '🔄', metadata: '📝' };
       container.innerHTML = workers.map(w => {
-        const busy = w.status && !w.status.includes('idle') && !w.status.includes('waiting');
-        const icon = w.type === 'MD' ? '📝' : w.type === 'CV' ? '🔄' : '⬇️';
-        return `<span class="worker-chip ${busy ? 'busy' : ''}" title="${escapeHtml(w.type + '#' + w.id + ': ' + (w.status || ''))}">
-          <span class="wid">${icon} ${w.type}#${w.id}</span>
-          <span class="wst">${escapeHtml(w.status || 'idle')}</span>
+        const status = w.status || 'Idle';
+        const busy = !/idle/i.test(status);
+        const icon = ICONS[w.type] || '⚙️';
+        return `<span class="worker-chip ${busy ? 'busy' : ''}" title="${escapeHtml(`${w.type} ${w.id}: ${status}`)}">
+          <span class="wid">${icon} ${escapeHtml(w.id)}</span>
+          <span class="wst">${escapeHtml(status)}</span>
         </span>`;
       }).join('');
     }
@@ -1607,7 +1630,9 @@
       const latencyEl = document.getElementById('networkLatency');
       const start = Date.now();
       try {
-        const res = await fetch('/api/status', { method: 'HEAD', cache: 'no-store' });
+        // /api/ping is the liveness probe (GET + HEAD); /api/status answers 405
+        // to HEAD, which used to paint "HTTP 405" in the connection dot.
+        const res = await fetch('/api/ping', { method: 'HEAD', cache: 'no-store' });
         const latency = Date.now() - start;
         if (res.ok) {
           if (offlineModeActive) {
@@ -1657,12 +1682,14 @@
       else if (tabName === 'logs') loadLogs();
     }
 
+    // Job ids are YouTube video ids (strings), not numbers — `Number(id)` used
+    // to turn every selection into NaN, so the bulk bar collected nothing.
     function toggleSelectAll() {
       const selectAll = document.getElementById('selectAll');
       const checkboxes = document.querySelectorAll('.job-checkbox');
       checkboxes.forEach(cb => {
         cb.checked = selectAll.checked;
-        const id = Number(cb.dataset.id);
+        const id = String(cb.dataset.id);
         if (selectAll.checked) selectedJobs.add(id);
         else selectedJobs.delete(id);
       });
@@ -1670,7 +1697,7 @@
     }
 
     function toggleJobSelection(id) {
-      id = Number(id);
+      id = String(id);
       if (selectedJobs.has(id)) selectedJobs.delete(id);
       else selectedJobs.add(id);
       updateBulkActions();
@@ -1693,7 +1720,7 @@
       let okCount = 0;
       for (const id of ids) {
         try {
-          const res = await fetch(`/api/jobs/${id}/retry`, { method: 'POST' });
+          const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
           if (res.ok) okCount++;
         } catch {}
       }
@@ -1750,6 +1777,14 @@
       refreshData();
     }
 
+    // One poll cycle of the header cards, the worker strip and the job table.
+    // Every field below is read from the payload `/api/status` actually
+    // answers with: `stats` carries the SQL aggregate counts
+    // (totalQueued/downloading/downloaded/failed/…), while speed, ETA, workers,
+    // disk and the pause flag are top-level. Reading a key that is not there
+    // does not throw — it paints "undefined" on the card or (for the job list)
+    // throws inside the render and blanks the table, which is exactly what the
+    // `jobs.filter is not a function` TypeError used to do here.
     async function fetchStatus() {
       try {
         const res = await fetch('/api/status');
@@ -1757,42 +1792,56 @@
         const data = await res.json();
         lastSuccessfulFetch = new Date();
         updateUpdatedAgo();
-        
-        document.getElementById('downloadingCount').textContent = data.stats.downloading;
-        document.getElementById('aggregateSpeed').textContent = data.stats.aggregate_speed 
-          ? `${formatBytesPerSec(data.stats.aggregate_speed)} total` 
-          : '0 B/s';
-        
-        document.getElementById('completedCount').textContent = data.stats.completed;
-        const totalKnown = data.stats.total_jobs ?? (data.stats.completed + data.stats.pending + data.stats.downloading + data.stats.failed);
-        const pct = totalKnown > 0 ? Math.round((data.stats.completed / totalKnown) * 100) : 0;
+
+        const s = data.stats || {};
+        const completed = s.downloaded ?? 0;
+        const queued = s.totalQueued ?? 0;
+
+        document.getElementById('downloadingCount').textContent = s.downloading ?? 0;
+        // `speed` is bytes/s, `aggregateSpeed` the same number pre-formatted.
+        const speedBps = Number(data.speed) || 0;
+        document.getElementById('aggregateSpeed').textContent = speedBps > 0
+          ? `${data.aggregateSpeed || formatBytesPerSec(speedBps)} total`
+          : ((s.converting ?? 0) + (s.metadataPending ?? 0) > 0 ? '⚙️ convert / metadata stage' : '0 B/s');
+
+        document.getElementById('completedCount').textContent = completed;
+        const totalKnown = s.total ?? 0;
+        const pct = totalKnown > 0 ? Math.round((completed / totalKnown) * 100) : 0;
         document.getElementById('completedSub').textContent = `${pct}% of ${totalKnown} jobs`;
-        
-        document.getElementById('failedCount').textContent = data.stats.failed;
-        
-        if (data.stats.disk_free !== null && data.stats.disk_free !== undefined) {
-          const freeGB = (data.stats.disk_free / (1024**3)).toFixed(1);
-          const totalGB = data.stats.disk_total ? (data.stats.disk_total / (1024**3)).toFixed(1) : null;
-          document.getElementById('diskFree').textContent = `${freeGB} GB`;
-          if (totalGB && data.stats.disk_total > 0) {
-            const usedPct = Math.round(((data.stats.disk_total - data.stats.disk_free) / data.stats.disk_total) * 100);
-            const fill = document.getElementById('diskBar');
-            fill.style.width = `${Math.min(100, Math.max(0, 100 - usedPct))}%`;
+
+        document.getElementById('failedCount').textContent = s.failed ?? 0;
+
+        // diskSpace.free is a pre-built "X GB / Y GB" label ("unknown" when no
+        // probe could answer); `percent` is the FREE share, so the bar shrinks
+        // as the disk fills.
+        const disk = data.diskSpace || {};
+        document.getElementById('diskFree').textContent = disk.free || '--';
+        const freePct = Number(disk.percent);
+        if (Number.isFinite(freePct) && freePct >= 0) {
+          const usedPct = 100 - freePct;
+          const fill = document.getElementById('diskBar');
+          if (fill) {
+            fill.style.width = `${Math.min(100, Math.max(0, freePct))}%`;
             fill.style.background = usedPct > 90 ? 'var(--danger)' : usedPct > 75 ? 'var(--warning)' : 'var(--accent-gradient)';
           }
         }
-        
-        document.getElementById('queuePosition').textContent = data.stats.pending > 0 ? `${data.stats.pending} queued` : 'Empty';
-        document.getElementById('globalETA').textContent = data.stats.global_eta 
-          ? `ETA: ${formatETA(data.stats.global_eta)}` 
-          : (data.stats.downloading > 0 ? 'ETA: calculating...' : 'ETA: --');
-        
-        document.getElementById('activeWorkers').textContent = data.stats.active_workers;
+
+        document.getElementById('queuePosition').textContent = queued > 0 ? `${queued} queued` : 'Empty';
+        // `globalETA` is already a formatted duration ("12m 4s") or '--'.
+        document.getElementById('globalETA').textContent = data.globalETA && data.globalETA !== '--'
+          ? `ETA: ${data.globalETA}`
+          : ((s.downloading ?? 0) > 0 ? 'ETA: calculating...' : 'ETA: --');
+
+        const workersEl = document.getElementById('activeWorkers');
+        if (workersEl) {
+          workersEl.textContent = data.activeWorkers ?? 0;
+          workersEl.title = `${data.activeWorkers ?? 0} of ${data.targetWorkers ?? '?'} download slots in use`;
+        }
 
         const pauseBtn = document.getElementById('pauseBtn');
         const pauseBanner = document.getElementById('pauseBanner');
         const pauseReason = document.getElementById('pauseReason');
-        if (data.paused) {
+        if (data.isPaused) {
           pauseBtn.textContent = '▶️ Resume All';
           pauseBtn.className = 'btn btn-success';
           pauseBanner.classList.add('show');
@@ -1810,33 +1859,52 @@
         const runtimeEl = document.getElementById('runtimeBadge');
         if (runtimeEl) {
           const rt = data.runtime || {};
-          const up = data.uptime ? formatETA(data.uptime) : '';
-          const upText = up ? `up ${up}` : '';
-          runtimeEl.textContent = [rt.name, rt.version, upText].filter(Boolean).join(' · ');
+          // `uptime` is a pre-formatted duration string, not a second count.
+          const upText = data.uptime && data.uptime !== '--' ? `up ${data.uptime}` : '';
+          runtimeEl.textContent = [rt.bun ? `bun ${rt.bun}` : rt.platform, upText].filter(Boolean).join(' · ');
         }
 
-        if (data.reliability) renderReliability(data.reliability);
-        
-        if (data.stats.failed > lastFailedCount) {
-          showNotification(`New download failure detected (${data.stats.failed} total)`, 'warning');
+        // The reliability panel has its own endpoint — /api/status does not
+        // carry it. fetchReliability() swallows its own failures, so awaiting it
+        // here cannot blank the cards or the job table below.
+        await fetchReliability();
+
+        if ((s.failed ?? 0) > lastFailedCount) {
+          showNotification(`New download failure detected (${s.failed} total)`, 'warning');
         }
-        if (data.stats.completed > lastCompletedCount && lastCompletedCount > 0) {
-          showNotification(`A download completed! (${data.stats.completed} total)`, 'success');
+        if (completed > lastCompletedCount && lastCompletedCount > 0) {
+          showNotification(`A download completed! (${completed} total)`, 'success');
         }
-        lastFailedCount = data.stats.failed;
-        lastCompletedCount = data.stats.completed;
-        
+        lastFailedCount = s.failed ?? 0;
+        lastCompletedCount = completed;
+
         await checkNetworkStatus();
-        
-        const jobsRes = await fetch('/api/jobs');
-        if (jobsRes.ok) {
-          lastJobs = await jobsRes.json();
-          renderJobs(lastJobs);
-        }
+
+        await loadJobs();
       } catch (err) {
         console.error('Failed to fetch status:', err);
         checkNetworkStatus();
       }
+    }
+
+    // GET /api/jobs answers with the shared { ok, jobs } envelope; the table,
+    // the filters and the detail drawer all want the array, so unwrap it here
+    // once instead of at every call site.
+    async function loadJobs() {
+      const res = await fetch('/api/jobs', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const payload = await res.json();
+      lastJobs = Array.isArray(payload && payload.jobs) ? payload.jobs : [];
+      renderJobs(lastJobs);
+      return lastJobs;
+    }
+
+    async function fetchReliability() {
+      try {
+        const res = await fetch('/api/reliability', { cache: 'no-store' });
+        if (!res.ok) return;
+        renderReliability(await res.json());
+      } catch {}
     }
     
     // Reliability & resume panel.
@@ -1907,10 +1975,10 @@
 
     async function requeueFailed() {
       try {
-        const res = await fetch('/api/requeue-failed', { method: 'POST' });
+        const res = await fetch('/api/failed/requeue', { method: 'POST' });
         const data = await res.json();
         if (data.ok) {
-          showNotification(`Re-queued ${data.requeued} failed jobs`, 'success');
+          showNotification(`Re-queued ${data.requeued ?? 0} failed jobs`, 'success');
           refreshData();
         } else {
           showNotification(data.error || 'Failed to requeue', 'error');
@@ -2031,7 +2099,7 @@
     
     async function retryJob(id) {
       try {
-        const res = await fetch(`/api/jobs/${id}/retry`, { method: 'POST' });
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
         const data = await res.json();
         if (data.ok) {
           showNotification('Job re-queued successfully', 'success');
@@ -2052,7 +2120,7 @@
 
     async function stopJob(id) {
       try {
-        const res = await fetch(`/api/jobs/${id}/stop`, { method: 'POST' });
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/stop`, { method: 'POST' });
         const data = await res.json();
         if (data.ok) {
           showNotification('Job stopped and parked as paused', 'success');
@@ -2092,15 +2160,17 @@
           container.innerHTML = '<div class="source-empty">No saved sources yet. Paste a playlist or channel URL above.</div>';
           return;
         }
+        // GET /api/sources → { ok, sources: [{ key, url, trackedJobs }] }. `key`
+        // is which config.json list the URL lives in, and trackedJobs is the
+        // number of queue rows that source owns.
+        const KIND_LABELS = { playlists: 'Playlist', channels: 'Channel', channelPlaylists: 'Channel playlist' };
         container.innerHTML = data.sources.map(src => {
-          const kind = src.isChannel ? 'Channel' : 'Playlist';
-          const sub = [kind, src.channelTitle || '', src.title || '', src.folder ? `folder: ${src.folder}` : '', `${src.jobCount} jobs`]
-            .filter(Boolean)
-            .join(' · ');
+          const kind = KIND_LABELS[src.key] || src.key || 'Source';
+          const sub = [kind, `${src.trackedJobs ?? 0} job(s)`].filter(Boolean).join(' · ');
           return `
             <div class="source-row">
               <div class="source-info">
-                <div class="source-url"><a href="${escapeHtml(src.url)}" target="_blank" rel="noopener" style="color: #93c5fd; text-decoration: none;">${escapeHtml(src.title || src.url)}</a></div>
+                <div class="source-url"><a href="${escapeHtml(src.url)}" target="_blank" rel="noopener" style="color: #93c5fd; text-decoration: none;">${escapeHtml(src.url)}</a></div>
                 <div class="source-kind">${escapeHtml(sub)}</div>
               </div>
               <button class="btn btn-danger btn-sm source-remove" data-remove-source="${escapeHtml(src.url)}" onclick="removeSavedSource(this.dataset.removeSource, this)">🗑️ Remove</button>
@@ -2156,8 +2226,10 @@
         });
         const data = await res.json();
         if (data.ok) {
-          const kind = data.isChannel ? 'channel' : 'playlist';
-          showNotification(`Scanned ${kind}: ${data.newJobs} new jobs queued (${data.alreadyDownloaded} already downloaded, ${data.alreadyQueued} already queued)`, 'success');
+          // POST /api/scan → { ok, saved, source, message, found, added, skipped }.
+          const summary = data.message
+            || `Scanned ${data.found ?? 0} video(s): ${data.added ?? 0} added, ${data.skipped ?? 0} already known`;
+          showNotification(summary, 'success');
           input.value = '';
           folderInput.value = '';
           loadSources();
@@ -2176,10 +2248,11 @@
     async function purgeQueue() {
       if (!confirm('Purge all pending and downloading jobs? Completed jobs and media files will not be deleted.')) return;
       try {
-        const res = await fetch('/api/purge', { method: 'POST' });
+        const res = await fetch('/api/queue/purge', { method: 'POST' });
         const data = await res.json();
         if (data.ok) {
-          showNotification(`Purged ${data.purged} jobs`, 'success');
+          const stopped = data.stopped ? ` · ${data.stopped} transfer(s) interrupted` : '';
+          showNotification(`Purged ${data.deleted ?? 0} jobs${stopped}`, 'success');
           refreshData();
         } else {
           showNotification(data.error || 'Failed to purge queue', 'error');
@@ -2192,9 +2265,10 @@
     async function loadFailedItems() {
       const container = document.getElementById('failedItems');
       try {
-        const res = await fetch('/api/jobs');
+        const res = await fetch('/api/jobs', { cache: 'no-store' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const jobs = await res.json();
+        const payload = await res.json();
+        const jobs = Array.isArray(payload && payload.jobs) ? payload.jobs : [];
         const failed = jobs.filter(j => jobStatus(j) === 'failed');
         if (failed.length === 0) {
           container.innerHTML = '<p style="color: var(--text-muted); padding: 20px 0;">No failed jobs found. All downloads are running smoothly!</p>';
@@ -2204,14 +2278,16 @@
           <div class="history-item">
             <h4>${escapeHtml(job.title || 'Unknown')}</h4>
             <div class="history-meta" style="flex-wrap: wrap; margin-bottom: 8px;">
-              <span>🔁 Failures: <strong>${job.fail_count || 0}</strong></span>
-              ${job.retry_count ? `<span>Retries: ${job.retry_count}</span>` : ''}
-              <span>Last attempted: ${timeAgo(job.last_attempt_at) || 'never'}</span>
+              <span>⬇️ Download retries: <strong>${job.retry_count || 0}</strong></span>
+              <span>🔄 Conversion retries: <strong>${job.conversion_retry_count || 0}</strong></span>
+              <span>📝 Metadata retries: <strong>${job.metadata_retry_count || 0}</strong></span>
+              <span>Resumes: ${job.resume_count || 0}</span>
+              <span>Last attempted: ${timeAgo(job.updated_at) || 'never'}</span>
             </div>
             ${job.last_error ? `<div class="job-subnote" style="color: #fca5a5; word-break: break-all; margin-bottom: 10px;">⚠️ ${escapeHtml(job.last_error)}</div>` : ''}
             <div style="display: flex; gap: 8px;">
-              <button class="btn btn-success btn-sm" onclick="retryJob('${job.id}')">🔄 Retry</button>
-              <button class="btn btn-secondary btn-sm" onclick="resetFailCount('${job.id}')">Reset Counters</button>
+              <button class="btn btn-success btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="retryJob(this.dataset.jobId)">🔄 Retry</button>
+              <button class="btn btn-secondary btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="resetFailCount(this.dataset.jobId)">Reset Counters</button>
             </div>
           </div>
         `).join('');
@@ -2222,7 +2298,7 @@
 
     async function resetFailCount(id) {
       try {
-        const res = await fetch(`/api/jobs/${id}/reset-failures`, { method: 'POST' });
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/reset-failures`, { method: 'POST' });
         const data = await res.json();
         if (data.ok) {
           showNotification('Failure counters cleared', 'success');
@@ -2239,9 +2315,10 @@
     async function loadHistory() {
       const container = document.getElementById('historyItems');
       try {
-        const res = await fetch('/api/jobs');
+        const res = await fetch('/api/jobs', { cache: 'no-store' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const jobs = await res.json();
+        const payload = await res.json();
+        const jobs = Array.isArray(payload && payload.jobs) ? payload.jobs : [];
         const done = jobs.filter(j => jobStatus(j) === 'done');
         if (done.length === 0) {
           container.innerHTML = '<p style="color: var(--text-muted); padding: 20px 0;">No completed jobs in history yet.</p>';
@@ -2251,8 +2328,10 @@
           <div class="history-item">
             <h4>${escapeHtml(job.title || 'Unknown')}</h4>
             <div class="history-meta" style="flex-wrap: wrap;">
-              <span>Completed: ${timeAgo(job.updated_at)}</span>
+              <span>Completed: ${timeAgo(job.updated_at) || 'recently'}</span>
               ${job.file_size ? `<span>Size: ${formatBytes(job.file_size)}</span>` : ''}
+              ${job.duration ? `<span>Length: ${formatETA(Number(job.duration) || 0)}</span>` : ''}
+              ${job.relocated_to ? `<span style="word-break: break-all;">Secondary storage: ${escapeHtml(job.relocated_to)}</span>` : ''}
               ${job.file_path ? `<span style="word-break: break-all;">File: ${escapeHtml(job.file_path)}</span>` : ''}
             </div>
           </div>
@@ -2267,10 +2346,13 @@
       const type = document.getElementById('logType').value;
       viewer.textContent = 'Loading logs...';
       try {
-        const res = await fetch(`/api/logs?type=${type}`);
+        const res = await fetch(`/api/logs?type=${encodeURIComponent(type)}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        viewer.textContent = data.content || '(Log is currently empty)';
+        // /api/logs answers with a line array (`{ ok, logs, type }`), newest last.
+        viewer.textContent = Array.isArray(data.logs) && data.logs.length
+          ? data.logs.join('\n')
+          : '(Log is currently empty)';
       } catch (err) {
         viewer.textContent = `Error loading logs: ${err.message}`;
       }
@@ -2745,8 +2827,10 @@
     }
 
     function renderJobOverrideSection(job) {
-      const q = job.override_video_quality ?? '';
-      const f = job.override_target_format ?? '';
+      // The row carries the job's current effective values in the same columns
+      // the scanner wrote them to — there is no separate "override_*" column.
+      const q = job.video_quality ?? '';
+      const f = job.target_format ?? '';
       const qualityOptions = [
         { v: '', l: 'Global default' },
         { v: 'highest', l: 'Highest available' },
@@ -2786,8 +2870,8 @@
             </div>
           </div>
           <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;">
-            <button class="btn btn-primary btn-sm" onclick="saveJobOverride('${job.id}', true)">💾 Save &amp; Re-Download</button>
-            <button class="btn btn-secondary btn-sm" onclick="saveJobOverride('${job.id}', false)">Save Settings Only</button>
+            <button class="btn btn-primary btn-sm" data-job-id="${escapeHtml(job.id)}" data-retry="1" onclick="saveJobOverride(this.dataset.jobId, this.dataset.retry === '1')">💾 Save &amp; Re-Download</button>
+            <button class="btn btn-secondary btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="saveJobOverride(this.dataset.jobId, false)">Save Settings Only</button>
           </div>
         </div>
       `;
@@ -2795,7 +2879,9 @@
 
     function renderAudioTrackSection(job) {
       const tracks = job.audio_tracks || [];
-      const sel = job.selected_audio_languages;
+      // `audio_selection` is the saved picker state: an array of language codes
+      // (custom selection) or null (follow the global multi-audio mode).
+      const sel = job.audio_selection;
       const isCustom = Array.isArray(sel);
       const selectedSet = new Set(isCustom ? sel : []);
       const rows = tracks.map(t => {
@@ -2814,7 +2900,7 @@
         <div class="audio-tracks-box">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
             <strong style="font-size: 0.85rem;">🎵 Multi-Language Audio Tracks</strong>
-            <button class="btn btn-secondary btn-sm" id="probeAudioBtn" data-job-id="${job.id}" onclick="probeJobAudioTracks(this.dataset.jobId, this)">🔍 Probe Tracks</button>
+            <button class="btn btn-secondary btn-sm" id="probeAudioBtn" data-job-id="${escapeHtml(job.id)}" onclick="probeJobAudioTracks(this.dataset.jobId, this)">🔍 Probe Tracks</button>
           </div>
           ${tracks.length === 0 ? `
             <div style="font-size: 0.75rem; color: var(--text-muted);">
@@ -2823,9 +2909,9 @@
           ` : `
             <div style="max-height: 180px; overflow-y: auto; margin-bottom: 8px;">${rows}</div>
             <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;">
-              <button class="btn btn-primary btn-sm" onclick="saveAudioSelection('${job.id}', true)">💾 Save &amp; Re-Download</button>
-              <button class="btn btn-secondary btn-sm" onclick="saveAudioSelection('${job.id}', false)">Save Selection</button>
-              <button class="btn btn-secondary btn-sm" onclick="resetAudioSelection('${job.id}')">Reset to Global</button>
+              <button class="btn btn-primary btn-sm" data-job-id="${escapeHtml(job.id)}" data-redownload="1" onclick="saveAudioSelection(this.dataset.jobId, this.dataset.redownload === '1')">💾 Save &amp; Re-Download</button>
+              <button class="btn btn-secondary btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="saveAudioSelection(this.dataset.jobId, false)">Save Selection</button>
+              <button class="btn btn-secondary btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="resetAudioSelection(this.dataset.jobId)">Reset to Global</button>
             </div>
           `}
         </div>
@@ -2847,7 +2933,7 @@
     async function submitJobOverride(id, audioTracks, retry, successText, includeAllOverrides = false) {
       const payload = jobOverridePayload(audioTracks, retry, includeAllOverrides);
       try {
-        const res = await fetch(`/api/jobs/${id}/override`, {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/override`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
@@ -2880,7 +2966,7 @@
       }
       showNotification('Probing audio streams via yt-dlp...', 'info');
       try {
-        const res = await fetch(`/api/jobs/${id}/probe-audio`, { method: 'POST' });
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/audio-probe`, { method: 'POST' });
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to probe audio');
         showNotification(`Probed: ${data.tracks ? data.tracks.length : 0} audio tracks found`, 'success');
@@ -2923,7 +3009,7 @@
 
     async function resetAudioSelection(id) {
       try {
-        const res = await fetch(`/api/jobs/${id}/override`, {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/override`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ audioTracks: null, retry: false }),
@@ -2939,12 +3025,14 @@
     }
 
     function renderSidecarSection(job) {
+      // Per-job sidecar flags (`want_*`) are the only thing POST /api/jobs/:id/sidecars
+      // writes; .info.json stays a global setting, so it is shown, not toggled.
       const flags = [
-        { k: 'subtitles', l: 'Subtitles (.srt / .vtt)', v: job.subtitles_downloaded },
-        { k: 'thumbnail', l: 'Thumbnail image', v: job.thumbnail_downloaded },
-        { k: 'description', l: 'Description (.description)', v: job.description_downloaded },
-        { k: 'info_json', l: 'Info metadata (.info.json)', v: job.info_json_downloaded },
+        { k: 'subtitles', l: 'Subtitles (.srt / .vtt)', v: job.want_subtitles },
+        { k: 'thumbnail', l: 'Thumbnail image', v: job.want_thumbnail },
+        { k: 'description', l: 'Description (.description)', v: job.want_description },
       ];
+      const fetched = Array.isArray(job.metadata_files) ? job.metadata_files : [];
       return `
         <div class="audio-tracks-box" style="margin-top: 14px;">
           <strong style="font-size: 0.85rem;">📄 Sidecar Metadata Files</strong>
@@ -2959,7 +3047,8 @@
               </label>
             `).join('')}
           </div>
-          <button class="btn btn-secondary btn-sm" onclick="saveSidecarSelection('${job.id}')">💾 Save Sidecar Flags</button>
+          ${fetched.length ? `<div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 8px; word-break: break-all;">Fetched: ${fetched.map(escapeHtml).join(' · ')}</div>` : ''}
+          <button class="btn btn-secondary btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="saveSidecarSelection(this.dataset.jobId)">💾 Save Sidecar Flags</button>
         </div>
       `;
     }
@@ -2970,7 +3059,7 @@
         body[i.dataset.flag] = i.checked;
       });
       try {
-        const res = await fetch(`/api/jobs/${id}/sidecars`, {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/sidecars`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
@@ -2995,8 +3084,8 @@
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border);">
           <span class="status-badge status-${status}">${escapeHtml(status)}</span>
           <div style="display: flex; gap: 6px;">
-            ${status === 'failed' ? `<button class="btn btn-success btn-sm" onclick="retryJob('${job.id}')">🔄 Retry</button>` : ''}
-            ${isStoppable(job) ? `<button class="btn btn-warning btn-sm" onclick="stopJob('${job.id}')">⏹️ Stop</button>` : ''}
+            ${status === 'failed' ? `<button class="btn btn-success btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="retryJob(this.dataset.jobId)">🔄 Retry</button>` : ''}
+            ${isStoppable(job) ? `<button class="btn btn-warning btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="stopJob(this.dataset.jobId)">⏹️ Stop</button>` : ''}
           </div>
         </div>
         <div class="detail-grid">
@@ -3016,11 +3105,13 @@
           ${detailRow('Duration', job.duration ? formatETA(job.duration) : '')}
           ${detailRow('Conversion status', job.conversion_status)}
           ${detailRow('Metadata status', job.metadata_status)}
-          ${detailRow('Failures / Retries', `${job.fail_count ?? 0} failures · ${job.retry_count ?? 0} retries · ${job.resume_count ?? 0} resumes`)}
+          ${detailRow('Stage retries', `${job.retry_count ?? 0} download · ${job.conversion_retry_count ?? 0} convert · ${job.metadata_retry_count ?? 0} metadata`)}
+          ${detailRow('Resumes', job.resume_count ?? 0)}
+          ${detailRow('Best progress', job.best_progress ? `${Number(job.best_progress).toFixed(1)}%` : '')}
           ${detailRow('Pause reason', job.pause_reason)}
           ${detailRow('Last error', job.last_error)}
-          ${detailRow('Created', timeAgo(job.created_at))}
-          ${detailRow('Updated', timeAgo(job.updated_at))}
+          ${detailRow('Created (UTC)', job.created_at)}
+          ${detailRow('Updated (UTC)', job.updated_at ? `${job.updated_at} · ${timeAgo(job.updated_at) || 'now'}` : '')}
         </div>
         ${renderJobOverrideSection(job)}
         ${renderAudioTrackSection(job)}

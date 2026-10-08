@@ -304,12 +304,15 @@ function matchRoute(pattern: string, segments: string[]): RouteParams | null {
 }
 
 // The jobs list and the single-job endpoint must return identical shapes.
+// The dashboard reads this column list verbatim (job table + detail drawer), so
+// it carries the timestamps the drawer's Created/Updated rows and the History
+// tab's "Completed: …" line need — a row without them renders as an empty cell.
 const JOB_COLUMNS = `id, url, title, folder, output_directory, file_path, target_format, video_quality,
                 download_status, conversion_status, metadata_status, pause_reason, metadata_files,
-                retry_count, conversion_retry_count, resume_count, best_progress, last_error,
-                file_size, progress, speed, eta, duration, partial_file_path,
-                audio_tracks, audio_selection, superseded_file, relocated_to,
-                want_subtitles, want_thumbnail, want_description`;
+                retry_count, conversion_retry_count, metadata_retry_count, resume_count,
+                best_progress, last_error, file_size, progress, speed, eta, duration,
+                partial_file_path, audio_tracks, audio_selection, superseded_file, relocated_to,
+                want_subtitles, want_thumbnail, want_description, created_at, updated_at`;
 
 /** JSON-valued columns in SQLite; hand the dashboard real arrays/nulls. */
 function mapJobRow(r: any) {

@@ -635,11 +635,17 @@ slashes collapse (`/api/jobs/` is `/api/jobs`). Static action paths are listed
 *before* `:param` routes so a wrong method answers 405 instead of binding the
 segment as an id (gotcha 21).
 
-Job retry, delete, queue purge, and per-job pause mutations must check all
-pipeline stages and claims inside an immediate SQLite transaction (`withIdleJobs()`
+Job retry and per-job override must check all pipeline stages and claims inside
+an immediate SQLite transaction (`withIdleJobs()`
 for id-based operations). If any targeted row is downloading, converting, fetching
 metadata, or still holds a download/conversion claim, return HTTP 409 with
 `{ ok: false, error: "Job is currently in progress" }` and make no partial bulk changes.
+The cancel-flavoured routes are the deliberate exception: `POST /api/jobs/pause`,
+`POST /api/jobs/:id/stop`, `DELETE /api/jobs/:id`, `DELETE /api/jobs` and
+`POST /api/queue/purge` park or remove rows that are active *and interrupt their
+children* (park first, then signal, so the worker releases its own claim through
+its token and the `.part` stays resumable). Refusing those rows would make each
+button useless for exactly the job the operator is clicking it about.
 
 | Method | Route | Purpose |
 | --- | --- | --- |
@@ -647,20 +653,20 @@ metadata, or still holds a download/conversion claim, return HTTP 409 with
 | GET · HEAD | `/api/ping` | liveness probe used by the UI |
 | GET | `/api/version` | engine/runtime info (`Bun.version`, platform/arch, uptime seconds) |
 | GET | `/api/status` | stats, speed, ETA, disk, live worker lines, pause state, `runtime`; `diskSpace.free` reads `"unknown"` when no disk probe could answer |
-| GET | `/api/jobs` | up to 500 jobs with status/retry/progress fields, plus parsed `audio_tracks` / `audio_selection` / `metadata_files` and boolean `want_*` sidecar flags |
+| GET | `/api/jobs` | `{ ok, jobs }` — up to 500 jobs with status/retry/progress fields (`JOB_COLUMNS` in `web.ts` is the single source of truth for what the dashboard may read: per-stage retry counters, `best_progress`, `partial_file_path`, `relocated_to`, the `created_at` / `updated_at` stamps the drawer and the history tab show), plus parsed `audio_tracks` / `audio_selection` / `metadata_files` and boolean `want_*` sidecar flags |
 | GET | `/api/jobs/:id` | one job, read fresh from the DB — the detail drawer fetches this instead of trusting a poll-cycle-old list row |
 | POST | `/api/scan` | `{url, folder?}` → validate/canonicalize → save source to `config.json` → scan & ingest; returns `saved`, `source: {url, key, added}`, and counts. Save failure starts no scan; scan failure keeps the saved source. Folder override applies only to this scan |
-| POST | `/api/queue/purge` | delete every idle pending / paused / waiting_live / failed job; returns `{ok, deleted}` or 409 if any candidate still holds an active claim |
+| POST | `/api/queue/purge` | delete every idle pending / paused / waiting_live / failed job **and the rows that are downloading right now**, interrupting those children first so nothing keeps writing after the button; returns `{ok, deleted, stopped}` |
 | POST | `/api/pause` · `/api/resume` | global pause / resume-all |
 | POST | `/api/jobs/:id/retry` | re-queue one idle job (all stages, budgets reset); 404 for an unknown id, 409 while any pipeline stage/claim is active. For a downloaded job this is a deliberate re-download: the id is scrubbed from the yt-dlp archive and the existing file stashed as `.superseded` first (§7.2). 500 when the previous file cannot be moved aside |
 | POST | `/api/jobs/:id/override` | partial `{targetFormat?, videoQuality?, audioTracks?}` edit; nullable values reset to global behavior. Optional `retry:true` applies the override and queues a deliberate re-download atomically (or retries current settings when sent alone); 400 invalid payload, 404 unknown id, 409 active pipeline stage |
 | POST | `/api/jobs/:id/reset-failures` | zero the per-stage retry counters; 404 for an unknown id |
 | POST | `/api/jobs/:id/sidecars` | per-job sidecar toggles: `{subtitles?, thumbnail?, description?}` (booleans). Flipping a flag on for a finished download re-opens the metadata stage so the worker fetches the files against the existing media; flipping off never deletes fetched files. 400 for an empty/non-boolean body |
-| POST | `/api/jobs/pause` | bulk user-pause by `{ids: []}`; 409 and no changes if any requested job has an active stage/claim |
-| DELETE | `/api/jobs` | bulk delete by `{ids: []}`; 409 and no changes if any requested job has an active stage/claim |
+| POST | `/api/jobs/pause` | bulk user-pause by `{ids: []}`: parks each row with `pause_reason = 'user'` and interrupts its transfer, keeping a mid-download claim so the `.part` still resumes; 400 when no ids are given |
+| DELETE | `/api/jobs` | bulk delete by `{ids: []}`, cancelling active children the same way; `{ok, deleted, stopped}` |
 | POST | `/api/jobs/:id/audio-tracks` | per-job audio-track selection: `{tracks:["es",…]}` saves it, `{tracks:null}` returns the job to the global mode |
 | POST | `/api/jobs/:id/audio-probe` | runs the yt-dlp `-J` probe for one job, stores + returns its audio tracks |
-| DELETE | `/api/jobs/:id` | delete one idle job; 409 while any pipeline stage/claim is active |
+| DELETE | `/api/jobs/:id` | delete one job, cancelling its in-flight child first so no yt-dlp keeps writing into a file nothing tracks; 404 for an unknown id, `{ok, deleted, stopped}` otherwise |
 | POST | `/api/retry/:id` · `/api/failcount/reset/:id` · `/api/jobs/delete` | **legacy aliases** of the canonical routes above — kept on purpose for older dashboards and scripts |
 | GET | `/api/failed` | failed jobs |
 | POST | `/api/failed/requeue` | force-requeue eligible failed jobs (cooldown ignored, permanent errors still skipped) |
@@ -672,6 +678,12 @@ metadata, or still holds a download/conversion claim, return HTTP 409 with
 
 Frontend is plain JS in `web_ui.html` — no build step. After editing it,
 re-extract the inline `<script>` and syntax-check it (see section 9.4).
+
+The page has no types and no imports, so **the key names it reads are the
+contract** — see gotcha 41 and `tests/web-ui-contract.test.ts`, which executes
+the real inline script over a stub DOM against `handleRequest` and asserts the
+job table renders. Every list endpoint answers with an envelope
+(`{ ok, jobs }`, `{ ok, sources }`, `{ ok, logs }`), never a bare array.
 
 ---
 
@@ -724,6 +736,7 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/config-manager.test.ts` | every schema key is reachable from `update_config.ts`; the manager reads the sweep thresholds from `STALE_CLAIM_THRESHOLDS` and counts partials with the engine's predicate |
 | `tests/offline-mode.test.ts` | the run-level switch (`--offline`/`YTA_OFFLINE`, last flag wins, argv beats env, unparsable ≠ false), the settings round-trip (live + persisted), `isPathInside` (siblings sharing a prefix are NOT inside), and `relocateFinishedJobs`: move + sidecar + recorded path, idempotence, no-op without `secondaryStoragePath`, crash-window adoption, "already under the root", a non-candidate table (downloading / needs conversion / mid-metadata / failed), a failed move that keeps the only copy, and the stale-path CAS |
 | `tests/dashboard.test.ts` | `formatHeaderLine` counters, and the `Res:n` field appearing only when partials are held |
+| `tests/web-ui-contract.test.ts` | the dashboard page vs the API it calls: every `/api/…` path `web_ui.html` fetches must resolve, and the real inline `<script>` (run over a stub DOM against `handleRequest`) must render one row per job with no `undefined` on a card (gotcha 41) |
 | `tests/integration.test.ts` | **end-to-end engine runs** (see 9.3) |
 
 ### 9.3 End-to-end tests with mock tools
@@ -1127,6 +1140,22 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     `file_path` to a file in the output tree (a re-download: see `recordSuccess`)
     must clear `relocated_to` in the same statement, or the pass will never
     revisit it.
+41. **The dashboard reads response keys by name, so a key rename is a UI
+    regression.** `web_ui.html` cannot import anything from `src/web.ts`, and a
+    miss on a key name is silent by shape: `data.stats.completed` is
+    `undefined`, not an error. What is *not* silent is a container: handing the
+    `{ ok, jobs }` envelope to a function that expects the array throws inside
+    the poll cycle, `fetchStatus`'s `catch` logs one line to a browser console
+    nobody watches, and the job table stays empty while the engine keeps
+    downloading — "no jobs in the Web UI" with a healthy terminal. So: unwrap
+    the envelope at the boundary (one `loadJobs()`, not four call sites), map
+    `jobStatus` onto the columns the DB really writes (`downloaded`,
+    `waiting_live`, `in_progress` — not `done`), and treat `/api/status` as
+    stats + top-level fields (speed, ETA, workers, disk, `isPaused`) with
+    `/api/reliability` as its own request. `tests/web-ui-contract.test.ts` runs
+    the page's real script against `handleRequest` and fails on a blank table,
+    an `undefined` card, or a `/api/…` path the route table no longer has;
+    keep it green when adding a dashboard field.
 
 ---
 
