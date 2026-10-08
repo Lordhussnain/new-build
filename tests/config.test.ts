@@ -63,6 +63,10 @@ describe("parseConfig", () => {
     expect(() => parseConfig({ targetFormat: "avi" })).toThrow();
     expect(() => parseConfig({ subtitleFormat: "txt" })).toThrow();
     expect(() => parseConfig({ maxConcurrentDownloads: 0 })).toThrow();
+    expect(parseConfig({}).userAgent).toBe("");
+    expect(parseConfig({ userAgent: "Mozilla/5.0" }).userAgent).toBe("Mozilla/5.0");
+    expect(() => parseConfig({ userAgent: `bad${String.fromCharCode(10)}user-agent` })).toThrow();
+    expect(() => parseConfig({ userAgent: "x".repeat(513) })).toThrow();
   });
 
   test("rejects contradictory backoff/window settings", () => {

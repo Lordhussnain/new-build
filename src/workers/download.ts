@@ -22,7 +22,7 @@ import {
 } from "../db";
 import { activeDlSlots, autoscaler } from "../autoscale";
 import { aria2cPath, jsRuntime, ytDlp } from "../tools";
-import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
+import { checkDiskSpace, killProcessTree, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
 import {
   dropSupersededFile,
   findPartialFile,
@@ -161,14 +161,16 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
       const doomed = activeProcs.get(id);
       if (doomed && doomed.exitCode === null) {
         try {
-          doomed.kill("SIGINT");
+          killProcessTree(doomed, "SIGINT");
         } catch {}
       }
     });
 
     try {
       await runDownload(id, job, config);
+      stopHeartbeat();
     } catch (err: any) {
+      stopHeartbeat();
       await handleDownloadFailure(id, job, config, err);
     } finally {
       stopHeartbeat();
@@ -254,6 +256,10 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     // hook of its own for an external downloader). One writer keeps the
     // dashboard's progress/speed/ETA columns identical on both paths.
     const reportProgress = (pctNum: number, bps: number, etaNum: number, totalBytes: number | null) => {
+      if (isUserPaused(job.id)) {
+        updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
+        return;
+      }
       if (bps > 0) autoscaler.recordSpeed(id, bps);
       if (Number.isNaN(pctNum) || pctNum < 0 || Date.now() - lastProgressUpdate <= 500) return;
       // Backfill file_size from progress so the global ETA has a total to work with.
@@ -492,13 +498,7 @@ export async function cleanupDownloadProcess(
   try {
     if (timer !== undefined) clearTimeout(timer);
     if (proc.exitCode === null) {
-      if (!proc.killed) {
-        try {
-          proc.kill("SIGINT");
-        } catch {
-          // It may have exited between the exitCode check and kill().
-        }
-      }
+      const children = killProcessTree(proc, "SIGINT");
 
       let graceTimer: ReturnType<typeof setTimeout> | undefined;
       let exited: boolean;
@@ -516,13 +516,16 @@ export async function cleanupDownloadProcess(
         if (graceTimer !== undefined) clearTimeout(graceTimer);
       }
 
-      if (!exited && proc.exitCode === null) {
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          // The subprocess may have exited just before the force-kill.
-        }
+      if (!exited || proc.exitCode === null) {
+        killProcessTree(proc, "SIGKILL");
       }
+      for (const cpid of children) {
+        try {
+          process.kill(cpid, "SIGKILL");
+        } catch {}
+      }
+    } else {
+      killProcessTree(proc, "SIGKILL");
     }
     await proc.exited;
   } finally {

@@ -6,317 +6,396 @@
   <title>🎬 YouTube Archive Engine V5</title>
   <style>
     :root {
-      --bg-primary: #0f0f0f;
-      --bg-secondary: #1a1a1a;
-      --bg-card: #252525;
-      --text-primary: #ffffff;
-      --text-secondary: #aaaaaa;
+      --bg-primary: #0b0f19;
+      --bg-secondary: #121829;
+      --bg-card: #182238;
+      --bg-card-hover: #1f2c48;
+      --bg-card-elevated: #1e2a44;
+      --bg-input: #0f1626;
+      --text-primary: #f8fafc;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
       --accent: #3b82f6;
-      --success: #22c55e;
+      --accent-hover: #2563eb;
+      --accent-light: rgba(59, 130, 246, 0.15);
+      --accent-gradient: linear-gradient(135deg, #3b82f6, #6366f1);
+      --success: #10b981;
+      --success-light: rgba(16, 185, 129, 0.15);
       --warning: #f59e0b;
+      --warning-light: rgba(245, 158, 11, 0.15);
       --danger: #ef4444;
-      --border: #333333;
+      --danger-light: rgba(239, 68, 68, 0.15);
+      --purple: #8b5cf6;
+      --cyan: #06b6d4;
+      --border: rgba(255, 255, 255, 0.08);
+      --border-hover: rgba(255, 255, 255, 0.16);
+      --border-accent: rgba(59, 130, 246, 0.5);
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 14px;
+      --radius-xl: 18px;
+      --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.25);
+      --shadow-md: 0 6px 16px rgba(0, 0, 0, 0.35);
+      --shadow-lg: 0 16px 36px rgba(0, 0, 0, 0.5);
     }
     
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
       background: var(--bg-primary);
       color: var(--text-primary);
-      padding: 20px;
+      padding: 24px;
       line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
     }
     
+    /* --- Header & Branding ------------------------------------------------ */
     header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 30px;
+      margin-bottom: 24px;
       padding-bottom: 20px;
       border-bottom: 1px solid var(--border);
       flex-wrap: wrap;
-      gap: 15px;
+      gap: 16px;
     }
     
-    h1 { font-size: 1.8rem; font-weight: 700; color: var(--accent); }
+    .brand-wrap {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-icon {
+      font-size: 2rem;
+      line-height: 1;
+      filter: drop-shadow(0 0 12px rgba(59, 130, 246, 0.4));
+    }
+
+    .brand-text h1 {
+      font-size: 1.6rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      background: linear-gradient(135deg, #ffffff 40%, #93c5fd);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .brand-tag {
+      font-size: 0.72rem;
+      color: var(--text-secondary);
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
     
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    
+    .runtime-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: var(--radius-sm);
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      font-size: 0.72rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    
+    .updated-ago {
+      color: var(--text-muted);
+      font-size: 0.76rem;
+      min-width: 90px;
+      text-align: right;
+    }
+
     .network-status {
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 16px;
-      border-radius: 20px;
+      padding: 6px 14px;
+      border-radius: 999px;
       background: var(--bg-card);
-      font-size: 0.9rem;
+      border: 1px solid var(--border);
+      font-size: 0.82rem;
+      font-weight: 500;
     }
     
     .status-dot {
-      width: 10px;
-      height: 10px;
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
       background: var(--success);
+      box-shadow: 0 0 8px var(--success);
       animation: pulse 2s infinite;
     }
     
-    .status-dot.disconnected { background: var(--danger); animation: none; }
-    .status-dot.degraded { background: var(--warning); animation: none; }
+    .status-dot.disconnected { background: var(--danger); box-shadow: 0 0 8px var(--danger); animation: none; }
+    .status-dot.degraded { background: var(--warning); box-shadow: 0 0 8px var(--warning); animation: none; }
     
     @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.5; }
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.45; transform: scale(0.9); }
     }
-    
+
+    /* --- Pause Alert Banner ----------------------------------------------- */
+    .pause-banner {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 12px 18px;
+      margin-bottom: 22px;
+      border-radius: var(--radius-md);
+      background: rgba(245, 158, 11, 0.12);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      color: var(--warning);
+      font-size: 0.86rem;
+      box-shadow: 0 4px 16px rgba(245, 158, 11, 0.1);
+    }
+    .pause-banner.show { display: flex; }
+    .pause-banner-content { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .pause-banner .reason {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.8rem;
+      padding: 2px 8px;
+      border-radius: var(--radius-sm);
+      background: rgba(245, 158, 11, 0.15);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+      word-break: break-all;
+    }
+
+    /* --- Top Stat Cards --------------------------------------------------- */
     .stats-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 15px;
-      margin-bottom: 30px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 14px;
+      margin-bottom: 24px;
     }
     
     .stat-card {
       background: var(--bg-card);
-      padding: 20px;
-      border-radius: 12px;
+      padding: 16px 18px;
+      border-radius: var(--radius-lg);
       border: 1px solid var(--border);
+      position: relative;
+      overflow: hidden;
+      transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
     }
-    
+    .stat-card:hover {
+      transform: translateY(-2px);
+      border-color: var(--border-hover);
+      box-shadow: var(--shadow-md);
+    }
+    .stat-card::before {
+      content: "";
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 3px;
+      background: var(--border);
+    }
+    .stat-card.card-downloading::before { background: var(--accent); }
+    .stat-card.card-completed::before { background: var(--success); }
+    .stat-card.card-failed::before { background: var(--danger); }
+    .stat-card.card-disk::before { background: var(--cyan); }
+    .stat-card.card-queue::before { background: var(--warning); }
+    .stat-card.card-workers::before { background: var(--purple); }
+
     .stat-card h3 {
-      font-size: 0.85rem;
+      font-size: 0.72rem;
       color: var(--text-secondary);
-      margin-bottom: 8px;
+      margin-bottom: 6px;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: 0.06em;
+      font-weight: 700;
     }
     
     .stat-value {
-      font-size: 1.8rem;
-      font-weight: 700;
+      font-size: 1.7rem;
+      font-weight: 800;
       color: var(--text-primary);
+      line-height: 1.2;
     }
     
     .stat-sub {
-      font-size: 0.8rem;
+      font-size: 0.76rem;
       color: var(--text-secondary);
-      margin-top: 5px;
+      margin-top: 4px;
     }
     
     .progress-bar {
       width: 100%;
       height: 6px;
-      background: var(--bg-secondary);
-      border-radius: 3px;
-      margin-top: 10px;
+      background: var(--bg-input);
+      border-radius: 999px;
+      margin-top: 8px;
       overflow: hidden;
     }
     
     .progress-fill {
       height: 100%;
-      background: linear-gradient(90deg, var(--accent), #60a5fa);
-      border-radius: 3px;
-      transition: width 0.3s ease;
+      background: var(--accent-gradient);
+      border-radius: 999px;
+      transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     }
-    
-    .controls {
+
+    /* --- Worker Status Strip ---------------------------------------------- */
+    .workers-strip {
       display: flex;
-      gap: 10px;
-      margin-bottom: 20px;
       flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 20px;
     }
-    
+    .workers-strip:empty { display: none; }
+    .worker-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      max-width: 380px;
+      padding: 5px 12px;
+      border-radius: 999px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.74rem;
+      color: var(--text-secondary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .worker-chip .wid { font-weight: 800; color: var(--text-muted); }
+    .worker-chip.busy {
+      border-color: var(--accent);
+      background: var(--accent-light);
+      color: #bfdbfe;
+    }
+    .worker-chip.busy .wid { color: var(--accent); }
+
+    /* --- Common Buttons --------------------------------------------------- */
     .btn {
-      padding: 10px 20px;
-      border: none;
-      border-radius: 8px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 8px 14px;
+      border: 1px solid transparent;
+      border-radius: var(--radius-sm);
+      font-family: inherit;
       font-weight: 600;
+      font-size: 0.82rem;
       cursor: pointer;
-      transition: all 0.2s;
-      font-size: 0.9rem;
+      transition: all 0.15s ease;
+      user-select: none;
+      white-space: nowrap;
     }
+    .btn:active { transform: scale(0.98); }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+    
+    .btn-sm { padding: 4px 10px; font-size: 0.74rem; }
+    .btn-icon { width: 32px; height: 32px; padding: 0; border-radius: var(--radius-sm); }
     
     .btn-primary {
       background: var(--accent);
-      color: white;
+      color: #ffffff;
+      box-shadow: 0 2px 8px rgba(59, 130, 246, 0.3);
     }
-    
-    .btn-primary:hover { background: #2563eb; }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
     
     .btn-success {
-      background: var(--success);
-      color: white;
+      background: #10b981;
+      color: #ffffff;
+      box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3);
     }
-    
-    .btn-success:hover { background: #16a34a; }
+    .btn-success:hover:not(:disabled) { background: #059669; }
     
     .btn-danger {
-      background: var(--danger);
-      color: white;
+      background: #ef4444;
+      color: #ffffff;
+      box-shadow: 0 2px 8px rgba(239, 68, 68, 0.3);
     }
-    
-    .btn-danger:hover { background: #dc2626; }
+    .btn-danger:hover:not(:disabled) { background: #dc2626; }
     
     .btn-warning {
-      background: var(--warning);
-      color: white;
+      background: #f59e0b;
+      color: #ffffff;
+      box-shadow: 0 2px 8px rgba(245, 158, 11, 0.3);
     }
-    
-    .btn-warning:hover { background: #d97706; }
+    .btn-warning:hover:not(:disabled) { background: #d97706; }
     
     .btn-secondary {
       background: var(--bg-card);
       color: var(--text-primary);
-      border: 1px solid var(--border);
+      border-color: var(--border);
     }
-    
-    .btn-secondary:hover { background: var(--bg-secondary); }
-    
-    .tabs {
-      display: flex;
-      gap: 5px;
-      margin-bottom: 20px;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 10px;
-    }
-    
-    .tab {
-      padding: 10px 20px;
-      background: transparent;
-      border: none;
-      color: var(--text-secondary);
-      cursor: pointer;
-      font-weight: 600;
-      border-radius: 8px 8px 0 0;
-      transition: all 0.2s;
-    }
-    
-    .tab:hover { background: var(--bg-card); color: var(--text-primary); }
-    .tab.active { background: var(--accent); color: white; }
-    
-    .tab-content { display: none; }
-    .tab-content.active { display: block; }
-    
-    .jobs-table {
-      width: 100%;
-      border-collapse: collapse;
-      background: var(--bg-card);
-      border-radius: 12px;
-      overflow: hidden;
-    }
-    
-    .jobs-table th,
-    .jobs-table td {
-      padding: 15px;
-      text-align: left;
-      border-bottom: 1px solid var(--border);
-    }
-    
-    .jobs-table th {
-      background: var(--bg-secondary);
-      font-weight: 600;
-      color: var(--text-secondary);
-      font-size: 0.85rem;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-    
-    .jobs-table tr:hover { background: var(--bg-secondary); }
-    
-    .status-badge {
-      padding: 4px 12px;
-      border-radius: 20px;
-      font-size: 0.75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-    }
-    
-    .status-pending { background: #6b7280; color: white; }
-    .status-downloading { background: var(--accent); color: white; }
-    .status-paused { background: var(--warning); color: white; }
-    .status-downloaded { background: var(--success); color: white; }
-    .status-failed { background: var(--danger); color: white; }
-    .status-converting { background: #8b5cf6; color: white; }
-    .status-done { background: var(--success); color: white; }
-    .status-waiting_live { background: #0ea5e9; color: white; }
-    
-    .search-box {
-      padding: 10px 15px;
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      color: var(--text-primary);
-      font-size: 0.9rem;
-      width: 300px;
-    }
-    
-    .search-box:focus {
-      outline: none;
-      border-color: var(--accent);
-    }
-    
-    .bulk-actions {
-      display: none;
-      align-items: center;
-      gap: 10px;
-      padding: 15px;
-      background: var(--bg-card);
-      border-radius: 8px;
-      margin-bottom: 20px;
-    }
-    
-    .notification-container {
-      position: fixed;
-      top: 20px;
-      right: 20px;
-      z-index: 1000;
-      max-width: 400px;
-    }
-    
-    .notification {
-      background: var(--bg-card);
-      padding: 15px 20px;
-      border-radius: 8px;
-      margin-bottom: 10px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-      animation: slideIn 0.3s ease-out;
-      border-left: 4px solid var(--accent);
-    }
-    
-    .notification.success { border-left-color: var(--success); }
-    .notification.error { border-left-color: var(--danger); }
-    .notification.warning { border-left-color: var(--warning); }
-    
-    @keyframes slideIn {
-      from { transform: translateX(400px); opacity: 0; }
-      to { transform: translateX(0); opacity: 1; }
-    }
-    
-    .add-url-section {
-      background: var(--bg-card);
-      padding: 20px;
-      border-radius: 12px;
-      margin-bottom: 20px;
-      border: 1px solid var(--border);
-    }
-    
-    .add-url-section input {
-      padding: 10px 15px;
-      background: var(--bg-secondary);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      color: var(--text-primary);
-      font-size: 0.9rem;
-      width: 100%;
-      margin-bottom: 10px;
-    }
-    
-    .add-url-section input:focus {
-      outline: none;
-      border-color: var(--accent);
+    .btn-secondary:hover:not(:disabled) {
+      background: var(--bg-card-hover);
+      border-color: var(--border-hover);
     }
 
-    .source-manager {
+    .btn-turbo-active {
+      background: linear-gradient(135deg, #f59e0b, #ef4444) !important;
+      color: #ffffff !important;
+      border: 1px solid rgba(255, 255, 255, 0.25) !important;
+      font-weight: 700 !important;
+      box-shadow: 0 0 14px rgba(245, 158, 11, 0.45) !important;
+    }
+    .btn-turbo-active:hover:not(:disabled) {
+      background: linear-gradient(135deg, #d97706, #dc2626) !important;
+    }
+
+    /* --- Add URL Section -------------------------------------------------- */
+    .add-url-section {
       background: var(--bg-card);
       padding: 18px 20px;
-      border-radius: 12px;
+      border-radius: var(--radius-lg);
+      margin-bottom: 20px;
+      border: 1px solid var(--border);
+    }
+    .add-url-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .add-url-header h3 { font-size: 0.96rem; font-weight: 700; }
+    .add-url-inputs {
+      display: grid;
+      grid-template-columns: 2fr 1fr auto;
+      gap: 10px;
+      align-items: center;
+    }
+    .add-url-inputs input {
+      padding: 9px 14px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-size: 0.85rem;
+      font-family: inherit;
+      width: 100%;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    .add-url-inputs input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+    }
+
+    /* --- Saved Sources Section -------------------------------------------- */
+    .source-manager {
+      background: var(--bg-card);
+      padding: 16px 20px;
+      border-radius: var(--radius-lg);
       margin-bottom: 20px;
       border: 1px solid var(--border);
     }
@@ -327,124 +406,300 @@
       gap: 12px;
       margin-bottom: 8px;
     }
-    .source-manager-heading h3 { font-size: 0.95rem; }
-    .source-list { display: grid; gap: 8px; margin-top: 12px; }
+    .source-manager-heading h3 { font-size: 0.92rem; font-weight: 700; }
+    .source-list { display: grid; gap: 8px; margin-top: 10px; }
     .source-row {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
       min-width: 0;
-      padding: 10px 12px;
-      border-radius: 8px;
+      padding: 9px 12px;
+      border-radius: var(--radius-sm);
       border: 1px solid var(--border);
-      background: var(--bg-secondary);
+      background: var(--bg-input);
     }
     .source-info { min-width: 0; }
-    .source-url { overflow-wrap: anywhere; font-size: 0.82rem; }
+    .source-url { overflow-wrap: anywhere; font-size: 0.8rem; font-weight: 500; }
     .source-kind { color: var(--text-secondary); font-size: 0.72rem; margin-top: 2px; }
-    .source-empty { color: var(--text-secondary); font-size: 0.82rem; padding: 10px 0; }
-    .source-remove { flex: 0 0 auto; padding: 6px 10px; font-size: 0.75rem; }
-    
-    .log-viewer {
-      background: var(--bg-secondary);
-      padding: 15px;
-      border-radius: 8px;
-      font-family: 'Courier New', monospace;
-      font-size: 0.85rem;
-      max-height: 500px;
-      overflow-y: auto;
-      white-space: pre-wrap;
-      word-break: break-all;
-    }
-    
-    .history-item {
-      background: var(--bg-card);
-      padding: 15px;
-      border-radius: 8px;
-      margin-bottom: 10px;
-      border: 1px solid var(--border);
-    }
-    
-    .history-item h4 {
-      color: var(--accent);
-      margin-bottom: 8px;
-    }
-    
-    .history-meta {
-      display: flex;
-      gap: 20px;
-      font-size: 0.85rem;
-      color: var(--text-secondary);
-    }
-    
+    .source-empty { color: var(--text-muted); font-size: 0.82rem; padding: 10px 0; }
+    .source-remove { flex: 0 0 auto; }
+
+    /* --- Reliability & System Health Panel -------------------------------- */
     .reliability-panel {
       background: var(--bg-card);
       border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 15px 18px;
-      margin-bottom: 18px;
+      border-radius: var(--radius-lg);
+      padding: 16px 20px;
+      margin-bottom: 20px;
     }
-    
-    .reliability-panel h3 {
-      font-size: 0.95rem;
+    .reliability-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
       margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .reliability-heading h3 {
+      font-size: 0.92rem;
+      font-weight: 700;
       display: flex;
       align-items: center;
       gap: 8px;
     }
-    
-    .reliability-grid {
+    .reliability-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .reliability-summary-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
       gap: 10px;
     }
+    .reliability-details-grid {
+      display: none;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .reliability-details-grid.expanded { display: grid; }
     
     .reliability-item {
-      background: var(--bg-secondary);
-      border-radius: 8px;
-      padding: 10px 12px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 8px 12px;
     }
-    
     .reliability-item .label {
-      font-size: 0.7rem;
+      font-size: 0.68rem;
       text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-secondary);
-      margin-bottom: 4px;
-    }
-    
-    .reliability-item .value {
-      font-size: 0.95rem;
+      letter-spacing: 0.06em;
+      color: var(--text-muted);
+      margin-bottom: 2px;
       font-weight: 600;
     }
+    .reliability-item .value {
+      font-size: 0.88rem;
+      font-weight: 600;
+    }
+
+    /* --- Action Toolbar & Filter Controls --------------------------------- */
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .controls-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .search-box {
+      padding: 8px 14px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-size: 0.85rem;
+      font-family: inherit;
+      width: 260px;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    .search-box:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+    }
+    select.search-box {
+      width: 170px;
+      cursor: pointer;
+    }
     
+    .bulk-actions {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 16px;
+      background: var(--bg-card-elevated);
+      border: 1px solid var(--accent);
+      border-radius: var(--radius-md);
+      margin-bottom: 16px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    /* --- Keyboard Shortcuts Hint ------------------------------------------ */
+    .shortcut-hint {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      margin-bottom: 14px;
+    }
+    .shortcut-hint span { display: inline-flex; align-items: center; gap: 4px; }
+    .kbd {
+      display: inline-block;
+      min-width: 18px;
+      text-align: center;
+      padding: 1px 5px;
+      border: 1px solid var(--border);
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      background: var(--bg-card);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.68rem;
+      color: var(--text-secondary);
+    }
+
+    /* --- Tabs ------------------------------------------------------------- */
+    .tabs {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 6px;
+    }
+    .tab {
+      padding: 8px 16px;
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.85rem;
+      border-radius: var(--radius-sm);
+      transition: all 0.15s;
+      font-family: inherit;
+    }
+    .tab:hover { background: var(--bg-card); color: var(--text-primary); }
+    .tab.active { background: var(--accent-light); color: #93c5fd; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* --- Jobs Table ------------------------------------------------------- */
+    .table-container {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      overflow-x: auto;
+    }
+    .jobs-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.84rem;
+    }
+    .jobs-table th, .jobs-table td {
+      padding: 12px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    .jobs-table th {
+      background: var(--bg-secondary);
+      font-weight: 700;
+      color: var(--text-secondary);
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      white-space: nowrap;
+    }
+    .jobs-table tbody tr {
+      cursor: pointer;
+      transition: background 0.12s ease;
+    }
+    .jobs-table tbody tr:hover { background: rgba(255, 255, 255, 0.03); }
+    .jobs-table tbody tr.selected { background: rgba(59, 130, 246, 0.14); }
+    .jobs-table tbody tr:last-child td { border-bottom: none; }
+
+    th.sortable { cursor: pointer; user-select: none; }
+    th.sortable:hover { color: var(--accent); }
+    th.sortable .arrow { opacity: 0.3; font-size: 0.7em; }
+    th.sortable.sorted .arrow { opacity: 1; color: var(--accent); }
+
+    /* Status Badges */
+    .status-badge {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 999px;
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .status-pending { background: rgba(107, 114, 128, 0.2); color: #9ca3af; border: 1px solid rgba(107, 114, 128, 0.4); }
+    .status-downloading { background: rgba(59, 130, 246, 0.2); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.4); }
+    .status-paused { background: rgba(245, 158, 11, 0.2); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.4); }
+    .status-done, .status-downloaded { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }
+    .status-failed { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
+    .status-converting { background: rgba(139, 92, 246, 0.2); color: #c4b5fd; border: 1px solid rgba(139, 92, 246, 0.4); }
+    .status-waiting_live { background: rgba(6, 182, 212, 0.2); color: #67e8f9; border: 1px solid rgba(6, 182, 212, 0.4); }
+
     .pill {
       display: inline-block;
-      padding: 2px 9px;
+      padding: 2px 8px;
       border-radius: 999px;
-      font-size: 0.72rem;
+      font-size: 0.7rem;
       font-weight: 600;
-      background: var(--bg-secondary);
+      background: var(--bg-input);
       border: 1px solid var(--border);
     }
-    
-    .pill.ok { color: #4ade80; border-color: #166534; }
-    .pill.warn { color: #fbbf24; border-color: #92400e; }
-    .pill.bad { color: #f87171; border-color: #991b1b; }
-    
-    .job-subnote {
-      font-size: 0.7rem;
-      color: var(--text-secondary);
-      margin-top: 3px;
-    }
-    
+    .pill.ok { color: #34d399; border-color: rgba(52, 211, 153, 0.35); background: rgba(52, 211, 153, 0.1); }
+    .pill.warn { color: #fbbf24; border-color: rgba(251, 191, 36, 0.35); background: rgba(251, 191, 36, 0.1); }
+    .pill.bad { color: #f87171; border-color: rgba(248, 113, 113, 0.35); background: rgba(248, 113, 113, 0.1); }
 
-    /* --- Settings modal ---------------------------------------------------- */
+    .job-subnote { font-size: 0.68rem; color: var(--text-muted); margin-top: 3px; }
+
+    /* --- Self-healing sweep list ------------------------------------------ */
+    .sweep-list { display: flex; flex-direction: column; gap: 4px; margin-top: 2px; }
+    .sweep-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 7px;
+      align-items: center;
+      font-size: 0.72rem;
+      padding: 3px 6px;
+      background: var(--bg-card);
+      border-radius: var(--radius-sm);
+    }
+    .sweep-row .sweep-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sweep-row .sweep-cadence { color: var(--text-muted); font-size: 0.68rem; white-space: nowrap; }
+
+    /* --- Log Viewer & History --------------------------------------------- */
+    .log-viewer {
+      background: var(--bg-input);
+      padding: 16px;
+      border-radius: var(--radius-md);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.8rem;
+      line-height: 1.5;
+      max-height: 520px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      border: 1px solid var(--border);
+    }
+    .history-item {
+      background: var(--bg-card);
+      padding: 14px 16px;
+      border-radius: var(--radius-md);
+      margin-bottom: 8px;
+      border: 1px solid var(--border);
+    }
+    .history-item h4 { color: var(--accent); margin-bottom: 6px; font-size: 0.88rem; }
+    .history-meta { display: flex; gap: 16px; font-size: 0.78rem; color: var(--text-secondary); }
+
+    /* --- Settings Modal (Redesigned & User-Friendly) ---------------------- */
     .modal-backdrop {
       position: fixed;
       inset: 0;
-      background: rgba(0, 0, 0, 0.65);
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(4px);
       display: none;
       align-items: flex-start;
       justify-content: center;
@@ -456,82 +711,296 @@
     .modal {
       background: var(--bg-card);
       border: 1px solid var(--border);
-      border-radius: 12px;
+      border-radius: var(--radius-xl);
       width: 100%;
-      max-width: 720px;
-      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+      max-width: 860px;
+      box-shadow: var(--shadow-lg);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      animation: modalSlide 0.2s ease-out;
+    }
+    @keyframes modalSlide {
+      from { opacity: 0; transform: translateY(-16px) scale(0.98); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
     }
     .modal-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 14px 18px;
+      padding: 16px 22px;
       border-bottom: 1px solid var(--border);
+      background: var(--bg-secondary);
     }
-    .modal-header h3 { font-size: 1rem; }
-    .modal-body { padding: 6px 18px 18px; }
-    .modal-footer {
+    .modal-header-left {
       display: flex;
       align-items: center;
-      justify-content: flex-end;
       gap: 10px;
-      padding: 14px 18px;
-      border-top: 1px solid var(--border);
     }
-    .settings-group { margin-top: 16px; }
-    .settings-group > h4 {
+    .modal-header h3 { font-size: 1.05rem; font-weight: 700; }
+    .modal-badge {
       font-size: 0.72rem;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--accent-light);
+      color: #93c5fd;
+      font-weight: 600;
+    }
+    
+    /* Settings Toolbar (Search + Category Tabs) */
+    .settings-toolbar {
+      padding: 14px 22px 10px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+    }
+    .settings-search-wrapper {
+      position: relative;
+      margin-bottom: 12px;
+    }
+    .settings-search-input {
+      width: 100%;
+      padding: 10px 36px 10px 36px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      color: var(--text-primary);
+      font-size: 0.88rem;
+      font-family: inherit;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    .settings-search-input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+    }
+    .settings-search-icon {
+      position: absolute;
+      left: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 0.9rem;
+      color: var(--text-muted);
+      pointer-events: none;
+    }
+    .settings-search-clear {
+      position: absolute;
+      right: 10px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 0.9rem;
+      padding: 4px;
+      display: none;
+    }
+    .settings-search-clear:hover { color: var(--text-primary); }
+
+    .settings-category-tabs {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+      scrollbar-width: thin;
+    }
+    .settings-cat-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-radius: var(--radius-sm);
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.15s;
+    }
+    .settings-cat-tab:hover {
+      background: var(--bg-card-hover);
+      color: var(--text-primary);
+    }
+    .settings-cat-tab.active {
+      background: var(--accent-light);
+      border-color: var(--accent);
+      color: #bfdbfe;
+    }
+    .settings-cat-tab .tab-count {
+      font-size: 0.68rem;
+      padding: 1px 5px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.08);
+    }
+    .settings-cat-tab .tab-dirty-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--warning);
+      display: inline-block;
+    }
+
+    .modal-body {
+      padding: 16px 22px 22px;
+      max-height: calc(85vh - 200px);
+      overflow-y: auto;
+    }
+
+    /* Speed Profile Card in Settings */
+    .speed-profile-card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 14px 16px;
+      margin-bottom: 18px;
+    }
+    .speed-profile-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+    .speed-profile-title {
+      font-size: 0.88rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .speed-profile-state {
+      font-size: 0.74rem;
+      color: var(--text-secondary);
+    }
+    .speed-profile-options {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 8px;
+    }
+    .speed-profile-button {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 9px 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      font: inherit;
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .speed-profile-button:hover {
+      border-color: var(--accent);
+      background: var(--bg-card-hover);
+    }
+    .speed-profile-button.active {
+      border-color: var(--accent);
+      background: var(--accent-light);
+      color: #bfdbfe;
+      box-shadow: 0 0 10px rgba(59, 130, 246, 0.2);
+    }
+
+    /* Settings Group Card */
+    .settings-group {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 14px 18px;
+      margin-bottom: 16px;
+    }
+    .settings-group > h4 {
+      font-size: 0.78rem;
       text-transform: uppercase;
       letter-spacing: 0.06em;
-      color: var(--text-secondary);
-      margin-bottom: 8px;
+      color: var(--accent);
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
+    
     .setting-row {
       display: grid;
-      grid-template-columns: 1fr 190px;
-      gap: 12px;
+      grid-template-columns: 1fr 220px;
+      gap: 16px;
       align-items: center;
-      padding: 9px 0;
+      padding: 11px 0;
       border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      transition: background 0.12s;
     }
     .setting-row:last-child { border-bottom: none; }
-    .setting-row .desc { font-size: 0.8rem; }
+    .setting-row.is-dirty {
+      background: rgba(245, 158, 11, 0.04);
+      margin: 0 -10px;
+      padding-left: 10px;
+      padding-right: 10px;
+      border-radius: var(--radius-sm);
+    }
+    .setting-row .desc { font-size: 0.82rem; }
+    .setting-row .desc .name-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
     .setting-row .desc .name { font-weight: 600; }
     .setting-row .desc .help {
       color: var(--text-secondary);
-      font-size: 0.72rem;
-      margin-top: 2px;
-      line-height: 1.35;
+      font-size: 0.73rem;
+      margin-top: 3px;
+      line-height: 1.4;
     }
-    .setting-row.is-dirty .desc .name::after {
-      content: " *";
-      color: var(--accent);
+
+    .pill-dirty {
+      color: #f59e0b;
+      border-color: rgba(245, 158, 11, 0.4);
+      background: rgba(245, 158, 11, 0.12);
+      font-size: 0.66rem;
+      font-weight: 700;
     }
+    .pill-restart {
+      color: #fca5a5;
+      border-color: rgba(239, 68, 68, 0.4);
+      background: rgba(239, 68, 68, 0.12);
+      font-size: 0.66rem;
+      font-weight: 600;
+    }
+
     .setting-row input[type="number"],
     .setting-row input[type="text"],
     .setting-row select {
       width: 100%;
-      background: var(--bg-secondary);
+      background: var(--bg-input);
       border: 1px solid var(--border);
-      border-radius: 6px;
+      border-radius: var(--radius-sm);
       color: var(--text-primary);
-      padding: 7px 9px;
-      font-size: 0.85rem;
+      padding: 7px 10px;
+      font-size: 0.82rem;
       font-family: inherit;
+      transition: border-color 0.15s, box-shadow 0.15s;
     }
     .setting-row input:focus, .setting-row select:focus {
       outline: none;
       border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
     }
     .setting-row .unit {
-      color: var(--text-secondary);
+      color: var(--text-muted);
       font-size: 0.72rem;
-      margin-left: 5px;
+      margin-left: 6px;
+      white-space: nowrap;
     }
+
+    /* Modern Switch */
     .switch {
       position: relative;
-      width: 42px;
-      height: 22px;
+      width: 44px;
+      height: 24px;
       flex-shrink: 0;
       justify-self: start;
     }
@@ -539,30 +1008,42 @@
     .switch .track {
       position: absolute;
       inset: 0;
-      background: var(--border);
+      background: rgba(255, 255, 255, 0.15);
       border-radius: 999px;
       cursor: pointer;
-      transition: background 0.15s;
+      transition: background 0.2s cubic-bezier(0.4, 0, 0.2, 1);
     }
     .switch .track::before {
       content: "";
       position: absolute;
-      width: 16px;
-      height: 16px;
+      width: 18px;
+      height: 18px;
       left: 3px;
       top: 3px;
-      background: #fff;
+      background: #ffffff;
       border-radius: 50%;
-      transition: transform 0.15s;
+      transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
     }
     .switch input:checked + .track { background: var(--accent); }
     .switch input:checked + .track::before { transform: translateX(20px); }
 
-    /* --- Job detail drawer ------------------------------------------------- */
+    .modal-footer {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 14px 22px;
+      border-top: 1px solid var(--border);
+      background: var(--bg-secondary);
+    }
+
+    /* --- Job Detail Drawer ------------------------------------------------ */
     .drawer-backdrop {
       position: fixed;
       inset: 0;
-      background: rgba(0, 0, 0, 0.55);
+      background: rgba(0, 0, 0, 0.65);
+      backdrop-filter: blur(2px);
       display: none;
       z-index: 90;
     }
@@ -573,48 +1054,50 @@
       right: 0;
       bottom: 0;
       width: 100%;
-      max-width: 460px;
+      max-width: 480px;
       background: var(--bg-card);
       border-left: 1px solid var(--border);
       transform: translateX(100%);
-      transition: transform 0.2s ease;
+      transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
       z-index: 95;
       display: flex;
       flex-direction: column;
-      box-shadow: -12px 0 40px rgba(0, 0, 0, 0.45);
+      box-shadow: -12px 0 40px rgba(0, 0, 0, 0.6);
     }
     .drawer.open { transform: translateX(0); }
     .drawer-header {
       display: flex;
-      align-items: flex-start;
+      align-items: center;
       justify-content: space-between;
-      gap: 10px;
-      padding: 14px 16px;
+      gap: 12px;
+      padding: 16px 20px;
       border-bottom: 1px solid var(--border);
+      background: var(--bg-secondary);
     }
-    .drawer-header h3 { font-size: 0.95rem; line-height: 1.35; }
-    .drawer-body { padding: 14px 16px 24px; overflow-y: auto; }
+    .drawer-header h3 { font-size: 0.95rem; font-weight: 700; line-height: 1.35; }
+    .drawer-body { padding: 16px 20px 28px; overflow-y: auto; }
     .detail-grid { display: grid; grid-template-columns: 1fr; gap: 8px; }
     .detail-row {
       display: grid;
-      grid-template-columns: 118px 1fr;
+      grid-template-columns: 120px 1fr;
       gap: 10px;
       font-size: 0.8rem;
       padding: 6px 0;
       border-bottom: 1px solid rgba(255, 255, 255, 0.05);
     }
-    .detail-row .k { color: var(--text-secondary); }
+    .detail-row .k { color: var(--text-muted); font-weight: 500; }
     .detail-row .v { word-break: break-all; }
     .detail-row .v.mono {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 0.74rem;
     }
+
     .audio-tracks-box {
       margin-top: 16px;
-      padding: 12px 14px;
+      padding: 14px;
       border: 1px solid var(--border);
-      border-radius: 10px;
-      background: rgba(255, 255, 255, 0.02);
+      border-radius: var(--radius-md);
+      background: var(--bg-input);
     }
     .audio-tracks-box .mono {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -623,165 +1106,151 @@
     .override-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; }
     .override-field { display: flex; flex-direction: column; gap: 5px; font-size: 0.73rem; color: var(--text-secondary); }
     .override-field select {
-      width: 100%; padding: 7px 8px; border-radius: 7px; border: 1px solid var(--border);
-      background: var(--bg-secondary); color: var(--text-primary); font-size: 0.76rem;
+      width: 100%; padding: 7px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+      background: var(--bg-card); color: var(--text-primary); font-size: 0.76rem;
     }
-    @media (max-width: 420px) { .override-fields { grid-template-columns: 1fr; } }
-    .jobs-table tbody tr { cursor: pointer; }
-    .jobs-table tbody tr:hover { background: rgba(255, 255, 255, 0.03); }
-    .jobs-table tbody tr.selected { background: rgba(59, 130, 246, 0.12); }
-    .kbd {
-      display: inline-block;
-      min-width: 18px;
-      text-align: center;
-      padding: 1px 5px;
+
+    /* --- Notification Container ------------------------------------------- */
+    .notification-container {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      z-index: 1000;
+      max-width: 420px;
+    }
+    .notification {
+      background: var(--bg-card-elevated);
+      padding: 12px 18px;
+      border-radius: var(--radius-md);
+      margin-bottom: 10px;
+      box-shadow: var(--shadow-lg);
+      border-left: 4px solid var(--accent);
       border: 1px solid var(--border);
-      border-bottom-width: 2px;
-      border-radius: 4px;
-      background: var(--bg-secondary);
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 0.7rem;
-      color: var(--text-primary);
+      border-left-width: 4px;
+      font-size: 0.84rem;
+      animation: slideIn 0.25s ease-out;
     }
-    .shortcut-hint {
-      display: flex;
-      gap: 14px;
-      flex-wrap: wrap;
-      align-items: center;
-      font-size: 0.72rem;
-      color: var(--text-secondary);
-      margin-bottom: 14px;
+    .notification.success { border-left-color: var(--success); }
+    .notification.error { border-left-color: var(--danger); }
+    .notification.warning { border-left-color: var(--warning); }
+    
+    @keyframes slideIn {
+      from { transform: translateX(360px); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
     }
-    .shortcut-hint span { display: inline-flex; align-items: center; gap: 5px; }
 
-    /* --- Self-healing sweep list ------------------------------------------- */
-    .sweep-list { display: flex; flex-direction: column; gap: 4px; margin-top: 2px; }
-    .sweep-row {
-      display: grid;
-      grid-template-columns: 1fr auto auto;
-      gap: 7px;
-      align-items: center;
-      font-size: 0.74rem;
-      padding: 3px 6px;
-      background: var(--bg-secondary);
-      border-radius: 5px;
-    }
-    .sweep-row .sweep-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .sweep-row .sweep-cadence { color: var(--text-secondary); font-size: 0.68rem; white-space: nowrap; }
-    .sweep-row .pill { font-size: 0.66rem; padding: 1px 7px; }
-
-
+    /* --- Responsive Queries ----------------------------------------------- */
     @media (max-width: 768px) {
-      .setting-row { grid-template-columns: 1fr; gap: 6px; }
+      .setting-row { grid-template-columns: 1fr; gap: 8px; }
+      .add-url-inputs { grid-template-columns: 1fr; }
       .drawer { max-width: 100%; }
       .stats-grid { grid-template-columns: repeat(2, 1fr); }
-      .controls { flex-direction: column; }
-      .btn { width: 100%; }
-      .jobs-table { font-size: 0.85rem; }
-      .jobs-table th, .jobs-table td { padding: 8px; }
-      header { flex-direction: column; gap: 15px; }
-      h1 { font-size: 1.4rem; }
+      .controls { flex-direction: column; align-items: stretch; }
+      .controls-group { width: 100%; justify-content: space-between; }
       .search-box { width: 100%; }
+      select.search-box { width: 100%; }
+      header { flex-direction: column; align-items: flex-start; }
+      .header-right { width: 100%; justify-content: space-between; }
     }
-    
     @media (max-width: 480px) {
       .stats-grid { grid-template-columns: 1fr; }
-      body { padding: 10px; }
+      body { padding: 12px; }
     }
-    /* --- workers strip, pause banner, status filter, sorting, runtime ------ */
-    .header-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-    .runtime-badge { color: var(--text-secondary); font-size: 0.72rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .updated-ago { color: var(--text-secondary); font-size: 0.78rem; min-width: 90px; text-align: right; }
-    .pause-banner { display: none; align-items: center; gap: 10px; padding: 10px 14px; margin-bottom: 15px; border-radius: 10px; background: rgba(245,158,11,.12); border: 1px solid rgba(245,158,11,.45); color: var(--warning); font-size: 0.85rem; }
-    .pause-banner.show { display: flex; }
-    .pause-banner .reason { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; opacity: 0.85; word-break: break-all; }
-    .workers-strip { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 15px; }
-    .workers-strip:empty { display: none; }
-    .worker-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 360px; padding: 3px 10px; border-radius: 999px; background: var(--bg-card); border: 1px solid var(--border); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.71rem; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .worker-chip .wid { font-weight: 700; color: var(--text-secondary); }
-    .worker-chip.busy { border-color: var(--accent); color: var(--text-primary); }
-    .worker-chip.busy .wid { color: var(--accent); }
-    th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
-    th.sortable:hover { color: var(--accent); }
-    th.sortable .arrow { opacity: 0.3; font-size: 0.7em; }
-    th.sortable.sorted .arrow { opacity: 1; color: var(--accent); }
-    #statusFilter { width: 170px; }
   </style>
 </head>
 <body>
   <header>
-    <h1>🎬 YouTube Archive Engine V5</h1>
+    <div class="brand-wrap">
+      <span class="brand-icon">🎬</span>
+      <div class="brand-text">
+        <h1>YouTube Archive Engine</h1>
+        <div class="brand-tag">V5 Autonomous Pipeline</div>
+      </div>
+    </div>
     <div class="header-right">
       <span class="runtime-badge" id="runtimeBadge"></span>
       <span class="updated-ago" id="updatedAgo" title="Last successful refresh"></span>
       <div class="network-status">
         <div class="status-dot" id="networkDot"></div>
         <span id="networkText">Connected</span>
-        <span id="networkLatency" style="color: var(--text-secondary); font-size: 0.8em;"></span>
+        <span id="networkLatency" style="color: var(--text-muted); font-size: 0.78rem;"></span>
       </div>
     </div>
   </header>
 
   <div class="pause-banner" id="pauseBanner">
-    <span>⏸️ Engine paused</span>
-    <span class="reason" id="pauseReason"></span>
+    <div class="pause-banner-content">
+      <span>⏸️ <strong>Engine paused:</strong></span>
+      <span class="reason" id="pauseReason"></span>
+    </div>
+    <button class="btn btn-warning btn-sm" onclick="togglePause()">▶️ Resume Engine</button>
   </div>
   
   <div class="stats-grid">
-    <div class="stat-card">
-      <h3>Downloading</h3>
+    <div class="stat-card card-downloading">
+      <h3>⬇️ Downloading</h3>
       <div class="stat-value" id="downloadingCount">0</div>
       <div class="stat-sub" id="aggregateSpeed">0 B/s</div>
     </div>
-    <div class="stat-card">
-      <h3>Completed</h3>
+    <div class="stat-card card-completed">
+      <h3>✅ Completed</h3>
       <div class="stat-value" id="completedCount">0</div>
       <div class="stat-sub" id="completedSub">Total jobs</div>
     </div>
-    <div class="stat-card">
-      <h3>Failed</h3>
+    <div class="stat-card card-failed">
+      <h3>❌ Failed</h3>
       <div class="stat-value" id="failedCount">0</div>
       <div class="stat-sub">Requires attention</div>
     </div>
-    <div class="stat-card">
-      <h3>Free Disk Space</h3>
+    <div class="stat-card card-disk">
+      <h3>💾 Free Disk</h3>
       <div class="stat-value" id="diskFree">--</div>
       <div class="progress-bar"><div class="progress-fill" id="diskBar" style="width: 100%;"></div></div>
     </div>
-    <div class="stat-card">
-      <h3>Queue Position</h3>
+    <div class="stat-card card-queue">
+      <h3>⏱️ Queue Status</h3>
       <div class="stat-value" id="queuePosition">--</div>
       <div class="stat-sub" id="globalETA">ETA: --</div>
     </div>
-    <div class="stat-card">
-      <h3>System Resources</h3>
+    <div class="stat-card card-workers">
+      <h3>⚡ Active Workers</h3>
       <div class="stat-value" id="activeWorkers">0</div>
-      <div class="stat-sub">Active workers</div>
+      <div class="stat-sub">Worker slots</div>
     </div>
   </div>
 
   <div class="workers-strip" id="workersStrip" title="Live worker status — download (DL), metadata (MD) and conversion (CV) workers"></div>
   
   <div class="add-url-section">
-    <h3 style="margin-bottom: 10px;">➕ Save a Playlist, Channel or Video</h3>
-    <input type="text" id="newUrlInput" placeholder="Paste a full YouTube playlist, channel or video URL..." />
-    <input type="text" id="folderOverride" placeholder="Optional: Custom folder for this scan" />
-    <button class="btn btn-primary" id="scanUrlButton" onclick="scanUrl()">📡 Save &amp; Scan</button>
-    <p class="stat-sub" style="margin-top: 8px;">Sources are saved to config.json for future runs. Re-scanning skips videos already in the archive.</p>
+    <div class="add-url-header">
+      <h3>➕ Save a Playlist, Channel or Video</h3>
+      <span style="font-size: 0.74rem; color: var(--text-secondary);">Saved automatically to config.json</span>
+    </div>
+    <div class="add-url-inputs">
+      <input type="text" id="newUrlInput" placeholder="Paste a full YouTube playlist, channel or video URL..." />
+      <input type="text" id="folderOverride" placeholder="Optional: Custom subfolder" />
+      <button class="btn btn-primary" id="scanUrlButton" onclick="scanUrl()">📡 Save &amp; Scan</button>
+    </div>
   </div>
 
   <div class="source-manager">
     <div class="source-manager-heading">
-      <h3>📚 Saved sources</h3>
-      <button class="btn btn-secondary" style="padding: 5px 10px; font-size: 0.75rem;" onclick="loadSources()">🔄 Refresh</button>
+      <h3>📚 Saved Sources</h3>
+      <button class="btn btn-secondary btn-sm" onclick="loadSources()">🔄 Refresh</button>
     </div>
-    <p class="stat-sub">Removing a source deletes it from config.json and removes its exclusively owned jobs from the database. Jobs also used by another saved source stay queued. Already-downloaded files are not deleted.</p>
+    <p class="stat-sub">Removing a source deletes it from config.json and removes its exclusively owned jobs. Already-downloaded media is preserved.</p>
     <div id="savedSources" class="source-list"><div class="source-empty">Loading sources...</div></div>
   </div>
   
   <div class="reliability-panel">
-    <h3>🛡️ Reliability &amp; Resume</h3>
-    <div class="reliability-grid">
+    <div class="reliability-heading">
+      <h3>🛡️ Reliability &amp; Self-Healing</h3>
+      <div class="reliability-actions">
+        <button id="relToggleBtn" class="btn btn-secondary btn-sm" onclick="toggleReliabilityDetails()">▼ Technical Details</button>
+        <button class="btn btn-success btn-sm" onclick="requeueFailed()">♻️ Requeue failed</button>
+      </div>
+    </div>
+    <div class="reliability-summary-grid">
       <div class="reliability-item">
         <div class="label">Engine</div>
         <div class="value" id="relEngine">--</div>
@@ -795,13 +1264,14 @@
         <div class="value" id="relResumableFailed">--</div>
       </div>
       <div class="reliability-item">
-        <div class="label">Waiting for VOD</div>
-        <div class="value" id="relWaiting">--</div>
-      </div>
-
-      <div class="reliability-item">
         <div class="label">Download engine</div>
         <div class="value" id="relDownloader">--</div>
+      </div>
+    </div>
+    <div class="reliability-details-grid" id="reliabilityDetails">
+      <div class="reliability-item">
+        <div class="label">Waiting for VOD</div>
+        <div class="value" id="relWaiting">--</div>
       </div>
       <div class="reliability-item">
         <div class="label">Connections</div>
@@ -831,51 +1301,52 @@
         <div class="label">Stale claims</div>
         <div class="value" id="relStaleClaims">--</div>
       </div>
-      <div class="reliability-item">
+      <div class="reliability-item" style="grid-column: span 2;">
         <div class="label">Resume / backoff</div>
         <div class="value" id="relPolicy">--</div>
       </div>
-      <div class="reliability-item">
+      <div class="reliability-item" style="grid-column: span 2;">
         <div class="label">Self-healing sweeps</div>
         <div class="value" id="relSweeps">--</div>
       </div>
-      <div class="reliability-item">
-        <div class="label">Actions</div>
-        <div class="value">
-          <button class="btn btn-success" style="padding: 4px 10px; font-size: 0.72rem;" onclick="requeueFailed()">♻️ Requeue failed</button>
-        </div>
-      </div>
-
     </div>
   </div>
   
   <div class="controls">
-    <button class="btn btn-warning" id="pauseBtn" onclick="togglePause()">⏸️ Pause All</button>
-    <button class="btn btn-success" onclick="refreshData()">🔄 Refresh</button>
-    <button class="btn btn-secondary" onclick="openSettings()">⚙️ Settings</button>
-    <button class="btn btn-danger" onclick="purgeQueue()">🗑️ Purge Queue</button>
-    <select id="statusFilter" class="search-box" onchange="renderJobs(lastJobs)">
-      <option value="all">All statuses</option>
-      <option value="downloading">⬇️ Downloading</option>
-      <option value="pending">Not started</option>
-      <option value="paused">⏸️ Paused</option>
-      <option value="waiting_live">Waiting for VOD</option>
-      <option value="done">✅ Done</option>
-      <option value="failed">❌ Failed</option>
-    </select>
-    <input type="text" class="search-box" id="searchInput" placeholder="🔍 Search jobs... (Press / to focus)" onkeyup="filterJobs()" />
+    <div class="controls-group">
+      <button class="btn btn-warning" id="pauseBtn" onclick="togglePause()">⏸️ Pause All</button>
+      <button class="btn btn-secondary" id="turboBtn" onclick="toggleTurboMode()" title="Toggle Aggressive IDM Mode (32 connections, 64 fragments, 10M chunk, 64K buffer, uncapped)">⚡ Turbo IDM: OFF</button>
+      <button class="btn btn-success" onclick="refreshData()">🔄 Refresh</button>
+    </div>
+    <div class="controls-group">
+      <button class="btn btn-secondary" onclick="openSettings()">⚙️ Settings</button>
+      <button class="btn btn-danger" onclick="purgeQueue()">🗑️ Purge Queue</button>
+    </div>
+    <div class="controls-group" style="margin-left: auto;">
+      <select id="statusFilter" class="search-box" onchange="renderJobs(lastJobs)">
+        <option value="all">All statuses</option>
+        <option value="downloading">⬇️ Downloading</option>
+        <option value="pending">Not started</option>
+        <option value="paused">⏸️ Paused</option>
+        <option value="waiting_live">Waiting for VOD</option>
+        <option value="done">✅ Done</option>
+        <option value="failed">❌ Failed</option>
+      </select>
+      <input type="text" class="search-box" id="searchInput" placeholder="🔍 Search jobs... (Press /)" onkeyup="filterJobs()" />
+    </div>
   </div>
   
   <div class="bulk-actions" id="bulkActions">
-    <span id="selectedCount">0 selected</span>
-    <button class="btn btn-success" onclick="bulkRetry()">🔄 Retry Selected</button>
-    <button class="btn btn-warning" onclick="bulkPause()">⏸️ Pause Selected</button>
-    <button class="btn btn-danger" onclick="bulkDelete()">🗑️ Delete Selected</button>
+    <span id="selectedCount" style="font-weight: 700;">0 selected</span>
+    <button class="btn btn-success btn-sm" onclick="bulkRetry()">🔄 Retry Selected</button>
+    <button class="btn btn-warning btn-sm" onclick="bulkPause()">⏸️ Pause Selected</button>
+    <button class="btn btn-danger btn-sm" onclick="bulkDelete()">🗑️ Delete Selected</button>
   </div>
   
   <div class="shortcut-hint">
     <span><span class="kbd">/</span> search</span>
     <span><span class="kbd">s</span> settings</span>
+    <span><span class="kbd">t</span> turbo IDM</span>
     <span><span class="kbd">p</span> pause / resume</span>
     <span><span class="kbd">r</span> refresh</span>
     <span><span class="kbd">Esc</span> close</span>
@@ -889,27 +1360,29 @@
   </div>
   
   <div id="jobsTab" class="tab-content active">
-    <table class="jobs-table">
-      <thead>
-        <tr>
-          <th><input type="checkbox" id="selectAll" onchange="toggleSelectAll()" /></th>
-          <th class="sortable" data-sort="title" onclick="sortBy('title')">Title <span class="arrow"></span></th>
-          <th class="sortable" data-sort="progress" onclick="sortBy('progress')">Progress <span class="arrow"></span></th>
-          <th class="sortable" data-sort="speed" onclick="sortBy('speed')">Speed <span class="arrow"></span></th>
-          <th class="sortable" data-sort="eta" onclick="sortBy('eta')">ETA <span class="arrow"></span></th>
-          <th class="sortable" data-sort="status" onclick="sortBy('status')">Status <span class="arrow"></span></th>
-          <th>Metadata</th>
-          <th>Action</th>
-        </tr>
-      </thead>
-      <tbody id="jobsTableBody"></tbody>
-    </table>
+    <div class="table-container">
+      <table class="jobs-table">
+        <thead>
+          <tr>
+            <th style="width: 40px;"><input type="checkbox" id="selectAll" onchange="toggleSelectAll()" /></th>
+            <th class="sortable" data-sort="title" onclick="sortBy('title')">Title <span class="arrow"></span></th>
+            <th class="sortable" data-sort="progress" onclick="sortBy('progress')" style="width: 170px;">Progress <span class="arrow"></span></th>
+            <th class="sortable" data-sort="speed" onclick="sortBy('speed')" style="width: 110px;">Speed <span class="arrow"></span></th>
+            <th class="sortable" data-sort="eta" onclick="sortBy('eta')" style="width: 90px;">ETA <span class="arrow"></span></th>
+            <th class="sortable" data-sort="status" onclick="sortBy('status')">Status <span class="arrow"></span></th>
+            <th style="width: 100px;">Metadata</th>
+            <th style="width: 110px;">Action</th>
+          </tr>
+        </thead>
+        <tbody id="jobsTableBody"></tbody>
+      </table>
+    </div>
   </div>
   
   <div id="failedTab" class="tab-content">
     <div style="margin-bottom: 15px; display: flex; gap: 10px; align-items: center;">
       <button class="btn btn-success" onclick="requeueFailed()">♻️ Requeue All Failed</button>
-      <small style="color: var(--text-secondary);">Transient failures are retried automatically after their cooldown — permanent ones (private / removed / age-gated) are never re-queued.</small>
+      <small style="color: var(--text-secondary);">Transient failures retry automatically after their cooldown — permanent errors (private/deleted) are safely skipped.</small>
     </div>
     <div id="failedItems"></div>
   </div>
@@ -919,8 +1392,8 @@
   </div>
   
   <div id="logsTab" class="tab-content">
-    <div style="margin-bottom: 15px;">
-      <select id="logType" class="search-box" style="width: 200px; margin-right: 10px;">
+    <div style="margin-bottom: 15px; display: flex; gap: 10px; align-items: center;">
+      <select id="logType" class="search-box" style="width: 180px;">
         <option value="error">Error Log</option>
         <option value="report">Report Log</option>
       </select>
@@ -928,22 +1401,43 @@
     </div>
     <div class="log-viewer" id="logViewer">Loading logs...</div>
   </div>
-  
 
+  <!-- Settings Modal (Redesigned & User-Friendly) -->
   <div class="modal-backdrop" id="settingsModal">
     <div class="modal">
       <div class="modal-header">
-        <h3>⚙️ Downloader Settings</h3>
-        <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 0.72rem;" onclick="closeSettings()">✕ Close</button>
+        <div class="modal-header-left">
+          <h3>⚙️ Downloader &amp; Engine Settings</h3>
+          <span class="modal-badge" id="settingsSummaryBadge">Loading...</span>
+        </div>
+        <button class="btn btn-secondary btn-icon" onclick="closeSettings()" title="Close (Esc)">✕</button>
       </div>
+
+      <div class="settings-toolbar">
+        <div class="settings-search-wrapper">
+          <span class="settings-search-icon">🔍</span>
+          <input type="text" id="settingsSearchInput" class="settings-search-input"
+                 placeholder="Search settings (e.g. deno, aria2c, quality, worker, format)..."
+                 oninput="onSettingsSearch(this.value)" />
+          <button class="settings-search-clear" id="settingsSearchClear" onclick="clearSettingsSearch()" title="Clear search">✕</button>
+        </div>
+        <div class="settings-category-tabs" id="settingsCategoryTabs"></div>
+      </div>
+
       <div class="modal-body" id="settingsBody">
-        <div class="shortcut-hint">
-          <span>Changes apply to the next download — no restart needed.</span>
+        <div class="speed-profile-card">
+          <div class="speed-profile-header">
+            <div class="speed-profile-title">🚀 Download Speed Profile</div>
+            <div id="downloadSpeedProfileState" class="speed-profile-state">Loading presets…</div>
+          </div>
+          <div id="downloadSpeedProfileOptions" class="speed-profile-options" role="group" aria-label="Download speed profile"></div>
         </div>
         <div id="settingsFields"></div>
       </div>
+
       <div class="modal-footer">
         <span id="settingsStatus" style="margin-right: auto; font-size: 0.78rem; color: var(--text-secondary);"></span>
+        <button class="btn btn-secondary" id="settingsDiscardBtn" onclick="discardSettingsDraft()" style="display: none;">Discard Draft</button>
         <button class="btn btn-secondary" onclick="closeSettings()">Cancel</button>
         <button class="btn btn-primary" id="settingsSaveBtn" onclick="saveSettings()">💾 Save Changes</button>
       </div>
@@ -953,8 +1447,8 @@
   <div class="drawer-backdrop" id="drawerBackdrop" onclick="closeJobDetail()"></div>
   <div class="drawer" id="jobDrawer">
     <div class="drawer-header">
-      <h3 id="drawerTitle">Job</h3>
-      <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 0.72rem;" onclick="closeJobDetail()">✕</button>
+      <h3 id="drawerTitle">Job Details</h3>
+      <button class="btn btn-secondary btn-icon" onclick="closeJobDetail()" title="Close (Esc)">✕</button>
     </div>
     <div class="drawer-body" id="drawerBody"></div>
   </div>
@@ -972,295 +1466,311 @@
 
     let selectedJobs = new Set();
     let lastFailedCount = 0;
-    let lastUnavailableCount = 0;
-    let wasPaused = false;
-    let lastRefreshAt = 0;
+    let lastCompletedCount = 0;
+    let lastJobs = [];
+    let sortState = { key: null, dir: 1 };
+    let lastSuccessfulFetch = null;
+    let reliabilityDetailsExpanded = false;
 
-    // Derived job status used by the table, the filter, and sorting — reflects
-    // the conversion stage once the download itself is complete.
-    function jobStatus(job) {
-      let status = job.download_status;
-      if (status === 'downloaded') {
-        if (job.conversion_status === 'in_progress') status = 'converting';
-        else if (job.conversion_status === 'done') status = 'done';
-        else if (job.conversion_status === 'failed') status = 'failed';
-      }
-      return status;
+    const STATUS_ORDER = ['downloading', 'pending', 'waiting_live', 'paused', 'failed', 'done'];
+
+    function toggleReliabilityDetails() {
+      reliabilityDetailsExpanded = !reliabilityDetailsExpanded;
+      const el = document.getElementById('reliabilityDetails');
+      const btn = document.getElementById('relToggleBtn');
+      if (el) el.classList.toggle('expanded', reliabilityDetailsExpanded);
+      if (btn) btn.textContent = reliabilityDetailsExpanded ? '▲ Hide Details' : '▼ Technical Details';
     }
 
-    const STATUS_ORDER = ['downloading', 'converting', 'paused', 'pending', 'waiting_live', 'failed', 'downloaded', 'done'];
+    function jobStatus(job) {
+      if (job.download_status === 'failed' || job.conversion_status === 'failed') return 'failed';
+      if (job.download_status === 'downloading' || job.conversion_status === 'in_progress') return 'downloading';
+      if (job.download_status === 'paused') {
+        return job.pause_reason === 'waiting_live' ? 'waiting_live' : 'paused';
+      }
+      if (job.download_status === 'done' && (job.conversion_status === 'done' || job.conversion_status === 'not_needed')) {
+        return 'done';
+      }
+      return 'pending';
+    }
 
-    // Column sorting: click a header to sort by it, click again to flip.
-    let sortState = { key: null, dir: 1 };
     function sortBy(key) {
-      if (sortState.key === key) sortState.dir = -sortState.dir;
-      else sortState = { key, dir: 1 };
+      if (sortState.key === key) {
+        sortState.dir = -sortState.dir;
+      } else {
+        sortState.key = key;
+        sortState.dir = 1;
+      }
       document.querySelectorAll('th.sortable').forEach(th => {
-        const active = th.dataset.sort === sortState.key;
-        th.classList.toggle('sorted', active);
+        th.classList.toggle('sorted', th.dataset.sort === key);
         const arrow = th.querySelector('.arrow');
-        if (arrow) arrow.textContent = active ? (sortState.dir === 1 ? '▲' : '▼') : '';
+        if (arrow) arrow.textContent = th.dataset.sort === key ? (sortState.dir === 1 ? ' ▲' : ' ▼') : '';
       });
       renderJobs(lastJobs);
     }
 
     function timeAgo(iso) {
-      if (!iso) return '--';
-      const ms = Date.now() - new Date(iso).getTime();
-      if (!Number.isFinite(ms)) return '--';
-      const s = Math.round(ms / 1000);
-      if (s < 60) return `${Math.max(s, 0)}s ago`;
+      if (!iso) return '';
+      const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+      if (s < 5) return 'just now';
+      if (s < 60) return `${s}s ago`;
       const m = Math.floor(s / 60);
       if (m < 60) return `${m}m ago`;
       const h = Math.floor(m / 60);
-      if (h < 24) return `${h}h ${m % 60}m ago`;
+      if (h < 24) return `${h}h ago`;
       return `${Math.floor(h / 24)}d ago`;
     }
 
     function updateUpdatedAgo() {
       const el = document.getElementById('updatedAgo');
       if (!el) return;
-      if (!lastRefreshAt) { el.textContent = ''; return; }
-      const s = Math.round((Date.now() - lastRefreshAt) / 1000);
-      el.textContent = s < 2 ? 'updated just now' : `updated ${s}s ago`;
+      if (!lastSuccessfulFetch) { el.textContent = ''; return; }
+      const s = Math.round((Date.now() - lastSuccessfulFetch.getTime()) / 1000);
+      el.textContent = s < 3 ? 'Updated just now' : `Updated ${s}s ago`;
     }
     setInterval(updateUpdatedAgo, 1000);
 
-    // Live worker lines from /api/status: download (DL), metadata (MD) and
-    // conversion (CV) workers with whatever they are doing right now.
     function renderWorkers(workers) {
-      const strip = document.getElementById('workersStrip');
-      if (!strip) return;
-      strip.innerHTML = (workers || []).map(w => {
-        const busy = w.status && w.status !== 'Idle';
-        return `<span class="worker-chip ${busy ? 'busy' : ''}" title="${escapeHtml(w.status || 'Idle')}">
-            <span class="wid">${escapeHtml(w.id)}</span>${busy ? escapeHtml(w.status) : 'idle'}
-          </span>`;
+      const container = document.getElementById('workersStrip');
+      if (!container) return;
+      if (!workers || !workers.length) { container.innerHTML = ''; return; }
+      container.innerHTML = workers.map(w => {
+        const busy = w.status && !w.status.includes('idle') && !w.status.includes('waiting');
+        const icon = w.type === 'MD' ? '📝' : w.type === 'CV' ? '🔄' : '⬇️';
+        return `<span class="worker-chip ${busy ? 'busy' : ''}" title="${escapeHtml(w.type + '#' + w.id + ': ' + (w.status || ''))}">
+          <span class="wid">${icon} ${w.type}#${w.id}</span>
+          <span class="wst">${escapeHtml(w.status || 'idle')}</span>
+        </span>`;
       }).join('');
     }
-    
-    // Network status monitoring
+
     async function checkNetworkStatus() {
+      const dot = document.getElementById('networkDot');
+      const text = document.getElementById('networkText');
+      const latencyEl = document.getElementById('networkLatency');
       const start = Date.now();
       try {
-        await fetch('/api/ping', { method: 'HEAD', cache: 'no-cache' });
+        const res = await fetch('/api/status', { method: 'HEAD', cache: 'no-store' });
         const latency = Date.now() - start;
-        document.getElementById('networkText').textContent = 'Connected';
-        document.getElementById('networkLatency').textContent = `${latency}ms`;
-        document.querySelector('.status-dot').className = 'status-dot';
+        if (res.ok) {
+          dot.className = latency > 500 ? 'status-dot degraded' : 'status-dot';
+          text.textContent = 'Connected';
+          latencyEl.textContent = `${latency}ms`;
+        } else {
+          dot.className = 'status-dot disconnected';
+          text.textContent = `HTTP ${res.status}`;
+          latencyEl.textContent = '';
+        }
       } catch {
-        document.getElementById('networkText').textContent = 'Disconnected';
-        document.getElementById('networkLatency').textContent = '';
-        document.querySelector('.status-dot').className = 'status-dot disconnected';
+        dot.className = 'status-dot disconnected';
+        text.textContent = 'Offline';
+        latencyEl.textContent = '';
       }
     }
-    
-    setInterval(checkNetworkStatus, 5000);
-    
-    // Notifications
+
     function showNotification(message, type = 'info', duration = 5000) {
       const container = document.getElementById('notifications');
       const notif = document.createElement('div');
       notif.className = `notification ${type}`;
-      notif.textContent = message;
+      const icon = type === 'success' ? '✅ ' : type === 'error' ? '❌ ' : type === 'warning' ? '⚠️ ' : 'ℹ️ ';
+      notif.textContent = icon + message;
       container.appendChild(notif);
-      
       setTimeout(() => {
         notif.style.animation = 'slideIn 0.3s ease-out reverse';
         setTimeout(() => notif.remove(), 300);
       }, duration);
     }
-    
-    // Tab switching (btn is the clicked tab element, passed from the onclick handler)
+
     function switchTab(tabName, btn) {
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-
-      if (btn) btn.classList.add('active');
-      document.getElementById(`${tabName}Tab`).classList.add('active');
-
+      btn.classList.add('active');
+      const tabEl = document.getElementById(`${tabName}Tab`);
+      if (tabEl) tabEl.classList.add('active');
+      
       if (tabName === 'failed') loadFailedItems();
-      if (tabName === 'history') loadHistory();
-      if (tabName === 'logs') loadLogs();
+      else if (tabName === 'history') loadHistory();
+      else if (tabName === 'logs') loadLogs();
     }
-    
-    // Selection management
+
     function toggleSelectAll() {
+      const selectAll = document.getElementById('selectAll');
       const checkboxes = document.querySelectorAll('.job-checkbox');
-      const selectAll = document.getElementById('selectAll').checked;
       checkboxes.forEach(cb => {
-        cb.checked = selectAll;
-        if (selectAll) selectedJobs.add(cb.dataset.id);
-        else selectedJobs.delete(cb.dataset.id);
+        cb.checked = selectAll.checked;
+        const id = Number(cb.dataset.id);
+        if (selectAll.checked) selectedJobs.add(id);
+        else selectedJobs.delete(id);
       });
       updateBulkActions();
     }
-    
+
     function toggleJobSelection(id) {
+      id = Number(id);
       if (selectedJobs.has(id)) selectedJobs.delete(id);
       else selectedJobs.add(id);
       updateBulkActions();
     }
-    
+
     function updateBulkActions() {
-      const bar = document.getElementById('bulkActions');
-      bar.style.display = selectedJobs.size > 0 ? 'flex' : 'none';
-      document.getElementById('selectedCount').textContent = `${selectedJobs.size} selected`;
+      const bulkActions = document.getElementById('bulkActions');
+      const selectedCount = document.getElementById('selectedCount');
+      if (selectedJobs.size > 0) {
+        bulkActions.style.display = 'flex';
+        selectedCount.textContent = `${selectedJobs.size} selected`;
+      } else {
+        bulkActions.style.display = 'none';
+      }
     }
-    
-    // Bulk actions
+
     async function bulkRetry() {
-      const ids = [...selectedJobs];
-      if (ids.length === 0) return;
-      if (!confirm(`Retry ${ids.length} job(s)?`)) return;
-      selectedJobs.clear();
-      updateBulkActions();
+      const ids = Array.from(selectedJobs);
+      showNotification(`Retrying ${ids.length} jobs...`, 'info');
       let okCount = 0;
       for (const id of ids) {
         try {
-          const res = await fetch(`/api/retry/${encodeURIComponent(id)}`, { method: 'POST' });
+          const res = await fetch(`/api/jobs/${id}/retry`, { method: 'POST' });
           if (res.ok) okCount++;
         } catch {}
       }
-      showNotification(`🔄 Queued ${okCount} job(s) for retry`, 'success');
+      showNotification(`Successfully re-queued ${okCount}/${ids.length} jobs`, okCount ? 'success' : 'error');
+      selectedJobs.clear();
+      updateBulkActions();
       refreshData();
     }
 
     async function bulkPause() {
-      const ids = [...selectedJobs];
-      if (ids.length === 0) return;
-      if (!confirm(`Pause ${ids.length} job(s)?`)) return;
+      const ids = Array.from(selectedJobs);
+      showNotification(`Pausing ${ids.length} jobs...`, 'info');
       try {
         const res = await fetch('/api/jobs/pause', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ids })
+          body: JSON.stringify({ ids }),
         });
         const data = await res.json();
-        if (data.ok) {
-          showNotification(`⏸️ Paused ${data.paused} job(s)`, 'success');
-          selectedJobs.clear();
-          updateBulkActions();
-          refreshData();
+        if (res.ok && data.ok) {
+          showNotification(`Paused ${data.paused ?? ids.length} jobs`, 'success');
         } else {
-          showNotification(`❌ ${data.error || 'Pause failed'}`, 'error');
+          showNotification(data.error || 'Failed to pause selected jobs', 'error');
         }
-      } catch {
-        showNotification('❌ Failed to pause jobs', 'error');
+      } catch (e) {
+        showNotification(e.message || 'Pause request failed', 'error');
       }
+      selectedJobs.clear();
+      updateBulkActions();
+      refreshData();
     }
 
     async function bulkDelete() {
-      const ids = [...selectedJobs];
-      if (ids.length === 0) return;
-      if (!confirm(`Delete ${ids.length} job(s) permanently?`)) return;
+      const ids = Array.from(selectedJobs);
+      if (!confirm(`Are you sure you want to delete ${ids.length} selected jobs?`)) return;
+      showNotification(`Deleting ${ids.length} jobs...`, 'info');
       try {
-        const res = await fetch('/api/jobs/delete', {
-          method: 'POST',
+        const res = await fetch('/api/jobs', {
+          method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ids })
+          body: JSON.stringify({ ids }),
         });
         const data = await res.json();
-        if (data.ok) {
-          showNotification(`🗑️ Deleted ${data.deleted} job(s)`, 'success');
-          selectedJobs.clear();
-          updateBulkActions();
-          refreshData();
+        if (res.ok && data.ok) {
+          showNotification(`Deleted ${data.deleted ?? ids.length} jobs`, 'success');
         } else {
-          showNotification(`❌ ${data.error || 'Delete failed'}`, 'error');
+          showNotification(data.error || 'Failed to delete selected jobs', 'error');
         }
-      } catch {
-        showNotification('❌ Failed to delete jobs', 'error');
+      } catch (e) {
+        showNotification(e.message || 'Delete request failed', 'error');
       }
+      selectedJobs.clear();
+      updateBulkActions();
+      refreshData();
     }
-    
-    // Main data fetching — status stats and the jobs table come from two endpoints.
+
     async function fetchStatus() {
       try {
-        const [res, jobsRes, relRes] = await Promise.all([
-          fetch('/api/status'),
-          fetch('/api/jobs'),
-          fetch('/api/reliability').catch(() => null)
-        ]);
+        const res = await fetch('/api/status');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        const jobsData = jobsRes.ok ? await jobsRes.json() : { jobs: [] };
-        if (relRes && relRes.ok) renderReliability(await relRes.json());
-
-        document.getElementById('downloadingCount').textContent = data.stats?.downloading || 0;
-        document.getElementById('completedCount').textContent = data.stats?.downloaded || 0;
-        document.getElementById('failedCount').textContent = data.stats?.failed || 0;
-        document.getElementById('completedSub').textContent =
-          `${data.stats?.total || 0} total · ${data.stats?.metadataPending || 0} meta pending · ${data.stats?.converting || 0} converting`;
-
-        const speed = typeof data.speed === 'number' ? data.speed : 0;
-        document.getElementById('aggregateSpeed').textContent = formatBytesPerSec(speed);
-
-        if (data.diskSpace) {
-          // Backend already returns "X GB / Y GB" — do not append another unit.
-          document.getElementById('diskFree').textContent = data.diskSpace.free || '--';
-          const percent = data.diskSpace.percent || 100;
-          document.getElementById('diskBar').style.width = `${percent}%`;
-        }
-
-        document.getElementById('queuePosition').textContent = data.queuePosition ?? '--';
-        document.getElementById('globalETA').textContent = `ETA: ${data.globalETA || '--'}`;
-        document.getElementById('activeWorkers').textContent = data.activeWorkers || 0;
-
-        // Live workers, pause banner, runtime badge, and the updated-ago stamp.
-        renderWorkers(data.workers);
-        const banner = document.getElementById('pauseBanner');
-        if (data.isPaused) {
-          banner.classList.add('show');
-          document.getElementById('pauseReason').textContent = data.pauseReason || '';
-        } else {
-          banner.classList.remove('show');
-        }
-        const rt = data.runtime;
-        if (rt) {
-          document.getElementById('runtimeBadge').textContent =
-            `Bun ${rt.bun} · ${rt.platform}/${rt.arch} · up ${data.uptime || '--'}`;
-        }
-        lastRefreshAt = Date.now();
+        lastSuccessfulFetch = new Date();
         updateUpdatedAgo();
+        
+        document.getElementById('downloadingCount').textContent = data.stats.downloading;
+        document.getElementById('aggregateSpeed').textContent = data.stats.aggregate_speed 
+          ? `${formatBytesPerSec(data.stats.aggregate_speed)} total` 
+          : '0 B/s';
+        
+        document.getElementById('completedCount').textContent = data.stats.completed;
+        const totalKnown = data.stats.total_jobs ?? (data.stats.completed + data.stats.pending + data.stats.downloading + data.stats.failed);
+        const pct = totalKnown > 0 ? Math.round((data.stats.completed / totalKnown) * 100) : 0;
+        document.getElementById('completedSub').textContent = `${pct}% of ${totalKnown} jobs`;
+        
+        document.getElementById('failedCount').textContent = data.stats.failed;
+        
+        if (data.stats.disk_free !== null && data.stats.disk_free !== undefined) {
+          const freeGB = (data.stats.disk_free / (1024**3)).toFixed(1);
+          const totalGB = data.stats.disk_total ? (data.stats.disk_total / (1024**3)).toFixed(1) : null;
+          document.getElementById('diskFree').textContent = `${freeGB} GB`;
+          if (totalGB && data.stats.disk_total > 0) {
+            const usedPct = Math.round(((data.stats.disk_total - data.stats.disk_free) / data.stats.disk_total) * 100);
+            const fill = document.getElementById('diskBar');
+            fill.style.width = `${Math.min(100, Math.max(0, 100 - usedPct))}%`;
+            fill.style.background = usedPct > 90 ? 'var(--danger)' : usedPct > 75 ? 'var(--warning)' : 'var(--accent-gradient)';
+          }
+        }
+        
+        document.getElementById('queuePosition').textContent = data.stats.pending > 0 ? `${data.stats.pending} queued` : 'Empty';
+        document.getElementById('globalETA').textContent = data.stats.global_eta 
+          ? `ETA: ${formatETA(data.stats.global_eta)}` 
+          : (data.stats.downloading > 0 ? 'ETA: calculating...' : 'ETA: --');
+        
+        document.getElementById('activeWorkers').textContent = data.stats.active_workers;
 
-        // Keep the pause button in sync with the server state.
         const pauseBtn = document.getElementById('pauseBtn');
-        if (data.isPaused) {
+        const pauseBanner = document.getElementById('pauseBanner');
+        const pauseReason = document.getElementById('pauseReason');
+        if (data.paused) {
           pauseBtn.textContent = '▶️ Resume All';
-          pauseBtn.classList.remove('btn-warning');
-          pauseBtn.classList.add('btn-success');
+          pauseBtn.className = 'btn btn-success';
+          pauseBanner.classList.add('show');
+          pauseReason.textContent = data.pauseReason || 'paused';
         } else {
           pauseBtn.textContent = '⏸️ Pause All';
-          pauseBtn.classList.remove('btn-success');
-          pauseBtn.classList.add('btn-warning');
+          pauseBtn.className = 'btn btn-warning';
+          pauseBanner.classList.remove('show');
+          pauseReason.textContent = '';
         }
 
-        if (data.isPaused && !wasPaused) {
-          showNotification(`⏸️ Downloads paused${data.pauseReason ? ` (${data.pauseReason})` : ''}`, 'warning');
-        }
-        // Terminal skips are counted in `failed` (the video was not archived)
-        // but are not failures to worry about: "private video" is a permanent
-        // fact, not an incident. Report them separately so a playlist full of
-        // dead entries does not read as a broken engine.
-        const failedNow = data.stats?.failed || 0;
-        const unavailableNow = data.stats?.unavailable || 0;
-        const unavailableDelta = Math.max(0, unavailableNow - lastUnavailableCount);
-        const failedDelta = failedNow - lastFailedCount - unavailableDelta;
-        if (unavailableDelta > 0) {
-          showNotification(`⛔ ${unavailableDelta} video(s) skipped — unavailable, never retried`, 'warning');
-        }
-        if (failedDelta > 0) {
-          showNotification(`❌ ${failedDelta} download(s) failed`, 'error');
+        renderWorkers(data.workers);
+
+        const runtimeEl = document.getElementById('runtimeBadge');
+        if (runtimeEl) {
+          const rt = data.runtime || {};
+          const up = data.uptime ? formatETA(data.uptime) : '';
+          const upText = up ? `up ${up}` : '';
+          runtimeEl.textContent = [rt.name, rt.version, upText].filter(Boolean).join(' · ');
         }
 
-        lastFailedCount = failedNow;
-        lastUnavailableCount = unavailableNow;
-        wasPaused = data.isPaused || false;
-
-        lastJobs = jobsData.jobs || [];
-        renderJobs(lastJobs);
+        if (data.reliability) renderReliability(data.reliability);
+        
+        if (data.stats.failed > lastFailedCount) {
+          showNotification(`New download failure detected (${data.stats.failed} total)`, 'warning');
+        }
+        if (data.stats.completed > lastCompletedCount && lastCompletedCount > 0) {
+          showNotification(`A download completed! (${data.stats.completed} total)`, 'success');
+        }
+        lastFailedCount = data.stats.failed;
+        lastCompletedCount = data.stats.completed;
+        
+        await checkNetworkStatus();
+        
+        const jobsRes = await fetch('/api/jobs');
+        if (jobsRes.ok) {
+          lastJobs = await jobsRes.json();
+          renderJobs(lastJobs);
+        }
       } catch (err) {
         console.error('Failed to fetch status:', err);
+        checkNetworkStatus();
       }
     }
     
@@ -1281,10 +1791,6 @@
       const p = rel.policy || {};
       setText('relPolicy', `${p.maxResumeAttempts ?? '?'} resumes · ${p.retryBackoffBaseSeconds ?? '?'}-${p.retryBackoffMaxSeconds ?? '?'}s backoff`);
 
-      // --- Resume + self-healing state --------------------------------------
-      // What will actually pick up where it left off, and what each sweep
-      // currently has in scope. A partial only counts while its job is still
-      // in play, so this is smaller than the raw "kept partials" count.
       const r = rel.resume || {};
       const resumableEl = document.getElementById('relResumable');
       if (resumableEl) {
@@ -1297,24 +1803,22 @@
       setText('relInterrupted', `${r.interrupted ?? 0} job(s)`);
       setText('relStaleClaims', `${r.staleClaims ?? 0} job(s)`);
 
-      // --- Downloader tuning ------------------------------------------------
       const d = rel.downloader || {};
       const engineEl = document.getElementById('relDownloader');
       if (engineEl) {
         engineEl.innerHTML = d.engine === 'aria2c'
           ? `<span class="pill ok">aria2c ×${d.connectionsPerDownload ?? '?'}</span>`
           : '<span class="pill">yt-dlp native</span>';
-        const js = d.jsRuntime ? `${d.jsRuntime.name} n-challenge solver` : 'no JS runtime (YouTube n-challenge will fail)';
+        const js = d.jsRuntime ? `${d.jsRuntime.name} solver` : 'no JS runtime';
         engineEl.title = d.engine === 'aria2c'
-          ? `aria2c at ${d.path || 'PATH'} — ${d.connectionsPerDownload ?? '?'} connections per download, ${d.maxBandwidthKBps ? d.maxBandwidthKBps + ' KB/s cap' : 'uncapped'}; ${js}`
-          : `yt-dlp built-in downloader (install aria2c for multi-connection speed); ${js}`;
+          ? `aria2c at ${d.path || 'PATH'} — ${d.connectionsPerDownload ?? '?'} conns, ${d.maxBandwidthKBps ? d.maxBandwidthKBps + ' KB/s cap' : 'uncapped'}; ${js}`
+          : `yt-dlp built-in native downloader; ${js}`;
       }
       setText('relConnections', d.engine === 'aria2c' ? `${d.connectionsPerDownload ?? '?'} / download` : 'n/a (native)');
       setText('relFragments', `${d.concurrentFragments ?? '?'} parallel`);
       setText('relBandwidth', d.maxBandwidthKBps ? `${d.maxBandwidthKBps} KB/s` : 'uncapped');
       setText('relRamp', `+${d.autoscaleRampStep ?? '?'} / tick`);
 
-      // --- Self-healing sweeps ---------------------------------------------
       const sweepsEl = document.getElementById('relSweeps');
       if (sweepsEl) {
         const sweeps = rel.sweeps || [];
@@ -1332,42 +1836,44 @@
                   ${badge}
                 </div>`;
             }).join('')}</div>`
-          : '--';
+          : '<span class="pill">–</span>';
       }
     }
-    
+
     async function requeueFailed() {
       try {
-        const res = await fetch('/api/failed/requeue', { method: 'POST' });
+        const res = await fetch('/api/requeue-failed', { method: 'POST' });
         const data = await res.json();
-        const r = data.requeued || {};
-        const total = (r.downloads || 0) + (r.conversions || 0) + (r.metadata || 0);
-        showNotification(
-          total > 0
-            ? `♻️ Re-queued ${total} job(s) — permanent failures are skipped`
-            : '♻️ Nothing to re-queue (permanent failures are never retried)',
-          total > 0 ? 'success' : 'warning'
-        );
-        refreshData();
-      } catch {
-        showNotification('❌ Failed to re-queue failed jobs', 'error');
+        if (data.ok) {
+          showNotification(`Re-queued ${data.requeued} failed jobs`, 'success');
+          refreshData();
+        } else {
+          showNotification(data.error || 'Failed to requeue', 'error');
+        }
+      } catch (err) {
+        showNotification(err.message, 'error');
       }
     }
-    
+
     async function refreshData() {
+      showNotification('Refreshing data...', 'info', 1500);
       await fetchStatus();
-      showNotification('🔄 Dashboard refreshed', 'success', 2000);
     }
-    
+
     function renderJobs(jobs) {
       const tbody = document.getElementById('jobsTableBody');
-      const search = document.getElementById('searchInput').value.toLowerCase();
-      const statusFilter = (document.getElementById('statusFilter') || {}).value || 'all';
+      const search = (document.getElementById('searchInput')?.value || '').toLowerCase();
+      const statusFilter = document.getElementById('statusFilter')?.value || 'all';
 
-      const filtered = jobs.filter(job => {
-        const matchesSearch = job.title?.toLowerCase().includes(search) ||
-          job.folder?.toLowerCase().includes(search);
-        const matchesStatus = statusFilter === 'all' || jobStatus(job) === statusFilter;
+      let filtered = jobs.filter(job => {
+        const matchesSearch = !search || 
+          (job.title && job.title.toLowerCase().includes(search)) ||
+          (job.url && job.url.toLowerCase().includes(search)) ||
+          (job.folder && job.folder.toLowerCase().includes(search)) ||
+          (job.output_directory && job.output_directory.toLowerCase().includes(search)) ||
+          (job.file_path && job.file_path.toLowerCase().includes(search));
+        const status = jobStatus(job);
+        const matchesStatus = statusFilter === 'all' || status === statusFilter;
         return matchesSearch && matchesStatus;
       });
 
@@ -1383,8 +1889,8 @@
       }
 
       if (filtered.length === 0) {
-        const why = search ? 'No jobs match your search' : statusFilter !== 'all' ? 'No jobs with this status' : 'No jobs yet — add a playlist URL above';
-        tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-secondary);">${why}</td></tr>`;
+        const why = search ? 'No jobs match your search query' : statusFilter !== 'all' ? 'No jobs match this status filter' : 'No jobs found — save a playlist URL above';
+        tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 30px 15px;">${why}</td></tr>`;
         return;
       }
 
@@ -1397,18 +1903,14 @@
         const badgeText = status === 'paused' && job.pause_reason === 'waiting_live' ? 'waiting for VOD'
           : status === 'paused' && job.pause_reason === 'interrupted' ? 'paused (resume)'
           : statusLabel;
-        // Retry/resume bookkeeping — visible so a struggling video is
-        // distinguishable from one that simply has not started yet.
+
         const attempts = [];
         if (job.retry_count) attempts.push(`${job.retry_count} retry${job.retry_count === 1 ? '' : 's'}`);
         if (job.resume_count) attempts.push(`${job.resume_count} resume${job.resume_count === 1 ? '' : 's'}`);
         const attemptNote = attempts.length
           ? `<div class="job-subnote">🔁 ${attempts.join(' · ')}${job.partial_file_path ? ' · partial kept' : ''}</div>`
           : '';
-        // Resumable-partial indicator: a .part is on disk AND this job is still
-        // in play, so the next attempt continues from it rather than restarting.
-        // With aria2c that partial is paired with a .aria2 control file — both
-        // are shown in the tooltip so the resume state is legible.
+
         const willResume = !!job.partial_file_path &&
           ['pending', 'paused', 'downloading'].includes(job.download_status);
         const resumeNote = willResume
@@ -1428,28 +1930,34 @@
         }[meta] || escapeHtml(meta);
 
         return `
-          <tr data-job-id="${escapeHtml(job.id)}" onclick="openJobDetailById(this.dataset.jobId, event)" title="Click for details">
+          <tr data-job-id="${escapeHtml(job.id)}" onclick="openJobDetailById(this.dataset.jobId, event)" title="Click to view details and options">
             <td><input type="checkbox" class="job-checkbox" data-id="${escapeHtml(job.id)}" ${isChecked} onchange="toggleJobSelection(this.dataset.id)" /></td>
             <td>
-              ${escapeHtml(job.title || 'Unknown')}
-              ${location ? `<div style="font-size: 0.72rem; color: var(--text-secondary); margin-top: 3px; word-break: break-all;" title="${escapeHtml(location)}">📍 ${escapeHtml(location)}</div>` : ''}
+              <strong style="color: var(--text-primary); font-size: 0.86rem;">${escapeHtml(job.title || 'Unknown')}</strong>
+              ${location ? `<div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 2px; word-break: break-all;" title="${escapeHtml(location)}">📍 ${escapeHtml(location)}</div>` : ''}
             </td>
             <td>
               ${job.download_status === 'downloading' ? `
-                <div class="progress-bar" style="width: 150px;">
+                <div class="progress-bar" style="width: 140px;">
                   <div class="progress-fill" style="width: ${progress}%"></div>
                 </div>
-                <small>${progress.toFixed(1)}%</small>
-              ` : '-'}
+                <small style="color: var(--text-secondary); font-weight: 600;">${progress.toFixed(1)}%</small>
+              ` : '<span style="color: var(--text-muted);">–</span>'}
             </td>
-            <td>${job.download_status === 'downloading' && job.speed ? formatBytesPerSec(job.speed) : '-'}</td>
-            <td>${job.download_status === 'downloading' && job.eta ? formatETA(job.eta) : '-'}</td>
+            <td style="font-weight: 600; color: ${job.download_status === 'downloading' && job.speed ? '#38bdf8' : 'var(--text-muted)'};">
+              ${job.download_status === 'downloading' && job.speed ? formatBytesPerSec(job.speed) : '–'}
+            </td>
+            <td style="color: var(--text-secondary);">
+              ${job.download_status === 'downloading' && job.eta ? formatETA(job.eta) : '–'}
+            </td>
             <td><span class="status-badge ${statusClass}">${escapeHtml(badgeText)}</span>${attemptNote}${resumeNote}${errorNote}</td>
-            <td style="font-size: 0.78rem;">${metaBadge}</td>
+            <td style="font-size: 0.74rem;">${metaBadge}</td>
             <td>
-              ${status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob(this.closest('[data-job-id]').dataset.jobId)">🔄 Retry</button>` : ''}
-              ${isStoppable(job) ? `<button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" title="Interrupt this job now — the in-flight downloader is stopped, and a kept partial resumes on Retry." onclick="stopJob(this.closest('[data-job-id]').dataset.jobId)">⏹️ Stop</button>` : ''}
-              ${status === 'failed' || isStoppable(job) ? '' : '-'}
+              <div style="display: flex; gap: 4px; align-items: center;">
+                ${status === 'failed' ? `<button class="btn btn-success btn-sm" onclick="retryJob(this.closest('[data-job-id]').dataset.jobId)">🔄 Retry</button>` : ''}
+                ${isStoppable(job) ? `<button class="btn btn-warning btn-sm" title="Interrupt this download now — partial is preserved." onclick="stopJob(this.closest('[data-job-id]').dataset.jobId)">⏹️ Stop</button>` : ''}
+                ${status === 'failed' || isStoppable(job) ? '' : '<span style="color: var(--text-muted); font-size: 0.75rem;">–</span>'}
+              </div>
             </td>
           </tr>
         `;
@@ -1457,320 +1965,316 @@
     }
     
     async function retryJob(id) {
-      await fetch(`/api/retry/${encodeURIComponent(id)}`, { method: 'POST' });
-      showNotification('🔄 Job queued for retry', 'success');
-      refreshData();
+      try {
+        const res = await fetch(`/api/jobs/${id}/retry`, { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+          showNotification('Job re-queued successfully', 'success');
+          refreshData();
+        } else {
+          showNotification(data.error || 'Failed to retry job', 'error');
+        }
+      } catch (err) {
+        showNotification(err.message, 'error');
+      }
     }
 
-    // Show Stop only while something is actually running — the row where "why
-    // is this still going?" is a real question. POST /api/jobs/:id/stop parks a
-    // downloading job as a user pause (keeping its partial, so Retry resumes
-    // it) and releases any conversion/metadata claim. A row that has not
-    // started yet is left alone: holding those is what the selection's
-    // "Pause Selected" is for.
     function isStoppable(job) {
-      return job.download_status === 'downloading'
-        || job.conversion_status === 'in_progress'
-        || job.metadata_status === 'in_progress';
+      return job.download_status === 'downloading' ||
+        job.conversion_status === 'in_progress' ||
+        job.metadata_status === 'in_progress';
     }
 
     async function stopJob(id) {
       try {
-        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/stop`, { method: 'POST' });
+        const res = await fetch(`/api/jobs/${id}/stop`, { method: 'POST' });
         const data = await res.json();
         if (data.ok) {
-          const kept = data.job?.pause_reason === 'user' && data.job?.download_status === 'paused';
-          showNotification(kept ? '⏹️ Stopped — partial kept, Retry resumes it' : '⏹️ Job stopped', 'success');
+          showNotification('Job stopped and parked as paused', 'success');
           refreshData();
         } else {
-          showNotification(`❌ ${data.error || 'Stop failed'}`, 'error');
+          showNotification(data.error || 'Failed to stop job', 'error');
         }
-      } catch {
-        showNotification('❌ Failed to stop the job', 'error');
+      } catch (err) {
+        showNotification(err.message, 'error');
       }
     }
-    
+
     async function togglePause() {
-      const btn = document.getElementById('pauseBtn');
+      const isPaused = document.getElementById('pauseBtn').textContent.includes('Resume');
+      const endpoint = isPaused ? '/api/resume' : '/api/pause';
       try {
-        if (wasPaused) {
-          await fetch('/api/resume', { method: 'POST' });
-          wasPaused = false;
-          btn.textContent = '⏸️ Pause All';
-          btn.classList.replace('btn-success', 'btn-warning');
-          showNotification('▶️ Resumed downloads', 'success');
+        const res = await fetch(endpoint, { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+          showNotification(isPaused ? 'Engine resumed' : 'Engine paused', 'success');
+          refreshData();
         } else {
-          await fetch('/api/pause', { method: 'POST' });
-          wasPaused = true;
-          btn.textContent = '▶️ Resume All';
-          btn.classList.replace('btn-warning', 'btn-success');
-          showNotification('⏸️ Paused downloads', 'warning');
+          showNotification(data.error || 'Failed to toggle pause', 'error');
         }
-      } catch {
-        showNotification('❌ Failed to change pause state', 'error');
+      } catch (err) {
+        showNotification(err.message, 'error');
       }
-      // fetchStatus() keeps the button in sync with the server from here on.
     }
-    
+
     async function loadSources() {
       const container = document.getElementById('savedSources');
-      if (!container) return;
-      container.innerHTML = '<div class="source-empty">Loading sources...</div>';
       try {
-        const res = await fetch('/api/sources', { cache: 'no-store' });
+        const res = await fetch('/api/sources');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || 'Unable to load saved sources');
-        const sources = data.sources || [];
-        if (!sources.length) {
-          container.innerHTML = '<div class="source-empty">No saved sources. Add one above to keep it in config.json.</div>';
+        if (!data.ok || !data.sources || data.sources.length === 0) {
+          container.innerHTML = '<div class="source-empty">No saved sources yet. Paste a playlist or channel URL above.</div>';
           return;
         }
-        const labels = { playlists: 'Playlist / single video', channels: 'Channel', channelPlaylists: 'Channel playlists' };
-        container.innerHTML = sources.map(source => `
-          <div class="source-row">
-            <div class="source-info">
-              <div class="source-url" title="${escapeHtml(source.url)}">${escapeHtml(source.url)}</div>
-              <div class="source-kind">${escapeHtml(labels[source.key] || source.key)} · ${Number(source.trackedJobs) || 0} tracked database job(s)</div>
+        container.innerHTML = data.sources.map(src => {
+          const kind = src.isChannel ? 'Channel' : 'Playlist';
+          const sub = [kind, src.channelTitle || '', src.title || '', src.folder ? `folder: ${src.folder}` : '', `${src.jobCount} jobs`]
+            .filter(Boolean)
+            .join(' · ');
+          return `
+            <div class="source-row">
+              <div class="source-info">
+                <div class="source-url"><a href="${escapeHtml(src.url)}" target="_blank" rel="noopener" style="color: #93c5fd; text-decoration: none;">${escapeHtml(src.title || src.url)}</a></div>
+                <div class="source-kind">${escapeHtml(sub)}</div>
+              </div>
+              <button class="btn btn-danger btn-sm source-remove" data-remove-source="${escapeHtml(src.url)}" onclick="removeSavedSource(this.dataset.removeSource, this)">🗑️ Remove</button>
             </div>
-            <button class="btn btn-danger source-remove" data-remove-source data-source-url="${escapeHtml(source.url)}">🗑️ Remove</button>
-          </div>
-        `).join('');
-        container.querySelectorAll('[data-remove-source]').forEach(button => {
-          button.addEventListener('click', () => removeSavedSource(button.dataset.sourceUrl, button));
-        });
-      } catch (error) {
-        container.innerHTML = `<div class="source-empty">Could not load saved sources: ${escapeHtml(error.message || error)}</div>`;
+          `;
+        }).join('');
+      } catch (err) {
+        container.innerHTML = `<div class="source-empty" style="color: var(--danger);">Failed to load sources: ${escapeHtml(err.message)}</div>`;
       }
     }
 
     async function removeSavedSource(sourceUrl, button) {
-      if (!sourceUrl) return;
-      if (!confirm(`Remove this saved source from config.json and delete its unshared database jobs?\n\n${sourceUrl}\n\nAlready-downloaded files will remain on disk.`)) return;
+      if (!confirm(`Remove this source and its exclusively owned jobs?\n\n${sourceUrl}\n\nJobs also used by another saved source will stay queued. Downloaded files are not deleted.`)) return;
       if (button) button.disabled = true;
       try {
         const res = await fetch('/api/sources', {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: sourceUrl })
+          body: JSON.stringify({ url: sourceUrl }),
         });
         const data = await res.json();
-        if (!res.ok || !data.ok) {
-          showNotification(`❌ ${data.error || 'Could not remove source'}`, 'error');
-          return;
+        if (data.ok) {
+          showNotification(`Removed source (${data.deletedJobs} jobs cleaned up)`, 'success');
+          loadSources();
+          refreshData();
+        } else {
+          showNotification(data.error || 'Failed to remove source', 'error');
+          if (button) button.disabled = false;
         }
-        const retained = data.retainedJobs ? ` ${data.retainedJobs} shared job(s) remain because another saved source uses them.` : '';
-        showNotification(`✅ Source removed; ${data.deletedJobs || 0} database job(s) deleted.${retained}`, 'success');
-        await loadSources();
-        await fetchStatus();
-      } catch (error) {
-        showNotification('❌ Failed to remove source. Check the connection and try again.', 'error');
-      } finally {
+      } catch (err) {
+        showNotification(err.message, 'error');
         if (button) button.disabled = false;
       }
     }
 
     async function scanUrl() {
-      const url = document.getElementById('newUrlInput').value.trim();
-      const folder = document.getElementById('folderOverride').value.trim();
-      
+      const input = document.getElementById('newUrlInput');
+      const folderInput = document.getElementById('folderOverride');
+      const button = document.getElementById('scanUrlButton');
+      const url = (input.value || '').trim();
+      const folder = (folderInput.value || '').trim();
       if (!url) {
-        showNotification('⚠️ Please enter a URL', 'warning');
+        showNotification('Please enter a YouTube playlist, channel or video URL', 'warning');
         return;
       }
-      
-      const button = document.getElementById('scanUrlButton');
-      if (button.disabled) return;
       button.disabled = true;
-      button.textContent = '⏳ Saving & scanning...';
+      button.textContent = '⏳ Scanning...';
       try {
         const res = await fetch('/api/scan', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url, folder: folder || undefined })
+          body: JSON.stringify({ url, folder: folder || undefined }),
         });
         const data = await res.json();
-
-        if (res.ok && data.ok) {
-          showNotification(`✅ ${data.message || 'Source saved to config.json and scanned'}`, 'success');
-          // A scan may take a while; don't erase a new URL typed meanwhile.
-          if (document.getElementById('newUrlInput').value.trim() === url) {
-            document.getElementById('newUrlInput').value = '';
-            if (document.getElementById('folderOverride').value.trim() === folder) {
-              document.getElementById('folderOverride').value = '';
-            }
-          }
-          refreshData();
+        if (data.ok) {
+          const kind = data.isChannel ? 'channel' : 'playlist';
+          showNotification(`Scanned ${kind}: ${data.newJobs} new jobs queued (${data.alreadyDownloaded} already downloaded, ${data.alreadyQueued} already queued)`, 'success');
+          input.value = '';
+          folderInput.value = '';
           loadSources();
+          refreshData();
         } else {
-          showNotification(`❌ ${data.error}`, 'error');
+          showNotification(data.error || 'Scan failed', 'error');
         }
       } catch (err) {
-        showNotification('❌ Save/scan request failed. Check the connection and try again; duplicate sources are skipped.', 'error');
+        showNotification(err.message, 'error');
       } finally {
         button.disabled = false;
         button.textContent = '📡 Save & Scan';
       }
     }
-    
+
     async function purgeQueue() {
-      if (!confirm('⚠️ This will delete all pending, paused, and failed jobs. Continue?')) return;
-      
+      if (!confirm('Purge all pending and downloading jobs? Completed jobs and media files will not be deleted.')) return;
       try {
-        const res = await fetch('/api/queue/purge', { method: 'POST' });
+        const res = await fetch('/api/purge', { method: 'POST' });
         const data = await res.json();
-        showNotification(`🗑️ Purged ${data.deleted} jobs`, 'success');
-        refreshData();
+        if (data.ok) {
+          showNotification(`Purged ${data.purged} jobs`, 'success');
+          refreshData();
+        } else {
+          showNotification(data.error || 'Failed to purge queue', 'error');
+        }
       } catch (err) {
-        showNotification('❌ Failed to purge queue', 'error');
+        showNotification(err.message, 'error');
       }
     }
-    
+
     async function loadFailedItems() {
+      const container = document.getElementById('failedItems');
       try {
-        const res = await fetch('/api/failed');
-        const data = await res.json();
-        
-        const container = document.getElementById('failedItems');
-        if (data.failed.length === 0) {
-          container.innerHTML = '<p style="padding: 20px; text-align: center; color: var(--text-secondary);">No failed jobs</p>';
+        const res = await fetch('/api/jobs');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const jobs = await res.json();
+        const failed = jobs.filter(j => jobStatus(j) === 'failed');
+        if (failed.length === 0) {
+          container.innerHTML = '<p style="color: var(--text-muted); padding: 20px 0;">No failed jobs found. All downloads are running smoothly!</p>';
           return;
         }
-        
-        container.innerHTML = data.failed.map(job => {
-          const reason = formatLastError(job.last_error) || 'Unknown error';
-          const terminal = reason.startsWith('⛔');
-          const reasonColor = terminal ? 'var(--text-secondary)' : 'var(--danger)';
-          return `
-          <div class="history-item" data-job-id="${escapeHtml(job.id)}">
-            <h4>${escapeHtml(job.title)}</h4>
-            <p style="color: ${reasonColor}; margin: 10px 0;">${escapeHtml(reason)}</p>
-            <div class="history-meta">
-              <span>Folder: ${escapeHtml(job.folder)}</span>
-              <span>Retries: ${job.retry_count || 0} · meta: ${job.metadata_retry_count || 0} · convert: ${job.conversion_retry_count || 0}</span>
-              <button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob(this.closest('[data-job-id]').dataset.jobId)">🔄 Retry</button>
-              <button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" onclick="resetFailCount(this.closest('[data-job-id]').dataset.jobId)">🔢 Reset Count</button>
+        container.innerHTML = failed.map(job => `
+          <div class="history-item">
+            <h4>${escapeHtml(job.title || 'Unknown')}</h4>
+            <div class="history-meta" style="flex-wrap: wrap; margin-bottom: 8px;">
+              <span>🔁 Failures: <strong>${job.fail_count || 0}</strong></span>
+              ${job.retry_count ? `<span>Retries: ${job.retry_count}</span>` : ''}
+              <span>Last attempted: ${timeAgo(job.last_attempt_at) || 'never'}</span>
+            </div>
+            ${job.last_error ? `<div class="job-subnote" style="color: #fca5a5; word-break: break-all; margin-bottom: 10px;">⚠️ ${escapeHtml(job.last_error)}</div>` : ''}
+            <div style="display: flex; gap: 8px;">
+              <button class="btn btn-success btn-sm" onclick="retryJob('${job.id}')">🔄 Retry</button>
+              <button class="btn btn-secondary btn-sm" onclick="resetFailCount('${job.id}')">Reset Counters</button>
             </div>
           </div>
-        `;
-        }).join('');
+        `).join('');
       } catch (err) {
-        document.getElementById('failedItems').innerHTML = '<p style="padding: 20px; color: var(--danger);">Failed to load failed items</p>';
+        container.innerHTML = `<p style="color: var(--danger);">Failed to load failed jobs: ${escapeHtml(err.message)}</p>`;
       }
     }
-    
+
     async function resetFailCount(id) {
-      await fetch(`/api/failcount/reset/${encodeURIComponent(id)}`, { method: 'POST' });
-      showNotification('🔢 Fail count reset', 'success');
-      loadFailedItems();
-    }
-    
-    async function loadHistory() {
       try {
-        const res = await fetch('/api/history?limit=20');
+        const res = await fetch(`/api/jobs/${id}/reset-failures`, { method: 'POST' });
         const data = await res.json();
-        
-        const container = document.getElementById('historyItems');
-        if (data.history.length === 0) {
-          container.innerHTML = '<p style="padding: 20px; text-align: center; color: var(--text-secondary);">No run history available</p>';
+        if (data.ok) {
+          showNotification('Failure counters cleared', 'success');
+          loadFailedItems();
+          refreshData();
+        } else {
+          showNotification(data.error || 'Failed to reset', 'error');
+        }
+      } catch (err) {
+        showNotification(err.message, 'error');
+      }
+    }
+
+    async function loadHistory() {
+      const container = document.getElementById('historyItems');
+      try {
+        const res = await fetch('/api/jobs');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const jobs = await res.json();
+        const done = jobs.filter(j => jobStatus(j) === 'done');
+        if (done.length === 0) {
+          container.innerHTML = '<p style="color: var(--text-muted); padding: 20px 0;">No completed jobs in history yet.</p>';
           return;
         }
-        
-        container.innerHTML = data.history.map(run => {
-          const duration = run.duration_seconds ? `${Math.round(run.duration_seconds)}s` : '--';
-          return `
-            <div class="history-item">
-              <h4>Run #${run.id}</h4>
-              <div class="history-meta">
-                <span>Started: <time title="${escapeHtml(new Date(run.started_at || '').toLocaleString())}">${timeAgo(run.started_at)}</time></span>
-                <span>Duration: ${duration}</span>
-                <span style="color: var(--success);">✅ ${run.downloaded || 0}</span>
-                <span style="color: var(--text-secondary);">⊘ ${run.skipped || 0}</span>
-                <span style="color: var(--danger);">❌ ${run.failed || 0}</span>
-              </div>
+        container.innerHTML = done.slice(0, 50).map(job => `
+          <div class="history-item">
+            <h4>${escapeHtml(job.title || 'Unknown')}</h4>
+            <div class="history-meta" style="flex-wrap: wrap;">
+              <span>Completed: ${timeAgo(job.updated_at)}</span>
+              ${job.file_size ? `<span>Size: ${formatBytes(job.file_size)}</span>` : ''}
+              ${job.file_path ? `<span style="word-break: break-all;">File: ${escapeHtml(job.file_path)}</span>` : ''}
             </div>
-          `;
-        }).join('');
+          </div>
+        `).join('');
       } catch (err) {
-        document.getElementById('historyItems').innerHTML = '<p style="padding: 20px; color: var(--danger);">Failed to load history</p>';
+        container.innerHTML = `<p style="color: var(--danger);">Failed to load history: ${escapeHtml(err.message)}</p>`;
       }
     }
-    
+
     async function loadLogs() {
-      const logType = document.getElementById('logType').value;
+      const viewer = document.getElementById('logViewer');
+      const type = document.getElementById('logType').value;
+      viewer.textContent = 'Loading logs...';
       try {
-        const res = await fetch(`/api/logs?type=${logType}&limit=100`);
+        const res = await fetch(`/api/logs?type=${type}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        
-        const viewer = document.getElementById('logViewer');
-        if (data.logs && data.logs.length > 0) {
-          viewer.textContent = data.logs.join('\n');
-        } else {
-          viewer.textContent = 'No logs available';
-        }
+        viewer.textContent = data.content || '(Log is currently empty)';
       } catch (err) {
-        document.getElementById('logViewer').textContent = 'Failed to load logs';
+        viewer.textContent = `Error loading logs: ${err.message}`;
       }
     }
-    
-    // Utilities
+
     function formatBytes(bytes) {
-      if (!bytes || bytes <= 0) return "0 B";
-      const units = ["B", "KB", "MB", "GB", "TB"];
-      let i = 0, v = bytes;
-      while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-      return `${v.toFixed(1)} ${units[i]}`;
+      if (!bytes || bytes === 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`;
     }
-    
+
     function formatBytesPerSec(bps) {
-      return bps <= 0 ? "0 B/s" : `${formatBytes(bps)}/s`;
+      return `${formatBytes(bps)}/s`;
     }
-    
+
     function formatETA(seconds) {
-      if (!seconds || seconds <= 0) return '--';
-      const h = Math.floor(seconds / 3600);
-      const m = Math.floor((seconds % 3600) / 60);
-      const s = Math.floor(seconds % 60);
+      if (!seconds || seconds <= 0 || !Number.isFinite(seconds)) return '--';
+      const sec = Math.round(seconds);
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = sec % 60;
       if (h > 0) return `${h}h ${m}m`;
       if (m > 0) return `${m}m ${s}s`;
       return `${s}s`;
     }
-    
-    // The engine records a terminal skip as "[terminal] <reason> — skipped, it
-    // will not be retried automatically. yt-dlp: …" (see src/retry.ts). Show
-    // the reason, not the raw yt-dlp tail: a private video is not an error to
-    // debug, it is a decision the engine already made.
+
     function formatLastError(message) {
-      const raw = String(message || '');
-      if (!raw.trimStart().toLowerCase().startsWith('[terminal]')) return raw;
-      const rest = raw.trimStart().slice('[terminal]'.length).trim();
-      const label = (rest.split(' — ')[0] || '').trim() || 'Not downloadable';
-      return `⛔ ${label} — skipped, never auto-retried`;
+      if (!message) return '';
+      const m = String(message);
+      if (/HTTP Error 429/i.test(m)) return '⛔ Rate limited by YouTube (429) — backing off';
+      if (/Sign in to confirm you’re not a bot/i.test(m)) return '⛔ YouTube bot detection (sign-in required)';
+      if (/Private video/i.test(m)) return '⛔ Private video';
+      if (/Video unavailable/i.test(m)) return '⛔ Video unavailable';
+      return m;
     }
 
     function escapeHtml(text) {
-      if (!text) return '';
-      return text.toString()
+      if (text === null || text === undefined) return '';
+      return String(text)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#039;');
+        .replace(/'/g, '&#39;');
     }
-    
+
     function filterJobs() {
-      fetchStatus();
+      renderJobs(lastJobs);
     }
-    
 
     // ---------------------------------------------------------------------
     // Downloader settings (GET/POST /api/settings).
-    //
-    // The server owns the allow-list of editable keys and re-validates the
-    // whole config on save, so this panel is a thin form over that contract.
     // ---------------------------------------------------------------------
-    let settingsSnapshot = null;   // { fields, values, nonDefault }
-    let settingsDraft = {};        // key -> edited value
-    let settingsSaving = false;
+    let settingsSnapshot = null;
+    let settingsDraft = {};
+    let activeSettingsCategory = 'all';
+    let settingsSearchQuery = '';
+
+    const GROUP_TITLES = {
+      downloader: '🚀 Downloader',
+      media: '🎵 Media & Audio',
+      concurrency: '⚡ Concurrency',
+      reliability: '🛡️ Reliability & Resume',
+      storage: '💾 Storage & Disk',
+      watching: '📡 Sources & Watching',
+      advanced: '🧪 Advanced',
+    };
 
     function settingsInputId(key) { return `setting-${key}`; }
 
@@ -1794,53 +2298,259 @@
     function closeSettings() {
       document.getElementById('settingsModal').classList.remove('open');
       settingsDraft = {};
+      clearSettingsSearch();
+    }
+
+    function isTurboActive() {
+      if (!settingsSnapshot || !settingsSnapshot.values) return false;
+      const current = { ...settingsSnapshot.values, ...settingsDraft };
+      return (
+        current.useAria2c === true &&
+        Number(current.connectionsPerDownload) >= 32 &&
+        Number(current.concurrentFragments) >= 32 &&
+        Number(current.maxBandwidthKBps) === 0
+      );
+    }
+
+    function updateTurboButton() {
+      const btn = document.getElementById('turboBtn');
+      if (!btn) return;
+      const isTurbo = isTurboActive();
+      btn.disabled = false;
+      if (isTurbo) {
+        btn.textContent = '⚡ Turbo IDM: ON';
+        btn.classList.add('btn-turbo-active');
+      } else {
+        btn.textContent = '⚡ Turbo IDM: OFF';
+        btn.classList.remove('btn-turbo-active');
+      }
+    }
+
+    async function toggleTurboMode() {
+      const btn = document.getElementById('turboBtn');
+      if (btn) btn.disabled = true;
+      try {
+        if (!settingsSnapshot) {
+          const res = await fetch('/api/settings');
+          const data = await res.json();
+          if (res.ok && data.ok) settingsSnapshot = data;
+        }
+        if (!settingsSnapshot || !settingsSnapshot.speedProfiles) {
+          throw new Error('Speed profiles are not available');
+        }
+
+        const isTurbo = isTurboActive();
+        const targetProfileKey = isTurbo ? 'standard' : 'aggressive';
+        const profile = settingsSnapshot.speedProfiles[targetProfileKey];
+        if (!profile) throw new Error(`Profile ${targetProfileKey} not found`);
+
+        const saveRes = await fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(profile.values),
+        });
+        const data = await saveRes.json();
+        if (!saveRes.ok || !data.ok) throw new Error(data.error || 'Failed to toggle turbo');
+
+        settingsSnapshot = data;
+        settingsDraft = {};
+        updateTurboButton();
+        if (document.getElementById('settingsModal').classList.contains('open')) {
+          renderSettings();
+        }
+        showNotification(isTurbo ? 'Standard speed profile restored' : '⚡ Turbo Aggressive IDM profile enabled!', 'success');
+        refreshData();
+      } catch (err) {
+        showNotification(err.message, 'error');
+        updateTurboButton();
+      }
+    }
+
+    async function fetchSettingsSnapshot() {
+      try {
+        const res = await fetch('/api/settings');
+        const data = await res.json();
+        if (res.ok && data.ok) {
+          settingsSnapshot = data;
+          updateTurboButton();
+        }
+      } catch {}
+    }
+
+    function selectedDownloadSpeedProfile() {
+      if (!settingsSnapshot || !settingsSnapshot.speedProfiles) return null;
+      const current = { ...settingsSnapshot.values, ...settingsDraft };
+      for (const [name, profile] of Object.entries(settingsSnapshot.speedProfiles)) {
+        const matches = Object.entries(profile.values).every(([k, v]) => current[k] === v);
+        if (matches) return name;
+      }
+      return null;
+    }
+
+    function renderDownloadSpeedProfilePicker() {
+      const host = document.getElementById('downloadSpeedProfileOptions');
+      const label = document.getElementById('downloadSpeedProfileState');
+      if (!host || !label) return;
+      if (!settingsSnapshot || !settingsSnapshot.speedProfiles) {
+        label.textContent = 'Speed presets not available';
+        host.innerHTML = '';
+        return;
+      }
+      const selected = selectedDownloadSpeedProfile();
+      const current = settingsSnapshot.speedProfiles[selected];
+      label.textContent = current
+        ? `${current.label}: ${current.description}`
+        : 'Custom settings (modified from presets)';
+      host.innerHTML = Object.entries(settingsSnapshot.speedProfiles).map(([key, profile]) => {
+        const active = key === selected ? ' active' : '';
+        const icon = key === 'aggressive' ? '⚡' : key === 'maximum' ? '🚀' : '⚖️';
+        return `<button type="button" class="speed-profile-button${active}" onclick="applyDownloadSpeedProfile('${key}')">
+            <span>${icon} ${escapeHtml(profile.label)}</span>
+            ${active ? '<span style="font-size: 0.68rem; opacity: 0.85;">✓</span>' : ''}
+          </button>`;
+      }).join('');
+    }
+
+    function applyDownloadSpeedProfile(name) {
+      if (!settingsSnapshot || !settingsSnapshot.speedProfiles) return;
+      const profile = settingsSnapshot.speedProfiles[name];
+      if (!profile) return;
+      for (const [k, v] of Object.entries(profile.values)) {
+        settingsDraft[k] = v;
+      }
+      renderSettings();
+      updateTurboButton();
+      document.getElementById('settingsStatus').textContent = `${profile.label} preset staged — click Save Changes to apply.`;
+    }
+
+    function onSettingsSearch(query) {
+      settingsSearchQuery = (query || '').trim().toLowerCase();
+      const clearBtn = document.getElementById('settingsSearchClear');
+      if (clearBtn) clearBtn.style.display = settingsSearchQuery ? 'inline-block' : 'none';
+      renderSettings();
+    }
+
+    function clearSettingsSearch() {
+      const input = document.getElementById('settingsSearchInput');
+      if (input) input.value = '';
+      settingsSearchQuery = '';
+      const clearBtn = document.getElementById('settingsSearchClear');
+      if (clearBtn) clearBtn.style.display = 'none';
+      renderSettings();
+    }
+
+    function setSettingsCategory(cat) {
+      activeSettingsCategory = cat;
+      renderSettings();
     }
 
     function renderSettings() {
       const host = document.getElementById('settingsFields');
-      if (!settingsSnapshot) { host.innerHTML = ''; return; }
+      const tabsHost = document.getElementById('settingsCategoryTabs');
+      const badge = document.getElementById('settingsSummaryBadge');
 
-      // Every group the API sends is rendered, in the server's own order.
-      // A hardcoded list here used to silently DROP every field whose group it
-      // did not name — which is how storage, watching and advanced settings
-      // were missing from this panel even though /api/settings exposed them.
-      const GROUP_TITLES = {
-        downloader: '🚀 Downloader',
-        media: '🎵 Media & audio',
-        concurrency: '⚡ Concurrency',
-        reliability: '🛡️ Reliability & resume',
-        storage: '💾 Storage & disk',
-        watching: '📡 Sources & watching',
-        advanced: '🧪 Advanced',
-      };
+      if (!settingsSnapshot) {
+        if (host) host.innerHTML = '';
+        if (tabsHost) tabsHost.innerHTML = '';
+        renderDownloadSpeedProfilePicker();
+        return;
+      }
+      renderDownloadSpeedProfilePicker();
+
       const order = Object.keys(GROUP_TITLES);
       const present = [...new Set(settingsSnapshot.fields.map(f => f.group))];
       const groups = [
         ...order.filter(g => present.includes(g)),
-        // A group the UI has no title for still renders under its raw name,
-        // so a future field can never vanish from the panel again.
         ...present.filter(g => !order.includes(g)),
       ];
+
       const byGroup = new Map(groups.map(g => [g, []]));
       for (const f of settingsSnapshot.fields) byGroup.get(f.group)?.push(f);
 
-      host.innerHTML = groups.map(key => {
-        const rows = byGroup.get(key) || [];
+      // Render Category Navigation Tabs
+      if (tabsHost) {
+        const dirtyCountByGroup = new Map();
+        for (const [key] of Object.entries(settingsDraft)) {
+          const field = settingsSnapshot.fields.find(f => f.key === key);
+          if (field) {
+            dirtyCountByGroup.set(field.group, (dirtyCountByGroup.get(field.group) || 0) + 1);
+          }
+        }
+
+        const totalDirty = Object.keys(settingsDraft).length;
+        const allTab = `<button type="button" class="settings-cat-tab ${activeSettingsCategory === 'all' ? 'active' : ''}" onclick="setSettingsCategory('all')">
+          <span>🌟 All</span>
+          <span class="tab-count">${settingsSnapshot.fields.length}</span>
+          ${totalDirty > 0 ? `<span class="tab-dirty-dot" title="${totalDirty} unsaved changes"></span>` : ''}
+        </button>`;
+
+        const groupTabs = groups.map(g => {
+          const count = byGroup.get(g)?.length || 0;
+          const dirty = dirtyCountByGroup.get(g) || 0;
+          return `<button type="button" class="settings-cat-tab ${activeSettingsCategory === g ? 'active' : ''}" onclick="setSettingsCategory('${g}')">
+            <span>${GROUP_TITLES[g] || escapeHtml(g)}</span>
+            <span class="tab-count">${count}</span>
+            ${dirty > 0 ? `<span class="tab-dirty-dot" title="${dirty} unsaved changes"></span>` : ''}
+          </button>`;
+        }).join('');
+
+        tabsHost.innerHTML = allTab + groupTabs;
+      }
+
+      if (badge) {
+        const total = settingsSnapshot.fields.length;
+        const dirty = Object.keys(settingsDraft).length;
+        badge.textContent = dirty > 0 ? `${dirty} modified · ${total} settings` : `${total} settings`;
+      }
+
+      // Filter fields by search and active category
+      const q = settingsSearchQuery;
+      let matchedCount = 0;
+
+      const html = groups.map(key => {
+        if (activeSettingsCategory !== 'all' && activeSettingsCategory !== key && !q) return '';
+        const allInGroup = byGroup.get(key) || [];
+        const rows = allInGroup.filter(f => {
+          if (!q) return true;
+          return (
+            f.label.toLowerCase().includes(q) ||
+            f.help.toLowerCase().includes(q) ||
+            f.key.toLowerCase().includes(q) ||
+            (f.group && f.group.toLowerCase().includes(q))
+          );
+        });
         if (!rows.length) return '';
-        return `<div class="settings-group"><h4>${GROUP_TITLES[key] || escapeHtml(key)}</h4>${rows.map(renderSettingRow).join('')}</div>`;
+        matchedCount += rows.length;
+        return `<div class="settings-group">
+          <h4>${GROUP_TITLES[key] || escapeHtml(key)}</h4>
+          ${rows.map(renderSettingRow).join('')}
+        </div>`;
       }).join('');
+
+      if (q && matchedCount === 0) {
+        host.innerHTML = `<div style="text-align: center; padding: 40px 10px; color: var(--text-secondary);">
+          <div style="font-size: 1.5rem; margin-bottom: 8px;">🔍</div>
+          <p>No settings match "<strong>${escapeHtml(q)}</strong>"</p>
+          <button type="button" class="btn btn-secondary btn-sm" onclick="clearSettingsSearch()" style="margin-top: 12px;">Clear Search</button>
+        </div>`;
+      } else {
+        host.innerHTML = html;
+      }
+
       updateSaveButton();
     }
 
     function renderSettingRow(f) {
       const value = settingsDraft[f.key] !== undefined ? settingsDraft[f.key] : settingsSnapshot.values[f.key];
-      const dirty = settingsDraft[f.key] !== undefined ? ' is-dirty' : '';
+      const dirty = settingsDraft[f.key] !== undefined;
       const unit = f.unit ? `<span class="unit">${escapeHtml(f.unit)}</span>` : '';
-      // The engine reads these once at launch, so the saved value is not live.
-      // Saying so on the row beats the old behaviour of silently ignoring it.
-      const restart = f.restartRequired
-        ? `<span class="pill warn" title="Read once at startup — the saved value applies after the engine restarts.">restart</span>`
+      const restartBadge = f.restartRequired
+        ? `<span class="pill pill-restart" title="Read once at startup — takes effect after engine restart.">restart required</span>`
         : '';
+      const dirtyBadge = dirty
+        ? `<span class="pill pill-dirty" title="Changed — not yet saved">modified</span>`
+        : '';
+
       let control = '';
 
       if (f.type === 'boolean') {
@@ -1864,12 +2574,16 @@
                    placeholder="en, ja, es" oninput="onSettingChange('${f.key}', this.value)" />`;
       } else {
         control = `<input type="text" id="${settingsInputId(f.key)}" value="${escapeHtml(String(value ?? ''))}"
-                   placeholder="(off)" oninput="onSettingChange('${f.key}', this.value)" />`;
+                   placeholder="(blank = auto-detect)" oninput="onSettingChange('${f.key}', this.value)" />`;
       }
 
-      return `<div class="setting-row${dirty}" data-key="${f.key}">
+      return `<div class="setting-row${dirty ? ' is-dirty' : ''}" data-key="${f.key}">
           <div class="desc">
-            <div class="name">${escapeHtml(f.label)}${restart}</div>
+            <div class="name-row">
+              <span class="name">${escapeHtml(f.label)}</span>
+              ${dirtyBadge}
+              ${restartBadge}
+            </div>
             <div class="help">${escapeHtml(f.help)}</div>
           </div>
           <div>${control}</div>
@@ -1879,8 +2593,6 @@
     function onSettingChange(key, raw) {
       const field = settingsSnapshot.fields.find(f => f.key === key);
       if (!field) return;
-      // Normalise to the field's declared type so the draft mirrors what the
-      // server will coerce and validate.
       if (field.type === 'boolean') settingsDraft[key] = !!raw;
       else if (field.type === 'number') {
         const n = Number(String(raw).trim());
@@ -1890,14 +2602,27 @@
       const row = document.querySelector(`.setting-row[data-key="${key}"]`);
       if (row) row.classList.add('is-dirty');
       updateSaveButton();
+      updateTurboButton();
     }
 
     function updateSaveButton() {
       const btn = document.getElementById('settingsSaveBtn');
+      const discardBtn = document.getElementById('settingsDiscardBtn');
       const n = Object.keys(settingsDraft).length;
-      btn.disabled = n === 0;
-      btn.textContent = n === 0 ? '💾 No changes' : `💾 Save ${n} change${n === 1 ? '' : 's'}`;
-      btn.style.opacity = n === 0 ? '0.55' : '1';
+      if (btn) {
+        btn.disabled = n === 0;
+        btn.textContent = n === 0 ? '💾 Save Changes' : `💾 Save ${n} Change${n === 1 ? '' : 's'}`;
+      }
+      if (discardBtn) {
+        discardBtn.style.display = n > 0 ? 'inline-block' : 'none';
+      }
+    }
+
+    function discardSettingsDraft() {
+      settingsDraft = {};
+      renderSettings();
+      updateTurboButton();
+      document.getElementById('settingsStatus').textContent = 'Draft changes discarded.';
     }
 
     async function saveSettings() {
@@ -1913,39 +2638,30 @@
           body: JSON.stringify(settingsDraft),
         });
         const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || 'Save failed');
-        settingsSnapshot = { fields: data.fields, values: data.values, nonDefault: data.nonDefault };
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to save settings');
+        settingsSnapshot = data;
         settingsDraft = {};
         renderSettings();
-        const changed = (data.changed || []).length;
-        status.textContent = changed > 0
-          ? `✅ Applied ${changed} change${changed === 1 ? '' : 's'} to running downloads`
-          : '✅ Saved (values already current)';
-        showNotification(
-          changed > 0 ? `⚙️ Applied ${changed} setting${changed === 1 ? '' : 's'}` : '⚙️ Settings already current',
-          'success'
-        );
-        fetchStatus(); // refresh the reliability panel / downloader tile
+        updateTurboButton();
+
+        const restart = (data.restartRequired || []).length;
+        if (restart > 0) {
+          status.textContent = `Saved (${restart} setting${restart === 1 ? '' : 's'} apply after engine restart).`;
+          showNotification(`Settings saved! ${restart} change(s) require engine restart.`, 'warning');
+        } else {
+          status.textContent = 'Saved! Changes will apply to next download.';
+          showNotification('Settings saved successfully!', 'success');
+        }
       } catch (err) {
         status.textContent = `❌ ${err.message}`;
-        showNotification(`❌ ${err.message}`, 'error');
+        showNotification(err.message, 'error');
         btn.disabled = false;
       }
     }
 
-    // ---------------------------------------------------------------------
-    // Per-job detail drawer.
-    // ---------------------------------------------------------------------
-    let lastJobs = [];
-    let audioOverrideDirty = false;
-    let jobQualityDirty = false;
-    let jobTargetFormatDirty = false;
-
+    // --- Job Detail Drawer -----------------------------------------------
     async function openJobDetailById(id, event) {
       if (event && event.target && event.target.closest('input,button,a')) return;
-      // Fresh data from GET /api/jobs/:id — the list snapshot can be a poll
-      // cycle old, and the drawer is where you look for the truth. Fall back
-      // to the cached row if the single-job fetch fails.
       try {
         const res = await fetch(`/api/jobs/${encodeURIComponent(id)}`, { cache: 'no-store' });
         if (res.ok) {
@@ -1962,307 +2678,287 @@
       return `<div class="detail-row"><div class="k">${escapeHtml(k)}</div><div class="v${mono ? ' mono' : ''}">${escapeHtml(String(v))}</div></div>`;
     }
 
-    // ------------------------------------------------------------------
-    // Per-video quality / output-container controls. The global settings remain
-    // untouched; the override endpoint can save these and retry atomically.
-    // ------------------------------------------------------------------
     function renderJobOverrideSection(job) {
+      const q = job.override_video_quality ?? '';
+      const f = job.override_target_format ?? '';
       const qualityOptions = [
-        ['', 'Use global quality'],
-        ['highest', 'Highest available'],
-        ['4k', '4K (up to 2160p)'],
-        ['1440p', '1440p'],
-        ['1080p', '1080p'],
-        ['720p', '720p'],
-        ['480p', '480p'],
-        ['audio', 'Best audio only'],
+        { v: '', l: 'Global default' },
+        { v: 'highest', l: 'Highest available' },
+        { v: '4k', l: '4K (2160p)' },
+        { v: '1440p', l: '1440p (QHD)' },
+        { v: '1080p', l: '1080p (FHD)' },
+        { v: '720p', l: '720p (HD)' },
+        { v: '480p', l: '480p (SD)' },
+        { v: 'audio', l: 'Audio only' },
       ];
       const formatOptions = [
-        ['', 'Use global format'],
-        ['mp4', 'MP4'],
-        ['mkv', 'MKV'],
-        ['mp3', 'MP3 (extract audio)'],
+        { v: '', l: 'Global default' },
+        { v: 'mp4', l: 'MP4' },
+        { v: 'mkv', l: 'MKV' },
+        { v: 'webm', l: 'WebM' },
+        { v: 'mp3', l: 'MP3 (audio)' },
+        { v: 'm4a', l: 'M4A (audio)' },
       ];
-      const quality = job.video_quality || '';
-      const targetFormat = job.target_format || '';
-      const active = job.download_status === 'downloading' ||
-        job.conversion_status === 'in_progress' || job.metadata_status === 'in_progress';
-      const qualitySelect = qualityOptions.map(([value, label]) =>
-        `<option value="${value}" ${quality === value ? 'selected' : ''}>${label}</option>`).join('');
-      const formatSelect = formatOptions.map(([value, label]) =>
-        `<option value="${value}" ${targetFormat === value ? 'selected' : ''}>${label}</option>`).join('');
-      const actionLabel = job.download_status === 'downloaded' ? '💾 Save & re-download' : '💾 Save overrides & retry';
-      return `<div class="audio-tracks-box">
-          <div class="k" style="margin-bottom:6px;">Per-video download overrides</div>
+      return `
+        <div class="audio-tracks-box" style="margin-top: 14px;">
+          <div style="font-weight: 700; font-size: 0.85rem; margin-bottom: 6px;">⚙️ Per-Job Format &amp; Quality Overrides</div>
+          <div style="font-size: 0.72rem; color: var(--text-secondary); margin-bottom: 8px;">
+            Set format and quality overrides for this specific video.
+          </div>
           <div class="override-fields">
-            <label class="override-field">Quality
-              <select id="jobOverrideQuality" onchange="jobQualityDirty = true">${qualitySelect}</select>
-            </label>
-            <label class="override-field">Target format
-              <select id="jobOverrideTargetFormat" onchange="jobTargetFormatDirty = true">${formatSelect}</select>
-            </label>
+            <div class="override-field">
+              <label for="jobOverrideQuality">Video quality</label>
+              <select id="jobOverrideQuality">
+                ${qualityOptions.map(o => `<option value="${o.v}" ${o.v === q ? 'selected' : ''}>${o.l}</option>`).join('')}
+              </select>
+            </div>
+            <div class="override-field">
+              <label for="jobOverrideTargetFormat">Container format</label>
+              <select id="jobOverrideTargetFormat">
+                ${formatOptions.map(o => `<option value="${o.v}" ${o.v === f ? 'selected' : ''}>${o.l}</option>`).join('')}
+              </select>
+            </div>
           </div>
-          <div style="font-size:0.7rem; color:var(--text-secondary); margin:4px 0 9px; line-height:1.4;">
-            These choices affect only this video. “Use global” follows the current app setting. Audio-track changes below are included if you edit them.
-            ${job.download_status === 'downloaded' ? ' The existing file is kept until the replacement succeeds.' : ''}
+          <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;">
+            <button class="btn btn-primary btn-sm" onclick="saveJobOverride('${job.id}', true)">💾 Save &amp; Re-Download</button>
+            <button class="btn btn-secondary btn-sm" onclick="saveJobOverride('${job.id}', false)">Save Settings Only</button>
           </div>
-          <button class="btn btn-success" style="padding:6px 10px; font-size:0.74rem;" onclick="saveJobOverride(this.closest('[data-job-id]').dataset.jobId)" ${active ? 'disabled title="Wait for the active job stage to finish"' : ''}>${actionLabel}</button>
-        </div>`;
+        </div>
+      `;
     }
 
-    // ------------------------------------------------------------------
-    // Audio track picker — YouTube's "Audio track" menu, per downloaded
-    // video: original + auto-dubbed tracks, saved per job and applied on
-    // the next download attempt.
-    // ------------------------------------------------------------------
     function renderAudioTrackSection(job) {
-      const tracks = Array.isArray(job.audio_tracks) ? job.audio_tracks : [];
-      const sel = Array.isArray(job.audio_selection) ? job.audio_selection : null;
-      if (!tracks.length) {
-        return `<div class="audio-tracks-box">
-          <div class="k" style="margin-bottom:6px;">Audio tracks</div>
-          <div style="font-size:0.74rem; color: var(--text-secondary); margin-bottom:8px;">
-            Not discovered yet. Find what YouTube offers (original + auto-dubbed tracks), then pick which to keep.
-          </div>
-          <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks(this.closest('[data-job-id]').dataset.jobId)">🔍 Find audio tracks</button>
-        </div>`;
-      }
-      const rows = tracks.map((t) => {
-        const checked = sel ? sel.includes(t.language) : true;
-        const badge = t.isDefault ? ' <span style="opacity:0.65;">· original</span>' : '';
-        const tbr = t.tbr ? ` <span style="opacity:0.55;">· ${Math.round(t.tbr)} kbps</span>` : '';
-        return `<label style="display:flex; align-items:center; gap:8px; margin:4px 0; font-size:0.76rem; cursor:pointer;">
-            <input type="checkbox" class="audio-track-check" data-lang="${escapeHtml(t.language)}" onchange="audioOverrideDirty = true" ${checked ? 'checked' : ''} />
-            <span>${escapeHtml(t.label)} <span class="mono" style="opacity:0.55;">(${escapeHtml(t.language)} · ${escapeHtml(t.formatId)})</span>${badge}${tbr}</span>
-          </label>`;
+      const tracks = job.audio_tracks || [];
+      const sel = job.selected_audio_languages;
+      const isCustom = Array.isArray(sel);
+      const selectedSet = new Set(isCustom ? sel : []);
+      const rows = tracks.map(t => {
+        const checked = isCustom ? selectedSet.has(t.language) : (t.isDefault || t.isOriginal);
+        const sub = [t.label, t.isOriginal ? 'original' : '', t.isDefault ? 'default' : '', t.channels ? `${t.channels}ch` : '']
+          .filter(Boolean).join(' · ');
+        return `
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 0.78rem; padding: 4px 0;">
+            <input type="checkbox" class="audio-track-check" value="${escapeHtml(t.language)}" ${checked ? 'checked' : ''} />
+            <span><strong>${escapeHtml(t.language || 'und')}</strong>${sub ? ` <span style="color: var(--text-muted);">(${escapeHtml(sub)})</span>` : ''}</span>
+          </label>
+        `;
       }).join('');
-      const modeNote = sel
-        ? 'Per-video selection saved. It is applied on the next download attempt.'
-        : 'Following the global multi-audio setting until you save a per-video selection.';
-      const downloaded = job.download_status === 'downloaded';
-      return `<div class="audio-tracks-box">
-          <div class="k" style="margin-bottom:6px;">Audio tracks (${tracks.length})</div>
-          ${rows}
-          <div style="font-size:0.7rem; color: var(--text-secondary); margin:6px 0 8px;">${escapeHtml(modeNote)}${downloaded ? ' This video is already downloaded — saving &amp; re-downloading replaces it (the previous file is kept until the new download succeeds).' : ''}</div>
-          <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveAudioSelection(this.closest('[data-job-id]').dataset.jobId, ${downloaded})">💾 ${downloaded ? 'Save &amp; re-download' : 'Save selection'}</button>
-            ${sel ? `<button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="resetAudioSelection(this.closest('[data-job-id]').dataset.jobId)">↩️ Use global setting</button>` : ''}
-            <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks(this.closest('[data-job-id]').dataset.jobId)">🔄 Re-scan</button>
+
+      return `
+        <div class="audio-tracks-box">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <strong style="font-size: 0.85rem;">🎵 Multi-Language Audio Tracks</strong>
+            <button class="btn btn-secondary btn-sm" id="probeAudioBtn" data-job-id="${job.id}" onclick="probeJobAudioTracks(this.dataset.jobId, this)">🔍 Probe Tracks</button>
           </div>
-        </div>`;
+          ${tracks.length === 0 ? `
+            <div style="font-size: 0.75rem; color: var(--text-muted);">
+              Track list has not been probed yet. Click "Probe Tracks" to query YouTube for available audio streams.
+            </div>
+          ` : `
+            <div style="max-height: 180px; overflow-y: auto; margin-bottom: 8px;">${rows}</div>
+            <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;">
+              <button class="btn btn-primary btn-sm" onclick="saveAudioSelection('${job.id}', true)">💾 Save &amp; Re-Download</button>
+              <button class="btn btn-secondary btn-sm" onclick="saveAudioSelection('${job.id}', false)">Save Selection</button>
+              <button class="btn btn-secondary btn-sm" onclick="resetAudioSelection('${job.id}')">Reset to Global</button>
+            </div>
+          `}
+        </div>
+      `;
     }
 
-    function jobOverridePayload(audioTracks, retry) {
-      const quality = document.getElementById('jobOverrideQuality')?.value || '';
-      const targetFormat = document.getElementById('jobOverrideTargetFormat')?.value || '';
-      const payload = { retry };
-      if (jobQualityDirty) payload.videoQuality = quality || null;
-      if (jobTargetFormatDirty) payload.targetFormat = targetFormat || null;
+    function jobOverridePayload(audioTracks, retry, includeAllOverrides = false) {
+      const payload = { retry: !!retry };
       if (audioTracks !== undefined) payload.audioTracks = audioTracks;
+      if (includeAllOverrides) {
+        const qEl = document.getElementById('jobOverrideQuality');
+        const fEl = document.getElementById('jobOverrideTargetFormat');
+        if (qEl) payload.videoQuality = qEl.value === '' ? null : qEl.value;
+        if (fEl) payload.targetFormat = fEl.value === '' ? null : fEl.value;
+      }
       return payload;
     }
 
-    async function submitJobOverride(id, audioTracks, retry, successText) {
-      const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/override`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(jobOverridePayload(audioTracks, retry)),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.ok) throw new Error(data.error || 'Could not save the per-video override');
-      audioOverrideDirty = false;
-      jobQualityDirty = false;
-      jobTargetFormatDirty = false;
-      showNotification(successText, 'success');
-      const fresh = await fetchJob(id);
-      if (fresh) openJobDetail(fresh);
-      refreshData();
-      return data;
-    }
-
-    async function saveJobOverride(id) {
-      const boxes = document.querySelectorAll('#drawerBody .audio-track-check');
-      const tracks = audioOverrideDirty && boxes.length
-        ? [...boxes].filter(b => b.checked).map(b => b.dataset.lang)
-        : undefined;
+    async function submitJobOverride(id, audioTracks, retry, successText, includeAllOverrides = false) {
+      const payload = jobOverridePayload(audioTracks, retry, includeAllOverrides);
       try {
-        await submitJobOverride(
-          id,
-          tracks,
-          true,
-          '🎬 Saved per-video settings and queued a fresh download',
-        );
-      } catch (err) {
-        showNotification(`❌ ${err.message}`, 'error');
+        const res = await fetch(`/api/jobs/${id}/override`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to update overrides');
+        showNotification(successText, 'success');
+        closeJobDetail();
         refreshData();
+      } catch (err) {
+        showNotification(err.message, 'error');
       }
     }
 
-    async function probeJobAudioTracks(id) {
+    async function saveJobOverride(id, retry = true) {
+      await submitJobOverride(
+        id,
+        undefined,
+        retry,
+        retry ? 'Saved overrides & queued for download' : 'Saved overrides',
+        true
+      );
+    }
+
+    async function probeJobAudioTracks(id, btn) {
+      const originalText = btn ? btn.textContent : '';
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '⏳ Probing...';
+      }
+      showNotification('Probing audio streams via yt-dlp...', 'info');
       try {
-        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/audio-probe`, { method: 'POST' });
+        const res = await fetch(`/api/jobs/${id}/probe-audio`, { method: 'POST' });
         const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || 'Audio-track scan failed');
-        const job = lastJobs.find(j => j.id === id);
-        if (job) { job.audio_tracks = data.tracks; openJobDetail(job); }
-        showNotification(`🎧 Found ${data.tracks.length} audio track(s)`, 'success');
-        refreshData();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to probe audio');
+        showNotification(`Probed: ${data.tracks ? data.tracks.length : 0} audio tracks found`, 'success');
+        const freshJob = await fetchJob(id);
+        if (freshJob) openJobDetail(freshJob);
       } catch (err) {
-        showNotification(`❌ ${err.message}`, 'error');
+        showNotification(err.message, 'error');
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = originalText || '🔍 Probe Tracks';
+        }
       }
     }
 
     async function saveAudioSelection(id, andRedownload) {
-      // Scope to the drawer: only this job's checkboxes count. The quality and
-      // target-format controls are included too, so this button is one atomic
-      // save/re-download action rather than a second save followed by retry.
-      const boxes = document.querySelectorAll('#drawerBody .audio-track-check');
-      const tracks = [...boxes].filter(b => b.checked).map(b => b.dataset.lang);
-      try {
-        await submitJobOverride(
-          id,
-          tracks,
-          !!andRedownload,
-          andRedownload
-            ? `🎧 Re-downloading with ${tracks.length} selected audio track(s)`
-            : `🎧 Saved ${tracks.length} audio track(s) for the next download`,
-        );
-      } catch (err) {
-        showNotification(`❌ ${err.message}`, 'error');
-        refreshData();
+      const checked = Array.from(document.querySelectorAll('#drawerBody .audio-track-check:checked'))
+        .map(i => i.value);
+      if (checked.length === 0) {
+        if (!confirm('No tracks selected. Proceed with clearing multi-audio selection?')) return;
       }
+      await submitJobOverride(
+        id,
+        checked,
+        andRedownload,
+        andRedownload ? 'Saved audio tracks & re-downloading' : 'Saved audio track selection',
+        true
+      );
     }
 
     async function fetchJob(id) {
       try {
         const res = await fetch(`/api/jobs/${encodeURIComponent(id)}`, { cache: 'no-store' });
-        if (!res.ok) return null;
-        const data = await res.json();
-        return data.ok && data.job ? data.job : null;
-      } catch {
-        return null;
-      }
+        if (res.ok) {
+          const data = await res.json();
+          if (data.ok && data.job) return data.job;
+        }
+      } catch {}
+      return null;
     }
 
     async function resetAudioSelection(id) {
       try {
-        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/override`, {
+        const res = await fetch(`/api/jobs/${id}/override`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ audioTracks: null }),
+          body: JSON.stringify({ audioTracks: null, retry: false }),
         });
         const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || 'Reset failed');
-        audioOverrideDirty = false;
-        const fresh = await fetchJob(id);
-        if (fresh) openJobDetail(fresh);
-        showNotification('🎧 Following the global multi-audio setting', 'success');
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to reset audio');
+        showNotification('Reset audio selection to global defaults', 'success');
+        closeJobDetail();
         refreshData();
       } catch (err) {
-        showNotification(`❌ ${err.message}`, 'error');
+        showNotification(err.message, 'error');
       }
     }
 
-    // ------------------------------------------------------------------
-    // Sidecar files — subtitles, thumbnail, description. Set per video at
-    // ingest time from the global config, editable here per job; enabling a
-    // flag on a finished download fetches the files right away.
-    // ------------------------------------------------------------------
     function renderSidecarSection(job) {
       const flags = [
-        ['subtitles', '📝 Subtitles', 'want_subtitles'],
-        ['thumbnail', '🖼️ Thumbnail', 'want_thumbnail'],
-        ['description', '📄 Description', 'want_description'],
+        { k: 'subtitles', l: 'Subtitles (.srt / .vtt)', v: job.subtitles_downloaded },
+        { k: 'thumbnail', l: 'Thumbnail image', v: job.thumbnail_downloaded },
+        { k: 'description', l: 'Description (.description)', v: job.description_downloaded },
+        { k: 'info_json', l: 'Info metadata (.info.json)', v: job.info_json_downloaded },
       ];
-      const rows = flags.map(([key, label, col]) =>
-        `<label style="display:flex; align-items:center; gap:8px; margin:4px 0; font-size:0.76rem; cursor:pointer;">
-           <input type="checkbox" class="sidecar-check" data-key="${key}" ${job[col] ? 'checked' : ''} />
-           <span>${label}</span>
-         </label>`).join('');
-      const sidecars = Array.isArray(job.metadata_files) && job.metadata_files.length
-        ? `<div style="font-size:0.7rem; color: var(--text-secondary); margin-top:6px;">Fetched so far: <span class="mono">${escapeHtml(job.metadata_files.join(', '))}</span></div>`
-        : '';
-      const note = job.download_status === 'downloaded'
-        ? 'Changes are fetched right away against the downloaded file.'
-        : 'Changes apply to the metadata pass after this video downloads.';
-      return `<div class="audio-tracks-box">
-          <div class="k" style="margin-bottom:6px;">Sidecar files</div>
-          ${rows}
-          ${sidecars}
-          <div style="font-size:0.7rem; color: var(--text-secondary); margin:6px 0 8px;">${note} Subtitle languages follow the “Subtitle languages” setting.</div>
-          <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveSidecarSelection(this.closest('[data-job-id]').dataset.jobId)">💾 Save${job.download_status === 'downloaded' ? ' &amp; fetch' : ''}</button>
+      return `
+        <div class="audio-tracks-box" style="margin-top: 14px;">
+          <strong style="font-size: 0.85rem;">📄 Sidecar Metadata Files</strong>
+          <div style="font-size: 0.72rem; color: var(--text-secondary); margin-bottom: 8px;">
+            Toggle sidecar downloads. Enabling a new sidecar re-opens metadata processing.
           </div>
-        </div>`;
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px;">
+            ${flags.map(f => `
+              <label style="display: flex; align-items: center; gap: 6px; font-size: 0.78rem;">
+                <input type="checkbox" class="sidecar-check" data-flag="${f.k}" ${f.v ? 'checked' : ''} />
+                <span>${f.l}</span>
+              </label>
+            `).join('')}
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="saveSidecarSelection('${job.id}')">💾 Save Sidecar Flags</button>
+        </div>
+      `;
     }
 
     async function saveSidecarSelection(id) {
-      const checks = document.querySelectorAll('#drawerBody .sidecar-check');
       const body = {};
-      for (const c of checks) body[c.dataset.key] = c.checked;
+      document.querySelectorAll('#drawerBody .sidecar-check').forEach(i => {
+        body[i.dataset.flag] = i.checked;
+      });
       try {
-        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/sidecars`, {
+        const res = await fetch(`/api/jobs/${id}/sidecars`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
         const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || 'Save failed');
-        showNotification(`📎 Sidecar settings saved${data.metadata_status === 'pending' ? ' — fetching now' : ''}`, 'success');
-        const fresh = await fetchJob(id);
-        if (fresh) openJobDetail(fresh);
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to update sidecars');
+        showNotification('Sidecar settings saved', 'success');
+        closeJobDetail();
         refreshData();
       } catch (err) {
-        showNotification(`❌ ${err.message}`, 'error');
+        showNotification(err.message, 'error');
       }
     }
 
     function openJobDetail(job) {
-      audioOverrideDirty = false;
-      jobQualityDirty = false;
-      jobTargetFormatDirty = false;
-      document.getElementById('drawerTitle').textContent = job.title || 'Job';
-      const parts = job.partial_file_path || '';
-      // aria2c keeps a control file beside the partial; show it so the resume
-      // state is legible rather than a mystery.
-      const control = parts ? `${parts}.aria2` : '';
+      document.getElementById('drawerTitle').textContent = job.title || `Job ${job.id}`;
+      const status = jobStatus(job);
+      const isDL = job.download_status === 'downloading';
       const body = document.getElementById('drawerBody');
 
-      body.innerHTML = `<div data-job-id="${escapeHtml(job.id)}">
-        <div class="detail-grid">
-          ${detailRow('Video ID', job.id, true)}
-          ${detailRow('URL', job.url, true)}
-          ${detailRow('Folder', job.folder)}
-          ${detailRow('Output dir', job.output_directory, true)}
-          ${detailRow('Download', job.download_status)}
-          ${detailRow('Conversion', job.conversion_status)}
-          ${detailRow('Quality override', job.video_quality || 'Global setting')}
-          ${detailRow('Target format', job.target_format || 'Global setting')}
-          ${detailRow('Metadata', job.metadata_status)}
-          ${detailRow('File', job.file_path, true)}
-          ${detailRow('Size', job.file_size ? formatBytes(job.file_size) : null)}
-          ${detailRow('Duration', job.duration ? formatETA(job.duration) : null)}
-          ${detailRow('Progress', `${(Number(job.progress) || 0).toFixed(1)}%`)}
-          ${detailRow('Best progress', job.best_progress ? `${Number(job.best_progress).toFixed(1)}%` : null)}
-          ${detailRow('Retries', job.retry_count || 0)}
-          ${detailRow('Resumes', job.resume_count || 0)}
-          ${detailRow('Kept partial', parts, true)}
-          ${detailRow('aria2c control', control, true)}
-          ${detailRow('Last error', formatLastError(job.last_error))}
+      body.innerHTML = `
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border);">
+          <span class="status-badge status-${status}">${escapeHtml(status)}</span>
+          <div style="display: flex; gap: 6px;">
+            ${status === 'failed' ? `<button class="btn btn-success btn-sm" onclick="retryJob('${job.id}')">🔄 Retry</button>` : ''}
+            ${isStoppable(job) ? `<button class="btn btn-warning btn-sm" onclick="stopJob('${job.id}')">⏹️ Stop</button>` : ''}
+          </div>
         </div>
-        ${job.video_quality ? `<div style="margin-top:10px; font-size:0.74rem; color: var(--text-secondary); line-height:1.4;">🎚️ A quality override is either your own choice or one the engine applied automatically because the requested format was not available for this video. Every skipped video records its reason above and is never retried on its own.</div>` : ''}
+        <div class="detail-grid">
+          ${detailRow('ID', job.id, true)}
+          ${detailRow('URL', `<a href="${escapeHtml(job.url)}" target="_blank" rel="noopener" style="color: #93c5fd; text-decoration: none;">${escapeHtml(job.url)}</a>`)}
+          ${detailRow('Target format', job.target_format)}
+          ${detailRow('Video quality', job.video_quality)}
+          ${detailRow('Download status', job.download_status)}
+          ${detailRow('Progress', job.progress !== null && job.progress !== undefined ? `${Number(job.progress).toFixed(1)}%` : '')}
+          ${detailRow('Speed', isDL && job.speed ? formatBytesPerSec(job.speed) : '')}
+          ${detailRow('ETA', isDL && job.eta ? formatETA(job.eta) : '')}
+          ${detailRow('Partial file', job.partial_file_path, true)}
+          ${detailRow('Final file', job.file_path, true)}
+          ${detailRow('Output folder', job.output_directory || job.folder, true)}
+          ${detailRow('File size', job.file_size ? formatBytes(job.file_size) : '')}
+          ${detailRow('Duration', job.duration ? formatETA(job.duration) : '')}
+          ${detailRow('Conversion status', job.conversion_status)}
+          ${detailRow('Metadata status', job.metadata_status)}
+          ${detailRow('Failures / Retries', `${job.fail_count ?? 0} failures · ${job.retry_count ?? 0} retries · ${job.resume_count ?? 0} resumes`)}
+          ${detailRow('Pause reason', job.pause_reason)}
+          ${detailRow('Last error', job.last_error)}
+          ${detailRow('Created', timeAgo(job.created_at))}
+          ${detailRow('Updated', timeAgo(job.updated_at))}
+        </div>
         ${renderJobOverrideSection(job)}
         ${renderAudioTrackSection(job)}
         ${renderSidecarSection(job)}
-        ${job.superseded_file ? `<div style="margin-top:12px; padding:8px 10px; border-radius:8px; background:rgba(59,130,246,0.10); font-size:0.73rem; color: var(--text-secondary);">🔁 Re-download in progress — the previous file is kept as <span class="mono">${escapeHtml(job.superseded_file)}</span> until the new download succeeds, and restored automatically if the re-download fails permanently.</div>` : ''}
-        ${job.last_error ? `<div style="margin-top:14px; font-size:0.74rem; color: var(--text-secondary); line-height:1.4;">A kept partial means the next attempt resumes from it. Permanent failures (private / removed / age-gated / geo-blocked) are never retried automatically.</div>` : ''}
-        <div style="margin-top:16px; display:flex; gap:8px; flex-wrap:wrap;">
-          <button class="btn btn-success" style="padding:6px 12px; font-size:0.75rem;" onclick="retryJob(this.closest('[data-job-id]').dataset.jobId); closeJobDetail();">🔄 Retry job</button>
-          ${isStoppable(job) ? `<button class="btn btn-warning" style="padding:6px 12px; font-size:0.75rem;" onclick="stopJob(this.closest('[data-job-id]').dataset.jobId); closeJobDetail();">⏹️ Stop job</button>` : ''}
-          <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.75rem;" onclick="openJobDetailById(this.closest('[data-job-id]').dataset.jobId)">🔄 Refresh</button>
-          <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.75rem;" onclick="closeJobDetail()">Close</button>
-        </div>
-      </div>`;
+      `;
 
       document.getElementById('jobDrawer').classList.add('open');
       document.getElementById('drawerBackdrop').classList.add('open');
@@ -2272,9 +2968,8 @@
       document.getElementById('jobDrawer').classList.remove('open');
       document.getElementById('drawerBackdrop').classList.remove('open');
     }
-    // Keyboard shortcuts. Plain keys work when focus is not in a field; the
-    // Ctrl variants are kept for anyone who already uses them. Escape always
-    // backs out of the topmost overlay first.
+
+    // Keyboard shortcuts
     const anyOverlayOpen = () =>
       document.getElementById('settingsModal').classList.contains('open') ||
       document.getElementById('jobDrawer').classList.contains('open');
@@ -2285,7 +2980,8 @@
       if (e.key === 'Escape') {
         if (document.getElementById('settingsModal').classList.contains('open')) { closeSettings(); return; }
         if (document.getElementById('jobDrawer').classList.contains('open')) { closeJobDetail(); return; }
-        document.getElementById('searchInput').blur();
+        const s = document.getElementById('searchInput');
+        if (s) s.blur();
         return;
       }
       if (anyOverlayOpen()) return;
@@ -2300,18 +2996,21 @@
         case 's':
           e.preventDefault(); openSettings();
           break;
+        case 't':
+          e.preventDefault(); toggleTurboMode();
+          break;
         case '/':
           e.preventDefault();
-          document.getElementById('searchInput').focus();
+          const s = document.getElementById('searchInput');
+          if (s) s.focus();
           break;
       }
     });
     
-    // Initial load, then poll every 5s while the tab is visible. A hidden tab
-    // skips the fetch entirely (browsers throttle its timers anyway) and
-    // refreshes once the moment it becomes visible again.
+    // Initial load, then poll every 5s while the tab is visible.
     refreshData();
     loadSources();
+    fetchSettingsSnapshot();
     setInterval(() => { if (!document.hidden) fetchStatus(); }, 5000);
     document.addEventListener('visibilitychange', () => { if (!document.hidden) fetchStatus(); });
   </script>

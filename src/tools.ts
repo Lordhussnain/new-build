@@ -231,6 +231,8 @@ export interface ToolSearchEnv {
   /** Stand-in for the folder holding the running executable. */
   exeDir?: string;
   platform?: NodeJS.Platform;
+  /** Explicit deno path configured by the operator. */
+  denoPath?: string;
   /**
    * Environment for the probe's child process (PATH included).
    *
@@ -369,9 +371,18 @@ const JS_RUNTIMES: { name: JsRuntimeName; posix: string[]; win: string[] }[] = [
  * Preference matches yt-dlp's own: Deno (sandboxed, default) → Node → Bun →
  * QuickJS. A missing runtime is never fatal — the engine still starts — but
  * every YouTube download will then fail the n-challenge until one appears.
+ * An operator can specify an explicit Deno executable via `denoPath`.
  */
 export async function resolveJsRuntime(search: ToolSearchEnv = {}): Promise<JsRuntime | null> {
+  const customDeno = (search.denoPath || "").trim().replace(/^["']|["']$/g, "");
+  const denoDisabled = customDeno.toLowerCase() === "none";
+  if (customDeno && !denoDisabled) {
+    const found = await resolveTool(customDeno, ["--version"], ["deno"], ["deno.exe"], search);
+    if (found) return { name: "deno", path: found.path };
+  }
+
   for (const rt of JS_RUNTIMES) {
+    if (rt.name === "deno" && denoDisabled) continue;
     const found = await resolveTool("", ["--version"], rt.posix, rt.win, search);
     if (found) return { name: rt.name, path: found.path };
   }
@@ -386,6 +397,7 @@ export async function checkDependencies(
     ffmpegPath: string;
     aria2cPath?: string;
     useAria2c?: boolean;
+    denoPath?: string;
   },
   search: ToolSearchEnv = {},
 ): Promise<void> {
@@ -406,6 +418,7 @@ export async function checkDependencies(
   ]);
   const jsRt = await resolveJsRuntime({
     ...search,
+    denoPath: search.denoPath ?? config.denoPath,
     bunInterpreter: search.bunInterpreter ?? bunInterpreterPath(),
   });
 
@@ -457,6 +470,11 @@ export async function checkDependencies(
     console.log(
       "  ⚪ JS runtime: not found — YouTube downloads need Deno (recommended), Node.js ≥ 22, or Bun to solve the n-challenge. See https://github.com/yt-dlp/yt-dlp/wiki/EJS",
     );
+  }
+  if (config.denoPath && config.denoPath.trim() && config.denoPath.trim().toLowerCase() !== "none") {
+    if (!jsRt || jsRt.name !== "deno") {
+      console.warn(`  ⚠️ Deno: not found or invalid at "${config.denoPath}" — falling back to other runtimes or none`);
+    }
   }
 
   if (missing.length > 0) {

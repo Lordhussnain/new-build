@@ -66,13 +66,31 @@ export function effectiveTargetFormat(
  * file finer, it just cannot open a 17th connection to one server.
  */
 export const ARIA2C_MAX_CONNECTIONS_PER_SERVER = 16;
+export const ARIA2C_MIN_SPLIT_SIZE_BYTES = 1048576; // 1M (aria2c rejects anything lower with exit 28)
+
+export function parseAria2cSplitSizeBytes(sizeStr: string): number | null {
+  const match = sizeStr.trim().match(/^(\d+(?:\.\d+)?)\s*([KkMmGg]?)[Bb]?$/);
+  if (!match) return null;
+  const num = parseFloat(match[1]);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  const unit = match[2].toUpperCase();
+  if (unit === "K") return Math.floor(num * 1024);
+  if (unit === "M") return Math.floor(num * 1024 * 1024);
+  if (unit === "G") return Math.floor(num * 1024 * 1024 * 1024);
+  return Math.floor(num);
+}
 
 export function buildAria2cArgs(config: Config): string {
   const n = Math.max(1, Math.floor(config.connectionsPerDownload));
   const x = Math.min(n, ARIA2C_MAX_CONNECTIONS_PER_SERVER);
   const parts = [`-x ${x}`, `-s ${n}`, `-j ${n}`];
   const split = (config.minSplitSize || "").trim();
-  if (split && split !== "1M") parts.push(`--min-split-size ${split}`);
+  const bytes = split ? parseAria2cSplitSizeBytes(split) : null;
+  // aria2c rejects --min-split-size below 1M (exit 28). yt-dlp's own default is 1M,
+  // so we safely omit the flag when empty, invalid, or <= 1M.
+  if (bytes !== null && bytes > ARIA2C_MIN_SPLIT_SIZE_BYTES) {
+    parts.push(`--min-split-size ${split}`);
+  }
   return parts.join(" ");
 }
 
@@ -271,6 +289,11 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
   if (chunk) args.push("--http-chunk-size", chunk);
   const buffer = (config.bufferSize || "").trim();
   if (buffer) args.push("--buffer-size", buffer);
+
+  // Optional request identity override. It is an argv value, never interpolated
+  // through a shell; the default profile leaves yt-dlp's own User-Agent intact.
+  const userAgent = (config.userAgent || "").trim();
+  if (userAgent) args.push("--user-agent", userAgent);
 
   return {
     engine,

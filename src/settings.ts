@@ -60,6 +60,58 @@ const VIDEO_QUALITY_OPTIONS = [
 ];
 
 /**
+ * Quick presets for the Web UI. Applying a preset stages these existing config
+ * keys in the settings editor; the operator can still tune them individually
+ * before saving. The Standard profile is the shipped baseline, while Maximum
+ * Speed enables the larger native-fragment/chunk/buffer settings and the
+ * explicit browser-style User-Agent requested by the operator.
+ */
+export const DOWNLOAD_SPEED_PROFILES = {
+  standard: {
+    label: "Standard",
+    description: "Balanced defaults: aria2c ×16, 16 native fragments, default chunk/buffer/User-Agent, and no rate cap.",
+    values: {
+      useAria2c: true,
+      connectionsPerDownload: 16,
+      minSplitSize: "1M",
+      concurrentFragments: 16,
+      httpChunkSize: "",
+      bufferSize: "",
+      userAgent: "",
+      maxBandwidthKBps: 0,
+    },
+  },
+  maximum: {
+    label: "Maximum speed",
+    description: "Uncapped aria2c ×16 plus 32 native fragments, 10M HTTP chunks, a 16K buffer, and the supplied Chrome/120 User-Agent.",
+    values: {
+      useAria2c: true,
+      connectionsPerDownload: 16,
+      minSplitSize: "1M",
+      concurrentFragments: 32,
+      httpChunkSize: "10M",
+      bufferSize: "16K",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+      maxBandwidthKBps: 0,
+    },
+  },
+  aggressive: {
+    label: "Aggressive (IDM)",
+    description: "Ultra-fast IDM-style downloads: aria2c ×32 (split 1M), 64 native fragments, 10M HTTP chunks, 64K buffer, and uncapped bandwidth.",
+    values: {
+      useAria2c: true,
+      connectionsPerDownload: 32,
+      minSplitSize: "1M",
+      concurrentFragments: 64,
+      httpChunkSize: "10M",
+      bufferSize: "64K",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+      maxBandwidthKBps: 0,
+    },
+  },
+} satisfies Record<string, { label: string; description: string; values: Partial<Config> }>;
+
+/**
  * The editable knobs, grouped for the settings panel.
  *
  * Ranges mirror the Zod schema so the UI never offers a value the engine would
@@ -136,6 +188,13 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     type: "text",
     group: "downloader",
     help: "yt-dlp socket buffer (e.g. 16K). Blank = yt-dlp's default.",
+  },
+  {
+    key: "userAgent",
+    label: "User-Agent override",
+    type: "text",
+    group: "downloader",
+    help: "Optional yt-dlp request User-Agent. Blank uses yt-dlp's default; a custom value may be rejected by some services and cannot guarantee higher throughput.",
   },
   {
     key: "maxBandwidthKBps",
@@ -523,6 +582,14 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     help: "Explicit aria2c executable, or \"none\" to force the native downloader even when aria2c is installed. Takes effect after a restart.",
   },
   {
+    key: "denoPath",
+    label: "Deno path",
+    type: "text",
+    group: "advanced",
+    restartRequired: true,
+    help: "Explicit Deno executable path (blank = auto-discover on PATH) for yt-dlp's YouTube n-challenge JS runtime (--js-runtimes \"deno:<path>\"). Takes effect after a restart.",
+  },
+  {
     key: "validateCookiesOnStart",
     label: "Validate cookies on start",
     type: "boolean",
@@ -577,6 +644,8 @@ export interface SettingsSnapshot {
   values: Record<string, unknown>;
   /** Keys that differ from the schema defaults — handy for "reset" affordances. */
   nonDefault: string[];
+  /** Presets used by the settings modal's one-click performance selector. */
+  speedProfiles: typeof DOWNLOAD_SPEED_PROFILES;
 }
 
 /** Current values plus the descriptors the UI needs to render them. */
@@ -589,7 +658,7 @@ export function readSettings(config: Config): SettingsSnapshot {
       nonDefault.push(field.key);
     }
   }
-  return { fields: EDITABLE_SETTINGS, values, nonDefault };
+  return { fields: EDITABLE_SETTINGS, values, nonDefault, speedProfiles: DOWNLOAD_SPEED_PROFILES };
 }
 
 export interface ApplySettingsResult {

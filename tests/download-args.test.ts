@@ -15,6 +15,7 @@ import {
   resolveDownloaderEngine,
 } from "../src/download-args";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
+import { DOWNLOAD_SPEED_PROFILES } from "../src/settings";
 
 const cfg = (overrides: Partial<Config> = {}): Config => ({ ...DEFAULT_CONFIG, ...overrides });
 
@@ -63,6 +64,7 @@ describe("buildAria2cArgs", () => {
 
   test("adds --min-split-size only when it differs from yt-dlp's default", () => {
     expect(buildAria2cArgs(cfg({ minSplitSize: "1M" }))).not.toContain("--min-split-size");
+    expect(buildAria2cArgs(cfg({ minSplitSize: "512K" }))).not.toContain("--min-split-size");
     expect(buildAria2cArgs(cfg({ minSplitSize: "4M" }))).toBe("-x 16 -s 16 -j 16 --min-split-size 4M");
   });
 
@@ -199,6 +201,38 @@ describe("buildDownloadPlan", () => {
     expect(flagValue(plan.args, "--buffer-size")).toBe("16K");
   });
 
+  test("adds a configured User-Agent as a single argv value", () => {
+    const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36";
+    expect(build().args).not.toContain("--user-agent");
+    const plan = build({ userAgent: ua });
+    expect(flagValue(plan.args, "--user-agent")).toBe(ua);
+  });
+
+  test("maximum-speed preset creates the intended uncapped native invocation", () => {
+    const plan = build(DOWNLOAD_SPEED_PROFILES.maximum.values, false);
+    expect(plan.engine).toBe("native");
+    expect(flagValue(plan.args, "--concurrent-fragments")).toBe("32");
+    expect(flagValue(plan.args, "--http-chunk-size")).toBe("10M");
+    expect(flagValue(plan.args, "--buffer-size")).toBe("16K");
+    expect(flagValue(plan.args, "--user-agent")).toBe(DOWNLOAD_SPEED_PROFILES.maximum.values.userAgent);
+    expect(plan.args).not.toContain("--limit-rate");
+  });
+
+  test("aggressive IDM speed preset creates the intended multi-connection and fragment invocation", () => {
+    const planNative = build(DOWNLOAD_SPEED_PROFILES.aggressive.values, false);
+    expect(planNative.engine).toBe("native");
+    expect(flagValue(planNative.args, "--concurrent-fragments")).toBe("64");
+    expect(flagValue(planNative.args, "--http-chunk-size")).toBe("10M");
+    expect(flagValue(planNative.args, "--buffer-size")).toBe("64K");
+    expect(flagValue(planNative.args, "--user-agent")).toBe(DOWNLOAD_SPEED_PROFILES.aggressive.values.userAgent);
+    expect(planNative.args).not.toContain("--limit-rate");
+
+    const planAria2 = build(DOWNLOAD_SPEED_PROFILES.aggressive.values, true);
+    expect(planAria2.engine).toBe("aria2c");
+    expect(planAria2.args).toContain("--downloader-args");
+    expect(flagValue(planAria2.args, "--downloader-args")).toBe("aria2c:-x 16 -s 32 -j 32");
+  });
+
   test("adds the download archive and live filter only when enabled", () => {
     expect(flagValue(build().args, "--download-archive")).toBe(DEFAULT_CONFIG.archiveFile);
     expect(build().args).not.toContain("--match-filters");
@@ -297,6 +331,17 @@ describe("buildDownloadPlan", () => {
     });
     expect(flagValue(plan.args, "--js-runtimes")).toBe(`deno:${join("/opt", "deno")}`);
     expect(flagValue(plan.args, "--remote-components")).toBe("ejs:github");
+  });
+
+  test("formats explicit deno path as deno:/path/to/deno for yt-dlp", () => {
+    const plan = buildDownloadPlan({
+      job,
+      config: cfg({ denoPath: "/custom/bin/deno" }),
+      activeSlots: 1,
+      aria2cAvailable: false,
+      jsRuntime: { name: "deno", path: "/custom/bin/deno" },
+    });
+    expect(flagValue(plan.args, "--js-runtimes")).toBe("deno:/custom/bin/deno");
   });
 });
 

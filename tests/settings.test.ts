@@ -15,6 +15,7 @@ import { DEFAULT_CONFIG, type Config } from "../src/config";
 import { activeDownloadJobs, getConfig, setConfig } from "../src/state";
 import { db, initDatabase } from "../src/db";
 import {
+  DOWNLOAD_SPEED_PROFILES,
   EDITABLE_SETTINGS,
   NON_EDITABLE_SETTINGS,
   SETTING_GROUPS,
@@ -60,6 +61,7 @@ describe("the editable allow-list", () => {
       "fragmentRetries",
       "httpChunkSize",
       "bufferSize",
+      "userAgent",
       "maxBandwidthKBps",
       "autoscaleRampStep",
     ]) {
@@ -125,7 +127,7 @@ describe("the editable allow-list", () => {
   test("settings read by the engine only at startup are marked restartRequired", () => {
     // The panel must be able to tell an operator that a change needs a restart
     // instead of implying it is live.
-    for (const key of ["ytDlpPath", "ffmpegPath", "aria2cPath", "maxDownloadWorkers", "webPort", "daemonMode"]) {
+    for (const key of ["ytDlpPath", "ffmpegPath", "aria2cPath", "denoPath", "maxDownloadWorkers", "webPort", "daemonMode"]) {
       expect(requiresRestart(key)).toBe(true);
     }
     for (const key of [
@@ -148,6 +150,40 @@ describe("readSettings", () => {
     expect(snapshot.values.connectionsPerDownload).toBe(4);
     expect(snapshot.nonDefault).toContain("connectionsPerDownload");
     expect(snapshot.nonDefault).not.toContain("concurrentFragments");
+    expect(snapshot.speedProfiles).toEqual(DOWNLOAD_SPEED_PROFILES);
+  });
+
+  test("defines standard and maximum-speed presets from the existing tuning knobs", () => {
+    expect(DOWNLOAD_SPEED_PROFILES.standard.values).toMatchObject({
+      useAria2c: true,
+      connectionsPerDownload: 16,
+      minSplitSize: "1M",
+      concurrentFragments: 16,
+      httpChunkSize: "",
+      bufferSize: "",
+      userAgent: "",
+      maxBandwidthKBps: 0,
+    });
+    expect(DOWNLOAD_SPEED_PROFILES.maximum.values).toMatchObject({
+      useAria2c: true,
+      connectionsPerDownload: 16,
+      minSplitSize: "1M",
+      concurrentFragments: 32,
+      httpChunkSize: "10M",
+      bufferSize: "16K",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+      maxBandwidthKBps: 0,
+    });
+    expect(DOWNLOAD_SPEED_PROFILES.aggressive.values).toMatchObject({
+      useAria2c: true,
+      connectionsPerDownload: 32,
+      minSplitSize: "1M",
+      concurrentFragments: 64,
+      httpChunkSize: "10M",
+      bufferSize: "64K",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+      maxBandwidthKBps: 0,
+    });
   });
 });
 
@@ -472,6 +508,7 @@ describe("GET /api/settings", () => {
     expect(body.ok).toBe(true);
     expect(body.fields.length).toBe(EDITABLE_SETTINGS.length);
     expect(body.values.connectionsPerDownload).toBe(12);
+    expect(body.speedProfiles).toEqual(DOWNLOAD_SPEED_PROFILES);
   });
 });
 
@@ -485,16 +522,17 @@ describe("POST /api/settings", () => {
       const res = await handleRequest(
         new Request("http://x/api/settings", {
           method: "POST",
-          body: JSON.stringify({ connectionsPerDownload: 24, maxBandwidthKBps: 5000 }),
+          body: JSON.stringify({ connectionsPerDownload: 24, maxBandwidthKBps: 5000, userAgent: "Mozilla/5.0 test" }),
         }),
         getConfig(),
       );
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.ok).toBe(true);
-      expect(body.changed.sort()).toEqual(["connectionsPerDownload", "maxBandwidthKBps"]);
+      expect(body.changed.sort()).toEqual(["connectionsPerDownload", "maxBandwidthKBps", "userAgent"]);
       expect(body.values.connectionsPerDownload).toBe(24);
       expect(body.values.maxBandwidthKBps).toBe(5000);
+      expect(body.values.userAgent).toBe("Mozilla/5.0 test");
       expect(getConfig().connectionsPerDownload).toBe(24);
     } finally {
       process.chdir(cwd);

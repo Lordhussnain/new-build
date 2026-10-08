@@ -444,6 +444,31 @@ describe("POST /api/jobs/:id/override", () => {
     expect(getJob("over06")).toMatchObject({ download_status: "pending", retry_count: 0, last_error: null });
   });
 
+  test("saving overrides with retry:false updates target format and video quality without queuing", async () => {
+    insertJob("over07", { download_status: "paused", target_format: null, video_quality: null });
+    const res = await api("/api/jobs/over07/override", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetFormat: "mp4", videoQuality: "720p", retry: false }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, queued: false, targetFormat: "mp4", videoQuality: "720p" });
+    expect(getJob("over07")).toMatchObject({ download_status: "paused", target_format: "mp4", video_quality: "720p" });
+  });
+
+  test("retrying a job with overrides unpauses an engine stopped by BAD_DOWNLOADER_ARGS", async () => {
+    insertJob("over08", { download_status: "paused", target_format: null, video_quality: null });
+    triggerPause("BAD_DOWNLOADER_ARGS (test)");
+    const res = await api("/api/jobs/over08/override", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetFormat: "mp4", videoQuality: "720p", retry: true }),
+    });
+    expect(res.status).toBe(200);
+    const status = await (await api("/api/status")).json();
+    expect(status.isPaused).toBe(false);
+  });
+
   test("an audio-track-only retry preserves the existing no-conversion policy", async () => {
     insertJob("over05", { download_status: "downloaded", conversion_status: "not_needed" });
     const res = await api("/api/jobs/over05/override", {

@@ -58,4 +58,28 @@ describe("download subprocess cleanup", () => {
     expect(await proc.exited).not.toBe(0);
     expect(activeProcs.has(workerId)).toBe(false);
   });
+
+  test("kills child processes of the downloader so external tools like aria2c do not continue running", async () => {
+    // Spawn a parent process that spawns a long-running child process
+    const proc = Bun.spawn(
+      ["bash", "-c", "sleep 100 & wait"],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    activeProcs.set(workerId, proc);
+    await Bun.sleep(100);
+
+    const childCheck = Bun.spawnSync(["pgrep", "-P", String(proc.pid)]);
+    const childPid = childCheck.stdout.toString().trim();
+    expect(childPid.length).toBeGreaterThan(0);
+
+    await cleanupDownloadProcess(workerId, proc);
+
+    expect(await proc.exited).not.toBe(0);
+    expect(activeProcs.has(workerId)).toBe(false);
+
+    // Verify the child process was also killed
+    await Bun.sleep(100);
+    const aliveCheck = Bun.spawnSync(["pgrep", "-f", "^sleep 100"]);
+    expect(aliveCheck.stdout.toString().trim()).toBe("");
+  });
 });

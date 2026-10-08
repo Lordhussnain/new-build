@@ -25,6 +25,7 @@ import { applySettings, readSettings } from "./settings";
 import { effectiveTargetFormat, effectiveVideoQuality, resolveDownloaderEngine } from "./download-args";
 import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-tracks";
 import { formatBytesPerSec, formatDuration } from "./util";
+import { updateWorkerLine } from "./dashboard";
 import { errorLogPath, logError } from "./logger";
 import { QUALITY_FORMATS, withConfigWriteLock, type Config } from "./config";
 
@@ -828,6 +829,9 @@ const ROUTES: Route[] = [
           : saveJobOverrideById(params.id, config, parsed.value);
         if (changed === "in-progress") return jobInProgressResponse();
         if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+        if (retry && isPaused() && getPauseReason()?.startsWith("BAD_DOWNLOADER_ARGS")) {
+          triggerResume();
+        }
         const saved = db.query("SELECT target_format, video_quality, audio_selection FROM jobs WHERE id = ?").get(params.id) as any;
         return Response.json({
           ok: true,
@@ -849,6 +853,9 @@ const ROUTES: Route[] = [
         const changed = retryJobById(params.id, config);
         if (changed === "in-progress") return jobInProgressResponse();
         if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+        if (isPaused() && getPauseReason()?.startsWith("BAD_DOWNLOADER_ARGS")) {
+          triggerResume();
+        }
         return Response.json({ ok: true });
       } catch (e: any) {
         return Response.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
@@ -1011,7 +1018,7 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/jobs/:id/stop",
-    handler: ({ params }) => {
+    handler: ({ params, config }) => {
       // Stop one job NOW without deleting it: the in-flight downloader (and any
       // encode or sidecar fetch) is interrupted, and a mid-download job is
       // parked as a user pause so its .part file resumes exactly where it
@@ -1024,7 +1031,7 @@ const ROUTES: Route[] = [
       // stale-claim reaper noticed it).
       const row = db
         .query(
-          `SELECT id, download_status, conversion_status, metadata_status,
+          `SELECT id, title, download_status, conversion_status, metadata_status,
                   conversion_claimed_by, conversion_claim_token,
                   metadata_claimed_by, metadata_claim_token
              FROM jobs WHERE id = ?`,
@@ -1037,6 +1044,11 @@ const ROUTES: Route[] = [
       // itself, so the .part survives for the next Resume/Retry.
       parkDownloadingJobs([id]);
       stopActiveStages([id]);
+      for (const [workerId, jobId] of activeDownloadJobs) {
+        if (jobId === id) {
+          updateWorkerLine(workerId, `⏸️ Paused | ${(row as any).title || id}`, config);
+        }
+      }
       // A killed encode/fetch is simply re-queued; the claim is cleared through
       // its own token so the (now interrupted) worker cannot record an outcome.
       if (row.conversion_status === "in_progress") {
@@ -1131,6 +1143,9 @@ const ROUTES: Route[] = [
         const changed = retryJobById(params.id, config);
         if (changed === "in-progress") return jobInProgressResponse();
         if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+        if (isPaused() && getPauseReason()?.startsWith("BAD_DOWNLOADER_ARGS")) {
+          triggerResume();
+        }
         return Response.json({ ok: true });
       } catch (e: any) {
         return Response.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
