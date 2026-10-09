@@ -197,6 +197,40 @@ describe("HTTP 416 / unrecoverable resume", () => {
     }
   });
 
+  test("a 416 with only a stranded control file sweeps it (no control-without-data wedge)", async () => {
+    const id = "416-stranded-control";
+    const { job, config, part, control } = await claimStuckJob(id, { withPartial: false });
+    try {
+      // A hand-deleted or AV-truncated .part leaves its .aria2 behind: aria2c
+      // would refuse both to resume and to restart, so the 416 branch must not
+      // hand the job back with that litter still in place.
+      await writeFile(control, "mock-control-file");
+      await handleDownloadFailure(5, job, config, new Error(HTTP_416));
+      expect(existsSync(part)).toBe(false);
+      expect(existsSync(control)).toBe(false);
+    } finally {
+      await cleanupDirs();
+    }
+  });
+
+  test("a corrupt-resume with only a stranded control file sweeps it before restarting", async () => {
+    const id = "corrupt-stranded-control";
+    const { job, config, part, control } = await claimStuckJob(id, { withPartial: false });
+    try {
+      await writeFile(control, "mock-control-file");
+      await handleDownloadFailure(
+        5,
+        job,
+        config,
+        new Error("ERROR: unable to resume: the server truncated the response"),
+      );
+      expect(existsSync(part)).toBe(false);
+      expect(existsSync(control)).toBe(false);
+    } finally {
+      await cleanupDirs();
+    }
+  });
+
   test("a corrupt-resume error KEEPS the partial (the 416 branch is not a catch-all)", async () => {
     // The neighbouring class must not change: an "unable to resume / corrupt"
     // tail gets bounded resume attempts before the partial is discarded.

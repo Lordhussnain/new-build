@@ -26,6 +26,7 @@ import { checkDiskSpace, killProcessTree, notePipelineFailure, notePipelineSucce
 import {
   dropSupersededFile,
   findPartialFile,
+  findStrandedPartials,
   recordJobPartial,
   removePartialFiles,
   restoreSupersededFile,
@@ -760,14 +761,20 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
     // restart clears progress/best_progress in the same statement that re-queues.
     const status = retry.exhausted ? "failed" : "pending";
 
-    if (partial) {
+    // Every resume pair this job leaves behind: the recorded/found data file, or
+    // — when the data file is gone — any stranded control file (see
+    // findStrandedPartials). aria2c refuses both to resume and to restart while a
+    // control file is present, so the stranded case must be swept too.
+    const litter = partial ? [partial] : await findStrandedPartials(job.output_directory, base);
+    for (const target of litter) {
       // Both files, in the one safe order: a `.part` without its `.aria2` (or
       // the reverse) leaves aria2c unable to resume AND unable to restart.
-      const removal = await removePartialFiles(partial);
+      const removal = await removePartialFiles(target);
       if (removal.fatal) {
         // Nothing was deleted and aria2c still refuses to restart, so this can
         // only wait for the lock (an orphaned aria2c/ffmpeg, an AV scan) to go
-        // away — with its partial still recorded for whoever retries.
+        // away — with its partial still recorded for whoever retries. A stranded
+        // control file has no data file to record, so the path stays NULL.
         const msg =
           `resume state is unusable (HTTP 416) and its partial is locked (${removal.error}). ` +
           `Close the program holding it — usually an orphaned aria2c/ffmpeg or an antivirus scan on the download folder.`;
@@ -775,7 +782,7 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
           job,
           "parking a locked 416 partial",
           `download_status = ?, retry_count = ?, best_progress = ?, partial_file_path = ?, last_error = ?`,
-          [status, retry.retryCount, retry.bestProgress, partial, msg.slice(0, 500)],
+          [status, retry.retryCount, retry.bestProgress, partial || null, msg.slice(0, 500)],
         );
         logError("download", `${job.id} ${job.title}: ${msg}`);
         if (!parked) return;
@@ -814,7 +821,7 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
       updateWorkerLine(id, `❌ Retry budget spent — partial discarded, cooldown will restart it | ${job.title}`, config);
       return;
     }
-    if (partial) {
+    if (litter.length > 0) {
       // A fresh attempt still has to survive a genuinely broken stream, so the
       // no-progress budget is charged (it forgives again as soon as the restart
       // gets further than the previous attempt did).
@@ -850,10 +857,17 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
     const restartFromScratch = resumeCount >= Math.max(1, config.maxResumeAttempts) || !partial;
     let partialRemoved = false;
 
-    if (restartFromScratch && partial) {
+    // The data file, or — when it is gone — any stranded control file for it
+    // (see findStrandedPartials). Both are swept control file first.
+    const litter = restartFromScratch
+      ? partial
+        ? [partial]
+        : await findStrandedPartials(job.output_directory, base)
+      : [];
+    for (const target of litter) {
       // The aria2c control file goes first — stranding it makes aria2c refuse
       // to restart (see removePartialFiles).
-      const removal = await removePartialFiles(partial);
+      const removal = await removePartialFiles(target);
       if (removal.fatal) {
         // Keep both files if a process/antivirus holds either one. This is a
         // retryable failure, but its no-progress attempt still spends budget.
@@ -863,7 +877,7 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
           job,
           "parking a locked partial",
           `download_status = ?, retry_count = ?, resume_count = ?, partial_file_path = ?, best_progress = ?, last_error = ?`,
-          [status, retry.retryCount, resumeCount, partial, retry.bestProgress, msg.slice(0, 500)],
+          [status, retry.retryCount, resumeCount, partial || null, retry.bestProgress, msg.slice(0, 500)],
         );
         logError("download", `${job.id} ${job.title}: ${msg}`);
         if (!parked) return;

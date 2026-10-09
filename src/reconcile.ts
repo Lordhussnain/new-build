@@ -673,6 +673,29 @@ export async function findPartialFile(dir: string, baseFilename: string): Promis
 }
 
 /**
+ * The data-file paths of a job's STRANDED aria2c control files: `<base>.<ext>.part.aria2`
+ * whose `.part` is gone. `findPartialFile` cannot see these (it matches only the
+ * data file), but aria2c treats them exactly like a live pair and refuses to
+ * resume or restart while one is present — so a restart-from-scratch path must
+ * pass each returned path through `removePartialFiles`, control file first.
+ */
+export async function findStrandedPartials(dir: string, baseFilename: string): Promise<string[]> {
+  try {
+    const files = await readdir(dir);
+    const out: string[] = [];
+    for (const f of files) {
+      if (!f.startsWith(baseFilename + ".")) continue;
+      if (!f.endsWith(`.part${ARIA2_CONTROL_SUFFIX}`)) continue;
+      const dataPath = resolve(dir, f.slice(0, -ARIA2_CONTROL_SUFFIX.length));
+      if (!existsSync(dataPath)) out.push(dataPath);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Synchronous sibling of `findPartialFile`, for paths that cannot await
  * (the shutdown handler and the worker's pause path run outside any async
  * context).
@@ -910,21 +933,23 @@ export async function cleanOrphanedFiles(
       // Young enough that a download may just have started writing it.
       if (Date.now() - s2.mtimeMs < ORPHAN_PARTIAL_MAX_AGE_MS) continue;
       // Its data file is still there — this is live resume state, keep it.
-      if (existsSync(fullPath.slice(0, -ARIA2_CONTROL_SUFFIX.length))) continue;
-      try {
-        await unlink(fullPath);
+      const dataPath = fullPath.slice(0, -ARIA2_CONTROL_SUFFIX.length);
+      if (existsSync(dataPath)) continue;
+      // Through the one pair-removal contract (control file first, strict), not
+      // a bare unlink: the data path is already gone, so this removes only the
+      // control file, and a lock is reported as one rather than counted removed.
+      const removal = await removePartialFiles(dataPath);
+      if (removal.fatal) {
+        // Locked (an orphaned aria2c, an antivirus scan). Litter that will
+        // not move is not a failure of the engine, but it must not be
+        // reported as removed either — the next startup sweep retries it.
+        summary.locked++;
+        logError(
+          "reconcile",
+          `stranded control file ${fullPath} is locked (${removal.error || "unknown"}) — left in place, will retry on the next sweep`,
+        );
+      } else if (removal.controlRemoved) {
         removed++;
-      } catch (e: any) {
-        if (e?.code !== "ENOENT") {
-          // Locked (an orphaned aria2c, an antivirus scan). Litter that will
-          // not move is not a failure of the engine, but it must not be
-          // reported as removed either — the next startup sweep retries it.
-          summary.locked++;
-          logError(
-            "reconcile",
-            `stranded control file ${fullPath} is locked (${e?.code || e?.message || e}) — left in place, will retry on the next sweep`,
-          );
-        }
       }
     }
 
