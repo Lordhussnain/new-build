@@ -38,6 +38,8 @@ export interface Job {
   pause_reason: string | null;
   metadata_retry_count: number;
   metadata_files: string | null;
+  /** JSON array of sidecar types confirmed unavailable after a successful fetch. */
+  metadata_unavailable: string | null;
   download_claimed_by: string | null;
   download_claimed_at: string | null;
   /** Unique token for the current download claim (required by every claim update). */
@@ -147,6 +149,7 @@ export function initDatabase(path: string = "archive.db"): void {
       conversion_status TEXT DEFAULT 'pending',
       metadata_status TEXT DEFAULT 'not_needed',
       metadata_files TEXT,
+      metadata_unavailable TEXT,
       pause_reason TEXT,
       metadata_retry_count INTEGER DEFAULT 0,
       metadata_claimed_by TEXT,
@@ -188,6 +191,19 @@ export function initDatabase(path: string = "archive.db"): void {
      )`,
   );
   db.run(`CREATE INDEX IF NOT EXISTS idx_job_sources_job ON job_sources(job_id)`);
+  // Explicitly deleted jobs stay suppressed when a playlist is scanned again.
+  // This table is independent of jobs/job_sources so the tombstone survives
+  // row deletion and process restarts until the user explicitly allows it again.
+  db.run(
+    `CREATE TABLE IF NOT EXISTS ignored_videos (
+       video_id TEXT PRIMARY KEY,
+       url TEXT NOT NULL,
+       title TEXT NOT NULL,
+       source_urls TEXT NOT NULL DEFAULT '[]',
+       ignored_at TEXT DEFAULT CURRENT_TIMESTAMP
+     )`,
+  );
+  db.run(`CREATE INDEX IF NOT EXISTS idx_ignored_videos_time ON ignored_videos(ignored_at)`);
   db.run(
     `CREATE TABLE IF NOT EXISTS playlist_state (
        folder TEXT PRIMARY KEY,
@@ -232,6 +248,7 @@ export function initDatabase(path: string = "archive.db"): void {
   ensureColumn("jobs", "metadata_status", "metadata_status TEXT DEFAULT 'not_needed'");
   ensureColumn("jobs", "video_quality", "video_quality TEXT");
   ensureColumn("jobs", "metadata_files", "metadata_files TEXT");
+  ensureColumn("jobs", "metadata_unavailable", "metadata_unavailable TEXT");
   ensureColumn("jobs", "pause_reason", "pause_reason TEXT");
   ensureColumn("jobs", "metadata_retry_count", "metadata_retry_count INTEGER DEFAULT 0");
   // Reliability & resume columns.
@@ -596,6 +613,91 @@ export function perVideoCap(config: Config): number {
 
 export function isVideoInDb(videoId: string): boolean {
   return !!db.query("SELECT id FROM jobs WHERE id = ?").get(videoId);
+}
+
+export function isVideoIgnored(videoId: string): boolean {
+  return !!db.query("SELECT 1 FROM ignored_videos WHERE video_id = ? LIMIT 1").get(videoId);
+}
+
+export interface IgnoredVideo {
+  video_id: string;
+  url: string;
+  title: string;
+  source_urls: string[];
+  ignored_at: string;
+}
+
+/**
+ * Atomically remember explicitly deleted videos and remove their queue rows.
+ * Source ownership is copied before the FK cascade removes job_sources. The
+ * ignored tombstones then outlive both the job rows and engine restarts.
+ */
+export function deleteJobsAndIgnore(ids: Iterable<string>): { deleted: number; ignored: number } {
+  const uniqueIds = [...new Set([...ids].filter((id): id is string => typeof id === "string" && id.length > 0))];
+  if (uniqueIds.length === 0) return { deleted: 0, ignored: 0 };
+  const placeholders = uniqueIds.map(() => "?").join(",");
+  const deleteAndIgnore = db.transaction((batch: string[]) => {
+    const jobs = db
+      .query(`SELECT id, url, title FROM jobs WHERE id IN (${placeholders})`)
+      .all(...batch) as { id: string; url: string | null; title: string | null }[];
+    if (jobs.length === 0) return { deleted: 0, ignored: 0 };
+
+    const sourceQuery = db.prepare("SELECT source_url FROM job_sources WHERE job_id = ? ORDER BY source_url");
+    const ignore = db.prepare(
+      `INSERT INTO ignored_videos (video_id, url, title, source_urls, ignored_at)
+       VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(video_id) DO UPDATE SET
+         url = excluded.url,
+         title = excluded.title,
+         source_urls = excluded.source_urls,
+         ignored_at = CURRENT_TIMESTAMP`,
+    );
+    for (const job of jobs) {
+      const sources = sourceQuery.all(job.id) as { source_url: string }[];
+      ignore.run(
+        job.id,
+        job.url || `https://www.youtube.com/watch?v=${job.id}`,
+        job.title || job.id,
+        JSON.stringify(sources.map((source) => source.source_url)),
+      );
+    }
+    db.run(`DELETE FROM jobs WHERE id IN (${placeholders})`, batch);
+    // SQLite may include cascaded job_sources rows in `changes`; count the
+    // selected job rows instead so the API reports videos, not FK side effects.
+    return { deleted: jobs.length, ignored: jobs.length };
+  });
+  return deleteAndIgnore(uniqueIds);
+}
+
+export function listIgnoredVideos(limit = 500): IgnoredVideo[] {
+  const cappedLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
+  const rows = db
+    .query(
+      `SELECT video_id, url, title, source_urls, ignored_at
+         FROM ignored_videos ORDER BY ignored_at DESC, video_id LIMIT ?`,
+    )
+    .all(cappedLimit) as {
+      video_id: string;
+      url: string;
+      title: string;
+      source_urls: string;
+      ignored_at: string;
+    }[];
+  return rows.map((row) => {
+    let sourceUrls: string[] = [];
+    try {
+      const parsed = JSON.parse(row.source_urls);
+      if (Array.isArray(parsed)) sourceUrls = parsed.filter((url): url is string => typeof url === "string");
+    } catch {
+      // A malformed legacy value must not break the ignored-jobs panel.
+    }
+    return { ...row, source_urls: sourceUrls };
+  });
+}
+
+/** Remove a tombstone so future playlist scans may enqueue the video again. */
+export function allowIgnoredVideo(videoId: string): number {
+  return db.run("DELETE FROM ignored_videos WHERE video_id = ?", [videoId]).changes;
 }
 
 // ---------------------------------------------------------------------------

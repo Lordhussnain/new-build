@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { DEFAULT_CONFIG } from "../src/config";
 import { db, initDatabase } from "../src/db";
 import { getConfig, setConfig } from "../src/state";
-import { parseRssFeed, startRssPolling } from "../src/rss";
+import { parseRssFeed, resolveChannelId, startRssPolling, type ResolveChannelIdOptions } from "../src/rss";
 
 const SAMPLE_FEED = `<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns:media="http://search.yahoo.com/mrss/" xmlns="http://www.w3.org/2005/Atom">
@@ -54,6 +54,82 @@ const SAMPLE_FEED = `<?xml version="1.0" encoding="UTF-8"?>
     <published>2026-09-23T12:00:00+00:00</published>
   </entry>
 </feed>`;
+
+function fakeChannelSpawner(output: string | null, state: { killed: boolean }): NonNullable<ResolveChannelIdOptions["spawn"]> {
+  return ((
+    _args: string[],
+    _options: { stdout: "pipe"; stderr: "pipe"; signal: AbortSignal },
+  ) => {
+    let exitCode: number | null = null;
+    let resolveExit!: (code: number) => void;
+    let stdoutController!: ReadableStreamDefaultController<Uint8Array>;
+    let stderrController!: ReadableStreamDefaultController<Uint8Array>;
+    const exited = new Promise<number>((resolve) => {
+      resolveExit = resolve;
+    });
+    const stdout = new ReadableStream<Uint8Array>({
+      start(controller) {
+        stdoutController = controller;
+      },
+    });
+    const stderr = new ReadableStream<Uint8Array>({
+      start(controller) {
+        stderrController = controller;
+      },
+    });
+    const finish = (code: number) => {
+      if (exitCode !== null) return;
+      exitCode = code;
+      if (output) stdoutController.enqueue(new TextEncoder().encode(output));
+      stdoutController.close();
+      stderrController.close();
+      resolveExit(code);
+    };
+    const proc = {
+      stdout,
+      stderr,
+      exited,
+      get exitCode() {
+        return exitCode;
+      },
+      kill() {
+        state.killed = true;
+        finish(137);
+      },
+    } as unknown as Bun.PipedSubprocess;
+    // A null output simulates a subprocess that ignores AbortSignal and hangs;
+    // the production watchdog must still hard-kill it.
+    if (output !== null) queueMicrotask(() => finish(0));
+    return proc;
+  }) as NonNullable<ResolveChannelIdOptions["spawn"]>;
+}
+
+describe("resolveChannelId", () => {
+  test("resolves a handle once and caches the channel id", async () => {
+    const url = "https://www.youtube.com/@rss-resolver-cache";
+    const state = { killed: false };
+    let spawns = 0;
+    const spawn: NonNullable<ResolveChannelIdOptions["spawn"]> = (...args) => {
+      spawns++;
+      return fakeChannelSpawner("UC1234567890abcdefghij", state)(...args);
+    };
+    expect(await resolveChannelId(url, DEFAULT_CONFIG, { spawn })).toBe("UC1234567890abcdefghij");
+    expect(await resolveChannelId(url, DEFAULT_CONFIG, { spawn })).toBe("UC1234567890abcdefghij");
+    expect(spawns).toBe(1);
+    expect(state.killed).toBe(false);
+  });
+
+  test("hard-kills a hung @handle lookup at its watchdog", async () => {
+    const url = "https://www.youtube.com/@rss-resolver-hang";
+    const state = { killed: false };
+    const result = await resolveChannelId(url, DEFAULT_CONFIG, {
+      timeoutMs: 5,
+      spawn: fakeChannelSpawner(null, state),
+    });
+    expect(result).toBeNull();
+    expect(state.killed).toBe(true);
+  });
+});
 
 describe("parseRssFeed", () => {
   test("extracts the feed title and every entry", () => {
@@ -121,6 +197,51 @@ describe("RSS polling after Web UI source changes", () => {
       expect(db.query("SELECT COUNT(*) AS n FROM jobs").get()).toEqual({ n: 3 });
       // Disabling it live must also be respected by the already-created timer.
       setConfig({ ...getConfig(), rssEnabled: false });
+      await ticks[1]();
+      expect(fetchFeed).toHaveBeenCalledTimes(1);
+    } finally {
+      timeout.mockRestore();
+      interval.mockRestore();
+      fetchFeed.mockRestore();
+      setConfig({ ...DEFAULT_CONFIG });
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps an idle timer through offline/disabled startup and resumes when toggled live", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-rss-offline-"));
+    initDatabase(":memory:");
+    const channel = "https://www.youtube.com/channel/UC1234567890abcdefghij";
+    const initial = {
+      ...DEFAULT_CONFIG,
+      outputRoot: dir,
+      channels: [channel],
+      rssEnabled: false,
+      offlineMode: true,
+      skipShorts: false,
+    };
+    setConfig(initial);
+    const ticks: Array<() => Promise<void>> = [];
+    const captureTick = (fn: unknown) => {
+      ticks.push(fn as () => Promise<void>);
+      return 0;
+    };
+    const timeout = spyOn(globalThis, "setTimeout").mockImplementation(captureTick as unknown as typeof setTimeout);
+    const interval = spyOn(globalThis, "setInterval").mockImplementation(captureTick as unknown as typeof setInterval);
+    const fetchFeed = spyOn(globalThis, "fetch").mockResolvedValue(new Response(SAMPLE_FEED));
+    try {
+      startRssPolling(initial);
+      expect(ticks).toHaveLength(2);
+
+      // Offline and disabled are both respected without tearing down the poller.
+      await ticks[0]();
+      expect(fetchFeed).not.toHaveBeenCalled();
+      setConfig({ ...initial, offlineMode: false, rssEnabled: true });
+      await ticks[1]();
+      expect(fetchFeed).toHaveBeenCalledTimes(1);
+      expect(db.query("SELECT COUNT(*) AS n FROM jobs").get()).toEqual({ n: 3 });
+
+      setConfig({ ...getConfig(), offlineMode: true });
       await ticks[1]();
       expect(fetchFeed).toHaveBeenCalledTimes(1);
     } finally {

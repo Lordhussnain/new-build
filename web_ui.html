@@ -1352,9 +1352,11 @@
       <button class="btn btn-warning" id="pauseBtn" onclick="togglePause()">⏸️ Pause All</button>
       <button class="btn btn-secondary" id="turboBtn" onclick="toggleTurboMode()" title="Toggle Aggressive IDM Mode (32 connections, 64 fragments, 10M chunk, 64K buffer, uncapped)">⚡ Turbo IDM: OFF</button>
       <button class="btn btn-success" onclick="refreshData()">🔄 Refresh</button>
+      <button class="btn btn-secondary" id="metadataScanBtn" onclick="scanMissingMetadata()" title="Check every downloaded video and queue missing enabled metadata sidecars">📝 Scan Missing Metadata</button>
     </div>
     <div class="controls-group">
       <button class="btn btn-secondary" onclick="openSettings()">⚙️ Settings</button>
+      <button class="btn btn-secondary" onclick="openIgnoredVideos()">🚫 Ignored Videos</button>
       <button class="btn btn-danger" onclick="purgeQueue()">🗑️ Purge Queue</button>
     </div>
     <div class="controls-group" style="margin-left: auto;">
@@ -1475,6 +1477,23 @@
         <button class="btn btn-secondary" id="settingsDiscardBtn" onclick="discardSettingsDraft()" style="display: none;">Discard Draft</button>
         <button class="btn btn-secondary" onclick="closeSettings()">Cancel</button>
         <button class="btn btn-primary" id="settingsSaveBtn" onclick="saveSettings()">💾 Save Changes</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="ignoredVideosModal">
+    <div class="modal" style="max-width: 760px;">
+      <div class="modal-header">
+        <div class="modal-header-left">
+          <h3>🚫 Ignored Videos</h3>
+          <span class="modal-badge">All source scans skip these</span>
+        </div>
+        <button class="btn btn-secondary btn-icon" onclick="closeIgnoredVideos()" title="Close">✕</button>
+      </div>
+      <div class="modal-body" id="ignoredVideosBody">Loading ignored videos…</div>
+      <div class="modal-footer">
+        <span style="margin-right: auto; font-size: 0.78rem; color: var(--text-secondary);">Use “Allow again” to let a later source scan queue the video.</span>
+        <button class="btn btn-secondary" onclick="closeIgnoredVideos()">Close</button>
       </div>
     </div>
   </div>
@@ -1718,14 +1737,25 @@
       const ids = Array.from(selectedJobs);
       showNotification(`Retrying ${ids.length} jobs...`, 'info');
       let okCount = 0;
+      const failures = [];
       for (const id of ids) {
         try {
           const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
-          if (res.ok) okCount++;
-        } catch {}
+          const data = await res.json().catch(() => null);
+          if (res.ok && data?.ok) okCount++;
+          else failures.push({ id, error: data?.error || `HTTP ${res.status}` });
+        } catch (e) {
+          failures.push({ id, error: e.message || 'Network request failed' });
+        }
       }
-      showNotification(`Successfully re-queued ${okCount}/${ids.length} jobs`, okCount ? 'success' : 'error');
-      selectedJobs.clear();
+      if (failures.length) {
+        selectedJobs = new Set(failures.map(failure => failure.id));
+        const first = failures[0];
+        showNotification(`Re-queued ${okCount}/${ids.length}; ${failures.length} failed. ${first.id}: ${first.error}`, okCount ? 'warning' : 'error');
+      } else {
+        selectedJobs.clear();
+        showNotification(`Successfully re-queued ${okCount}/${ids.length} jobs`, 'success');
+      }
       updateBulkActions();
       refreshData();
     }
@@ -1733,48 +1763,114 @@
     async function bulkPause() {
       const ids = Array.from(selectedJobs);
       showNotification(`Pausing ${ids.length} jobs...`, 'info');
+      let succeeded = false;
       try {
         const res = await fetch('/api/jobs/pause', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ids }),
         });
-        const data = await res.json();
-        if (res.ok && data.ok) {
+        const data = await res.json().catch(() => null);
+        if (res.ok && data?.ok) {
           showNotification(`Paused ${data.paused ?? ids.length} jobs`, 'success');
+          succeeded = true;
         } else {
-          showNotification(data.error || 'Failed to pause selected jobs', 'error');
+          showNotification(data?.error || `Pause failed (HTTP ${res.status})`, 'error');
         }
       } catch (e) {
         showNotification(e.message || 'Pause request failed', 'error');
       }
-      selectedJobs.clear();
+      if (succeeded) selectedJobs.clear();
       updateBulkActions();
       refreshData();
     }
 
     async function bulkDelete() {
       const ids = Array.from(selectedJobs);
-      if (!confirm(`Are you sure you want to delete ${ids.length} selected jobs?`)) return;
+      if (ids.length === 0) return;
+      if (!confirm(`Delete ${ids.length} selected job(s) and keep them out of future playlist/channel scans? You can restore them in Ignored Videos.`)) return;
       showNotification(`Deleting ${ids.length} jobs...`, 'info');
+      let succeeded = false;
       try {
         const res = await fetch('/api/jobs', {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ids }),
         });
-        const data = await res.json();
-        if (res.ok && data.ok) {
-          showNotification(`Deleted ${data.deleted ?? ids.length} jobs`, 'success');
+        const data = await res.json().catch(() => null);
+        if (res.ok && data?.ok) {
+          showNotification(`Removed ${data.deleted ?? ids.length} job(s); future scans will skip them. Use Ignored Videos to allow one again.`, 'success');
+          succeeded = true;
         } else {
-          showNotification(data.error || 'Failed to delete selected jobs', 'error');
+          showNotification(data?.error || `Delete failed (HTTP ${res.status})`, 'error');
         }
       } catch (e) {
         showNotification(e.message || 'Delete request failed', 'error');
       }
-      selectedJobs.clear();
+      // Keep the selected ids after any error so the user can inspect or retry
+      // the failed operation instead of having to find the rows again.
+      if (succeeded) selectedJobs.clear();
       updateBulkActions();
       refreshData();
+    }
+
+    async function openIgnoredVideos() {
+      document.getElementById('ignoredVideosModal').classList.add('open');
+      await loadIgnoredVideos();
+    }
+
+    function closeIgnoredVideos() {
+      document.getElementById('ignoredVideosModal').classList.remove('open');
+    }
+
+    async function loadIgnoredVideos() {
+      const body = document.getElementById('ignoredVideosBody');
+      body.textContent = 'Loading ignored videos…';
+      try {
+        const res = await fetch('/api/ignored-videos', { cache: 'no-store' });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+        const videos = Array.isArray(data.videos) ? data.videos : [];
+        if (videos.length === 0) {
+          body.innerHTML = '<div class="source-empty">No ignored videos. Jobs you delete will appear here and stay out of future playlist scans.</div>';
+          return;
+        }
+        body.innerHTML = videos.map(video => {
+          const sources = Array.isArray(video.source_urls) ? video.source_urls : [];
+          const sourceList = sources.length
+            ? sources.map(source => `<div>${escapeHtml(source)}</div>`).join('')
+            : '<div>No source association saved</div>';
+          return `
+            <div style="display:flex; gap:14px; align-items:flex-start; justify-content:space-between; padding:14px; margin-bottom:10px; border:1px solid var(--border); border-radius:var(--radius-md); background:var(--bg-secondary);">
+              <div style="min-width:0; overflow-wrap:anywhere;">
+                <strong>${escapeHtml(video.title || video.video_id)}</strong>
+                <div style="font-size:.76rem; color:var(--text-muted); margin-top:4px;">Video ID: ${escapeHtml(video.video_id)} · Ignored: ${escapeHtml(video.ignored_at || 'unknown')}</div>
+                <div style="font-size:.74rem; color:var(--text-secondary); margin-top:5px;">${sourceList}</div>
+              </div>
+              <button class="btn btn-success btn-sm" data-allow-video="${escapeHtml(video.video_id)}">Allow again</button>
+            </div>`;
+        }).join('');
+        body.querySelectorAll('[data-allow-video]').forEach(button => {
+          button.addEventListener('click', () => allowIgnoredVideoAgain(button.dataset.allowVideo, button));
+        });
+      } catch (e) {
+        body.innerHTML = `<div class="source-empty" style="color:var(--danger);">Could not load ignored videos: ${escapeHtml(e.message || 'Request failed')}</div>`;
+      }
+    }
+
+    async function allowIgnoredVideoAgain(id, button) {
+      if (button) button.disabled = true;
+      try {
+        const res = await fetch(`/api/ignored-videos/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+        showNotification(data.message || 'Video allowed again; a later source scan may queue it.', 'success');
+        await loadIgnoredVideos();
+        refreshData();
+      } catch (e) {
+        showNotification(e.message || 'Could not allow video again', 'error');
+        if (button) button.disabled = false;
+      }
     }
 
     // One poll cycle of the header cards, the worker strip and the job table.
@@ -1985,6 +2081,42 @@
         }
       } catch (err) {
         showNotification(err.message, 'error');
+      }
+    }
+
+    async function scanMissingMetadata() {
+      const button = document.getElementById('metadataScanBtn');
+      if (button?.disabled) return;
+      const originalText = button?.textContent || '📝 Scan Missing Metadata';
+      if (button) {
+        button.disabled = true;
+        button.textContent = '🔍 Checking downloaded videos…';
+      }
+      try {
+        const res = await fetch('/api/metadata/scan', { method: 'POST' });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+        const parts = [
+          `Checked ${data.scanned ?? 0} downloaded video(s)`,
+          `queued ${data.queued ?? 0} missing-metadata job(s)`,
+        ];
+        if (data.alreadyQueued) parts.push(`${data.alreadyQueued} already queued`);
+        if (data.alreadyRunning) parts.push(`${data.alreadyRunning} already running`);
+        if (data.complete) parts.push(`${data.complete} complete`);
+        if (data.sourceUnavailable) parts.push(`${data.sourceUnavailable} unavailable at source`);
+        if (data.failed) parts.push(`${data.failed} exhausted metadata retry(s) left unchanged`);
+        if (data.missingMedia) parts.push(`${data.missingMedia} missing media file(s) skipped`);
+        if (data.unreadableDirectories) parts.push(`${data.unreadableDirectories} folder(s) could not be read`);
+        if (data.noMetadataRequested) parts.push(`${data.noMetadataRequested} with metadata disabled`);
+        showNotification(parts.join(' · '), data.queued ? 'success' : 'info', 8000);
+        fetchStatus();
+      } catch (err) {
+        showNotification(err.message || 'Could not scan metadata', 'error', 8000);
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = originalText;
+        }
       }
     }
 
@@ -2246,7 +2378,7 @@
     }
 
     async function purgeQueue() {
-      if (!confirm('Purge all pending and downloading jobs? Completed jobs and media files will not be deleted.')) return;
+      if (!confirm('Purge all pending and downloading jobs? This clears the queue now but does not ignore videos, so configured sources may add them again on a later scan. Use Delete Selected to keep specific videos out of future scans. Completed jobs and media files are not deleted.')) return;
       try {
         const res = await fetch('/api/queue/purge', { method: 'POST' });
         const data = await res.json();
@@ -3033,6 +3165,8 @@
         { k: 'description', l: 'Description (.description)', v: job.want_description },
       ];
       const fetched = Array.isArray(job.metadata_files) ? job.metadata_files : [];
+      const unavailable = Array.isArray(job.metadata_unavailable) ? job.metadata_unavailable : [];
+      const unavailableLabels = unavailable.map(k => ({ subtitles: 'subtitles', thumbnail: 'thumbnail', description: 'description', infoJson: 'info.json' }[k] || k));
       return `
         <div class="audio-tracks-box" style="margin-top: 14px;">
           <strong style="font-size: 0.85rem;">📄 Sidecar Metadata Files</strong>
@@ -3048,6 +3182,7 @@
             `).join('')}
           </div>
           ${fetched.length ? `<div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 8px; word-break: break-all;">Fetched: ${fetched.map(escapeHtml).join(' · ')}</div>` : ''}
+          ${unavailableLabels.length ? `<div style="font-size: 0.72rem; color: var(--warning); margin-bottom: 8px;">Not returned by the last source check: ${unavailableLabels.map(escapeHtml).join(' · ')}. Future scans will skip these types; save an enabled sidecar choice to retry, or toggle info.json off and on.</div>` : ''}
           <button class="btn btn-secondary btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="saveSidecarSelection(this.dataset.jobId)">💾 Save Sidecar Flags</button>
         </div>
       `;

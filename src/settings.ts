@@ -126,7 +126,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     type: "boolean",
     group: "offline",
     help:
-      "Stops every download: scans, RSS watching and sidecar fetches are off too, so nothing touches the network. The engine keeps doing local work — converting files that still need conversion and moving finished files to secondary storage — and queued downloads wait, untouched, until the mode is turned off. Applies live; also settable with --offline / YTA_OFFLINE=1 for a single run.",
+      "Stops network work: downloads, scans, RSS requests, sidecar fetches and network probes stay idle while offline. The engine keeps converting and moving finished files; queued downloads wait untouched. Enabled watchers resume automatically when turned off, without a restart. Applies live; also settable with --offline / YTA_OFFLINE=1 for a single run.",
   },
   // --- downloader -----------------------------------------------------------
   {
@@ -276,7 +276,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     label: "Download subtitles",
     type: "boolean",
     group: "media",
-    help: "Fetch subtitle sidecars for newly added videos. Already-downloaded videos can be toggled individually from their job detail panel.",
+    help: "Default for new jobs. Existing jobs keep their per-video Sidecar Files choice; change it in the job detail panel, then use Scan Missing Metadata to backfill selected sidecars without re-downloading media.",
   },
   {
     key: "subtitleLanguages",
@@ -297,21 +297,21 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     label: "Save thumbnails",
     type: "boolean",
     group: "media",
-    help: "Save a .jpg thumbnail sidecar next to each downloaded video.",
+    help: "Default for new jobs. Existing jobs keep their per-video Sidecar Files choice; use Scan Missing Metadata to backfill selected sidecars without re-downloading media.",
   },
   {
     key: "writeDescription",
     label: "Save descriptions",
     type: "boolean",
     group: "media",
-    help: "Save the video description as a .description sidecar file.",
+    help: "Default for new jobs. Existing jobs keep their per-video Sidecar Files choice; use Scan Missing Metadata to backfill selected sidecars without re-downloading media.",
   },
   {
     key: "writeInfoJson",
     label: "Save info.json",
     type: "boolean",
     group: "media",
-    help: "Save yt-dlp's full metadata dump as a .info.json sidecar file.",
+    help: "Save yt-dlp's full metadata dump as a .info.json sidecar. Scan Missing Metadata checks downloaded jobs against this global setting.",
   },
   {
     key: "skipShorts",
@@ -615,7 +615,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     max: 65535,
     group: "advanced",
     restartRequired: true,
-    help: "HTTP port for this dashboard. Takes effect after a restart (the current page keeps working until then).",
+    help: "HTTP port for this dashboard. Takes effect after a restart; `bun run start --port <n>` overrides it for one run without changing config.json.",
   },
   {
     key: "webBind",

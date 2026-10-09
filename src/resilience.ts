@@ -21,6 +21,7 @@ import {
   abortController,
   isPaused,
   getPauseReason,
+  getConfig,
   setPaused,
 } from "./state";
 import type { Config } from "./config";
@@ -292,7 +293,17 @@ export function networkMonitorTick(
   isUp: boolean,
   currentlyPaused: boolean,
   currentPauseReason: string | null,
+  offlineMode = false,
 ): NetworkMonitorDecision {
+  // Offline work must not be gated by connectivity. Clear only a pause that
+  // this monitor itself caused; a user, disk, or circuit-breaker pause remains.
+  if (offlineMode) {
+    return {
+      consecutiveFails: 0,
+      shouldPause: false,
+      shouldResume: currentlyPaused && currentPauseReason === "NETWORK_DISCONNECTED",
+    };
+  }
   if (!isUp) {
     const next = consecutiveFails + 1;
     return {
@@ -313,6 +324,8 @@ export interface NetworkMonitorOptions {
   probe?: NetworkProbe;
   /** Milliseconds between probes (default: 15 000). */
   intervalMs?: number;
+  /** Optional lifetime signal; production defaults to the engine shutdown signal. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -325,18 +338,31 @@ export interface NetworkMonitorOptions {
 export async function networkMonitor(opts: NetworkMonitorOptions = {}): Promise<void> {
   const probe = opts.probe ?? defaultNetworkProbe;
   const intervalMs = opts.intervalMs ?? 15_000;
+  const signal = opts.signal ?? abortController.signal;
   let consecutiveFails = 0;
   console.log("🌐 Network monitor started.");
-  while (!abortController.signal.aborted) {
-    const isUp = await checkInternet(probe);
-    const decision = networkMonitorTick(consecutiveFails, isUp, isPaused(), getPauseReason());
+  while (!signal.aborted) {
+    // Don't even issue a probe in offline mode. Re-check after the awaited
+    // probe as well: the setting may have changed while a request was in flight.
+    const offlineBeforeProbe = getConfig().offlineMode;
+    const isUp = offlineBeforeProbe ? false : await checkInternet(probe);
+    // Preserve the offline observation even if the mode was turned off before
+    // the next line; no probe actually ran during that tick.
+    const offlineNow = offlineBeforeProbe || getConfig().offlineMode;
+    const decision = networkMonitorTick(
+      consecutiveFails,
+      isUp,
+      isPaused(),
+      getPauseReason(),
+      offlineNow,
+    );
     consecutiveFails = decision.consecutiveFails;
     if (decision.shouldPause) {
       triggerPause("NETWORK_DISCONNECTED");
       console.log("🌐 Network down detected. Pausing engine gracefully.");
     }
     if (decision.shouldResume) {
-      console.log("🌐 Network restored!");
+      console.log(offlineNow ? "🌐 Offline mode: clearing the network-caused pause for local work." : "🌐 Network restored!");
       triggerResume();
     }
     await Bun.sleep(intervalMs);

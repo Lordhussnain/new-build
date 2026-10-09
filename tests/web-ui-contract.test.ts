@@ -234,6 +234,7 @@ describe("the dashboard's API calls", () => {
       "audio_tracks",
       "audio_selection",
       "metadata_files",
+      "metadata_unavailable",
       "relocated_to",
       "want_subtitles",
       "want_thumbnail",
@@ -286,6 +287,17 @@ describe("the dashboard renders the queue", () => {
     expect(String(ui.el("relPolicy").textContent)).toContain("backoff");
   });
 
+  test("the manual metadata scan button calls the route and reports its result", async () => {
+    await ui.run("scanMissingMetadata");
+    expect(ui.el("metadataScanBtn").disabled).toBe(false);
+    expect(ui.el("metadataScanBtn").textContent).toBe("📝 Scan Missing Metadata");
+    const notifications = ui.el("notifications").children as StubElement[];
+    expect(notifications.map((notification) => String(notification.textContent)).join("\n")).toContain(
+      "Checked 1 downloaded video(s)",
+    );
+    expect(ui.errors).toEqual([]);
+  });
+
   test("the failed and history tabs unwrap the same envelope", async () => {
     await ui.run("loadFailedItems");
     expect(ui.el("failedItems").innerHTML).toContain("Broken Video");
@@ -306,6 +318,16 @@ describe("the dashboard renders the queue", () => {
     expect(ui.run("jobStatus", { download_status: "downloaded", metadata_status: "failed" })).toBe("failed");
   });
 
+  test("the detail drawer explains sidecars confirmed unavailable at the source", async () => {
+    db.run("UPDATE jobs SET metadata_unavailable = ? WHERE id = ?", [JSON.stringify(["thumbnail", "infoJson"]), "uicontract2"]);
+    await ui.run("openJobDetailById", "uicontract2");
+    const drawer = String(ui.el("drawerBody").innerHTML);
+    expect(drawer).toContain("Not returned by the last source check");
+    expect(drawer).toContain("thumbnail");
+    expect(drawer).toContain("info.json");
+    expect(ui.errors).toEqual([]);
+  });
+
   test("the log tab prints the { ok, logs } lines instead of an empty panel", async () => {
     // loadLogs renders `logs.join('\n')`; a missing file still answers with the
     // "No logs available" line, so a blank viewer can only mean a shape break.
@@ -315,6 +337,19 @@ describe("the dashboard renders the queue", () => {
     expect(viewer.split("\n").length).toBeGreaterThan(0);
     expect(viewer.trim()).not.toBe("");
     expect(viewer).not.toContain("undefined");
+  });
+
+  test("the ignored-videos manager loads titles as escaped text", async () => {
+    db.run(
+      "INSERT INTO ignored_videos (video_id, url, title, source_urls) VALUES (?, ?, ?, ?)",
+      ["ignored-ui", "https://www.youtube.com/watch?v=ignored-ui", "<script>bad()</script>", JSON.stringify(["https://www.youtube.com/playlist?list=UI_TEST"])],
+    );
+    await ui.run("openIgnoredVideos");
+    const body = ui.el("ignoredVideosBody").innerHTML;
+    expect(body).toContain("&lt;script&gt;bad()&lt;/script&gt;");
+    expect(body).not.toContain("<script>bad()</script>");
+    expect(body).toContain("Allow again");
+    expect(body).toContain("UI_TEST");
   });
 
   test("a job selection keeps video ids as strings", async () => {

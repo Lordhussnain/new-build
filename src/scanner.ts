@@ -7,11 +7,12 @@
 
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { db, getNextIndex, isVideoInDb } from "./db";
+import { readArchiveIds } from "./archive";
+import { db, getNextIndex, isVideoIgnored, isVideoInDb } from "./db";
 import { isSourceBlocked, sourceIdentity } from "./sources";
 import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
 import { sanitizeFolderName } from "./util";
-import { stats } from "./state";
+import { getConfig, stats } from "./state";
 import type { Config } from "./config";
 
 export interface ListingItem {
@@ -131,15 +132,22 @@ export async function ingestItems(
   overrideFolderName?: string,
   sourceUrl?: string,
 ): Promise<{ found: number; added: number; skipped: number }> {
+  if (config.offlineMode || getConfig().offlineMode) return { found: 0, added: 0, skipped: 0 };
   if (items.length === 0) return { found: 0, added: 0, skipped: 0 };
   const sourceKey = sourceUrl ? sourceIdentity(sourceUrl) : null;
   const folder = sanitizeFolderName(overrideFolderName || items[0].playlist || "Single Videos");
   const outputDir = join(config.outputRoot, folder);
   await mkdir(outputDir, { recursive: true });
-  // A delete may have landed while this scan was awaiting the directory I/O.
+  // A live offline toggle or source delete may have landed while this scan was
+  // awaiting directory I/O. Do not enqueue results after either change.
+  if (config.offlineMode || getConfig().offlineMode) return { found: 0, added: 0, skipped: 0 };
   if (sourceKey && isSourceBlocked(sourceKey)) {
     return { found: items.length, added: 0, skipped: items.length };
   }
+  // Source cleanup can remove a completed job row while yt-dlp keeps its
+  // download history. Consult that history once per listing so another
+  // playlist cannot re-queue the same completed video ID.
+  const archivedIds = readArchiveIds(config.archiveFile);
   const targetFormat = config.videoQuality === "audio" ? "mp3" : (config.targetFormat || "mp4");
   const wantSubs = config.downloadSubtitles ? 1 : 0;
   const wantThumb = config.writeThumbnail ? 1 : 0;
@@ -161,6 +169,14 @@ export async function ingestItems(
       ? db.prepare("INSERT OR IGNORE INTO job_sources (source_url, job_id) VALUES (?, ?)")
       : null;
     for (const item of batch) {
+      // A dashboard Delete is a durable opt-out, not just a temporary row
+      // removal. Keep the video hidden across playlist/RSS scans and restarts
+      // until the operator explicitly allows it again.
+      if (isVideoIgnored(item.id)) {
+        skipped++;
+        stats.skipped++;
+        continue;
+      }
       if (
         config.skipShorts &&
         !config.downloadShorts &&
@@ -183,6 +199,11 @@ export async function ingestItems(
           `UPDATE jobs SET download_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND download_status = 'waiting_live'`,
           [item.id],
         );
+        skipped++;
+        stats.skipped++;
+        continue;
+      }
+      if (archivedIds.has(item.id)) {
         skipped++;
         stats.skipped++;
         continue;
@@ -218,7 +239,11 @@ export async function scanAndIngest(
   config: Config,
   overrideFolderName?: string,
 ): Promise<{ found: number; added: number; skipped: number }> {
-  if (isSourceBlocked(url)) return { found: 0, added: 0, skipped: 0 };
+  const empty = { found: 0, added: 0, skipped: 0 };
+  // The callers check offline mode too, but this boundary is authoritative: the
+  // setting can change while a daemon/startup scan is between sources.
+  if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return empty;
   const items = await getPlaylistItems(url, config);
+  if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return empty;
   return ingestItems(items, config, overrideFolderName, url);
 }

@@ -23,7 +23,8 @@ import {
   type Config,
 } from "../src/config";
 import { db, initDatabase, listJobsAwaitingRelocation, recordRelocatedFile } from "../src/db";
-import { getConfig, setConfig } from "../src/state";
+import { getConfig, isPaused, getPauseReason, setConfig, setPaused } from "../src/state";
+import { networkMonitor } from "../src/resilience";
 import { applySettings, EDITABLE_SETTINGS, readSettings } from "../src/settings";
 import { relocateFinishedJobs, relocationPendingCount, resetRelocationBackoff } from "../src/relocate";
 import { isPathInside } from "../src/util";
@@ -112,6 +113,36 @@ describe("offline mode as a setting", () => {
     // … and persisted, so the next start still knows.
     expect(JSON.parse(await readFile(path, "utf8")).offlineMode).toBe(true);
     setConfig({ ...DEFAULT_CONFIG });
+  });
+
+  test("the network monitor stays idle offline and resumes probing after a live toggle", async () => {
+    const previousConfig = getConfig();
+    const previousPause = { paused: isPaused(), reason: getPauseReason() };
+    const controller = new AbortController();
+    let probes = 0;
+    setPaused(false, null);
+    setConfig({ ...DEFAULT_CONFIG, offlineMode: true });
+    const monitor = networkMonitor({
+      intervalMs: 2,
+      signal: controller.signal,
+      probe: async () => {
+        probes++;
+        return true;
+      },
+    });
+
+    try {
+      await Bun.sleep(20);
+      expect(probes).toBe(0);
+      setConfig({ ...DEFAULT_CONFIG, offlineMode: false });
+      await Bun.sleep(20);
+      expect(probes).toBeGreaterThan(0);
+    } finally {
+      controller.abort();
+      await monitor;
+      setConfig(previousConfig);
+      setPaused(previousPause.paused, previousPause.reason);
+    }
   });
 });
 

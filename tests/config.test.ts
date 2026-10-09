@@ -11,6 +11,7 @@ import {
   loadConfigSafe,
   parseConfig,
   saveConfig,
+  webPortOverrideFromRuntime,
   CONFIG_PATH,
 } from "../src/config";
 
@@ -73,6 +74,25 @@ describe("parseConfig", () => {
     expect(() => parseConfig({ retryBackoffBaseSeconds: 600, retryBackoffMaxSeconds: 60 })).toThrow();
     expect(() => parseConfig({ downloadTimeoutMinutes: 120, maxDownloadMinutes: 30 })).toThrow();
     expect(() => parseConfig({ minDownloadWorkers: 8, maxDownloadWorkers: 4 })).toThrow();
+  });
+});
+
+describe("CLI web port override", () => {
+  test("accepts --port 3010 and --port=3010 without requiring a config edit", () => {
+    expect(webPortOverrideFromRuntime(["--port", "3010"])).toBe(3010);
+    expect(webPortOverrideFromRuntime(["--port=3010"])).toBe(3010);
+    expect(webPortOverrideFromRuntime(["--offline", "--port", "8080"])).toBe(8080);
+  });
+
+  test("returns null when absent and the last explicit port wins", () => {
+    expect(webPortOverrideFromRuntime(["--offline"])).toBeNull();
+    expect(webPortOverrideFromRuntime(["--port", "3010", "--port=3020"])).toBe(3020);
+  });
+
+  test("rejects missing, non-integer, and out-of-range values", () => {
+    for (const argv of [["--port"], ["--port", "--offline"], ["--port="], ["--port", "abc"], ["--port", "3000.5"], ["--port", "0"], ["--port", "65536"]]) {
+      expect(() => webPortOverrideFromRuntime(argv)).toThrow("--port");
+    }
   });
 });
 

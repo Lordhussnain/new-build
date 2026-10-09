@@ -143,7 +143,27 @@ describe("the route table", () => {
     const data = await res.json();
     expect(data.ok).toBe(true);
     expect(data.deleted).toBe(2);
+    expect(data.ignored).toBe(2);
     expect(getJob("route05")).toBeFalsy();
+
+    const ignoredResponse = await api("/api/ignored-videos");
+    const ignored = await ignoredResponse.json();
+    expect(ignored.videos.map((video: any) => video.video_id).sort()).toEqual(["route05", "route06"]);
+    const allowAgain = await api("/api/ignored-videos/route05", { method: "DELETE" });
+    expect(await allowAgain.json()).toMatchObject({ ok: true, allowed: true });
+    expect((await (await api("/api/ignored-videos")).json()).videos).toHaveLength(1);
+  });
+
+  test("malformed bulk deletion returns a JSON error and leaves jobs untouched", async () => {
+    insertJob("route-malformed-delete");
+    const response = await api("/api/jobs", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: "not-json",
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ ok: false, error: "Expected a JSON body with a non-empty ids array" });
+    expect(getJob("route-malformed-delete")).toBeTruthy();
   });
 
   test("the legacy POST /api/jobs/delete alias still works", async () => {
@@ -260,7 +280,7 @@ describe("job mutations reject active pipeline claims", () => {
     const response = await api("/api/jobs/busydelete", { method: "DELETE" });
     expect(response.status).toBe(200);
     const data = await response.json();
-    expect(data).toMatchObject({ ok: true, deleted: 1 });
+    expect(data).toMatchObject({ ok: true, deleted: 1, ignored: 1 });
     expect(getJob("busydelete")).toBeNull();
   });
 
@@ -373,7 +393,7 @@ describe("job mutations reject active pipeline claims", () => {
 });
 
 // --- Deliberate re-downloads and per-job sidecars -----------------------------
-import { mkdtemp, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
@@ -523,6 +543,27 @@ describe("POST /api/jobs/:id/override", () => {
   });
 });
 
+describe("ignored-video allow-again", () => {
+  test("clears the yt-dlp archive before removing the durable ignore", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-allow-again-"));
+    const archive = join(dir, "downloaded_videos.txt");
+    const config = cfgWith({ archiveFile: archive });
+    setConfig(config);
+    try {
+      await writeFile(archive, "youtube allow01\n", "utf8");
+      insertJob("allow01", { download_status: "downloaded" });
+      expect((await apiWith("/api/jobs/allow01", config, { method: "DELETE" })).status).toBe(200);
+
+      const response = await apiWith("/api/ignored-videos/allow01", config, { method: "DELETE" });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: true, allowed: true });
+      expect((await readFile(archive, "utf8")).trim()).toBe("");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("retry as a deliberate re-download", () => {
   test("scrubs the yt-dlp archive and stashes the existing file", async () => {
     const dir = await mkdtemp(join(tmpdir(), "yta-webretry-"));
@@ -601,6 +642,25 @@ describe("POST /api/jobs/:id/sidecars", () => {
     expect(data).toMatchObject({ ok: true, want_subtitles: false, want_thumbnail: false, metadata_status: "done" });
   });
 
+  test("explicitly enabling a sidecar clears its source-unavailable marker", async () => {
+    insertJob("side-retry", {
+      download_status: "downloaded",
+      metadata_status: "failed",
+      metadata_retry_count: 4,
+      metadata_unavailable: JSON.stringify(["subtitles", "thumbnail"]),
+      want_subtitles: 1,
+      want_thumbnail: 1,
+    });
+    const res = await api("/api/jobs/side-retry/sidecars", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subtitles: true }),
+    });
+    expect(res.status).toBe(200);
+    expect(getJob("side-retry")).toMatchObject({ metadata_status: "pending", metadata_retry_count: 0 });
+    expect(JSON.parse(getJob("side-retry").metadata_unavailable)).toEqual(["thumbnail"]);
+  });
+
   test("rejects empty bodies and non-boolean flags", async () => {
     insertJob("side03", { download_status: "downloaded" });
     const empty = await api("/api/jobs/side03/sidecars", {
@@ -635,10 +695,12 @@ describe("job payloads", () => {
       want_thumbnail: 0,
       want_description: 1,
       metadata_files: JSON.stringify(["001.en.srt", "001.jpg"]),
+      metadata_unavailable: JSON.stringify(["description"]),
     });
     const res = await api("/api/jobs/shape01");
     const data = await res.json();
     expect(data.job.metadata_files).toEqual(["001.en.srt", "001.jpg"]);
+    expect(data.job.metadata_unavailable).toEqual(["description"]);
     expect(data.job.want_subtitles).toBe(true);
     expect(data.job.want_thumbnail).toBe(false);
     expect(data.job.want_description).toBe(true);

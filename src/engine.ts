@@ -6,7 +6,7 @@
 
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { loadConfig, offlineOverrideFromRuntime } from "./config";
+import { loadConfig, offlineOverrideFromRuntime, webPortOverrideFromRuntime } from "./config";
 import { aria2cPath, checkDependencies, validateCookies } from "./tools";
 import { initDatabase, pruneJobsForUnconfiguredSources } from "./db";
 import {
@@ -74,6 +74,11 @@ export async function main(): Promise<void> {
     console.log(
       `📴 Offline mode forced for this run by --offline / YTA_OFFLINE: ${offlineOverride ? "ON" : "OFF"} (config.json is left unchanged).`,
     );
+  }
+  const webPortOverride = webPortOverrideFromRuntime();
+  const listenPort = webPortOverride ?? config.webPort;
+  if (webPortOverride !== null) {
+    console.log(`🌐 Web UI port overridden for this run by --port: ${webPortOverride} (config.json is left unchanged).`);
   }
   setConfig(config);
   await checkDependencies(config);
@@ -143,11 +148,11 @@ export async function main(): Promise<void> {
   // 2b) HTTP gate: the port stays the lock for the dashboard and API. It is
   //     acquired second, so a refused start never leaves the port held.
   try {
-    webServer = startWebServer(config.webPort, config);
+    webServer = startWebServer(listenPort, config);
   } catch (err: any) {
     if (err?.code === "EADDRINUSE" || String(err?.message || "").includes("in use")) {
       console.error(
-        `\n❌ Port ${config.webPort} is already in use — another engine instance is running.`,
+        `\n❌ Port ${listenPort} is already in use — another engine instance is running.`,
       );
       console.error("   Stop that instance first (autostart task, another terminal, or a still-exiting process).");
       console.error("   Two instances against one archive.db corrupt each other's job state.");
@@ -190,23 +195,19 @@ export async function main(): Promise<void> {
 
   // Establish the cookies baseline, then keep watching for the whole run: a
   // cookies.txt exported from the browser *after* startup must be picked up
-  // without a restart (cookiesWatch runs on an interval below).
-  //
-  // Offline mode skips both: nothing fetches, so a credential change can rescue
-  // nothing, and validating cookies is a network round-trip to YouTube.
+  // without a restart. The watcher only reads local files; validation below is
+  // the network request and stays disabled while offline.
+  cookiesWatch(config);
   if (config.offlineMode) {
     console.log("🍪 Cookies: not used (offline mode).");
-  } else {
-    cookiesWatch(config);
-    if (config.validateCookiesOnStart && existsSync(config.cookiesFile)) {
-      const valid = await validateCookies(config.cookiesFile);
-      if (!valid) console.warn("⚠️ Cookies may be invalid or expired.");
-      else console.log("✅ Cookies validated.");
-    } else if (!existsSync(config.cookiesFile)) {
-      console.log(
-        `ℹ️ No ${config.cookiesFile} yet — downloads run anonymously. Drop the file in while the engine runs and it is picked up within a minute.`,
-      );
-    }
+  } else if (config.validateCookiesOnStart && existsSync(config.cookiesFile)) {
+    const valid = await validateCookies(config.cookiesFile);
+    if (!valid) console.warn("⚠️ Cookies may be invalid or expired.");
+    else console.log("✅ Cookies validated.");
+  } else if (!existsSync(config.cookiesFile)) {
+    console.log(
+      `ℹ️ No ${config.cookiesFile} yet — downloads run anonymously. Drop the file in while the engine runs and it is picked up within a minute.`,
+    );
   }
 
   // 3) Load every link from config.json, fetch video details, store in DB.
@@ -230,24 +231,19 @@ export async function main(): Promise<void> {
   initDashboard(config);
   const uiHost = !config.webBind || config.webBind === "0.0.0.0" ? "127.0.0.1" : config.webBind;
   console.log(
-    `Web UI: http://${uiHost}:${config.webPort}${config.webToken ? "  (token required)" : ""}${config.webBind === "0.0.0.0" ? "  — listening on ALL interfaces" : ""}`,
+    `Web UI: http://${uiHost}:${listenPort}${config.webToken ? "  (token required)" : ""}${config.webBind === "0.0.0.0" ? "  — listening on ALL interfaces" : ""}`,
   );
 
-  // Cheap new-upload watcher (no-op when rssEnabled=false or no channels) and
-  // the daemon-mode rescan loop. Both parse live YouTube pages, so offline mode
-  // leaves them off: the queue is frozen on purpose, not stale by accident.
+  // These services are registered even when the engine starts offline; each
+  // reads the live config before doing network work. This is what makes the
+  // dashboard's offline toggle reversible without a restart.
   if (config.offlineMode) {
-    console.log("📡 RSS watcher and rescans disabled (offline mode).");
-  } else {
-    startRssPolling(config);
+    console.log("📡 RSS watcher and rescans idle until offline mode ends.");
   }
+  startRssPolling(config);
 
-  if (config.offlineMode) {
-    // The monitor probes YouTube and pauses the engine after consecutive
-    // failures. Offline that is guaranteed: it would pause the very run whose
-    // purpose is local work, and nothing would ever convert.
-    console.log("🌐 Network monitor disabled (offline mode).");
-  } else if (config.networkMonitorEnabled) {
+  if (config.networkMonitorEnabled) {
+    if (config.offlineMode) console.log("🌐 Network monitor idle until offline mode ends.");
     networkMonitor();
   } else {
     console.log("🌐 Network monitor disabled (networkMonitorEnabled=false).");
@@ -264,9 +260,9 @@ export async function main(): Promise<void> {
   // re-queues failed CONVERSIONS, which is exactly what offline mode wants, so
   // the sweep keeps running; download re-queues simply wait for the mode to end.
   setInterval(() => requeueFailedJobs(getConfig()), 60_000);
-  // Cookies sweep: notice cookies.txt appearing / changing / vanishing mid-run
-  // (meaningless while offline — nothing fetches).
-  if (!config.offlineMode) setInterval(() => cookiesWatch(getConfig()), 60_000);
+  // Cookies sweep is local filesystem observation (not a network fetch), so it
+  // stays registered through offline mode and is ready if the mode ends live.
+  setInterval(() => cookiesWatch(getConfig()), 60_000);
   // Secondary-storage relocation: files that need no conversion still have to
   // reach secondary storage (src/relocate.ts).
   startRelocation();
@@ -283,8 +279,9 @@ export async function main(): Promise<void> {
     supervise(`converter-worker-${i}`, () => converterWorker(i, config));
   }
 
-  // Daemon-mode full rescans are also network work.
-  if (config.daemonMode && !config.offlineMode) startAutonomousPolling(config);
+  // Daemon-mode full rescans are armed even when starting offline; the poller
+  // checks live offlineMode before every scan and resumes on a later tick.
+  if (config.daemonMode) startAutonomousPolling(config);
 
   setInterval(renderDashboard, 2000);
   console.log(

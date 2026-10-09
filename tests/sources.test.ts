@@ -13,6 +13,7 @@ import { handleRequest } from "../src/web";
 const dirs: string[] = [];
 const baseConfig = (overrides: Partial<Config> = {}): Config => ({ ...DEFAULT_CONFIG, ...overrides });
 const playlist = "https://www.youtube.com/playlist?list=PL_saved";
+const overlappingPlaylist = "https://www.youtube.com/playlist?list=PL_overlap";
 const channel = "https://www.youtube.com/@Teacher";
 
 async function makeDir(): Promise<string> {
@@ -202,6 +203,40 @@ describe("removeSource", () => {
     expect(db.query("SELECT id FROM jobs WHERE id = 'stale02'").get()).toBeNull();
   });
 
+  test("an overlapping playlist does not requeue archived IDs after source cleanup", async () => {
+    const dir = await makeDir();
+    const path = join(dir, "config.json");
+    const archive = join(dir, "downloaded_videos.txt");
+    const config = baseConfig({
+      playlists: [playlist, overlappingPlaylist],
+      outputRoot: join(dir, "out"),
+      archiveFile: archive,
+    });
+    setConfig(config);
+    await saveConfig(config, path);
+
+    const firstPlaylist = Array.from({ length: 100 }, (_, i) => ({
+      id: `video${String(i).padStart(6, "0")}`,
+      title: `Video ${i}`,
+      playlist: "First Playlist",
+      duration: 120,
+    }));
+    expect((await ingestItems(firstPlaylist, config, undefined, playlist)).added).toBe(100);
+    db.run("UPDATE jobs SET download_status = 'downloaded'");
+    await writeFile(archive, `${firstPlaylist.map((item) => `youtube ${item.id}`).join("\n")}\n`, "utf8");
+
+    // Source removal still deletes its exclusive job rows; the yt-dlp archive
+    // is the durable record that prevents those completed IDs being queued again.
+    const removed = await removeSource(playlist, path);
+    expect(removed).toMatchObject({ removed: true, deletedJobs: 100, retainedJobs: 0 });
+    expect(db.query("SELECT COUNT(*) AS n FROM jobs").get()).toEqual({ n: 0 });
+
+    const overlap = firstPlaylist.slice(35, 65).map((item) => ({ ...item, playlist: "Second Playlist" }));
+    const rescanned = await ingestItems(overlap, getConfig(), undefined, overlappingPlaylist);
+    expect(rescanned).toEqual({ found: 30, added: 0, skipped: 30 });
+    expect(db.query("SELECT COUNT(*) AS n FROM jobs").get()).toEqual({ n: 0 });
+  });
+
   test("legacy jobs can be associated before a source is removed", async () => {
     const dir = await makeDir();
     const path = join(dir, "config.json");
@@ -291,6 +326,27 @@ describe("GET/DELETE /api/sources", () => {
       expect(await removed.json()).toMatchObject({ ok: true, deletedJobs: 1, retainedJobs: 0 });
       expect((await loadConfig()).playlists).toEqual([]);
       expect(db.query("SELECT id FROM jobs WHERE id = 'api001'").get()).toBeNull();
+    } finally {
+      process.chdir(cwd);
+    }
+  });
+
+  test("does not run the legacy network lookup when deleting a source offline", async () => {
+    const dir = await makeDir();
+    const cwd = process.cwd();
+    process.chdir(dir);
+    try {
+      const config = baseConfig({ playlists: [playlist], offlineMode: true });
+      setConfig(config);
+      await saveConfig(config);
+      const removed = await handleRequest(new Request("http://x/api/sources", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: playlist }),
+      }), getConfig());
+      expect(removed.status).toBe(200);
+      expect(await removed.json()).toMatchObject({ ok: true, legacyLookupSkippedOffline: true });
+      expect((await loadConfig()).playlists).toEqual([]);
     } finally {
       process.chdir(cwd);
     }

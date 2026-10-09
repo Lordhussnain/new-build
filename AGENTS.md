@@ -40,6 +40,7 @@ bun install            # zod (+ dev: typescript, @types/bun)
 # Alternative reproducible dependency install when using npm:
 npm ci                  # installs from package-lock.json; Bun is still the runtime
 bun run start          # run the engine (reads ./config.json, creates it if absent)
+bun run start --port 3010 # override the dashboard port for this run only
 bun run config         # interactive config manager (TTY)
 bun run typecheck      # tsc --noEmit
 bun test               # full suite: unit + end-to-end (mocked tools; no network needed)
@@ -163,10 +164,11 @@ dependency-free — it is the module that breaks every import cycle.
 
 ### Startup order (engine.ts `main()`)
 
-1. `loadConfig()` → `setConfig()` (must be first: dependency search uses paths from it).
-   `--offline` / `YTA_OFFLINE` override `offlineMode` in memory **here** (never
-   written to config.json), so a one-off offline pass does not change the next
-   normal start — and the dependency probe below sees it.
+1. `loadConfig()` → apply per-run CLI overrides → `setConfig()` (must be first:
+   dependency search uses paths from it). `--offline` / `YTA_OFFLINE` override
+   `offlineMode` in memory; `--port <n>` selects the HTTP listener port for this
+   run. Neither override is written to config.json, so a one-off option does not
+   change the next normal start — and the dependency probe below sees offline mode.
 2. `checkDependencies()` — fails fast with install hints. In offline mode a
    missing yt-dlp is a note, not a failure (nothing spawns it); **ffmpeg stays
    required** — conversion is the point of an offline pass
@@ -193,14 +195,15 @@ dependency-free — it is the module that breaks every import cycle.
 9. cookie validation (if enabled)
 10. scan every configured playlist/channel into the jobs table (skipped in offline mode)
 11. `initDashboard()`
-12. `networkMonitor()` (off in offline mode), `reapStaleClaims` (60s, lease-gated),
-    `autoscaleTick` (15s), `requeueFailedJobs` (60s), `cookiesWatch` (60s, off in
-    offline mode), `startRssPolling()` (off in offline mode), `startRelocation()`
-    (one pass +5s, then every 60s)
+12. `networkMonitor()` (if enabled; skips probes while offline),
+    `reapStaleClaims` (60s, lease-gated), `autoscaleTick` (15s),
+    `requeueFailedJobs` (60s), `cookiesWatch` (60s, local file observation),
+    `startRssPolling()` (always armed; no fetch while offline/disabled),
+    `startRelocation()` (one pass +5s, then every 60s)
 13. supervised worker pools (download × N, metadata × N, convert × N — the download
     and metadata loops stay idle in offline mode; workers are always started, so a
     live settings toggle takes effect without a restart)
-14. `startAutonomousPolling()` if daemon mode (off in offline mode)
+14. `startAutonomousPolling()` if daemon mode (armed offline but does not scan until online)
 
 ---
 
@@ -325,9 +328,12 @@ while (!abortController.signal.aborted) {
   `--no-overwrites`, `--download-archive`, parses `PROGRESS:` lines from the
   progress template into the DB, and captures the final path from
   `--print after_move:FILEPATH:%(filepath)s` (validated before any filesystem call).
-- **metadataWorker** — second yt-dlp pass with `--skip-download`, writes
-  sidecars next to the media file using the same basename, records the file
-  list in `metadata_files`.
+- **metadataWorker** — second yt-dlp pass with `--skip-download`, writes only
+  requested sidecar types absent next to the media file (same basename), and
+  records the file list in `metadata_files`. `metadata-files.ts` owns the
+  case-insensitive sidecar classification; `metadata-scan.ts` backs the
+  dashboard's manual `POST /api/metadata/scan` action, which checks all
+  database-tracked downloaded jobs and queues only missing requested types.
 - **converterWorker** — ffmpeg mp3 transcode or mp4 remux (`-c:v copy`), then
   optionally moves the media file **and its sidecars** to
   `secondaryStoragePath/<folder>/`, then hashes it.
@@ -372,9 +378,12 @@ re-queues a failed sidecar pass on an already-converted job.
 | Crash recovery | `reconcile.ts reconcileCrashedJobs()` | `downloading` → `paused + interrupted` (auto-claimable); also clears orphan claims from legacy user-paused downloads while keeping them held. **Refuses to run without the engine lease** — this sweep resets every in-flight claim, so it may only touch a database its own process owns. Clearing each row's claim token is what fences the previous engine's stale workers out |
 | Stale-claim reaper | `reconcile.ts reapStaleClaims(config)` | Lease-gated (only the engine holding the engine lease reaps) and **heartbeat-based**: downloads silent >`max(20 min, maxDownloadMinutes)` (actively owned jobs are additionally protected in-process, and progress renews the heartbeat), conversions silent >3 h, metadata silent >15 min — `staleClaimCondition()` is the single predicate, shared with the dashboard's stale-claims panel so the two cannot drift. Each reclaim is `reapStaleClaim()`, a CAS on `(token, owner, status, expired-heartbeat)`: a worker that renewed its heartbeat, or a second reaper that got there first, makes the update match 0 rows and the job is left alone. Also sweeps the stranded `.aria2` control files of the jobs it actually reclaimed this tick (a dead worker's pair whose data file is gone would wedge the next attempt) through the same `removePartialFiles` contract: a locked control file is reported and retried on the next tick, never forced |
 | Missing-file reconciliation | `reconcile.ts reconcileMissingFiles()` | scrubs the yt-dlp archive + re-queues |
-| Failed-job sweep | `reconcile.ts requeueFailedJobs()` | after cooldown, non-permanent failures start a fresh per-video retry window; permanent download errors are skipped; `ignoreCooldown` for the UI button |
+| Failed-job sweep | `reconcile.ts requeueFailedJobs()` | after cooldown, non-permanent failures start a fresh per-video retry window; permanent download and metadata source errors stay parked; `ignoreCooldown` for the UI button |
 | Partial-file cleanup | `reconcile.ts cleanOrphanedFiles()` | keeps every resume-able partial — `pending`/`downloading`/`paused`/`waiting_live` owners and retryable failures waiting for cooldown are **never** aged out; deletes exhausted partials when auto-requeue is disabled, partials nothing will resume once they are a week old (`PARTIAL_MAX_AGE_MS`), day-old orphans (`ORPHAN_PARTIAL_MAX_AGE_MS`) and unowned `.superseded` backups. Recorded paths and walked paths are compared through `pathKey()` (absolute + case-folded), because the DB stores absolute paths while the walk is relative to `outputRoot`. Returns `{removed, locked}`: a partial whose control file is locked keeps BOTH files, is counted as `locked`, logged, and retried by a later sweep — never counted as removed |
-| Offline mode | `config.ts offlineMode` + `offlineOverrideFromRuntime()` → loop guards in `workers/download.ts`, `workers/metadata.ts` | No download, no scan, no RSS, no sidecar fetch, no cookie validation, no network monitor: every one of those is a network round-trip. The download and metadata loops idle (workers are still started, so flipping the setting live works), queued jobs keep their status and `.part` files, and conversion + relocation keep running. Conversion deliberately keeps its ordering rule (`claimConvertJob` still requires terminal metadata), so a job waiting on sidecars waits — the mode finishes local work, it does not reorder the pipeline. `--offline`/`YTA_OFFLINE` set it for one run only; the stored setting is untouched |
+| Per-video ignore | `db.ts ignored_videos` + `scanner.ts ingestItems()` + `web_ui.html` Ignored Videos panel | Explicit job deletion stores a durable tombstone outside `jobs`/`job_sources`, so startup scans and RSS rescans do not recreate the video. `DELETE /api/ignored-videos/:id` clears the tombstone and archive entry; a later scan can queue it for an intentional re-download |
+| Cross-source video dedupe | `scanner.ts ingestItems()` + `archive.ts readArchiveIds()` | `jobs.id` deduplicates queued rows across source URLs and records extra `job_sources` ownership. If source cleanup removes a completed row, the configured downloader archive is the fallback that keeps another playlist from re-queueing that ID |
+| Metadata sidecar backfill | `metadata-files.ts` + `metadata-scan.ts` + `workers/metadata.ts` + `POST /api/metadata/scan` | Manual dashboard action, database-tracked downloaded jobs only. Respects per-job subtitle/thumbnail/description choices and global info.json setting; caches directory listings, skips missing media/unreadable folders/active stages, and queues only absent requested types. The worker rechecks and writes only missing sidecars without downloading media again. Successful source-side absences are persisted in `metadata_unavailable`; failed jobs keep their retry budget. Per-job sidecar toggles explicitly clear that kind to allow a deliberate recheck. Offline mode is rejected; no automatic recurring scans |
+| Offline mode | `config.ts offlineMode` + `offlineOverrideFromRuntime()` → loop guards in `workers/download.ts`, `workers/metadata.ts`, `scanner.ts`, `rss.ts`, `polling.ts`, and `resilience.ts` | No download, scan, RSS fetch, sidecar fetch, cookie validation, or network probe while offline. The download/metadata loops and scheduled network watchers stay armed but idle, so a live dashboard toggle works in either direction without a restart; queued jobs keep their status and `.part` files. The cookie watcher only reads local files and continues. Conversion + relocation keep running. Conversion deliberately keeps its ordering rule (`claimConvertJob` still requires terminal metadata), so a job waiting on sidecars waits — the mode finishes local work, it does not reorder the pipeline. `--offline`/`YTA_OFFLINE` set it for one run only; the stored setting is untouched |
 | Secondary-storage relocation | `relocate.ts relocateFinishedJobs()` (driven by `startRelocation()`) | Moves finished media (sidecars first, `moveToSecondaryStorage`) whose conversion is already `done`/`not_needed`, adopts a file a crashed run copied but never recorded, and re-offers every file when `secondaryStoragePath` changes (that is what `relocated_to` stores — the ROOT, not a boolean). Claim-free by design: one engine per `archive.db` (lease) + one pass in flight per process + idempotent steps + a CAS on the old path. It never moves a job that is downloading/converting/mid-sidecar, a file already under the root, or a job deleted mid-move |
 | Superseded-file recovery | `reconcile.ts reconcileSupersededFiles()` | startup heal of the deliberate-re-download hand-off: rolls back a stash whose rename never ran (`file_path` not yet recorded), restores a backup whose retry never became claimable, drops a backup whose re-download already finished, and adopts a legacy rename-first backup instead of letting the missing-file sweep re-queue the video |
 | Archive scrubbing | `archive.ts removeFromArchive()` | needed whenever a file disappears, else yt-dlp skips it forever |
@@ -653,7 +662,7 @@ button useless for exactly the job the operator is clicking it about.
 | GET · HEAD | `/api/ping` | liveness probe used by the UI |
 | GET | `/api/version` | engine/runtime info (`Bun.version`, platform/arch, uptime seconds) |
 | GET | `/api/status` | stats, speed, ETA, disk, live worker lines, pause state, `runtime`; `diskSpace.free` reads `"unknown"` when no disk probe could answer |
-| GET | `/api/jobs` | `{ ok, jobs }` — up to 500 jobs with status/retry/progress fields (`JOB_COLUMNS` in `web.ts` is the single source of truth for what the dashboard may read: per-stage retry counters, `best_progress`, `partial_file_path`, `relocated_to`, the `created_at` / `updated_at` stamps the drawer and the history tab show), plus parsed `audio_tracks` / `audio_selection` / `metadata_files` and boolean `want_*` sidecar flags |
+| GET | `/api/jobs` | `{ ok, jobs }` — up to 500 jobs with status/retry/progress fields (`JOB_COLUMNS` in `web.ts` is the single source of truth for what the dashboard may read: per-stage retry counters, `best_progress`, `partial_file_path`, `relocated_to`, the `created_at` / `updated_at` stamps the drawer and the history tab show), plus parsed `audio_tracks` / `audio_selection` / `metadata_files` / `metadata_unavailable` and boolean `want_*` sidecar flags |
 | GET | `/api/jobs/:id` | one job, read fresh from the DB — the detail drawer fetches this instead of trusting a poll-cycle-old list row |
 | POST | `/api/scan` | `{url, folder?}` → validate/canonicalize → save source to `config.json` → scan & ingest; returns `saved`, `source: {url, key, added}`, and counts. Save failure starts no scan; scan failure keeps the saved source. Folder override applies only to this scan |
 | POST | `/api/queue/purge` | delete every idle pending / paused / waiting_live / failed job **and the rows that are downloading right now**, interrupting those children first so nothing keeps writing after the button; returns `{ok, deleted, stopped}` |
@@ -662,6 +671,7 @@ button useless for exactly the job the operator is clicking it about.
 | POST | `/api/jobs/:id/override` | partial `{targetFormat?, videoQuality?, audioTracks?}` edit; nullable values reset to global behavior. Optional `retry:true` applies the override and queues a deliberate re-download atomically (or retries current settings when sent alone); 400 invalid payload, 404 unknown id, 409 active pipeline stage |
 | POST | `/api/jobs/:id/reset-failures` | zero the per-stage retry counters; 404 for an unknown id |
 | POST | `/api/jobs/:id/sidecars` | per-job sidecar toggles: `{subtitles?, thumbnail?, description?}` (booleans). Flipping a flag on for a finished download re-opens the metadata stage so the worker fetches the files against the existing media; flipping off never deletes fetched files. 400 for an empty/non-boolean body |
+| POST | `/api/metadata/scan` | manual whole-library sidecar check; only downloaded DB jobs, skips offline mode, queues missing requested metadata without re-downloading media |
 | POST | `/api/jobs/pause` | bulk user-pause by `{ids: []}`: parks each row with `pause_reason = 'user'` and interrupts its transfer, keeping a mid-download claim so the `.part` still resumes; 400 when no ids are given |
 | DELETE | `/api/jobs` | bulk delete by `{ids: []}`, cancelling active children the same way; `{ok, deleted, stopped}` |
 | POST | `/api/jobs/:id/audio-tracks` | per-job audio-track selection: `{tracks:["es",…]}` saves it, `{tracks:null}` returns the job to the global mode |
@@ -709,8 +719,8 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/retry.test.ts` | backoff math, watchdog scaling, error classification, the terminal reason table + `[terminal]` record round-trip (including the wordings that used to loop: `This video is private`, `This video is unavailable`), and the format fallback ladder (strictly descending, bottoms out at `highest`, `audio`/unknown never fall back) |
 | `tests/util.test.ts` | formatters, Windows filename hardening, `fitBaseFilename`, hashing |
 | `tests/config.test.ts` | defaults, validation, cross-field refinements, atomic load/save |
-| `tests/sources.test.ts` | URL classification, canonicalization, persisted source lists, dedup, concurrent saves/settings, validation/auth/write failures |
-| `tests/db.test.ts` | schema + legacy migration, atomic claims, the pipeline claim exclusions, all reconcile/requeue sweeps, ingestion dedupe, and the busy-wait on an archive another process still holds |
+| `tests/sources.test.ts` | URL classification, canonicalization, persisted source lists, cross-playlist archive dedupe after source cleanup, concurrent saves/settings, validation/auth/write failures |
+| `tests/db.test.ts` | schema + legacy migration, atomic claims, the pipeline claim exclusions, all reconcile/requeue sweeps, cross-source ingestion dedupe, durable ignored-video tombstones across a database reopen, and the busy-wait on an archive another process still holds |
 | `tests/engine-lease.test.ts` | the database-level engine lease: acquisition/refusal, takeover of an expired lease and of one whose owning process is gone, renewal failure after a takeover, the heartbeat's lost-lease signal, release + clean restart (fencing survives), and that the startup/reaper sweeps refuse to run without the lease. Uses file-backed databases and a real second process (`tests/fixtures/claim-worker.ts`) |
 | `tests/claim-races.test.ts` | claim ownership across SEPARATE connections and PROCESSES: two handles cannot claim the same job twice, three processes draining 40 jobs never double-claim (unique token per row), a crashed owner reclaimed only after its lease lapses, a stale worker's progress/release refused after its claim was taken, a long-running heartbeating conversion never reaped (and reaped once the heartbeat stops), metadata reaped on its heartbeat rather than `updated_at`, and two reapers racing one expired claim where exactly one CAS wins |
 | `tests/cookies.test.ts` | `cookiesArgs`/`cookiesState` on a missing/empty/present file, the appeared/updated/disappeared transitions, and `cookiesWatch`'s credential-blocked count |
@@ -725,7 +735,8 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/download-pause.test.ts` | user pause state survives download failure and successful file recording |
 | `tests/download-resume-416.test.ts` | the unrecoverable-resume branch: an HTTP 416 (or aria2c's control-file refusal) discards the `.part` WITH its `.aria2`, zeroes progress/best_progress and re-queues for a fresh transfer; the budget still bounds it; a lost claim writes nothing over the new owner's row; a plain corrupt error still KEEPS the partial |
 | `tests/audio-tracks.test.ts` | track parsing (variant collapse, drc drop, ordering), selection policy incl. per-job override, selector splicing, JSON column round-trips, and `probeAudioTracks` failures against a real child process (non-zero exit, unparsable JSON, and the abort at the timeout — every path the worker's single-audio fallback depends on) |
-| `tests/metadata.test.ts` | `subtitleArgs` — `all`/blank keep fetch-everything, explicit language lists pass through verbatim |
+| `tests/metadata.test.ts` | subtitle argument selection, only-missing worker flags, case-insensitive sidecar matching, and persistence parsing for source-unavailable metadata |
+| `tests/metadata-scan.test.ts` | all downloaded jobs vs skipped non-downloaded/missing media, existing sidecar detection, queue/retry reset, unavailable-source/failed-job no-repeat behavior, opt-outs, offline no-op, API route result |
 | `tests/autoscale.test.ts` | slot ramp step, backlog/ceiling clamps, idle collapse, disabled mode |
 | `tests/reconcile.test.ts` | `removePartialFiles` (control-file-first order, its `fatal` result, and `.ytdl` fragment DIRECTORY removal), `partialSidecars`, `findPartialFile`, the reaper's stranded-control-file sweep (swept, live pair kept, non-reclaimed job untouched, locked retry), `cleanOrphanedFiles` control-file handling and honest `{removed, locked}` counting plus the durable-work guarantees (relative `outputRoot` vs absolute recorded path via `pathKey`, resumable statuses never aged out, terminal partials and unowned `.superseded` backups swept, the fitted base name `recordPartialPaths` must search), and the superseded-file lifecycle (`stash`/`drop`/`restore` + every `reconcileSupersededFiles` crash state) |
 | `tests/convert.test.ts` | `findConvertedOutput` crash-window adoption: adopts a finished mp3/mp4, never the source itself, empty for unrelated sidecars |
@@ -733,12 +744,12 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/tools.test.ts` | `resolveTool` discovery against a real injected search space: NOTHING installed answers null (the native-downloader fallback), PATH discovery finds a shim, an explicit config path wins, a stale config path does not hide a PATH candidate, and a binary whose version probe fails is not usable |
 | `tests/logger.test.ts` | `errorLogPath()` routes test-run logs to the temp dir, never the operator's `error.log` |
 | `tests/disk.test.ts` | `diskUsage()` happy path, the `-1/-1` degraded path, and `checkDiskSpace`'s allow-through when free space is unknown — plus the forced fallback chain through `DiskProbeOptions` (a build without statfs, the win32 PowerShell probe, a hung shell timing out, an unusable shell answer, and the no-spawn rule for a path that is not on disk), with `driveLetterOf`/`parsePSDriveOutput` pinned directly |
-| `tests/web-routes.test.ts` | the `ROUTES` table: canonical per-job routes, the legacy aliases, JSON 404/405 + `Allow`, trailing-slash collapse, active-stage 409 guards across retry/delete/pause/purge, retry-as-re-download (archive scrub + `.superseded` stash), per-job format/quality/audio overrides, and sidecars |
+| `tests/web-routes.test.ts` | the `ROUTES` table: canonical per-job routes, the legacy aliases, JSON 404/405 + `Allow`, trailing-slash collapse, active-stage cancellation, durable job-delete ignores + allow-again, malformed bulk-delete errors, retry-as-re-download (archive scrub + `.superseded` stash), per-job format/quality/audio overrides, sidecar toggles, and explicit metadata-unavailable reset |
 | `tests/settings.test.ts` | the dashboard settings allow-list, type coercion (including every accepted boolean spelling and the rejection of `"maybe"`/empty — an invalid value must never coerce to `false`), Zod + cross-field validation, persistence, live-config propagation, and auth |
 | `tests/config-manager.test.ts` | every schema key is reachable from `update_config.ts`; the manager reads the sweep thresholds from `STALE_CLAIM_THRESHOLDS` and counts partials with the engine's predicate |
 | `tests/offline-mode.test.ts` | the run-level switch (`--offline`/`YTA_OFFLINE`, last flag wins, argv beats env, unparsable ≠ false), the settings round-trip (live + persisted), `isPathInside` (siblings sharing a prefix are NOT inside), and `relocateFinishedJobs`: move + sidecar + recorded path, idempotence, no-op without `secondaryStoragePath`, crash-window adoption, "already under the root", a non-candidate table (downloading / needs conversion / mid-metadata / failed), a failed move that keeps the only copy, and the stale-path CAS |
 | `tests/dashboard.test.ts` | `formatHeaderLine` counters, and the `Res:n` field appearing only when partials are held |
-| `tests/web-ui-contract.test.ts` | the dashboard page vs the API it calls: every `/api/…` path `web_ui.html` fetches must resolve, and the real inline `<script>` (run over a stub DOM against `handleRequest`) must render one row per job with no `undefined` on a card (gotcha 41) |
+| `tests/web-ui-contract.test.ts` | the dashboard page vs the API it calls: every `/api/…` path `web_ui.html` fetches must resolve, the manual metadata-scan button calls its route and reports the result, and the real inline `<script>` (run over a stub DOM against `handleRequest`) must render one row per job with no `undefined` on a card (gotcha 41) |
 | `tests/integration.test.ts` | **end-to-end engine runs** (see 9.3) |
 
 ### 9.3 End-to-end tests with mock tools
@@ -1152,14 +1163,18 @@ Windows — an environment assumption is still a broken test:
     stage drains stdout/stderr concurrently and kills/reaps a child if reading
     fails or the 10-minute watchdog fires; a child must not outlive a released
     claim. Preserve those bounded-process guarantees when adding a new stage.
-39. **Offline mode gates at CLAIM time, never by rewriting job state.**
+39. **Offline mode gates network work without rewriting job state.**
     `workers/download.ts` and `workers/metadata.ts` return to idle BEFORE
     `claimDownloadJob`/`claimMetadataJob` — no status is written, so a queued job
-    resumes exactly where it stood when the mode ends. Never "solve" offline mode
-    by pausing, skipping or failing the queue (that is work the operator cannot
-    get back), and never let a new network call bypass the guard: scans, RSS,
+    resumes exactly where it stood when the mode ends. The RSS watcher, daemon
+    rescan, and network monitor remain armed but read the live config before each
+    network operation; the cookie watcher is local filesystem observation and
+    remains safe to run. A scan already in flight must not ingest its results if
+    offline mode turns on before the DB write. Never "solve" offline mode by
+    pausing, skipping or failing the queue (that is work the operator cannot get
+    back), and never let a new network call bypass the guard: scans, RSS,
     rescans, cookie validation, the network monitor and the audio-track probe all
-    check `config.offlineMode` too.
+    check live `offlineMode` too.
 40. **The relocation pass has no claim token because it must not need one.**
     Three things make that safe, and all three are load-bearing: the engine lease
     (one engine per `archive.db`), `passInFlight` in `relocate.ts` (one pass per
@@ -1199,6 +1214,26 @@ Windows — an environment assumption is still a broken test:
     WAL is what lets the claiming workers and the Web UI share one archive.
     `tests/db.test.ts` holds the file from a second process and fails if the open
     gives up instead of waiting it out.
+43. **Dashboard job deletion is a durable per-video ignore, not a queue-only row delete.**
+    `DELETE /api/jobs/:id` and selected-job deletion atomically copy a tombstone
+    into `ignored_videos` before the `jobs` row cascades away. `scanner.ts` must
+    check that table before inserting any listing result, including RSS results;
+    otherwise a startup/daemon rescan will requeue the video the operator just
+    removed. Keep the tombstone separate from `job_sources` (which cascades with
+    the job), expose an explicit allow-again action, and do not apply this to
+    source removal or queue purge. `tests/db.test.ts` verifies the ignore survives
+    closing/reopening the SQLite archive and blocks a subsequent scan.
+44. **Video identity is global; source URLs are only ownership links.**
+    `jobs.id` is the YouTube video ID, so a second playlist that lists the same
+    video must link to the existing job instead of creating a second row.
+    Source cleanup may delete that row while leaving the finished media and
+    `--download-archive` entry behind; when `archiveFile` is enabled,
+    `scanner.ingestItems()` must consult
+    `readArchiveIds()` as a fallback or the next overlapping scan queues it
+    again. Read the archive once per listing, not once per item. The explicit
+    allow-again route must clear both the ignore tombstone and archive entry,
+    or the scanner will continue suppressing the user's opt-in. Pin both paths
+    with distinct-source and source-cleanup regressions.
 
 ---
 
@@ -1214,6 +1249,7 @@ Windows — an environment assumption is still a broken test:
 | Change engine ownership | `src/lease.ts` (acquisition/renewal/release/fencing) → `tests/engine-lease.test.ts` → the same-database integration scenario in `tests/integration.test.ts` |
 | Add a sweep | `src/reconcile.ts` (pure-ish, take `Config`) → register interval in `src/engine.ts` |
 | Change offline mode | `src/config.ts` (`offlineMode` + `offlineOverrideFromRuntime`) → guards in `src/engine.ts` / `workers/download.ts` / `workers/metadata.ts` → `tests/offline-mode.test.ts` + the offline scenario in `tests/integration.test.ts` |
+| Add a run-level CLI override | Pure parser in `src/config.ts` → apply to the in-memory config in `src/engine.ts` before `setConfig()` → focused `tests/config.test.ts`; document in README |
 | Change relocation | `src/relocate.ts` (+ the `RELOCATION_WHERE` predicate and `relocated_to` in `src/db.ts`, written by `workers/convert.ts finalizeConversion` and `workers/download.ts recordSuccess`) → `tests/offline-mode.test.ts` |
 | Add a worker | `src/workers/<name>.ts` → claim fn in `db.ts` → `supervise()` in `engine.ts` → TUI line in `dashboard.ts` |
 | Support a new site/URL shape | `src/sources.ts parseSourceUrl()` (Web UI validation/source identity) + `src/scanner.ts normalizeVideoUrl()` (job URL canonicalization) |

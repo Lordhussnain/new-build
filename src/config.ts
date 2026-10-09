@@ -371,3 +371,38 @@ export function offlineOverrideFromRuntime(
   }
   return null;
 }
+
+/**
+ * Per-run web port override for the engine CLI (`--port 3010` or `--port=3010`).
+ * The stored `webPort` remains unchanged. The last occurrence wins, matching
+ * the existing `--offline` override behavior.
+ */
+export function webPortOverrideFromRuntime(argv: readonly string[] = process.argv.slice(2)): number | null {
+  let override: number | null = null;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = String(argv[i]).trim();
+    if (arg === "--port") {
+      const next = argv[i + 1];
+      if (next === undefined || String(next).trim().startsWith("--")) {
+        throw new Error("Missing value for --port (expected an integer from 1 to 65535).");
+      }
+      override = parseCliPort(String(next));
+      i++;
+    } else if (arg.startsWith("--port=")) {
+      override = parseCliPort(arg.slice("--port=".length));
+    }
+  }
+  return override;
+}
+
+function parseCliPort(raw: string): number {
+  const value = raw.trim();
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`Invalid value for --port: ${JSON.stringify(raw)}. Port must be an integer from 1 to 65535.`);
+  }
+  const port = Number(value);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid value for --port: ${JSON.stringify(raw)}. Port must be an integer from 1 to 65535.`);
+  }
+  return port;
+}

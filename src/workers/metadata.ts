@@ -18,8 +18,14 @@ import {
   type Job,
 } from "../db";
 import { cookiesArgs, jsRuntimeArgs, ytDlp } from "../tools";
-import { computeBackoffMs } from "../retry";
-import { SIDECAR_SUFFIXES } from "../util";
+import { computeBackoffMs, isPermanentDownloadError } from "../retry";
+import {
+  findSidecarFiles,
+  missingMetadataKinds,
+  parseUnavailableMetadataKinds,
+  updateUnavailableMetadataKinds,
+  type MetadataKind,
+} from "../metadata-files";
 import { updateAbsoluteLine } from "../dashboard";
 import {
   abortController,
@@ -51,9 +57,58 @@ export function subtitleArgs(config: {
   return ["--write-subs", "--write-auto-subs", "--sub-langs", selector, "--convert-subs", config.subtitleFormat || "srt"];
 }
 
+/** Only ask yt-dlp for sidecar types confirmed missing on disk. */
+export function missingSidecarArgs(
+  config: Pick<Config, "subtitleLanguages" | "subtitleFormat">,
+  missing: readonly MetadataKind[],
+): string[] {
+  const args: string[] = [];
+  if (missing.includes("subtitles")) args.push(...subtitleArgs(config));
+  if (missing.includes("thumbnail")) args.push("--write-thumbnail", "--convert-thumbnails", "jpg");
+  if (missing.includes("description")) args.push("--write-description");
+  if (missing.includes("infoJson")) args.push("--write-info-json");
+  return args;
+}
+
 /** The claim this worker holds on `job`, identified by its unique token. */
 function metadataClaim(job: Job): ClaimRef {
   return claimRef("metadata", job);
+}
+
+function recordMetadataSuccess(
+  job: Job,
+  config: Config,
+  id: number,
+  sidecars: string[],
+  alreadyPresent = false,
+  attemptedKinds: readonly MetadataKind[] = [],
+): void {
+  // yt-dlp can exit successfully when a source has no requested captions or
+  // thumbnail. Remember those terminal absences so a later library scan does
+  // not repeatedly hammer the same unavailable metadata endpoint.
+  const unavailableList = updateUnavailableMetadataKinds(sidecars, job.metadata_unavailable, attemptedKinds);
+  const landed = releaseClaimedJob(
+    "metadata",
+    job.id,
+    metadataClaim(job),
+    `metadata_status = 'done', metadata_files = ?, metadata_unavailable = ?`,
+    [JSON.stringify(sidecars), JSON.stringify(unavailableList)],
+  );
+  if (landed !== 1) {
+    // Gone row = deliberate deletion; an existing row with a different owner is
+    // the race worth reporting.
+    if (db.query("SELECT id FROM jobs WHERE id = ?").get(job.id)) {
+      logError("metadata", `${job.id} ${job.title}: metadata claim lost before recording the sidecars`);
+    }
+    return;
+  }
+  stats.metadata++;
+  notePipelineSuccess("post");
+  updateMetadataWorkerLine(
+    id,
+    `${alreadyPresent ? "✅ Metadata check complete" : "✅ Metadata done"} (${sidecars.length} file(s)) | ${job.title}`,
+    config,
+  );
 }
 
 export async function metadataWorker(id: number, config: Config): Promise<void> {
@@ -156,6 +211,27 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
   const mediaDir = dirname(job.file_path);
   const mediaBase = basename(job.file_path).replace(/\.[^.]+$/, "");
   const outTemplate = join(mediaDir, `${mediaBase}.%(ext)s`);
+  const mediaFilename = basename(job.file_path);
+  const entriesBefore = await readdir(mediaDir).catch(() => [] as string[]);
+  const existingSidecars = findSidecarFiles(entriesBefore, mediaBase, mediaFilename);
+  const missing = missingMetadataKinds(
+    existingSidecars,
+    {
+      subtitles: Boolean(job.want_subtitles),
+      thumbnail: Boolean(job.want_thumbnail),
+      description: Boolean(job.want_description),
+      infoJson: config.writeInfoJson,
+    },
+    parseUnavailableMetadataKinds(job.metadata_unavailable),
+  );
+  if (missing.length === 0) {
+    if (isPaused()) {
+      releaseClaimedJob("metadata", job.id, metadataClaim(job), `metadata_status = 'pending'`);
+      return;
+    }
+    recordMetadataSuccess(job, config, id, existingSidecars, true);
+    return;
+  }
 
   const args = [
     ytDlp(),
@@ -175,10 +251,7 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
     "--newline",
     "--no-colors",
   ];
-  if (job.want_subtitles) args.push(...subtitleArgs(config));
-  if (job.want_thumbnail) args.push("--write-thumbnail", "--convert-thumbnails", "jpg");
-  if (job.want_description) args.push("--write-description");
-  if (config.writeInfoJson) args.push("--write-info-json");
+  args.push(...missingSidecarArgs(config, missing));
 
   const ctl = new AbortController();
   let proc: Bun.Subprocess | null = null;
@@ -229,30 +302,8 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
 
   // Record which sidecar files now exist next to the media file.
   const entries = await readdir(mediaDir).catch(() => [] as string[]);
-  const sidecars = entries.filter(
-    (f) =>
-      f.startsWith(mediaBase + ".") &&
-      SIDECAR_SUFFIXES.some((sfx) => f.endsWith(sfx)) &&
-      f !== basename(job.file_path!),
-  );
-  const landed = releaseClaimedJob(
-    "metadata",
-    job.id,
-    metadataClaim(job),
-    `metadata_status = 'done', metadata_files = ?`,
-    [JSON.stringify(sidecars)],
-  );
-  if (landed !== 1) {
-    // Gone row = deliberate deletion; an existing row with a different owner is
-    // the race worth reporting.
-    if (db.query("SELECT id FROM jobs WHERE id = ?").get(job.id)) {
-      logError("metadata", `${job.id} ${job.title}: metadata claim lost before recording the sidecars`);
-    }
-    return;
-  }
-  stats.metadata++;
-  notePipelineSuccess("post");
-  updateMetadataWorkerLine(id, `✅ Metadata done (${sidecars.length} file(s)) | ${job.title}`, config);
+  const sidecars = findSidecarFiles(entries, mediaBase, mediaFilename);
+  recordMetadataSuccess(job, config, id, sidecars, false, missing);
 }
 
 /** Metadata failures retry with exponential backoff up to the per-video cap. */
@@ -263,8 +314,9 @@ async function handleMetadataFailure(job: Job, config: Config, err: any, id: num
     return;
   }
   const attempts = (job.metadata_retry_count || 0) + 1;
+  const permanentSourceError = isPermanentDownloadError(errMsg);
   const cap = perVideoCap(config);
-  const newStatus = attempts >= cap ? "failed" : "pending";
+  const newStatus = permanentSourceError || attempts >= cap ? "failed" : "pending";
   // CAS on the claim token: a worker that lost its claim leaves the outcome to
   // the new owner instead of overwriting it.
   const landed = releaseClaimedJob(
@@ -282,9 +334,17 @@ async function handleMetadataFailure(job: Job, config: Config, err: any, id: num
   }
   if (newStatus === "failed") {
     stats.failed++;
-    logError("metadata", `${job.id} ${job.title}: ${errMsg}`);
-    notePipelineFailure("post", config);
-    updateMetadataWorkerLine(id, `❌ Metadata failed | ${job.title}`, config);
+    if (permanentSourceError) {
+      // A private, removed, or otherwise permanently unavailable source is not
+      // a metadata-service outage. Park it without burning the retry budget or
+      // tripping the post-processing circuit breaker.
+      notePipelineSuccess("post");
+      updateMetadataWorkerLine(id, `⚠️ Metadata unavailable at source | ${job.title}`, config);
+    } else {
+      logError("metadata", `${job.id} ${job.title}: ${errMsg}`);
+      notePipelineFailure("post", config);
+      updateMetadataWorkerLine(id, `❌ Metadata failed | ${job.title}`, config);
+    }
   } else {
     // Bounded like the converter: the job is already re-queued for any free
     // worker, so this delay only avoids hammering a failing endpoint. The

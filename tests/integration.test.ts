@@ -2271,6 +2271,16 @@ describe("unit: networkMonitorTick", () => {
     expect(tick.shouldPause).toBe(false);
     expect(tick.shouldResume).toBe(false);
   });
+
+  test("offline mode clears only a network-caused pause and never pauses for connectivity", async () => {
+    const { networkMonitorTick } = await import("../src/resilience");
+    const networkPause = networkMonitorTick(3, false, true, "NETWORK_DISCONNECTED", true);
+    expect(networkPause).toEqual({ consecutiveFails: 0, shouldPause: false, shouldResume: true });
+    const userPause = networkMonitorTick(3, false, true, "SHUTDOWN_REQUESTED", true);
+    expect(userPause).toEqual({ consecutiveFails: 0, shouldPause: false, shouldResume: false });
+    const running = networkMonitorTick(3, false, false, null, true);
+    expect(running).toEqual({ consecutiveFails: 0, shouldPause: false, shouldResume: false });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3112,6 +3122,62 @@ describe("integration: offline mode", () => {
       const status = await engine.api("/api/status");
       expect(status.offlineMode).toBe(true);
       expect(status.relocation.path).toBe(nas);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("daemon rescans pause and resume as offline mode is toggled live", async () => {
+    const dir = await makeRunDir();
+    const scanLog = join(dir, "daemon-scans.log");
+    const playlist = "https://www.youtube.com/playlist?list=OFFLINE_DAEMON";
+    const engine = await startEngine(
+      dir,
+      4015,
+      BASE_CONFIG(4015, {
+        playlists: [],
+        offlineMode: true,
+        daemonMode: true,
+        rescanIntervalHours: 0.0002,
+      }),
+      { FAKE_SCAN_LOG: scanLog },
+    );
+    const scanCount = async () =>
+      (await Bun.file(scanLog).text().catch(() => ""))
+        .split("\n")
+        .filter((line) => line === playlist).length;
+
+    try {
+      await waitFor("offline daemon engine started", async () => engine.stdout().includes("Engine started"));
+      const saved = await engine.api("/api/scan", {
+        method: "POST",
+        body: JSON.stringify({ url: playlist }),
+      });
+      expect(saved).toMatchObject({ ok: true, saved: true, found: 0, added: 0 });
+
+      // The recurring scanner is registered, but it must do no work while
+      // offline—even for a source saved through the dashboard during this run.
+      await Bun.sleep(1_600);
+      expect(await scanCount()).toBe(0);
+
+      const online = await engine.api("/api/settings", {
+        method: "POST",
+        body: JSON.stringify({ offlineMode: false }),
+      });
+      expect(online.ok).toBe(true);
+      await waitFor("daemon rescan after leaving offline mode", async () => (await scanCount()) > 0, 10_000);
+
+      const offline = await engine.api("/api/settings", {
+        method: "POST",
+        body: JSON.stringify({ offlineMode: true }),
+      });
+      expect(offline.ok).toBe(true);
+      // Allow a scan already in flight at the toggle boundary to finish; later
+      // interval ticks must remain idle until the next online transition.
+      await Bun.sleep(1_600);
+      const countWhileOffline = await scanCount();
+      await Bun.sleep(1_600);
+      expect(await scanCount()).toBe(countWhileOffline);
     } finally {
       await engine.stop();
     }

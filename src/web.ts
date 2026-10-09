@@ -9,10 +9,29 @@
 import { existsSync, readFileSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import os from "node:os";
-import { associateExistingJobsWithSource, claimRef, db, releaseClaimedJob } from "./db";
+import {
+  allowIgnoredVideo,
+  associateExistingJobsWithSource,
+  claimRef,
+  db,
+  deleteJobsAndIgnore,
+  listIgnoredVideos,
+  isVideoIgnored,
+  releaseClaimedJob,
+} from "./db";
 import { autoscaler, activeDlSlots } from "./autoscale";
-import { activeDownloadJobs, getConfig, getPauseReason, isPaused, markJobCancelled, workerStatuses } from "./state";
+import {
+  activeDownloadJobs,
+  clearJobCancelled,
+  getConfig,
+  getPauseReason,
+  isPaused,
+  markJobCancelled,
+  workerStatuses,
+} from "./state";
 import { getPlaylistItems, scanAndIngest } from "./scanner";
+import { scanDownloadedMetadata } from "./metadata-scan";
+import { parseUnavailableMetadataKinds, type MetadataKind } from "./metadata-files";
 import { parseSourceUrl, removeSource, saveSource, SOURCE_KEYS, sourceIdentity, type SourceUrl } from "./sources";
 import { cancelActiveStages, diskUsage, triggerPause, triggerResume, type CancelledStages } from "./resilience";
 import { removeFromArchive } from "./archive";
@@ -308,7 +327,7 @@ function matchRoute(pattern: string, segments: string[]): RouteParams | null {
 // it carries the timestamps the drawer's Created/Updated rows and the History
 // tab's "Completed: …" line need — a row without them renders as an empty cell.
 const JOB_COLUMNS = `id, url, title, folder, output_directory, file_path, target_format, video_quality,
-                download_status, conversion_status, metadata_status, pause_reason, metadata_files,
+                download_status, conversion_status, metadata_status, pause_reason, metadata_files, metadata_unavailable,
                 retry_count, conversion_retry_count, metadata_retry_count, resume_count,
                 best_progress, last_error, file_size, progress, speed, eta, duration,
                 partial_file_path, audio_tracks, audio_selection, superseded_file, relocated_to,
@@ -328,6 +347,7 @@ function mapJobRow(r: any) {
     audio_tracks: parseTracksJson(r.audio_tracks) ?? [],
     audio_selection: parseSelectionJson(r.audio_selection),
     metadata_files: metadataFiles,
+    metadata_unavailable: parseUnavailableMetadataKinds(r.metadata_unavailable),
     want_subtitles: !!r.want_subtitles,
     want_thumbnail: !!r.want_thumbnail,
     want_description: !!r.want_description,
@@ -580,6 +600,7 @@ function retryJobById(id: string, config: Config, override?: JobOverride): numbe
            WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
            ELSE metadata_status END,
          metadata_retry_count = 0,
+         metadata_unavailable = '[]',
          last_error = NULL,
          download_claimed_by = NULL, download_claimed_at = NULL,
          download_claim_token = NULL, download_heartbeat_at = NULL,
@@ -642,27 +663,44 @@ function resetFailCounters(id: string): number {
  * Delete a set of jobs by id (bulk action from the dashboard).
  *
  * Deletion is a cancellation too: any in-flight download, encode, or sidecar
- * fetch for these jobs is interrupted first, so "Delete" never leaves a yt-dlp
- * or ffmpeg running in the terminal for a row that no longer exists.
+ * fetch is interrupted first. The database transaction also stores a durable
+ * per-video ignore tombstone before removing each row, so the next playlist
+ * scan cannot quietly put a deleted job back in the queue.
  */
 async function deleteJobsBulk(req: Request): Promise<Response> {
-  const body = await req.json().catch(() => ({}));
-  const ids = Array.isArray(body?.ids)
-    ? body.ids.filter((x: any) => typeof x === "string" && x.length > 0).slice(0, 500)
+  const body: any = await req.json().catch(() => null);
+  const ids: string[] = Array.isArray(body?.ids)
+    ? [...new Set<string>(body.ids.filter((x: unknown): x is string => typeof x === "string" && x.length > 0).slice(0, 500))]
     : [];
-  if (ids.length === 0) return Response.json({ ok: false, error: "No job ids provided" }, { status: 400 });
-  const placeholders = ids.map(() => "?").join(",");
-  // Cancellation is part of the deletion: mark, interrupt, delete the rows,
-  // then sweep once more (see beginCancellation/finishCancellation).
-  const stoppedBefore = beginCancellation(ids);
-  // Count job rows, not raw `changes`: the cascaded job_sources rows would
-  // otherwise double-count every deletion.
-  const deleted = (
-    db.query(`SELECT COUNT(*) AS n FROM jobs WHERE id IN (${placeholders})`).get(...ids) as { n: number }
-  ).n;
-  db.run(`DELETE FROM jobs WHERE id IN (${placeholders})`, ids);
-  const late = finishCancellation(ids);
-  return Response.json({ ok: true, deleted, stopped: stoppedCount(stoppedBefore, late) });
+  if (ids.length === 0) {
+    return Response.json({ ok: false, error: "Expected a JSON body with a non-empty ids array" }, { status: 400 });
+  }
+
+  // Cancellation is part of the deletion: mark, interrupt, atomically save a
+  // durable ignore tombstone and delete the rows, then sweep once more.
+  let cancellationStarted = false;
+  let stoppedBefore: CancelledStages = { downloads: [], conversions: [], metadata: [] };
+  try {
+    cancellationStarted = true;
+    stoppedBefore = beginCancellation(ids);
+    const result = deleteJobsAndIgnore(ids);
+    const late = finishCancellation(ids);
+    return Response.json({
+      ok: true,
+      ...result,
+      stopped: stoppedCount(stoppedBefore, late),
+    });
+  } catch (error: any) {
+    if (cancellationStarted) {
+      try {
+        finishCancellation(ids);
+      } catch {}
+      for (const id of ids) clearJobCancelled(id);
+    }
+    const message = String(error?.message || error);
+    logError("job-delete", `Bulk delete failed for ${ids.length} selected job(s): ${message}`);
+    return Response.json({ ok: false, error: `Could not delete selected jobs: ${message}` }, { status: 500 });
+  }
 }
 
 const ROUTES: Route[] = [
@@ -808,6 +846,48 @@ const ROUTES: Route[] = [
         uptime,
         globalETA,
       });
+    },
+  },
+  {
+    methods: ["GET"],
+    pattern: "/api/ignored-videos",
+    handler: () => {
+      try {
+        return Response.json({ ok: true, videos: listIgnoredVideos() });
+      } catch (error: any) {
+        const message = String(error?.message || error);
+        logError("ignored-videos", `Could not list ignored videos: ${message}`);
+        return Response.json({ ok: false, error: `Could not load ignored videos: ${message}` }, { status: 500 });
+      }
+    },
+  },
+  {
+    methods: ["DELETE"],
+    pattern: "/api/ignored-videos/:id",
+    handler: ({ params, config }) => {
+      try {
+        if (!isVideoIgnored(params.id)) {
+          return Response.json({ ok: false, error: "Ignored video not found" }, { status: 404 });
+        }
+        if (!removeFromArchive(config.archiveFile, params.id)) {
+          return Response.json(
+            { ok: false, error: "Could not clear the video from the downloader archive; it remains ignored" },
+            { status: 500 },
+          );
+        }
+        if (allowIgnoredVideo(params.id) === 0) {
+          return Response.json({ ok: false, error: "Ignored video not found" }, { status: 404 });
+        }
+        return Response.json({
+          ok: true,
+          allowed: true,
+          message: "Ignore removed and archive cleared. The video may return on the next source scan.",
+        });
+      } catch (error: any) {
+        const message = String(error?.message || error);
+        logError("ignored-videos", `Could not allow ${params.id} again: ${message}`);
+        return Response.json({ ok: false, error: `Could not allow video again: ${message}` }, { status: 500 });
+      }
     },
   },
   {
@@ -960,17 +1040,23 @@ const ROUTES: Route[] = [
       // file. Flipping a flag off never deletes files that were already fetched.
       const id = params.id;
       const row = db
-        .query("SELECT id, download_status, metadata_status FROM jobs WHERE id = ?")
-        .get(id) as { id: string; download_status: string; metadata_status: string } | null;
+        .query("SELECT id, download_status, metadata_status, metadata_unavailable FROM jobs WHERE id = ?")
+        .get(id) as {
+        id: string;
+        download_status: string;
+        metadata_status: string;
+        metadata_unavailable: string | null;
+      } | null;
       if (!row) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
       const body = await req.json().catch(() => ({}));
-      const flags: { column: string; key: string }[] = [
-        { column: "want_subtitles", key: "subtitles" },
-        { column: "want_thumbnail", key: "thumbnail" },
-        { column: "want_description", key: "description" },
+      const flags: { column: string; key: string; kind: MetadataKind }[] = [
+        { column: "want_subtitles", key: "subtitles", kind: "subtitles" },
+        { column: "want_thumbnail", key: "thumbnail", kind: "thumbnail" },
+        { column: "want_description", key: "description", kind: "description" },
       ];
       const sets: string[] = [];
       const values: (number | string)[] = [];
+      const explicitRetries = new Set<MetadataKind>();
       for (const f of flags) {
         const v = (body as Record<string, unknown>)[f.key];
         if (v === undefined) continue;
@@ -982,6 +1068,7 @@ const ROUTES: Route[] = [
         }
         sets.push(`${f.column} = ?`);
         values.push(v ? 1 : 0);
+        if (v === true) explicitRetries.add(f.kind);
       }
       if (sets.length === 0) {
         return Response.json(
@@ -991,6 +1078,13 @@ const ROUTES: Route[] = [
       }
       values.push(id);
       db.run(`UPDATE jobs SET ${sets.join(", ")}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, values);
+      if (explicitRetries.size > 0) {
+        const unavailable = parseUnavailableMetadataKinds(row.metadata_unavailable);
+        const remaining = unavailable.filter((kind) => !explicitRetries.has(kind));
+        if (remaining.length !== unavailable.length) {
+          db.run("UPDATE jobs SET metadata_unavailable = ? WHERE id = ?", [JSON.stringify(remaining), id]);
+        }
+      }
       // Newly wanted sidecars for a finished download: re-open the metadata
       // stage so the worker fetches them now (unless it is already running).
       if (row.download_status === "downloaded" && !["pending", "in_progress"].includes(row.metadata_status)) {
@@ -1022,17 +1116,34 @@ const ROUTES: Route[] = [
     methods: ["DELETE"],
     pattern: "/api/jobs/:id",
     handler: ({ params }) => {
-      // A row must never be deleted while its child process keeps running: the
-      // old behaviour left orphaned yt-dlp/ffmpeg downloads in the terminal
-      // (and a 409 for exactly the case the button exists for). Cancellation
-      // is part of the deletion now: mark, interrupt, delete the row, sweep
-      // once more for a child that registered mid-delete.
-      const stopped = beginCancellation([params.id]);
+      // A row must never be deleted while its child process keeps running.
+      // Cancellation is part of deletion, and the durable ignore is committed
+      // with the row removal so a later source scan cannot re-add this video.
       const exists = db.query(`SELECT 1 FROM jobs WHERE id = ?`).get(params.id);
       if (!exists) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
-      db.run(`DELETE FROM jobs WHERE id = ?`, [params.id]);
-      const late = finishCancellation([params.id]);
-      return Response.json({ ok: true, deleted: 1, stopped: stoppedCount(stopped, late) });
+      let stopped: CancelledStages = { downloads: [], conversions: [], metadata: [] };
+      try {
+        stopped = beginCancellation([params.id]);
+        const result = deleteJobsAndIgnore([params.id]);
+        const late = finishCancellation([params.id]);
+        if (result.deleted === 0) {
+          clearJobCancelled(params.id);
+          return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+        }
+        return Response.json({
+          ok: true,
+          ...result,
+          stopped: stoppedCount(stopped, late),
+        });
+      } catch (error: any) {
+        try {
+          finishCancellation([params.id]);
+        } catch {}
+        clearJobCancelled(params.id);
+        const message = String(error?.message || error);
+        logError("job-delete", `Delete failed for ${params.id}: ${message}`);
+        return Response.json({ ok: false, error: `Could not delete job: ${message}` }, { status: 500 });
+      }
     },
   },
   {
@@ -1216,18 +1327,24 @@ const ROUTES: Route[] = [
         return Response.json({ ok: false, error: "Saved source not found" }, { status: 404 });
       }
       let legacyJobsLinked = 0;
+      let legacyLookupSkippedOffline = false;
       const tracked = db
         .query("SELECT COUNT(*) AS count FROM job_sources WHERE source_url = ?")
         .get(identity) as { count: number };
       // Older databases have jobs but no ownership table entries. When there
       // are no known links, list the source once and backfill matching job ids
-      // so this first removal also cleans pre-upgrade queue rows.
+      // so this first removal also cleans pre-upgrade queue rows. That fallback
+      // is network work; do not run it while offline.
       if ((tracked?.count || 0) === 0) {
-        try {
-          const items = await getPlaylistItems(source.url, config);
-          legacyJobsLinked = associateExistingJobsWithSource(identity, items.map((item) => item.id));
-        } catch (error: any) {
-          logError("source-delete", `Legacy job lookup for ${source.url}: ${error?.message || error}`);
+        if (getConfig().offlineMode) {
+          legacyLookupSkippedOffline = true;
+        } else {
+          try {
+            const items = await getPlaylistItems(source.url, config);
+            legacyJobsLinked = associateExistingJobsWithSource(identity, items.map((item) => item.id));
+          } catch (error: any) {
+            logError("source-delete", `Legacy job lookup for ${source.url}: ${error?.message || error}`);
+          }
         }
       }
       try {
@@ -1253,7 +1370,10 @@ const ROUTES: Route[] = [
           deletedJobs: result.deletedJobs,
           retainedJobs: result.retainedJobs,
           stopped: stoppedCount(stopped, late),
-          message: `Removed source from config.json and deleted ${result.deletedJobs} job(s).`,
+          legacyLookupSkippedOffline,
+          message: legacyLookupSkippedOffline
+            ? `Removed source from config.json and deleted ${result.deletedJobs} tracked job(s). Legacy jobs could not be matched while offline and were left unchanged.`
+            : `Removed source from config.json and deleted ${result.deletedJobs} job(s).`,
         });
       } catch (error: any) {
         logError("config", `Removing source ${source.url}: ${error?.message || error}`);
@@ -1363,6 +1483,26 @@ const ROUTES: Route[] = [
     },
   },
   {
+    methods: ["POST"],
+    pattern: "/api/metadata/scan",
+    handler: async ({ config }) => {
+      if (config.offlineMode || getConfig().offlineMode) {
+        return Response.json({ ok: false, error: "Metadata scanning is unavailable while offline" }, { status: 409 });
+      }
+      try {
+        const result = await scanDownloadedMetadata(config);
+        if (result.abortedOffline) {
+          return Response.json({ ok: false, error: "Offline mode was enabled during the scan; no jobs were changed" }, { status: 409 });
+        }
+        return Response.json({ ok: true, ...result });
+      } catch (error: any) {
+        const message = String(error?.message || error);
+        logError("metadata-scan", `Could not scan downloaded videos for metadata: ${message}`);
+        return Response.json({ ok: false, error: `Could not scan metadata: ${message}` }, { status: 500 });
+      }
+    },
+  },
+  {
     methods: ["GET"],
     pattern: "/api/failed",
     handler: () => {
@@ -1383,7 +1523,7 @@ const ROUTES: Route[] = [
     pattern: "/api/failed/requeue",
     handler: ({ config }) => {
       // Re-queue retryable failed stages immediately, ignoring cooldown and
-      // starting fresh windows; permanent downloads stay parked.
+      // starting fresh windows; permanent source errors stay parked.
       const result = requeueFailedJobs(config, { ignoreCooldown: true });
       return Response.json({ ok: true, requeued: result });
     },
@@ -1403,9 +1543,26 @@ const ROUTES: Route[] = [
       } catch {
         return Response.json({ ok: false, error: "Expected a JSON body" }, { status: 400 });
       }
+      const writeInfoJsonWasEnabled = getConfig().writeInfoJson;
       const result = await withConfigWriteLock(() => applySettings(getConfig(), patch as Record<string, unknown>));
       if (!result.ok) {
         return Response.json({ ok: false, error: result.error }, { status: 400 });
+      }
+      // Turning info.json back on is an explicit request to make previously
+      // unavailable info dumps eligible for the next manual metadata scan.
+      if (!writeInfoJsonWasEnabled && result.config?.writeInfoJson) {
+        const rows = db
+          .query("SELECT id, metadata_unavailable FROM jobs WHERE metadata_unavailable IS NOT NULL")
+          .all() as { id: string; metadata_unavailable: string }[];
+        for (const row of rows) {
+          const unavailable = parseUnavailableMetadataKinds(row.metadata_unavailable);
+          if (unavailable.includes("infoJson")) {
+            db.run("UPDATE jobs SET metadata_unavailable = ? WHERE id = ?", [
+              JSON.stringify(unavailable.filter((kind) => kind !== "infoJson")),
+              row.id,
+            ]);
+          }
+        }
       }
       // Echo back the fresh snapshot so the panel can re-render from the
       // server's view of the world rather than what it thinks it sent.

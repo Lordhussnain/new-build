@@ -14,9 +14,13 @@ import {
   claimMetadataJob,
   claimRef,
   db,
+  deleteJobsAndIgnore,
+  allowIgnoredVideo,
+  listIgnoredVideos,
   getNextIndex,
   heartbeatClaim,
   initDatabase,
+  isVideoIgnored,
   isVideoInDb,
   perVideoCap,
   releaseClaimedJob,
@@ -24,7 +28,7 @@ import {
 } from "../src/db";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 import { acquireEngineLease } from "../src/lease";
-import { activeDownloadJobs } from "../src/state";
+import { activeDownloadJobs, getConfig, setConfig } from "../src/state";
 import { ingestItems } from "../src/scanner";
 import {
   cleanOrphanedFiles,
@@ -106,6 +110,7 @@ describe("schema & migrations", () => {
       .map((r: any) => r.name);
     expect(tables).toContain("jobs");
     expect(tables).toContain("job_sources");
+    expect(tables).toContain("ignored_videos");
     expect(tables).toContain("playlist_state");
     expect(tables).toContain("run_history");
   });
@@ -143,6 +148,7 @@ describe("schema & migrations", () => {
       expect(row.resume_count).toBe(0);
       expect(row.best_progress).toBe(0);
       expect(row.video_quality).toBeNull();
+      expect(row.metadata_unavailable).toBeNull();
       // A legacy row with want_subtitles=1 gets metadata_status backfilled.
       expect(row.metadata_status).toBe("pending");
     } finally {
@@ -232,6 +238,50 @@ describe("schema & migrations", () => {
     expect(indexes).toContain("idx_jobs_dl_status");
     expect(indexes).toContain("idx_jobs_cv_status");
     expect(indexes).toContain("idx_jobs_md_status");
+  });
+});
+
+describe("ignored videos", () => {
+  test("a deleted playlist video stays ignored after restart until explicitly allowed again", async () => {
+    const dir = await makeTmpDir();
+    const dbPath = join(dir, "archive.db");
+    const source = "https://www.youtube.com/playlist?list=IGNORE_TEST";
+    const previousConfig = getConfig();
+    const config = testConfig({ outputRoot: join(dir, "downloads") });
+    const item = { id: "ignore001", title: "Do not download again", playlist: "Ignored Playlist", duration: 120 };
+    setConfig(config);
+    db.close();
+    initDatabase(dbPath);
+
+    try {
+      expect((await ingestItems([item], config, undefined, source)).added).toBe(1);
+      const removed = deleteJobsAndIgnore([item.id]);
+      expect(removed).toEqual({ deleted: 1, ignored: 1 });
+      expect(isVideoInDb(item.id)).toBe(false);
+      expect(isVideoIgnored(item.id)).toBe(true);
+
+      db.close();
+      initDatabase(dbPath);
+      const ignored = listIgnoredVideos();
+      expect(ignored).toHaveLength(1);
+      expect(ignored[0]).toMatchObject({
+        video_id: item.id,
+        title: item.title,
+        source_urls: [source],
+      });
+      const rescanned = await ingestItems([item], config, undefined, source);
+      expect(rescanned).toEqual({ found: 1, added: 0, skipped: 1 });
+      expect(isVideoInDb(item.id)).toBe(false);
+
+      expect(allowIgnoredVideo(item.id)).toBe(1);
+      expect((await ingestItems([item], config, undefined, source)).added).toBe(1);
+    } finally {
+      try {
+        db.close();
+      } catch {}
+      initDatabase(":memory:");
+      setConfig(previousConfig);
+    }
   });
 });
 
@@ -558,6 +608,14 @@ describe("requeueFailedJobs", () => {
       file_path: media,
       updated_at: "2020-01-01 00:00:00",
     });
+    insertJob("metafail-permanent", {
+      download_status: "downloaded",
+      metadata_status: "failed",
+      metadata_retry_count: 4,
+      last_error: "HTTP Error 404: Not Found",
+      file_path: media,
+      updated_at: "2020-01-01 00:00:00",
+    });
     insertJob("metafail-nofile", {
       download_status: "downloaded",
       metadata_status: "failed",
@@ -573,6 +631,7 @@ describe("requeueFailedJobs", () => {
     expect(getJob("convfail").conversion_retry_count).toBe(0);
     expect(getJob("metafail").metadata_status).toBe("pending");
     expect(getJob("metafail").metadata_retry_count).toBe(0);
+    expect(getJob("metafail-permanent")).toMatchObject({ metadata_status: "failed", metadata_retry_count: 4 });
     expect(getJob("metafail-nofile").metadata_status).toBe("failed");
   });
 
@@ -686,6 +745,25 @@ describe("ingestItems", () => {
     expect(r.added).toBe(0);
     expect(r.skipped).toBe(1);
     expect(isVideoInDb("vid001")).toBe(true);
+  });
+
+  test("dedupes an existing video ID across distinct source URLs", async () => {
+    const c = config();
+    const firstSource = "https://www.youtube.com/playlist?list=PL_first";
+    const secondSource = "https://www.youtube.com/playlist?list=PL_second";
+    await ingestItems([{ id: "cross01", title: "One", playlist: "First", duration: 120 }], c, undefined, firstSource);
+    const result = await ingestItems(
+      [{ id: "cross01", title: "One", playlist: "Second", duration: 120 }],
+      c,
+      undefined,
+      secondSource,
+    );
+
+    expect(result).toEqual({ found: 1, added: 0, skipped: 1 });
+    expect(db.query("SELECT COUNT(*) AS n FROM jobs WHERE id = 'cross01'").get()).toEqual({ n: 1 });
+    expect(
+      db.query("SELECT source_url FROM job_sources WHERE job_id = ? ORDER BY source_url").all("cross01"),
+    ).toEqual([{ source_url: firstSource }, { source_url: secondSource }]);
   });
 
   test("skips shorts but keeps long videos", async () => {

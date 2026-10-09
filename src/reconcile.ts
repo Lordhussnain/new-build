@@ -362,6 +362,7 @@ export function reconcileMissingFiles(config: Config): number {
            metadata_status = CASE
              WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
              ELSE metadata_status END,
+           metadata_unavailable = '[]',
            download_claimed_by = NULL, download_claimed_at = NULL,
            download_claim_token = NULL, download_heartbeat_at = NULL,
            conversion_claimed_by = NULL, conversion_claimed_at = NULL,
@@ -511,13 +512,15 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
     // --- Metadata -------------------------------------------------------------
     const failedMetadata = db
       .query(
-        `SELECT id, file_path FROM jobs
+        `SELECT id, file_path, last_error FROM jobs
          WHERE metadata_status = 'failed' ${modifier}`,
       )
       .all() as any[];
     for (const row of failedMetadata) {
-      // Without the media file the metadata fetch can never succeed.
-      if (!row.file_path || !existsSync(row.file_path)) continue;
+      // Without the media file or after a permanent source error the metadata
+      // fetch cannot succeed. Leave those rows terminal; the per-job sidecar
+      // control is the explicit retry path if the operator wants to try again.
+      if (!row.file_path || !existsSync(row.file_path) || isPermanentDownloadError(row.last_error)) continue;
       db.run(
         `UPDATE jobs SET metadata_status = 'pending', metadata_retry_count = 0,
            metadata_claimed_by = NULL, metadata_claimed_at = NULL,

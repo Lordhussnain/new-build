@@ -8,6 +8,10 @@ a terminal UI and a web dashboard to watch it all happen.
 ## Features
 
 - **Batch downloads** from a list of YouTube playlist or video URLs defined in `config.json`
+- **Cross-playlist deduplication by video ID** — different playlist/channel URLs
+  that contain the same video share one queued job; if source cleanup removes
+  its row after download, the configured yt-dlp archive still prevents another
+  playlist from queuing that completed ID.
 - **Concurrent worker pools** for downloading, metadata fetching, and format conversion, all driven by job state in a central SQLite database
 - **aria2c multi-connection downloads** — files split across up to 64 streams (16 by default) with automatic fallback to yt-dlp's native downloader when aria2c is not installed or for HLS/live streams. aria2c's own per-server connection cap (16) is clamped automatically, and a downloader argument aria2c rejects (exit 28) pauses the engine with a `BAD_DOWNLOADER_ARGS` reason instead of failing every video in the batch
 - **Dashboard download-speed profiles & Turbo IDM** — one-click **Standard**, **Maximum speed**, and **Aggressive (IDM)** presets stage aria2c, fragment, chunk, buffer, User-Agent, and bandwidth settings in Downloader Settings, plus a 1-click **⚡ Turbo IDM** toggle right in the main dashboard controls (or press <kbd>t</kbd>). Aggressive (IDM) mode uses 32 connections per download (split threshold 512K), 64 native DASH/HLS fragments, 10M HTTP chunks, a 64K socket buffer, and uncapped bandwidth for maximum network utilization like Internet Download Manager. Every setting remains individually tunable.
@@ -20,6 +24,7 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Unavailable videos are skipped, not retried** — private, deleted, members-only, age-gated, paid or geo-blocked videos are attempted **once**, classified with a plain-language reason (`Private video`, `Video unavailable`, `Not available in your region`, …), and parked as a terminal skip: no retry budget, no cooldown requeue, no `error.log` line per dead video, and no circuit-breaker trip for a whole playlist of them. The rest of the playlist keeps downloading, and the reason stays readable in the dashboard, the Failed tab, `/api/failed` and the run report
 - **An unavailable format is switched, not retried** — when yt-dlp answers `Requested format is not available`, the engine steps the quality down one rung (`4k → 1440p → 1080p → 720p → 480p → highest`), persists it as that job's quality override, and says so: `🎚️ Format 1080p not available — switched to 720p`. The ladder only ever moves down, so it cannot loop, and a stale multi-audio probe is cleared and re-probed first. Only a job that fails at every rung — a video with no usable formats — is parked, with `No format available` recorded as its reason
 - **Self-healing sweeps** — crashed jobs resume, stale claims are reclaimed, deleted downloads are re-fetched, and failed jobs are retried after a cooldown. With aria2c these sweeps resume from the download's `.aria2` control file, and a discarded partial always takes its control file with it
+- **Delete means don't re-download** — videos removed with Delete Selected or the per-job delete action are remembered in SQLite and skipped by all later source scans, including after restart. The dashboard's Ignored Videos panel lets you allow a video again.
 - **Resume state is protected, not aged away** — the startup sweep only deletes a `.part` once nothing will resume it: a `pending`, `paused`, or `waiting_live` job keeps its partial as long as the job exists, and a crash in the deliberate-re-download hand-off (`.superseded`) is rolled back or finished at the next start instead of leaving the old file unmanaged
 - **Single-instance safety: one engine per `archive.db`** — a database-level engine lease (owner token + expiring heartbeat + monotonic fencing number) is taken before the startup sweeps, so a second engine pointed at the same database refuses to start with an actionable message even if it uses a different `webPort` — it can never re-queue the running instance's in-flight work. The lease is renewed while the engine runs, released on a clean exit, taken over automatically after a crash, and shown on the reliability panel
 - **Claims are leases, not names** — every job claim carries a unique token and a heartbeat: download progress renews a download's lease, conversion and metadata stages heartbeat on an interval, and every progress, success, failure and release update must present that token (compare-and-swap). A worker that lost its claim — reaped after its lease lapsed, or superseded by a restarted engine — changes no job state instead of overwriting the new owner's
@@ -115,18 +120,21 @@ downloaded**, and the only work left is the work that needs no network.
 
 | Stage | Offline mode |
 | --- | --- |
-| Scans, RSS watching, daemon rescans | **off** — nothing touches YouTube |
+| Scans, RSS watching, daemon rescans | **idle** — no YouTube requests while offline; scheduled watchers resume when the mode ends |
 | Downloads (yt-dlp / aria2c) | **off** — queued jobs stay `pending`, unclaimed, with their `.part` files intact |
 | Metadata sidecars (subs/thumbnail/description/info.json) | **off** — every sidecar is a network fetch; `pending` stays `pending` |
 | Conversion (ffmpeg) | **on** — files that still need conversion are converted |
 | Secondary-storage move | **on** — finished files are moved, sidecars included |
-| Cookie validation, network monitor | **off** — a disconnected network must not pause the run |
+| Cookie validation, network probes | **off** — the monitor does not probe or pause local work while offline; local cookie-file watching continues |
 
 Queued downloads are *left exactly as they are*: they are not skipped, failed,
 or paused, so turning offline mode off resumes the queue where it stood. The
-file that gets converted or moved is finished for real — a converted file is
-recorded, and a moved file's new path is recorded, both with the same
-crash-safe updates a normal run uses.
+RSS watcher and daemon rescans are also armed while offline, but idle; they
+resume automatically when the mode ends, without restarting the engine. A scan
+already in flight may finish its request, but results are discarded if offline
+mode was enabled before ingestion. The file that gets converted or moved is
+finished for real — a converted file is recorded, and a moved file's new path
+is recorded, both with the same crash-safe updates a normal run uses.
 
 Turn it on from the dashboard (**⚙️ Settings → 📴 Offline mode**, applied live,
 no restart), from `config.json`, from `bun run config`, or for a single run
@@ -137,6 +145,17 @@ bun run start --offline        # this run only; config.json is not modified
 bun run start --offline=false  # override a machine-wide YTA_OFFLINE=1
 YTA_OFFLINE=1 bun run start    # same as --offline (scheduled tasks, shortcuts)
 ```
+
+Choose a different dashboard port for one run without changing `config.json`:
+
+```bash
+bun run start --port 3010
+# Equivalent form:
+bun run start --port=3010
+```
+
+The value must be an integer from 1 to 65535; the override lasts only for this
+process and is not written to `config.json`.
 
 The dashboard shows a blue **📴 Offline mode** banner while it is on, with how
 many finished files are still waiting to move to secondary storage, and the
@@ -172,8 +191,10 @@ duplicate sources or duplicate jobs, even if all videos were already queued.
   in the dashboard. It removes the URL from `config.json` and deletes its
   source-owned job rows from `archive.db`; jobs still referenced by another
   configured source are retained. Already-downloaded media files and the
-  yt-dlp download-history file are not deleted. The `bun run config` manager
-  performs the same cleanup when saving removed sources (stop the engine before
+  yt-dlp download-history file are not deleted, so a later overlapping playlist
+  still skips those completed video IDs after their job rows are gone when
+  `archiveFile` is enabled. The `bun run config` manager performs the same
+  cleanup when saving removed sources (stop the engine before
   using the terminal manager). Purging the queue alone does not remove sources
   from future scans.
 
@@ -289,12 +310,25 @@ the stale format ids, re-probes, and retries instead of parking the job.
 | `downloadSubtitles` | `true` | Fetch subtitle files for newly added videos. |
 | `subtitleLanguages` | `"all"` | Which subtitle languages to fetch: comma-separated codes (`"en, es, ja"` — regexes like `en.*` work), or `"all"` for every available language including auto-generated captions. |
 | `subtitleFormat` | `"srt"` | Container for the fetched subtitles (converted by yt-dlp). |
-| `writeThumbnail` / `writeDescription` / `writeInfoJson` | `true` | Thumbnail / description / info.json sidecars for newly added videos. |
+| `writeThumbnail` / `writeDescription` | `true` | Thumbnail / description sidecars requested for newly added jobs; per-video choices persist for existing jobs. |
+| `writeInfoJson` | `true` | Global `.info.json` sidecar setting; the manual scan checks every downloaded job against its current value. |
 
 Per-video control: every job's detail drawer has a **Sidecar files** section
 (subtitles / thumbnail / description). Flipping a flag on an
 already-downloaded video fetches the files right away against the existing
 media — no re-download; flipping one off never deletes files already fetched.
+
+For a library-wide repair, choose **📝 Scan Missing Metadata** in the dashboard.
+It checks every database-tracked downloaded video on disk and queues only the
+requested sidecar types that are absent; the metadata worker does not fetch
+sidecars already present and never re-downloads media. Per-video subtitle,
+thumbnail, and description choices are respected, along with the current
+global `writeInfoJson` setting. Missing media, unreadable folders, active
+metadata/conversion jobs, and offline mode are safely skipped. Successful
+fetches that confirm a sidecar is unavailable at the source are remembered so
+later scans do not keep retrying it; the job detail panel shows those types,
+and exhausted metadata jobs are left alone. Enabling that sidecar again from
+the job detail panel explicitly permits a recheck.
 
 ### Tuning from the dashboard
 
@@ -349,7 +383,7 @@ a startup snapshot) and the job table.
 The dashboard (`web_ui.html`, served at `/`) shows live stats, a workers strip
 (what each DL/MD/CV worker is doing right now), the reliability panel, a
 sortable/filterable job table, a per-job detail drawer, failed-job and run-history
-tabs, and the log viewer. It polls only while the tab is visible.
+tabs, an Ignored Videos manager, and the log viewer. It polls only while the tab is visible.
 
 API responses use `{ ok: true|false, … }`; unknown API paths are a JSON 404,
 and a known path with the wrong method is a JSON 405 (+ `Allow`). When
@@ -367,21 +401,24 @@ CLI/API clients.
 | `GET /api/version` | Engine/runtime info (Bun version, platform, uptime). |
 | `GET /api/status` | Stats, aggregate speed, workers, pause state, disk/RAM, ETA. |
 | `GET /api/jobs` | The 500 newest jobs. |
-| `GET /api/jobs/:id` | One job, fresh from the DB (what the detail drawer shows). |
+| `GET /api/ignored-videos` | Videos explicitly removed from the queue and suppressed from future scans. |
+| `DELETE /api/ignored-videos/:id` | Allow one ignored video again; clears its yt-dlp archive entry so a later source scan can queue it for an intentional re-download. |
+| `GET /api/jobs/:id` | One job, fresh from the DB (what the detail drawer shows), including fetched and source-unavailable sidecar lists. |
 | `POST /api/jobs/:id/retry` | Re-queue with fresh budgets (alias: `POST /api/retry/:id`). For a downloaded job this is a real re-download: the id is scrubbed from the yt-dlp archive and the old file stashed as `.superseded` first (restored if the re-download fails permanently). |
 | `POST /api/jobs/:id/reset-failures` | Clear the per-stage failure counters (alias: `POST /api/failcount/reset/:id`). |
 | `POST /api/jobs/:id/audio-tracks` | Save the per-video audio-track selection (`tracks: null` resets). |
 | `POST /api/jobs/:id/audio-probe` | Discover the audio tracks YouTube offers for this video. |
 | `POST /api/jobs/:id/sidecars` | Toggle per-video sidecars (`{subtitles?, thumbnail?, description?}`); enabling one on a finished download fetches it immediately. |
-| `DELETE /api/jobs/:id` | Delete one job row. |
+| `POST /api/metadata/scan` | Check all database-tracked downloaded videos and queue only their requested metadata sidecars missing from disk (offline mode is rejected). |
+| `DELETE /api/jobs/:id` | Remove one job and remember it as ignored so future source scans do not re-add it (until explicitly allowed again). |
 | `POST /api/jobs/pause` | Bulk user-pause `{ "ids": [...] }`. |
-| `DELETE /api/jobs` | Bulk delete `{ "ids": [...] }` (alias: `POST /api/jobs/delete`). |
+| `DELETE /api/jobs` | Remove selected jobs and persist ignore rules for their video IDs (alias: `POST /api/jobs/delete`). |
 | `GET /api/sources` | List configured source URLs and their tracked database-job counts. |
 | `DELETE /api/sources` | `{ "url" }` → remove the source from `config.json` and delete jobs owned only by it; jobs shared with other configured sources remain. |
 | `POST /api/scan` | `{ "url", "folder?" }` → save the source to `config.json`, then scan/add jobs. Returns `saved`, `source: {url, key, added}`, and `found`/`added`/`skipped`. |
-| `POST /api/queue/purge` | Delete all pending/paused/waiting/failed jobs. |
+| `POST /api/queue/purge` | Clear pending/paused/waiting/failed/downloading jobs now; unlike Delete Selected, it does not create ignore rules, so a later source scan can queue them again. |
 | `POST /api/pause` · `POST /api/resume` | Pause/resume the whole engine. |
-| `GET /api/failed` · `POST /api/failed/requeue` | Failed jobs; requeue all eligible (ignores cooldown). |
+| `GET /api/failed` · `POST /api/failed/requeue` | Failed jobs; requeue retryable failures (ignores cooldown), while permanent source errors remain parked. |
 | `GET`/`POST /api/settings` | Dashboard-editable settings snapshot / validated patch. |
 | `GET /api/reliability` | Resume + self-healing snapshot (see above). |
 | `GET /api/history?limit=` · `GET /api/logs?type=error\|report&limit=` | Run history; logs. |
@@ -543,9 +580,12 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
   `min(maxRetryAttempts, maxFailuresPerVideo)` within each retry window; an
   eligible failure starts a fresh window after the configured cooldown.
 - **yt-dlp download archive** — `archiveFile` is passed to
-  `--download-archive` as a second idempotence layer; if a downloaded file
-  disappears (moved/deleted by hand) the archive entry is scrubbed and the
-  video is fetched again on the next attempt.
+  `--download-archive` as a second idempotence layer and is also consulted
+  by source scans when a completed job row is no longer in SQLite, preventing
+  overlapping playlists (or a database reset) from queuing that video again.
+  When a tracked file disappears, the archive entry is scrubbed and the video
+  is fetched again on the next attempt; Retry and **Allow again** also scrub it
+  for deliberate re-downloads.
 - **Startup file reconciliation** — with `verifyExistingFiles` (default on) the
   engine checks that every file it recorded as downloaded still exists on
   disk; anything missing is scrubbed from the archive and re-queued instead of
