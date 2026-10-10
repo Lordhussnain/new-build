@@ -45,7 +45,7 @@ import {
   type BatchSourceEntry,
   type SourceUrl,
 } from "./sources";
-import { cancelActiveStages, diskUsage, triggerPause, triggerResume, type CancelledStages } from "./resilience";
+import { cancelActiveStages, diskUsage, interruptActiveDownloads, triggerPause, triggerResume, type CancelledStages } from "./resilience";
 import { removeFromArchive } from "./archive";
 import {
   findPartialFile,
@@ -1382,8 +1382,10 @@ const ROUTES: Route[] = [
         ids,
       ).changes;
       // Now stop the transfers: a pause the user asked for must stop the
-      // download now, not when yt-dlp happens to finish.
-      stopActiveStages(ids);
+      // download now, not when yt-dlp happens to finish. Downloads only: a
+      // sidecar fetch or conversion is never interrupted by a pause (see the
+      // route comment above), so it can finish and record its result.
+      interruptActiveDownloads(ids);
       return Response.json({ ok: true, paused });
     },
   },

@@ -189,6 +189,24 @@ export function cancelActiveStages(jobIds: Iterable<string>): CancelledStages {
   return stagesFor((jobId) => wanted.has(jobId));
 }
 
+/**
+ * Interrupt only the in-flight DOWNLOADS of `jobIds`. A pause parks the
+ * transfer and nothing else: a sidecar fetch or conversion for the same job
+ * keeps running. Killing those on pause used to record a failed metadata
+ * attempt (with yt-dlp's stderr tail as the error) for a pause the user never
+ * meant as a failure.
+ */
+export function interruptActiveDownloads(jobIds: Iterable<string>): string[] {
+  const wanted = new Set(jobIds);
+  const interrupted: string[] = [];
+  for (const [workerId, jobId] of activeDownloadJobs) {
+    if (!wanted.has(jobId)) continue;
+    interrupted.push(jobId);
+    interruptChild(activeProcs.get(workerId));
+  }
+  return interrupted;
+}
+
 /** Interrupt every in-flight child regardless of job (shutdown / pause-all). */
 export function cancelAllActiveStages(): CancelledStages {
   return stagesFor(() => true);
