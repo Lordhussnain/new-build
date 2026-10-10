@@ -423,6 +423,7 @@ export function isTransientDownloadError(message: string): boolean {
     "connection refused",
     "timeout",
     "timed out",
+    "stalled",
     "network is unreachable",
     "err_connection",
     "temporary failure",

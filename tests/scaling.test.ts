@@ -9,6 +9,7 @@ import { nextSlotTarget, type SlotTargetInput } from "../src/autoscale";
 import { perDownloadTransfers, buildAria2cArgs, CONNECTION_BUDGET } from "../src/download-args";
 import { fitToWidth, sanitizeTerminalText } from "../src/dashboard";
 import { DEFAULT_CONFIG } from "../src/config";
+import { isTransientDownloadError } from "../src/retry";
 
 function input(over: Partial<SlotTargetInput> = {}): SlotTargetInput {
   return {
@@ -112,5 +113,11 @@ describe("TUI text helpers", () => {
     // Each 中 is two columns: six of them is twelve columns.
     expect(fitToWidth("中中中中中中", 12)).toBe("中中中中中中");
     expect(fitToWidth("中中中中中中", 9)).toBe("中中中...");
+  });
+});
+
+describe("stalled transfers", () => {
+  test("a stall is classified as transient, so the job resumes from its partial", () => {
+    expect(isTransientDownloadError("Download stalled — no bytes for 180s; resuming from partial")).toBe(true);
   });
 });

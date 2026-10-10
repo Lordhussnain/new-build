@@ -256,6 +256,12 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
   let downloadTimer: ReturnType<typeof setTimeout> | undefined;
   let finalFilePath = "";
   let lastProgressUpdate = 0;
+  // Stall tracking: the newest downloaded-byte count and when it last grew.
+  let lastBytes = -1;
+  let lastByteAt = Date.now();
+  let postProcessing = false;
+  let stalledMs = 0;
+  let stallTimer: ReturnType<typeof setInterval> | undefined;
   let output: [string, string, number];
   try {
     // Keep registration, timer setup, stream construction, and draining in the
@@ -275,13 +281,40 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
       timedOut = true;
       downloadCtl.abort();
     }, timeoutMs);
+    stallTimer = setInterval(() => {
+      // A pause is a deliberate wait, and post-processing is silent by design:
+      // neither counts toward the stall clock.
+      if (postProcessing || isPaused() || isUserPaused(job.id)) {
+        lastByteAt = Date.now();
+        return;
+      }
+      const idle = Date.now() - lastByteAt;
+      if (idle < DOWNLOAD_STALL_MS || downloadCtl.signal.aborted) return;
+      stalledMs = idle;
+      logError(
+        "download",
+        `${job.id} ${job.title}: no bytes for ${Math.round(idle / 1000)}s — stopping the transfer to resume from its partial`,
+      );
+      updateWorkerLine(id, `⚠️ Stalled — restarting from partial | ${job.title}`, config);
+      downloadCtl.abort();
+    }, STALL_CHECK_MS);
 
     // Every downloader engine funnels through this one writer: the native
     // engine via yt-dlp's --progress-template, aria2c via its console readout
     // (same stdout — yt-dlp lets the child inherit it and fires no progress
     // hook of its own for an external downloader). One writer keeps the
     // dashboard's progress/speed/ETA columns identical on both paths.
-    const reportProgress = (pctNum: number, bps: number, etaNum: number, totalBytes: number | null) => {
+    const reportProgress = (
+      pctNum: number,
+      bps: number,
+      etaNum: number,
+      totalBytes: number | null,
+      downloadedBytes: number | null,
+    ) => {
+      if (downloadedBytes !== null && downloadedBytes > lastBytes) {
+        lastBytes = downloadedBytes;
+        lastByteAt = Date.now();
+      }
       if (isUserPaused(job.id)) {
         updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
         return;
@@ -300,6 +333,7 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     };
 
     const stdoutPromise = readProcessOutput(proc.stdout, (line) => {
+      if (POST_PROCESSING_LINE.test(line.trim())) postProcessing = true;
       if (line.startsWith("PROGRESS:")) {
         const parts = line.replace("PROGRESS:", "").split("|");
         const sizeNum = parseInt(parts[3], 10);
@@ -311,6 +345,7 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
           parseSpeedToBytesPerSec(parts[1]),
           parseFloat(parts[2]) || 0,
           Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : null,
+          Number.isFinite(dlNum) && dlNum >= 0 ? dlNum : null,
         );
       } else {
         const path = parseDownloadPath(line);
@@ -326,6 +361,7 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
               readout.speedBps,
               readout.etaSeconds,
               readout.totalBytes > 0 ? readout.totalBytes : null,
+              readout.downloadedBytes >= 0 ? readout.downloadedBytes : null,
             );
           }
         }
@@ -337,6 +373,7 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     // reaches existsSync: only a size/control-checked FILEPATH record below.
     output = await Promise.all([stdoutPromise, readProcessOutput(proc.stderr), proc.exited]);
   } finally {
+    if (stallTimer !== undefined) clearInterval(stallTimer);
     await cleanupDownloadProcess(id, proc, downloadTimer);
   }
   const [stdoutText, stderrText, code] = output;
@@ -348,6 +385,9 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
   }
 
   if (timedOut) throw new Error(`Process timed out (${Math.round(timeoutMs / 60000)}m)`);
+  if (stalledMs > 0) {
+    throw new Error(`Download stalled — no bytes for ${Math.round(stalledMs / 1000)}s; resuming from partial`);
+  }
 
   if (code === 0) {
     let filePath = finalFilePath && existsSync(finalFilePath) ? finalFilePath : "";
@@ -387,6 +427,24 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
 }
 
 const DOWNLOAD_PROCESS_CLEANUP_GRACE_MS = 2_000;
+
+/**
+ * A transfer that moves no bytes for this long is stalled: its child is stopped
+ * and the job resumes from its partial. Before this existed, a child that went
+ * silent (a hung socket, a fragment the server stopped serving) kept its slot
+ * and its claim lease until the total timeout — 15 to 180 minutes — while the
+ * dashboard showed the last percentage. The signal is downloaded bytes, not the
+ * percentage, so a slow transfer that is still moving is left alone.
+ */
+export const DOWNLOAD_STALL_MS = 180_000;
+const STALL_CHECK_MS = 15_000;
+/**
+ * yt-dlp lines that mean the transfer has finished and post-processing has
+ * started. Those phases are silent for minutes by design, so stall detection
+ * stops once one appears.
+ */
+const POST_PROCESSING_LINE =
+  /^\[(?:Merger|ffmpeg|ExtractAudio|EmbedThumbnail|Metadata|Fixup\w*|ModifyChapters|MoveFiles|SponsorBlock|VideoConvertor|VideoRemuxer)\]/;
 
 /**
  * How long the dashboard keeps showing "Format X not available — switched to Y".
