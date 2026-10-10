@@ -14,16 +14,16 @@ const WIN = process.platform === "win32";
  * updater. The mode comes from a file because `bun test` snapshots
  * `process.env` at startup and a variable set later never reaches a child.
  */
-const TEST_TIMEOUT_MS = WIN ? 30_000 : 10_000;
+const TEST_TIMEOUT_MS = WIN ? 90_000 : 10_000;
 
 /**
  * How long a *cooperative* fixture may take before the run counts as timed
  * out. It is a backstop for a broken fixture, not the behaviour under test —
- * and on Windows a first launch of a compiled executable can sit in Defender
- * for seconds, which used to trip it. The hard-kill test below keeps a tight
- * bound, because there the timeout is the thing being asserted.
+ * and on Windows the first launch of a compiled executable can spend tens of
+ * seconds in Defender. The hard-kill test below keeps a tight bound, because
+ * there the timeout is the thing being asserted.
  */
-const COOPERATIVE_BOUND_MS = WIN ? 20_000 : 2_000;
+const COOPERATIVE_BOUND_MS = WIN ? 60_000 : 2_000;
 
 type FakeMode = "ok" | "fail" | "hang";
 

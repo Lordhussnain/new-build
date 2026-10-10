@@ -394,7 +394,13 @@ export interface YtDlpUpdateResult {
 }
 
 let lastYtDlpUpdateAttemptAt: number | null = null;
+let lastYtDlpUpdateResult: YtDlpUpdateResult | null = null;
 let ytDlpUpdateInFlight: Promise<YtDlpUpdateResult> | null = null;
+// A successful update can finish before every worker in the same failure burst
+// reaches this branch. Let each distinct job consume that success once during
+// the cooldown, but do not let one still-broken job reset its retry budget over
+// and over against the same stale update result.
+const jobsRetriedAfterYtDlpUpdate = new Set<string>();
 
 /**
  * Run `yt-dlp -U` with both pipes drained, bounded diagnostic tails, and a hard
@@ -478,19 +484,38 @@ async function stopYtDlpUpdateProcess(proc: Bun.Subprocess): Promise<void> {
   await proc.exited.catch(() => {});
 }
 
-async function requestSignatureUpdate(): Promise<{ attempted: boolean; result: YtDlpUpdateResult | null }> {
-  if (ytDlpUpdateInFlight) return { attempted: true, result: await ytDlpUpdateInFlight };
+async function requestSignatureUpdate(
+  jobId: string,
+): Promise<{ attempted: boolean; result: YtDlpUpdateResult | null }> {
+  if (ytDlpUpdateInFlight) {
+    const result = await ytDlpUpdateInFlight;
+    if (result.ok) jobsRetriedAfterYtDlpUpdate.add(jobId);
+    return { attempted: true, result };
+  }
   if (
     lastYtDlpUpdateAttemptAt !== null &&
     Date.now() - lastYtDlpUpdateAttemptAt < YTDLP_UPDATE_COOLDOWN_MS
   ) {
+    // The update process may be very fast, especially once its executable has
+    // been warmed by the dependency probe. A sibling job that reaches this
+    // branch just after it exits still gets one retry against the updated
+    // binary; a subsequent failure from that same job uses the normal budget.
+    if (lastYtDlpUpdateResult?.ok && !jobsRetriedAfterYtDlpUpdate.has(jobId)) {
+      jobsRetriedAfterYtDlpUpdate.add(jobId);
+      return { attempted: false, result: lastYtDlpUpdateResult };
+    }
     return { attempted: false, result: null };
   }
   lastYtDlpUpdateAttemptAt = Date.now();
+  lastYtDlpUpdateResult = null;
+  jobsRetriedAfterYtDlpUpdate.clear();
   const update = runYtDlpSelfUpdate();
   ytDlpUpdateInFlight = update;
   try {
-    return { attempted: true, result: await update };
+    const result = await update;
+    lastYtDlpUpdateResult = result;
+    if (result.ok) jobsRetriedAfterYtDlpUpdate.add(jobId);
+    return { attempted: true, result };
   } finally {
     if (ytDlpUpdateInFlight === update) ytDlpUpdateInFlight = null;
   }
@@ -614,7 +639,7 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
   // extractor errors are not fixed by -U, and a broken updater must not reset
   // the video's retry budget or launch once per worker.
   if (isSignatureChallengeError(errMsg) && !isNChallengeError(errMsg)) {
-    const update = await requestSignatureUpdate();
+    const update = await requestSignatureUpdate(job.id);
     if (update.result?.ok) {
       if (!resetForRetry(job)) return;
       updateWorkerLine(id, `🔄 yt-dlp updated — retrying | ${job.title}`, config);

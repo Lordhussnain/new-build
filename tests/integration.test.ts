@@ -502,6 +502,44 @@ describe("integration: transient failures and resume", () => {
     }
   }, TEST_TIMEOUT);
 
+  test("a successful self-update grants one retry per job, not an unlimited reset", async () => {
+    const dir = await makeRunDir();
+    const updateLog = join(dir, "yt-dlp-update.log");
+    const engine = await startEngine(
+      dir,
+      4004,
+      BASE_CONFIG(4004, {
+        maxConcurrentDownloads: 1,
+        retryBackoffBaseSeconds: 1,
+        retryBackoffMaxSeconds: 2,
+        maxRetryAttempts: 3,
+        maxFailuresPerVideo: 3,
+        maxFailures: 50,
+      }),
+      {
+        FAKE_FAIL_TIMES: "2",
+        FAKE_FAIL_MODE: "signature",
+        FAKE_UPDATE_LOG: updateLog,
+        FAKE_DELAY_MS: "20",
+      },
+    );
+
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+      // The first signature failure gets one immediate, budget-free retry from
+      // the shared update. A second failure from that same job cannot consume
+      // the cached success again, so it spends exactly one normal retry.
+      for (const job of jobs) expect(job.retry_count).toBe(1);
+      expect(await Bun.file(updateLog).text()).toBe("update\n");
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
   test("does not reset retry budgets when yt-dlp self-update fails", async () => {
     const dir = await makeRunDir();
     const updateLog = join(dir, "yt-dlp-update.log");
