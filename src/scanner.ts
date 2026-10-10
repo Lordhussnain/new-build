@@ -89,7 +89,10 @@ function parseListingLine(line: string): ListingItem | null {
   const item: ListingItem = {
     title: (title || "video").trim(),
     id: (id || "").trim(),
-    playlist: (playlist || "playlist").trim(),
+    // yt-dlp prints NA for a field the video does not have. A single video has
+    // no playlist title, so it stays empty and the folder falls back to
+    // "Single Videos" (the same fallback ingest and Metadata Only use).
+    playlist: (playlist || "").trim() === "NA" ? "" : (playlist || "").trim(),
     duration: parseFloat(duration ?? "NaN"),
   };
   return item.id ? item : null;
