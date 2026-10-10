@@ -31,10 +31,20 @@ import {
   markJobCancelled,
   workerStatuses,
 } from "./state";
-import { getPlaylistItems, scanAndIngest } from "./scanner";
+import { getPlaylistItems, scanAndIngest, scanSourcesBatch } from "./scanner";
 import { scanDownloadedMetadata } from "./metadata-scan";
 import { parseUnavailableMetadataKinds, type MetadataKind } from "./metadata-files";
-import { parseSourceUrl, removeSource, saveSource, SOURCE_KEYS, sourceIdentity, type SourceUrl } from "./sources";
+import {
+  parseSourceUrl,
+  removeSource,
+  saveBatchSources,
+  saveSource,
+  SOURCE_KEYS,
+  sourceIdentity,
+  type BatchSaveResult,
+  type BatchSourceEntry,
+  type SourceUrl,
+} from "./sources";
 import { cancelActiveStages, diskUsage, triggerPause, triggerResume, type CancelledStages } from "./resilience";
 import { removeFromArchive } from "./archive";
 import {
@@ -1512,8 +1522,9 @@ const ROUTES: Route[] = [
     handler: async ({ req }) => {
       const body = await req.json().catch(() => null);
       let source: SourceUrl;
+      const singleVideo = Boolean(body?.singleVideo);
       try {
-        source = parseSourceUrl(body?.url);
+        source = parseSourceUrl(body?.url, { singleVideo });
         if (body.folder !== undefined && typeof body.folder !== "string") throw new Error("Folder must be a string");
       } catch (e: any) {
         return Response.json({ ok: false, saved: false, error: e.message }, { status: 400 });
@@ -1523,6 +1534,8 @@ const ROUTES: Route[] = [
       try {
         // Save first: a failed config write must not silently start a one-off
         // download, and a slow/failed scan must not lose the user's source.
+        // source.url is already canonical (a single-video request is a plain
+        // watch URL), so it does not need the option again.
         savedSource = await saveSource(source.url);
       } catch (e: any) {
         logError("config", `Saving source ${source.url}: ${e?.message || e}`);
@@ -1560,6 +1573,114 @@ const ROUTES: Route[] = [
           error: `URL saved to config.json, but the scan failed: ${e?.message || e}`,
         }, { status: 500 });
       }
+    },
+  },
+  {
+    methods: ["POST"],
+    pattern: "/api/scan/batch",
+    handler: async ({ req }) => {
+      // Batch import: many playlist / channel / video links in one request. The
+      // UI sends pasted text or the contents of an uploaded .txt file. Every
+      // valid line is saved in ONE config write before anything scans, and the
+      // scans run in the background, so a long list never holds the HTTP
+      // request open. Invalid lines come back with their line numbers.
+      const maxLinks = 2000;
+      const body = await req.json().catch(() => null);
+      if (!body || typeof body !== "object") {
+        return Response.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
+      }
+      if (body.folder !== undefined && typeof body.folder !== "string") {
+        return Response.json({ ok: false, error: "Folder must be a string" }, { status: 400 });
+      }
+      let lines: BatchSourceEntry[];
+      if (typeof body.urls === "string") {
+        lines = body.urls.split(/\r?\n/).map((input: string, index: number) => ({ line: index + 1, input: input.trim() }));
+      } else if (Array.isArray(body.urls)) {
+        lines = body.urls.map((input: unknown, index: number) => ({
+          line: index + 1,
+          input: typeof input === "string" ? input.trim() : "",
+        }));
+      } else {
+        return Response.json(
+          { ok: false, error: "urls must be text with one link per line, or an array of links" },
+          { status: 400 },
+        );
+      }
+      // Blank lines and "# comment" lines are notes, not links.
+      const entries = lines.filter((entry) => entry.input.length > 0 && !entry.input.startsWith("#"));
+      if (entries.length === 0) {
+        return Response.json({ ok: false, error: "No links found. Paste or upload one link per line." }, { status: 400 });
+      }
+      if (entries.length > maxLinks) {
+        return Response.json(
+          { ok: false, error: `A batch can hold at most ${maxLinks} links; split the list into smaller imports.` },
+          { status: 400 },
+        );
+      }
+
+      const folder = typeof body.folder === "string" && body.folder.trim() ? body.folder.trim() : undefined;
+      let result: BatchSaveResult;
+      try {
+        // Save first, exactly like /api/scan: a failed config write starts no scans.
+        result = await saveBatchSources(entries, undefined, { singleVideo: Boolean(body.singleVideo) });
+      } catch (e: any) {
+        logError("config", `Saving batch of ${entries.length} link(s): ${e?.message || e}`);
+        return Response.json({
+          ok: false, saved: false,
+          error: `Could not save links to config.json; no scan was started. ${e?.message || e}`,
+        }, { status: 500 });
+      }
+
+      const { saved, errors, valid } = result;
+      const added = saved.filter((source) => source.added).length;
+      const sources = {
+        total: saved.length,
+        added,
+        existing: saved.length - added,
+        videos: saved.filter((source) => source.url.startsWith("https://www.youtube.com/watch?v=")).length,
+        playlists: saved.filter((source) => source.url.startsWith("https://www.youtube.com/playlist?list=")).length,
+        channels: saved.filter((source) => source.key === "channels" || source.key === "channelPlaylists").length,
+      };
+      if (saved.length === 0) {
+        return Response.json({
+          ok: false,
+          total: entries.length,
+          valid,
+          invalid: errors.length,
+          errors,
+          sources,
+          scanning: 0,
+          error: `None of the ${entries.length} line(s) is a valid YouTube playlist, channel or video link.`,
+        }, { status: 400 });
+      }
+
+      const liveConfig = getConfig();
+      // Offline mode: saving stays useful; scanning is a network round-trip and
+      // is skipped, exactly as /api/scan does.
+      const scanning = liveConfig.offlineMode ? 0 : saved.length;
+      if (scanning > 0) {
+        void scanSourcesBatch(saved.map((source) => source.url), liveConfig, folder)
+          .then((outcomes) => {
+            const failed = outcomes.filter((outcome) => outcome.error).length;
+            const queued = outcomes.reduce((sum, outcome) => sum + outcome.added, 0);
+            console.log(`📥 Batch scan finished: ${outcomes.length - failed} source(s) ok, ${failed} failed, ${queued} video(s) queued`);
+          })
+          .catch((e: any) => logError("scan", `Batch scan: ${e?.message || e}`));
+      }
+      const message = liveConfig.offlineMode
+        ? `Saved ${saved.length} source(s) to config.json. Offline mode is on, so scanning is skipped — they are scanned at the next online start.`
+        : `Saved ${saved.length} source(s) (${added} new, ${saved.length - added} already saved). Scanning in the background; new videos appear in the job list as each source finishes.`;
+      return Response.json({
+        ok: true,
+        total: entries.length,
+        valid,
+        invalid: errors.length,
+        duplicates: valid - saved.length,
+        errors,
+        sources,
+        scanning,
+        message,
+      });
     },
   },
   {

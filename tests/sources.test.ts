@@ -7,7 +7,7 @@ import { DEFAULT_CONFIG, loadConfig, saveConfig, type Config } from "../src/conf
 import { getConfig, setConfig } from "../src/state";
 import { associateExistingJobsWithSource, db, initDatabase, pruneJobsForUnconfiguredSources } from "../src/db";
 import { ingestItems } from "../src/scanner";
-import { parseSourceUrl, removeSource, saveSource } from "../src/sources";
+import { parseSourceUrl, removeSource, saveBatchSources, saveSource } from "../src/sources";
 import { handleRequest } from "../src/web";
 
 const dirs: string[] = [];
@@ -65,6 +65,28 @@ describe("parseSourceUrl", () => {
     }
   });
 
+  test("single-video option keeps only the video from a watch link that also has a playlist", () => {
+    const watch = "https://www.youtube.com/watch?v=juY5TV5vNYw&list=PLG6V3xWznon-iJRo_B4XyCiMNaGJmOV-5&index=8";
+    const list = "PLG6V3xWznon-iJRo_B4XyCiMNaGJmOV-5";
+    expect(parseSourceUrl(watch, { singleVideo: true })).toEqual({
+      key: "playlists", url: "https://www.youtube.com/watch?v=juY5TV5vNYw",
+    });
+    expect(parseSourceUrl("https://www.youtube.com/watch?v=dO-s4y5S2NU&list=" + list + "&index=4", { singleVideo: true })).toEqual({
+      key: "playlists", url: "https://www.youtube.com/watch?v=dO-s4y5S2NU",
+    });
+    expect(parseSourceUrl("https://youtu.be/juY5TV5vNYw?list=" + list, { singleVideo: true })).toEqual({
+      key: "playlists", url: "https://www.youtube.com/watch?v=juY5TV5vNYw",
+    });
+    // Default behaviour is unchanged: a list id still means the whole playlist.
+    expect(parseSourceUrl(watch)).toEqual({ key: "playlists", url: "https://www.youtube.com/playlist?list=" + list });
+    expect(parseSourceUrl(watch, { singleVideo: false })).toEqual({ key: "playlists", url: "https://www.youtube.com/playlist?list=" + list });
+    // Without a video id there is nothing to extract: the playlist stays the source.
+    expect(parseSourceUrl("https://www.youtube.com/playlist?list=" + list, { singleVideo: true })).toEqual({
+      key: "playlists", url: "https://www.youtube.com/playlist?list=" + list,
+    });
+    expect(parseSourceUrl(channel, { singleVideo: true })).toEqual({ key: "channels", url: channel });
+  });
+
   test("rejects missing, malformed, unsupported and non-YouTube inputs", () => {
     for (const value of [
       undefined, null, {}, [], 123, "", "   ", "not a URL", "https://www.youtube.com/", "https://www.youtube.com/playlist?list=",
@@ -90,6 +112,16 @@ describe("saveSource", () => {
     expect(getConfig()).toEqual(saved);
     expect(original.playlists).toEqual([]); // Never mutate a captured/default array.
     expect(DEFAULT_CONFIG.playlists).toEqual([]);
+  });
+
+  test("single-video saves store only the video, and repeat saves do not duplicate it", async () => {
+    const path = join(await makeDir(), "config.json");
+    const watch = "https://www.youtube.com/watch?v=juY5TV5vNYw&list=PLG6V3xWznon-iJRo_B4XyCiMNaGJmOV-5&index=8";
+    expect(await saveSource(watch, path, { singleVideo: true })).toEqual({
+      key: "playlists", url: "https://www.youtube.com/watch?v=juY5TV5vNYw", added: true,
+    });
+    expect((await saveSource(watch, path, { singleVideo: true })).added).toBe(false);
+    expect((await loadConfig(path)).playlists).toEqual(["https://www.youtube.com/watch?v=juY5TV5vNYw"]);
   });
 
   test("repeated scans and share-link variants do not create duplicate sources", async () => {
@@ -415,6 +447,75 @@ describe("POST /api/scan persistence errors", () => {
       method: "POST", body: JSON.stringify({ url: playlist }),
     }), protectedConfig);
     expect(response.status).toBe(401);
+    expect(getConfig().playlists).toEqual([]);
+  });
+});
+
+describe("saveBatchSources", () => {
+  test("saves valid lines in one write, reports invalid lines by number and collapses repeats", async () => {
+    const path = join(await makeDir(), "config.json");
+    await saveSource(playlist, path);
+    const result = await saveBatchSources([
+      { line: 1, input: playlist },
+      { line: 2, input: channel },
+      { line: 3, input: "not a url" },
+      { line: 4, input: "https://www.youtube.com/watch?v=juY5TV5vNYw&list=PLG6V3xWznon-iJRo_B4XyCiMNaGJmOV-5&index=8" },
+      { line: 5, input: "https://youtu.be/juY5TV5vNYw?list=PLG6V3xWznon-iJRo_B4XyCiMNaGJmOV-5" },
+      { line: 6, input: channel },
+    ], path, { singleVideo: true });
+    expect(result.valid).toBe(5);
+    expect(result.errors).toEqual([{ line: 3, input: "not a url", error: expect.any(String) }]);
+    expect(result.saved).toEqual([
+      { key: "playlists", url: playlist, added: false },
+      { key: "channels", url: channel, added: true },
+      { key: "playlists", url: "https://www.youtube.com/watch?v=juY5TV5vNYw", added: true },
+    ]);
+    const saved = await loadConfig(path);
+    expect(saved.playlists).toEqual([playlist, "https://www.youtube.com/watch?v=juY5TV5vNYw"]);
+    expect(saved.channels).toEqual([channel]);
+    expect(getConfig()).toEqual(saved);
+  });
+
+  test("an all-invalid batch writes nothing and leaves the live config untouched", async () => {
+    const dir = await makeDir();
+    const path = join(dir, "config.json");
+    const before = getConfig();
+    const result = await saveBatchSources([{ line: 1, input: "nope" }], path);
+    expect(result).toEqual({ saved: [], errors: [{ line: 1, input: "nope", error: expect.any(String) }], valid: 0 });
+    expect(getConfig()).toBe(before);
+    expect(await readdir(dir)).toEqual([]);
+  });
+});
+
+describe("POST /api/scan/batch validation", () => {
+  test("rejects empty, malformed and oversized batches before writing configuration or scanning", async () => {
+    const config = getConfig();
+    const post = (body: string) => handleRequest(new Request("http://x/api/scan/batch", { method: "POST", body }), config);
+    for (const body of [
+      "not json",
+      "null",
+      JSON.stringify({}),
+      JSON.stringify({ urls: 42 }),
+      JSON.stringify({ urls: "\n# only a comment\n   \n" }),
+      JSON.stringify({ urls: [""] }),
+      JSON.stringify({ urls: playlist, folder: [] }),
+      JSON.stringify({ urls: Array.from({ length: 2001 }, () => playlist) }),
+    ]) {
+      const response = await post(body);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ ok: false });
+    }
+    expect(getConfig().playlists).toEqual([]);
+  });
+
+  test("an all-invalid batch reports every bad line with its number and saves nothing", async () => {
+    const response = await handleRequest(new Request("http://x/api/scan/batch", {
+      method: "POST", body: JSON.stringify({ urls: "https://example.com\nnot a url" }),
+    }), getConfig());
+    expect(response.status).toBe(400);
+    const data = await response.json();
+    expect(data).toMatchObject({ ok: false, valid: 0, invalid: 2, scanning: 0 });
+    expect(data.errors.map((e: { line: number }) => e.line)).toEqual([1, 2]);
     expect(getConfig().playlists).toEqual([]);
   });
 });

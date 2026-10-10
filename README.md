@@ -171,6 +171,18 @@ Share/tracking parameters are removed; a watch link with `list=` keeps the
 playlist, not just the currently selected video. Repeated scans do not append
 duplicate sources or duplicate jobs, even if all videos were already queued.
 
+**Single video only** (the checkbox under the URL box) changes that one case:
+a `watch?v=…&list=…&index=…` link saves only the video `v=` and drops the
+playlist. Links without a video id are unaffected.
+
+**📋 Batch Links** opens a box for many links at once, one per line, or an
+uploaded `.txt` file. Blank lines and lines starting with `#` are ignored. All
+valid links are saved to `config.json` in one write, then scanned in the
+background with four workers, so a long list does not hold the page open. The
+result shows counts by kind (playlists, single videos, channels), duplicates,
+and each invalid line with its line number. Invalid lines stay in the box so
+you can fix them and import again.
+
 - The response confirms **Saved to config.json**; a failed write is shown as
   an error and does not start a scan. Writes replace the file atomically, and
   concurrent source/settings updates cannot overwrite each other.
@@ -415,7 +427,8 @@ CLI/API clients.
 | `DELETE /api/jobs` | Remove selected jobs and persist ignore rules for their video IDs (alias: `POST /api/jobs/delete`). |
 | `GET /api/sources` | List configured source URLs and their tracked database-job counts. |
 | `DELETE /api/sources` | `{ "url" }` → remove the source from `config.json` and delete jobs owned only by it; jobs shared with other configured sources remain. |
-| `POST /api/scan` | `{ "url", "folder?" }` → save the source to `config.json`, then scan/add jobs. Returns `saved`, `source: {url, key, added}`, and `found`/`added`/`skipped`. |
+| `POST /api/scan` | `{ "url", "folder?", "singleVideo?" }` → save the source to `config.json`, then scan/add jobs. `singleVideo: true` saves only the video of a `watch?v=…&list=…` link. Returns `saved`, `source: {url, key, added}`, and `found`/`added`/`skipped`. |
+| `POST /api/scan/batch` | `{ "urls": text or [links], "folder?", "singleVideo?" }` → save every valid line in one config write, then scan in the background. Returns `total`, `valid`, `invalid`, `duplicates`, `errors` (`line`, `input`, `error`), `sources` (`added`, `existing`, `videos`, `playlists`, `channels`), and `scanning`. Up to 2000 links per request. |
 | `POST /api/queue/purge` | Clear pending/paused/waiting/failed/downloading jobs now; unlike Delete Selected, it does not create ignore rules, so a later source scan can queue them again. |
 | `POST /api/pause` · `POST /api/resume` | Pause/resume the whole engine. |
 | `GET /api/failed` · `POST /api/failed/requeue` | Failed jobs; requeue retryable failures (ignores cooldown), while permanent source errors remain parked. |

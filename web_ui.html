@@ -451,6 +451,64 @@
       border-color: var(--accent);
       box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
     }
+    .add-url-options {
+      margin-top: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      font-size: 0.8rem;
+      color: var(--text-secondary);
+    }
+    .add-url-options label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+
+    /* --- Batch Links modal -------------------------------------------------- */
+    .batch-textarea {
+      width: 100%;
+      min-height: 170px;
+      padding: 10px 12px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 0.8rem;
+      resize: vertical;
+    }
+    .batch-textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2); }
+    .batch-input {
+      width: 100%;
+      padding: 8px 12px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-size: 0.85rem;
+      font-family: inherit;
+    }
+    .batch-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      align-items: end;
+      margin-top: 12px;
+    }
+    .batch-field-label { display: block; font-size: 0.78rem; font-weight: 600; margin-bottom: 6px; }
+    .batch-check { display: flex; align-items: center; gap: 6px; font-size: 0.8rem; cursor: pointer; padding-bottom: 8px; }
+    .batch-result {
+      margin-top: 12px;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--bg-secondary);
+      font-size: 0.82rem;
+    }
+    .batch-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; text-align: center; }
+    .batch-stats div { padding: 6px 4px; border-radius: var(--radius-sm); background: var(--bg-input); }
+    .batch-stats strong { display: block; font-size: 1.05rem; }
+    .batch-errors { margin: 8px 0 0 18px; max-height: 160px; overflow-y: auto; color: var(--text-secondary); }
+    .batch-errors li { margin-bottom: 4px; word-break: break-all; }
 
     /* --- Saved Sources Section -------------------------------------------- */
     .source-manager {
@@ -1299,6 +1357,13 @@
       <input type="text" id="folderOverride" placeholder="Optional: Custom subfolder" />
       <button class="btn btn-primary" id="scanUrlButton" onclick="scanUrl()">📡 Save &amp; Scan</button>
     </div>
+    <div class="add-url-options">
+      <label title="For links like watch?v=…&list=…&index=…: save only that video instead of the whole playlist">
+        <input type="checkbox" id="singleVideoCheckbox" />
+        <span>Single video only (for <code>watch?v=…&amp;list=…</code> links)</span>
+      </label>
+      <button class="btn btn-secondary btn-sm" id="batchOpenBtn" onclick="openBatchImport()">📋 Batch Links</button>
+    </div>
   </div>
 
   <div class="source-manager">
@@ -1511,6 +1576,48 @@
         <button class="btn btn-secondary" id="settingsDiscardBtn" onclick="discardSettingsDraft()" style="display: none;">Discard Draft</button>
         <button class="btn btn-secondary" onclick="closeSettings()">Cancel</button>
         <button class="btn btn-primary" id="settingsSaveBtn" onclick="saveSettings()">💾 Save Changes</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="batchModal">
+    <div class="modal" style="max-width: 680px;">
+      <div class="modal-header">
+        <div class="modal-header-left">
+          <h3>📋 Batch Links</h3>
+          <span class="modal-badge">Playlists, channels and videos</span>
+        </div>
+        <button class="btn btn-secondary btn-icon" onclick="closeBatchImport()" title="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 12px;">
+          One YouTube link per line. Blank lines and lines starting with <code>#</code> are ignored.
+          Valid links are saved to config.json, then scanned in the background.
+        </p>
+        <textarea id="batchUrlsInput" class="batch-textarea" spellcheck="false" oninput="updateBatchCount()" placeholder="https://www.youtube.com/playlist?list=PLG6V3xWznon-iJRo_B4XyCiMNaGJmOV-5&#10;https://www.youtube.com/watch?v=juY5TV5vNYw&amp;list=PLG6V3xWznon-iJRo_B4XyCiMNaGJmOV-5&amp;index=8&#10;# comments are skipped"></textarea>
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 8px;">
+          <label class="btn btn-secondary btn-sm" style="cursor: pointer; margin: 0;">
+            📁 Upload .txt
+            <input type="file" id="batchFileInput" accept=".txt,text/plain" style="display: none;" onchange="loadBatchFile(event)" />
+          </label>
+          <span id="batchLineCount" style="font-size: 0.78rem; color: var(--text-secondary);">0 links</span>
+        </div>
+        <div class="batch-grid">
+          <div>
+            <label for="batchFolderInput" class="batch-field-label">Optional folder override</label>
+            <input type="text" id="batchFolderInput" class="batch-input" placeholder="e.g. My Favorite Batch" />
+          </div>
+          <label class="batch-check">
+            <input type="checkbox" id="batchSingleVideoCheckbox" />
+            <span>Single video only for <code>watch?v=…&amp;list=…</code> links</span>
+          </label>
+        </div>
+        <div id="batchResult" class="batch-result" style="display: none;"></div>
+      </div>
+      <div class="modal-footer">
+        <span style="margin-right: auto; font-size: 0.78rem; color: var(--text-secondary);">Lines that could not be imported stay here so you can fix them.</span>
+        <button class="btn btn-secondary" onclick="closeBatchImport()">Close</button>
+        <button class="btn btn-primary" id="batchImportBtn" onclick="runBatchImport()">📥 Import &amp; Scan</button>
       </div>
     </div>
   </div>
@@ -2671,10 +2778,11 @@
       button.disabled = true;
       button.textContent = '⏳ Scanning...';
       try {
+        const singleVideo = document.getElementById('singleVideoCheckbox').checked;
         const res = await fetch('/api/scan', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url, folder: folder || undefined }),
+          body: JSON.stringify({ url, folder: folder || undefined, singleVideo }),
         });
         const data = await res.json();
         if (data.ok) {
@@ -2694,6 +2802,117 @@
       } finally {
         button.disabled = false;
         button.textContent = '📡 Save & Scan';
+      }
+    }
+
+    // --- Batch Links ---------------------------------------------------------
+    function openBatchImport() {
+      // Start from the single-URL checkbox so the user does not set it twice.
+      document.getElementById('batchSingleVideoCheckbox').checked = document.getElementById('singleVideoCheckbox').checked;
+      document.getElementById('batchModal').classList.add('open');
+      updateBatchCount();
+      document.getElementById('batchUrlsInput').focus();
+    }
+
+    function closeBatchImport() {
+      document.getElementById('batchModal').classList.remove('open');
+    }
+
+    function batchLinesFrom(text) {
+      return String(text || '').split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#'));
+    }
+
+    function updateBatchCount() {
+      const count = batchLinesFrom(document.getElementById('batchUrlsInput').value).length;
+      document.getElementById('batchLineCount').textContent = `${count} link${count === 1 ? '' : 's'}`;
+    }
+
+    async function loadBatchFile(event) {
+      const input = event.target;
+      const file = input.files && input.files[0];
+      input.value = ''; // selecting the same file again must fire onchange
+      if (!file) return;
+      if (file.size > 1024 * 1024) {
+        showNotification('That file is larger than 1 MB. Split it into smaller .txt files.', 'warning');
+        return;
+      }
+      try {
+        const text = await file.text();
+        const area = document.getElementById('batchUrlsInput');
+        const existing = area.value.replace(/\s+$/, '');
+        area.value = existing ? `${existing}\n${text.replace(/\s+$/, '')}` : text;
+        updateBatchCount();
+        showNotification(`Loaded ${file.name}`, 'info');
+      } catch (err) {
+        showNotification(err.message, 'error');
+      }
+    }
+
+    function renderBatchResult(data) {
+      const box = document.getElementById('batchResult');
+      const s = data.sources || {};
+      const stat = (label, value) => `<div><strong>${Number(value) || 0}</strong>${escapeHtml(label)}</div>`;
+      const errors = Array.isArray(data.errors) ? data.errors : [];
+      const shown = errors.slice(0, 200);
+      box.innerHTML = `
+        <div class="batch-stats">
+          ${stat('lines read', data.total)}
+          ${stat('new sources', s.added)}
+          ${stat('already saved', s.existing)}
+          ${stat('invalid', data.invalid)}
+          ${stat('playlists', s.playlists)}
+          ${stat('single videos', s.videos)}
+          ${stat('channels', s.channels)}
+          ${stat('duplicates', data.duplicates)}
+        </div>
+        ${errors.length ? `
+          <div style="margin-top: 10px; font-weight: 600; color: var(--danger);">${errors.length} line(s) not imported:</div>
+          <ul class="batch-errors">
+            ${shown.map(e => `<li>Line ${Number(e.line) || '?'}: <code>${escapeHtml(e.input)}</code> — ${escapeHtml(e.error)}</li>`).join('')}
+          </ul>
+          ${errors.length > shown.length ? `<div style="color: var(--text-secondary);">…and ${errors.length - shown.length} more</div>` : ''}
+        ` : ''}`;
+      box.style.display = 'block';
+    }
+
+    async function runBatchImport() {
+      const area = document.getElementById('batchUrlsInput');
+      const button = document.getElementById('batchImportBtn');
+      if (batchLinesFrom(area.value).length === 0) {
+        showNotification('Paste or upload at least one link first', 'warning');
+        return;
+      }
+      const folder = (document.getElementById('batchFolderInput').value || '').trim();
+      const singleVideo = document.getElementById('batchSingleVideoCheckbox').checked;
+      button.disabled = true;
+      button.textContent = '⏳ Importing...';
+      try {
+        const res = await fetch('/api/scan/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ urls: area.value, singleVideo, folder: folder || undefined }),
+        });
+        const data = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+        renderBatchResult(data);
+        // Keep only the rejected lines so they can be fixed and imported again.
+        // A server failure (no errors list) leaves the user's text untouched.
+        if (Array.isArray(data.errors)) {
+          area.value = data.errors.map(e => e.input).join('\n');
+          updateBatchCount();
+        }
+        if (data.ok) {
+          const invalid = data.invalid ? ` ${data.invalid} invalid line(s) were left in the box.` : '';
+          showNotification(`${data.message || 'Batch imported.'}${invalid}`, data.invalid ? 'warning' : 'success', 8000);
+          loadSources();
+          refreshData();
+        } else {
+          showNotification(data.error || 'Batch import failed', 'error');
+        }
+      } catch (err) {
+        showNotification(err.message, 'error');
+      } finally {
+        button.disabled = false;
+        button.textContent = '📥 Import & Scan';
       }
     }
 
@@ -3587,6 +3806,7 @@
       if (e.key === 'Escape') {
         if (document.getElementById('settingsModal').classList.contains('open')) { closeSettings(); return; }
         if (document.getElementById('unconvertedModal').classList.contains('open')) { closeUnconvertedScan(); return; }
+        if (document.getElementById('batchModal').classList.contains('open')) { closeBatchImport(); return; }
         if (document.getElementById('jobDrawer').classList.contains('open')) { closeJobDetail(); return; }
         if (document.getElementById('rowPopover').classList.contains('open')) { closeRowPopover(); return; }
         const s = document.getElementById('searchInput');

@@ -315,3 +315,43 @@ export async function scanAndIngest(
   }
   throw lastErr;
 }
+
+export interface SourceScanOutcome {
+  url: string;
+  found: number;
+  added: number;
+  skipped: number;
+  error?: string;
+}
+
+/**
+ * Scan several saved sources with a bounded worker pool (the same shape as the
+ * startup scan). Each source is independent: one failing source is recorded in
+ * its outcome and never stops the rest. Used for batch imports, which run after
+ * the HTTP response so a long list cannot hold the request open.
+ */
+export async function scanSourcesBatch(
+  urls: string[],
+  config: Config,
+  folderOverride?: string,
+  concurrency = 4,
+): Promise<SourceScanOutcome[]> {
+  const outcomes: SourceScanOutcome[] = [];
+  const queue = [...urls];
+  const worker = async () => {
+    while (queue.length > 0) {
+      const url = queue.shift();
+      if (!url) break;
+      try {
+        const result = await scanAndIngest(url, config, folderOverride);
+        outcomes.push({ url, ...result });
+      } catch (err: any) {
+        const error = String(err?.message || err);
+        logError("scan", `${url}: ${error}`);
+        outcomes.push({ url, found: 0, added: 0, skipped: 0, error });
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, urls.length) }, () => worker()));
+  return outcomes;
+}

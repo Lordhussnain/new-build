@@ -12,8 +12,30 @@ export interface SourceUrl {
   key: SourceKey;
 }
 
+export interface ParseSourceOptions {
+  /**
+   * A watch/short link that carries both a video id and a playlist id
+   * (`watch?v=ID&list=PL…&index=8`) normally means the playlist. With
+   * `singleVideo`, the video id wins and the list is dropped, so only that
+   * one video is saved. Links without a video id are unaffected.
+   */
+  singleVideo?: boolean;
+}
+
+/** One line of a batch import, numbered for error reporting. */
+export interface BatchSourceEntry {
+  line: number;
+  input: string;
+}
+
+export interface BatchSourceError {
+  line: number;
+  input: string;
+  error: string;
+}
+
 /** Canonical identities ignore share/tracking params, not playlist/video ids. */
-export function parseSourceUrl(input: unknown): SourceUrl {
+export function parseSourceUrl(input: unknown, opts: ParseSourceOptions = {}): SourceUrl {
   if (typeof input !== "string" || !input.trim()) throw new Error("YouTube URL required");
   const text = input.trim();
   if (text.length > 8192 || /[\x00-\x20\x7f]/.test(text)) throw new Error("Invalid YouTube URL");
@@ -30,6 +52,21 @@ export function parseSourceUrl(input: unknown): SourceUrl {
     throw new Error("Enter a YouTube playlist, channel or video URL");
   }
 
+  const path = parsed.pathname.replace(/\/+$/, "");
+  const video = short
+    ? path.slice(1)
+    : path === "/watch"
+      ? parsed.searchParams.get("v")
+      : path.match(/^\/(?:shorts|live|embed)\/([\w-]+)$/)?.[1];
+  const hasVideo = Boolean(video && /^[\w-]{6,}$/.test(video));
+
+  // Explicit "single video only": keep the video id and ignore the playlist
+  // id. Never run it through normalizeVideoUrl() here; the canonical watch URL
+  // is what gets saved and later matched by sourceIdentity().
+  if (opts.singleVideo && hasVideo) {
+    return { key: "playlists", url: `https://www.youtube.com/watch?v=${video}` };
+  }
+
   // A watch/share link with a list id refers to the playlist, not just its
   // currently selected video. Never run it through normalizeVideoUrl(), which
   // deliberately strips the list id when recording individual jobs.
@@ -38,13 +75,7 @@ export function parseSourceUrl(input: unknown): SourceUrl {
     if (!/^[\w-]+$/.test(list)) throw new Error("Invalid YouTube playlist id");
     return { key: "playlists", url: `https://www.youtube.com/playlist?list=${list}` };
   }
-  const path = parsed.pathname.replace(/\/+$/, "");
-  const video = short
-    ? path.slice(1)
-    : path === "/watch"
-      ? parsed.searchParams.get("v")
-      : path.match(/^\/(?:shorts|live|embed)\/([\w-]+)$/)?.[1];
-  if (video && /^[\w-]{6,}$/.test(video)) {
+  if (hasVideo) {
     // The existing playlists collection also accepts single-video sources.
     return { key: "playlists", url: `https://www.youtube.com/watch?v=${video}` };
   }
@@ -104,8 +135,12 @@ function sameSource(existing: string, source: SourceUrl): boolean {
  * read the latest config inside it, so concurrent scans/settings cannot drop
  * each other's changes. Nothing becomes live unless the write succeeds.
  */
-export async function saveSource(input: unknown, configPath: string = CONFIG_PATH): Promise<SourceUrl & { added: boolean }> {
-  const source = parseSourceUrl(input);
+export async function saveSource(
+  input: unknown,
+  configPath: string = CONFIG_PATH,
+  opts: ParseSourceOptions = {},
+): Promise<SourceUrl & { added: boolean }> {
+  const source = parseSourceUrl(input, opts);
   return withConfigWriteLock(async () => {
     const current = getConfig();
     const existingKey = SOURCE_KEYS.find((key) => current[key].some((url) => sameSource(url, source)));
@@ -117,6 +152,72 @@ export async function saveSource(input: unknown, configPath: string = CONFIG_PAT
     setConfig(next);
     blockedSources.delete(sourceIdentity(source.url));
     return { ...source, key, added: !existingKey };
+  });
+}
+
+export interface BatchSaveResult {
+  /** Unique valid sources in input order; `added` is false when already saved. */
+  saved: (SourceUrl & { added: boolean })[];
+  /** Lines that were not valid YouTube sources, with their line numbers. */
+  errors: BatchSourceError[];
+  /** Valid lines before de-duplication (a playlist pasted twice counts twice). */
+  valid: number;
+}
+
+/**
+ * Save a whole batch under ONE config lock and ONE atomic write. Invalid lines
+ * are reported instead of aborting the batch; repeated lines collapse to one
+ * source. Like saveSource(), nothing becomes live unless the write succeeds,
+ * and the write happens BEFORE any caller starts scanning.
+ */
+export async function saveBatchSources(
+  entries: BatchSourceEntry[],
+  configPath: string = CONFIG_PATH,
+  opts: ParseSourceOptions = {},
+): Promise<BatchSaveResult> {
+  const errors: BatchSourceError[] = [];
+  const parsed = new Map<string, SourceUrl>();
+  let valid = 0;
+  for (const entry of entries) {
+    try {
+      const source = parseSourceUrl(entry.input, opts);
+      valid++;
+      if (!parsed.has(source.url)) parsed.set(source.url, source);
+    } catch (error: any) {
+      errors.push({ line: entry.line, input: entry.input, error: error?.message || "Invalid YouTube URL" });
+    }
+  }
+  if (parsed.size === 0) return { saved: [], errors, valid };
+
+  return withConfigWriteLock(async () => {
+    const current = getConfig();
+    // Index the live config once; sourceIdentity() gives the same answer as
+    // sameSource() for every entry, including legacy manual ones.
+    const known = new Map<string, SourceKey>();
+    for (const key of SOURCE_KEYS) {
+      for (const url of current[key]) {
+        const identity = sourceIdentity(url);
+        if (!known.has(identity)) known.set(identity, key);
+      }
+    }
+    let next: Config = current;
+    let changed = false;
+    const saved: (SourceUrl & { added: boolean })[] = [];
+    for (const source of parsed.values()) {
+      const existingKey = known.get(source.url);
+      if (!existingKey) {
+        next = { ...next, [source.key]: [...next[source.key], source.url] };
+        changed = true;
+        known.set(source.url, source.key);
+      }
+      saved.push({ ...source, key: existingKey || source.key, added: !existingKey });
+    }
+    if (changed) {
+      await saveConfig(next, configPath);
+      setConfig(next);
+    }
+    for (const source of parsed.values()) blockedSources.delete(sourceIdentity(source.url));
+    return { saved, errors, valid };
   });
 }
 
