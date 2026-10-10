@@ -3,7 +3,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG } from "../src/config";
-import { getPlaylistItems } from "../src/scanner";
+import { getPlaylistItems, LISTING_BATCH_SIZE, type ListingItem } from "../src/scanner";
 import { resolvedTools } from "../src/tools";
 
 const WIN = process.platform === "win32";
@@ -20,7 +20,7 @@ const WIN = process.platform === "win32";
  */
 const TEST_TIMEOUT_MS = WIN ? 30_000 : 10_000;
 
-type FakeMode = "ok" | "empty" | "fail" | "hang";
+type FakeMode = "ok" | "empty" | "fail" | "hang" | "many";
 
 const originalYtDlp = resolvedTools.ytDlp;
 let fixtureDir = "";
@@ -72,6 +72,7 @@ beforeAll(async () => {
       `const mode = readFileSync(${JSON.stringify(join(fixtureDir, "mode.txt"))}, "utf8").trim();`,
       `if (mode === "hang") await new Promise(() => {});`,
       `if (mode === "fail") { console.error("ERROR: Failed to extract playlist: scanner test error"); process.exit(7); }`,
+      `if (mode === "many") { const rows = []; for (let i = 1; i <= 120; i++) rows.push("Mock Playlist|||many" + String(i).padStart(3, "0") + "|||Video " + i + "|||60"); console.log(rows.join("\\n")); }`,
       `if (mode === "ok") console.log("Mock Playlist|||scan001|||First Video|||120\\nMock Playlist|||scan002|||Second Video|||NaN");`,
     ].join("\n") + "\n",
     "utf8",
@@ -151,6 +152,41 @@ describe("getPlaylistItems", () => {
       await expect(
         getPlaylistItems("https://www.youtube.com/playlist?list=abc", DEFAULT_CONFIG, { timeoutMs: 250 }),
       ).rejects.toThrow("yt-dlp playlist scan timed out after 250ms");
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "hands items to onItems in bounded batches while still returning the full list in order",
+    async () => {
+      await useScanner("many");
+      const batches: ListingItem[][] = [];
+      const items = await getPlaylistItems("https://www.youtube.com/playlist?list=abc", DEFAULT_CONFIG, {
+        onItems: (batch) => {
+          batches.push(batch);
+        },
+      });
+      expect(items).toHaveLength(120);
+      expect(items[0]?.id).toBe("many001");
+      expect(items[119]?.id).toBe("many120");
+      expect(batches.length).toBeGreaterThanOrEqual(3);
+      expect(batches.every((batch) => batch.length > 0 && batch.length <= LISTING_BATCH_SIZE)).toBe(true);
+      expect(batches.flat()).toEqual(items);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "rethrows a failure from onItems unchanged instead of reporting it as a yt-dlp failure",
+    async () => {
+      await useScanner("many");
+      await expect(
+        getPlaylistItems("https://www.youtube.com/playlist?list=abc", DEFAULT_CONFIG, {
+          onItems: () => {
+            throw new Error("sink boom");
+          },
+        }),
+      ).rejects.toThrow("sink boom");
     },
     TEST_TIMEOUT_MS,
   );

@@ -171,6 +171,10 @@ Share/tracking parameters are removed; a watch link with `list=` keeps the
 playlist, not just the currently selected video. Repeated scans do not append
 duplicate sources or duplicate jobs, even if all videos were already queued.
 
+Videos are queued as yt-dlp lists them, so a large playlist starts downloading
+while the rest of it is still being scanned. The request returns once the whole
+listing has been read.
+
 **Single video only** (the checkbox under the URL box) changes that one case:
 a `watch?v=…&list=…&index=…` link saves only the video `v=` and drops the
 playlist. Links without a video id are unaffected.

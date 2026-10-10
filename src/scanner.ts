@@ -68,11 +68,91 @@ export function isScanErrorTransient(message: string): boolean {
   );
 }
 
-/** Fetch a flat listing of a playlist/channel URL via yt-dlp. */
+/** Items per ingest batch while a listing is still running. */
+export const LISTING_BATCH_SIZE = 50;
+
+export interface PlaylistListingOptions {
+  timeoutMs?: number;
+  /**
+   * Called with each batch of items as yt-dlp prints them, while the listing is
+   * still running. Ingesting here lets downloads start before the rest of a
+   * large playlist has been listed. A rejection aborts the listing and is
+   * rethrown unchanged.
+   */
+  onItems?: (items: ListingItem[]) => Promise<void> | void;
+}
+
+/** Parse one `--print` line; null for blank lines and entries without an id. */
+function parseListingLine(line: string): ListingItem | null {
+  if (!line.trim()) return null;
+  const [playlist, id, title, duration] = line.split("|||");
+  const item: ListingItem = {
+    title: (title || "video").trim(),
+    id: (id || "").trim(),
+    playlist: (playlist || "playlist").trim(),
+    duration: parseFloat(duration ?? "NaN"),
+  };
+  return item.id ? item : null;
+}
+
+/** Read yt-dlp's stdout incrementally, emitting batches of parsed items. */
+async function streamListing(
+  stream: ReadableStream<Uint8Array>,
+  items: ListingItem[],
+  onItems: PlaylistListingOptions["onItems"],
+  onSinkError: (error: unknown) => void,
+): Promise<void> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let carry = "";
+  let batch: ListingItem[] = [];
+  const take = (line: string) => {
+    const item = parseListingLine(line);
+    if (item) {
+      items.push(item);
+      batch.push(item);
+    }
+  };
+  const emit = async () => {
+    if (batch.length === 0 || !onItems) {
+      batch = [];
+      return;
+    }
+    const ready = batch;
+    batch = [];
+    try {
+      await onItems(ready);
+    } catch (error) {
+      onSinkError(error);
+      throw error;
+    }
+  };
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    carry += decoder.decode(value, { stream: true });
+    let newline = carry.indexOf("\n");
+    while (newline !== -1) {
+      take(carry.slice(0, newline));
+      carry = carry.slice(newline + 1);
+      if (batch.length >= LISTING_BATCH_SIZE) await emit();
+      newline = carry.indexOf("\n");
+    }
+  }
+  carry += decoder.decode();
+  take(carry);
+  await emit();
+}
+
+/**
+ * Fetch a flat listing of a playlist/channel URL via yt-dlp. Returns every item
+ * (the legacy full-array contract); pass `onItems` to receive items while the
+ * listing is still running.
+ */
 export async function getPlaylistItems(
   url: string,
   config: Config,
-  opts: { timeoutMs?: number } = {},
+  opts: PlaylistListingOptions = {},
 ): Promise<ListingItem[]> {
   const args = [
     ytDlp(),
@@ -103,14 +183,28 @@ export async function getPlaylistItems(
       } catch {}
     }
   }, timeoutMs);
-  let out = "";
+  const items: ListingItem[] = [];
   let stderr = "";
   let code = -1;
+  // A failure in the consumer (e.g. a database error while ingesting a batch)
+  // is not a yt-dlp failure; keep it intact instead of wrapping it as a spawn error.
+  let sinkFailed = false;
+  let sinkError: unknown;
   try {
-    const child = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: ctl.signal });
+    // PYTHONUNBUFFERED: yt-dlp is Python, and a piped Python process otherwise
+    // holds its output in an 8 KB block, delaying the first batches.
+    const child = Bun.spawn(args, {
+      stdout: "pipe",
+      stderr: "pipe",
+      signal: ctl.signal,
+      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+    });
     proc = child;
-    [out, stderr, code] = await Promise.all([
-      new Response(child.stdout).text(),
+    [, stderr, code] = await Promise.all([
+      streamListing(child.stdout, items, opts.onItems, (error) => {
+        sinkFailed = true;
+        sinkError = error;
+      }),
       new Response(child.stderr).text(),
       child.exited,
     ]);
@@ -121,6 +215,7 @@ export async function getPlaylistItems(
       } catch {}
       await proc.exited.catch(() => {});
     }
+    if (sinkFailed) throw sinkError;
     if (timedOut) throw new Error(`yt-dlp playlist scan timed out after ${timeoutMs}ms`);
     throw new Error(`Could not start yt-dlp playlist scan: ${error instanceof Error ? error.message : error}`);
   } finally {
@@ -137,19 +232,7 @@ export async function getPlaylistItems(
       .slice(-500);
     throw new Error(`yt-dlp playlist scan failed (exit ${code})${detail ? `: ${detail}` : ""}`);
   }
-  return out
-    .split("\n")
-    .filter((l) => l.trim())
-    .map((line) => {
-      const [playlist, id, title, duration] = line.split("|||");
-      return {
-        title: (title || "video").trim(),
-        id: (id || "").trim(),
-        playlist: (playlist || "playlist").trim(),
-        duration: parseFloat(duration ?? "NaN"),
-      };
-    })
-    .filter((i) => i.id);
+  return items;
 }
 
 /**
@@ -277,6 +360,11 @@ export async function ingestItems(
 
 /** Full scan of one playlist/channel URL, then ingest.
  *
+ * Videos are ingested batch by batch while yt-dlp is still listing the source,
+ * so the download workers start on the first videos of a large playlist at once.
+ * Batches are idempotent (already-known videos are skipped), so a retried
+ * attempt never queues a video twice.
+ *
  * Transient network errors are retried with exponential backoff (up to
  * SCAN_MAX_RETRIES attempts) so a single HTTP hiccup doesn't permanently
  * drop an entire source during startup when managing 1000+ playlists.
@@ -286,17 +374,25 @@ export async function scanAndIngest(
   config: Config,
   overrideFolderName?: string,
 ): Promise<{ found: number; added: number; skipped: number }> {
-  const empty = { found: 0, added: 0, skipped: 0 };
+  const totals = { found: 0, added: 0, skipped: 0 };
   // The callers check offline mode too, but this boundary is authoritative: the
   // setting can change while a daemon/startup scan is between sources.
-  if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return empty;
+  if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return totals;
+
+  const ingestBatch = async (items: ListingItem[]) => {
+    // Re-check per batch: offline mode or a source removal can land mid-listing.
+    if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return;
+    const result = await ingestItems(items, config, overrideFolderName, url);
+    totals.found += result.found;
+    totals.added += result.added;
+    totals.skipped += result.skipped;
+  };
 
   let lastErr: unknown;
   for (let attempt = 1; attempt <= SCAN_MAX_RETRIES; attempt++) {
     try {
-      const items = await getPlaylistItems(url, config);
-      if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return empty;
-      return ingestItems(items, config, overrideFolderName, url);
+      await getPlaylistItems(url, config, { onItems: ingestBatch });
+      return totals;
     } catch (err: any) {
       lastErr = err;
       const msg = String(err?.message || err);
@@ -310,7 +406,7 @@ export async function scanAndIngest(
       );
       await Bun.sleep(backoffMs);
       // Re-check after the sleep: the engine may have gone offline.
-      if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return empty;
+      if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return totals;
     }
   }
   throw lastErr;
