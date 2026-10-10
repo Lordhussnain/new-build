@@ -8,7 +8,7 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { readArchiveIds } from "./archive";
-import { db, getNextIndex, isVideoIgnored, isVideoInDb } from "./db";
+import { db, getNextIndex, isVideoIgnored, isVideoInDb, takeReservedFileIndex } from "./db";
 import { isSourceBlocked, sourceIdentity } from "./sources";
 import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
 import { sanitizeFolderName } from "./util";
@@ -329,7 +329,8 @@ export async function ingestItems(
         stats.skipped++;
         continue;
       }
-      const index = getNextIndex(folder);
+      // A video whose sidecars were fetched first keeps the index they were named with.
+      const index = takeReservedFileIndex(folder, item.id) ?? getNextIndex(folder);
       stmt.run(
         item.id,
         normalizeVideoUrl(`https://www.youtube.com/watch?v=${item.id}`),

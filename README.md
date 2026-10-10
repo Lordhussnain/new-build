@@ -187,7 +187,7 @@ result shows counts by kind (playlists, single videos, channels), duplicates,
 and each invalid line with its line number. Invalid lines stay in the box so
 you can fix them and import again.
 
-**🧾 Metadata Only** fetches sidecar files (subtitles, thumbnail, description, `info.json`) for a pasted video or playlist without downloading any video. Files are written into the folder the videos would use, so a later download lands next to them. Tasks run one at a time in the background and appear in the modal with per-video progress and errors. Tick *Single video only* for `watch?v=…&list=…` links to fetch just that video.
+**🧾 Metadata Only** fetches sidecar files (subtitles, thumbnail, description, `info.json`) for a pasted video or playlist without downloading any video. Files are written into the folder the videos would use and named exactly as the download will name them (`NNN - Title`), so a later download reuses them instead of fetching them again. Tasks run one at a time in the background and appear in the modal with per-video progress and errors. Tick *Single video only* for `watch?v=…&list=…` links to fetch just that video.
 
 - The response confirms **Saved to config.json**; a failed write is shown as
   an error and does not start a scan. Writes replace the file atomically, and

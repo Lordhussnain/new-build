@@ -10,6 +10,7 @@ import { perDownloadTransfers, buildAria2cArgs, CONNECTION_BUDGET } from "../src
 import { fitToWidth, sanitizeTerminalText } from "../src/dashboard";
 import { DEFAULT_CONFIG } from "../src/config";
 import { isTransientDownloadError } from "../src/retry";
+import { initDatabase, reserveFileIndex, takeReservedFileIndex } from "../src/db";
 
 function input(over: Partial<SlotTargetInput> = {}): SlotTargetInput {
   return {
@@ -119,5 +120,22 @@ describe("TUI text helpers", () => {
 describe("stalled transfers", () => {
   test("a stall is classified as transient, so the job resumes from its partial", () => {
     expect(isTransientDownloadError("Download stalled — no bytes for 180s; resuming from partial")).toBe(true);
+  });
+});
+
+describe("metadata name reservations", () => {
+  test("a video keeps one reserved index, and ingest takes it back once", () => {
+    initDatabase(":memory:");
+    const first = reserveFileIndex("Folder A", "vid1");
+    expect(reserveFileIndex("Folder A", "vid1")).toBe(first);
+    expect(takeReservedFileIndex("Folder A", "vid1")).toBe(first);
+    expect(takeReservedFileIndex("Folder A", "vid1")).toBeNull();
+  });
+
+  test("the next video in the folder gets the following index", () => {
+    initDatabase(":memory:");
+    const a = reserveFileIndex("Folder B", "v1");
+    const b = reserveFileIndex("Folder B", "v2");
+    expect(b).toBe(a + 1);
   });
 });

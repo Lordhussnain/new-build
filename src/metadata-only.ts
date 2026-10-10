@@ -14,6 +14,8 @@ import { getPlaylistItems, PLAYLIST_SCAN_TIMEOUT_MS, type ListingItem } from "./
 import { missingSidecarArgs } from "./workers/metadata";
 import type { MetadataKind } from "./metadata-files";
 import { sanitizeFolderName } from "./util";
+import { db, reserveFileIndex } from "./db";
+import { jobFittedBaseFilename } from "./download-args";
 import { getConfig } from "./state";
 import { logError } from "./logger";
 import type { Config } from "./config";
@@ -113,7 +115,8 @@ async function runTask(task: MetadataOnlyTask, config: Config): Promise<void> {
         finish(task, "failed", `Stopped: offline mode turned on after ${task.done + task.failed} of ${task.total}`);
         return;
       }
-      const error = await fetchSidecars(item, outputDir, config, task.kinds);
+      const naming = resolveNaming(item, folder, outputDir);
+      const error = await fetchSidecars(item, naming.outputDir, naming.base, config, task.kinds);
       if (error) {
         task.failed++;
         task.errors.push(`${item.title}: ${error}`);
@@ -136,10 +139,29 @@ async function runTask(task: MetadataOnlyTask, config: Config): Promise<void> {
   }
 }
 
+/**
+ * The directory and base file name the download will use for this video, so
+ * the sidecars match it exactly:
+ *  - a job already exists → its own directory and name (that is what the
+ *    download writes);
+ *  - otherwise → the next playlist index, reserved for this video, named the
+ *    way ingestItems will name the job.
+ */
+function resolveNaming(item: ListingItem, folder: string, outputDir: string): { outputDir: string; base: string } {
+  const job = db
+    .query(`SELECT id, "index", title, output_directory FROM jobs WHERE id = ?`)
+    .get(item.id) as { id: string; index: number; title: string; output_directory: string } | null;
+  if (job) return { outputDir: job.output_directory, base: jobFittedBaseFilename(job) };
+  const index = reserveFileIndex(folder, item.id);
+  const base = jobFittedBaseFilename({ id: item.id, index, title: item.title, output_directory: outputDir });
+  return { outputDir, base };
+}
+
 /** Fetch the requested sidecars for one video. Returns an error string, or null on success. */
 async function fetchSidecars(
   item: ListingItem,
   outputDir: string,
+  base: string,
   config: Config,
   kinds: MetadataKind[],
 ): Promise<string | null> {
@@ -151,7 +173,7 @@ async function fetchSidecars(
     "--skip-download",
     "--no-simulate",
     "-o",
-    join(outputDir, "%(title)s [%(id)s].%(ext)s"),
+    join(outputDir, `${base}.%(ext)s`),
     "--socket-timeout",
     "15",
     "--retries",

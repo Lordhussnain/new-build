@@ -210,6 +210,16 @@ export function initDatabase(path: string = "archive.db"): void {
        next_index INTEGER NOT NULL DEFAULT 0
      )`,
   );
+  // Playlist indexes handed to metadata fetched before its download job exists.
+  // ingestItems takes them back, so the job's file names match those sidecars.
+  db.run(
+    `CREATE TABLE IF NOT EXISTS metadata_name_reservations (
+       folder TEXT NOT NULL,
+       id TEXT NOT NULL,
+       idx INTEGER NOT NULL,
+       PRIMARY KEY (folder, id)
+     )`,
+  );
   db.run(
     `CREATE TABLE IF NOT EXISTS run_history (
        id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -875,6 +885,31 @@ function cleanupUnownedSourceJobs(jobIds: Set<string>, activeSources: Set<string
     else deletedJobs += db.run("DELETE FROM jobs WHERE id = ?", [jobId]).changes;
   }
   return { affectedJobs: jobIds.size, deletedJobs, retainedJobs };
+}
+
+/**
+ * The playlist index a video will get, reserved for metadata fetched before its
+ * download job exists. Returns the same number on every call for the same
+ * video, so repeated metadata runs keep the same names.
+ */
+export function reserveFileIndex(folder: string, id: string): number {
+  const row = db
+    .query("SELECT idx FROM metadata_name_reservations WHERE folder = ? AND id = ?")
+    .get(folder, id) as { idx: number } | null;
+  if (row) return row.idx;
+  const idx = getNextIndex(folder);
+  db.run("INSERT INTO metadata_name_reservations (folder, id, idx) VALUES (?, ?, ?)", [folder, id, idx]);
+  return idx;
+}
+
+/** Take back (and forget) the index reserved for a video that is being queued as a job. */
+export function takeReservedFileIndex(folder: string, id: string): number | null {
+  const row = db
+    .query("SELECT idx FROM metadata_name_reservations WHERE folder = ? AND id = ?")
+    .get(folder, id) as { idx: number } | null;
+  if (!row) return null;
+  db.run("DELETE FROM metadata_name_reservations WHERE folder = ? AND id = ?", [folder, id]);
+  return row.idx;
 }
 
 export function getNextIndex(folder: string): number {
