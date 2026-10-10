@@ -707,3 +707,187 @@ describe("job payloads", () => {
     expect(data.job.superseded_file).toBeNull();
   });
 });
+
+describe("POST /api/jobs/:id/resume", () => {
+  test("unpauses a job and keeps its partial file for a smart pick-up", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-resume-"));
+    try {
+      const partial = join(dir, "001 - Paused.part");
+      await writeFile(partial, "partial-bytes");
+      insertJob("resume01", {
+        download_status: "paused",
+        pause_reason: "user",
+        progress: 42.5,
+        best_progress: 42.5,
+        partial_file_path: partial,
+        last_error: "interrupted by user",
+        output_directory: dir,
+        title: "Paused",
+        index: 1,
+      });
+
+      const res = await api("/api/jobs/resume01/resume", { method: "POST" });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.ok).toBe(true);
+      expect(data.resumed).toBe(true);
+      expect(data.job.download_status).toBe("pending");
+
+      const job = getJob("resume01");
+      expect(job.download_status).toBe("pending");
+      expect(job.pause_reason).toBeNull();
+      // Progress and partial survive — the worker picks up where it stopped.
+      expect(job.progress).toBe(42.5);
+      expect(job.partial_file_path).toBe(partial);
+      expect(existsSync(partial)).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects jobs that are not paused", async () => {
+    insertJob("resume02", { download_status: "pending" });
+    insertJob("resume03", { download_status: "failed", last_error: "boom" });
+
+    const pending = await api("/api/jobs/resume02/resume", { method: "POST" });
+    expect(pending.status).toBe(409);
+
+    const failed = await api("/api/jobs/resume03/resume", { method: "POST" });
+    expect(failed.status).toBe(409);
+    expect((await failed.json()).error).toContain("Retry");
+
+    const missing = await api("/api/jobs/nope/resume", { method: "POST" });
+    expect(missing.status).toBe(404);
+  });
+
+  test("unpauses an interrupted job the same way", async () => {
+    insertJob("resume04", { download_status: "paused", pause_reason: "interrupted", progress: 10 });
+    const res = await api("/api/jobs/resume04/resume", { method: "POST" });
+    expect(res.status).toBe(200);
+    expect(getJob("resume04").download_status).toBe("pending");
+  });
+});
+
+describe("retry wipes partial state (fresh restart from 0%)", () => {
+  test("removes the recorded .part + .aria2 pair and clears progress", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-retrywipe-"));
+    try {
+      const partial = join(dir, "001 - Wipe Me.part");
+      await writeFile(partial, "partial-bytes");
+      await writeFile(`${partial}.aria2`, "control");
+      insertJob("wipe01", {
+        download_status: "failed",
+        progress: 99,
+        best_progress: 99,
+        retry_count: 3,
+        partial_file_path: partial,
+        output_directory: dir,
+        title: "Wipe Me",
+        index: 1,
+      });
+      const config = cfgWith({ archiveFile: join(dir, "archive.txt") });
+
+      const res = await apiWith("/api/jobs/wipe01/retry", config, { method: "POST" });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.ok).toBe(true);
+      expect(data.warning).toBeUndefined();
+
+      // The partial pair is gone — the next attempt starts from 0%.
+      expect(existsSync(partial)).toBe(false);
+      expect(existsSync(`${partial}.aria2`)).toBe(false);
+
+      const job = getJob("wipe01");
+      expect(job.download_status).toBe("pending");
+      expect(job.partial_file_path).toBeNull();
+      expect(job.progress).toBe(0);
+      expect(job.best_progress).toBe(0);
+      expect(job.retry_count).toBe(0);
+      expect(job.last_error).toBeNull();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("finds and wipes an unrecorded partial via the directory scan", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-retrywipe2-"));
+    try {
+      // partial_file_path is NULL, but the .part sits on disk exactly where
+      // the worker would resume it — the wipe must cover what a resume finds.
+      const partial = join(dir, "001 - Orphan.part");
+      await writeFile(partial, "partial-bytes");
+      insertJob("wipe02", {
+        download_status: "failed",
+        output_directory: dir,
+        title: "Orphan",
+        index: 1,
+      });
+      const config = cfgWith({ archiveFile: join(dir, "archive.txt") });
+
+      const res = await apiWith("/api/jobs/wipe02/retry", config, { method: "POST" });
+      expect(res.status).toBe(200);
+
+      expect(existsSync(partial)).toBe(false);
+      expect(getJob("wipe02").partial_file_path).toBeNull();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("POST /api/scan/unconverted", () => {
+  test("imports local video files with the chosen target format pre-selected", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-scanunc-"));
+    try {
+      await writeFile(join(dir, "raw.mkv"), Buffer.alloc(4096, 1));
+      await writeFile(join(dir, "clip.mp4"), Buffer.alloc(4096, 1));
+      await writeFile(join(dir, "readme.txt"), "not a video");
+      const config = cfgWith({ outputRoot: dir });
+
+      const res = await apiWith("/api/scan/unconverted", config, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targetFormat: "webm" }),
+      });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.ok).toBe(true);
+      expect(data.imported).toBe(2);
+      expect(data.targetFormat).toBe("webm");
+
+      const rows = db.query("SELECT target_format, download_status, conversion_status FROM jobs").all() as any[];
+      expect(rows.length).toBe(2);
+      for (const row of rows) {
+        expect(row.target_format).toBe("webm");
+        expect(row.download_status).toBe("downloaded");
+        expect(row.conversion_status).toBe("pending");
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an unknown target format", async () => {
+    const res = await api("/api/scan/unconverted", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetFormat: "avi" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  test("rejects a folder outside the configured output root", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-scanunc2-"));
+    try {
+      const config = cfgWith({ outputRoot: dir });
+      const res = await apiWith("/api/scan/unconverted", config, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targetFormat: "mp4", folder: "../outside" }),
+      });
+      expect(res.status).toBe(400);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

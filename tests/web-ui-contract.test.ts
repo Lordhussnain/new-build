@@ -373,4 +373,70 @@ describe("the dashboard renders the queue", () => {
     // The override picker must pre-select the job's own container.
     expect(drawer).toContain('<option value="mp4" selected>MP4</option>');
   });
+
+  test("queued rows expose the per-job controls: gear, audio picker, and resume", async () => {
+    insertJob("uicontract-paused", {
+      title: "Paused Video",
+      download_status: "paused",
+      pause_reason: "user",
+      progress: 12.5,
+    });
+    const ui2 = await loadDashboard(DEFAULT_CONFIG);
+    await ui2.run("fetchStatus");
+    const html = String(ui2.el("jobsTableBody").innerHTML);
+    // Every non-done row (downloading, paused, failed) gets the gear
+    // (format/quality override) and the audio-tracks icon; the done row gets
+    // neither.
+    expect((html.match(/openOverridePopover/g) || []).length).toBe(3);
+    expect((html.match(/openAudioPopover/g) || []).length).toBe(3);
+    // A paused row gets the single-video resume action.
+    expect((html.match(/▶️ Resume</g) || []).length).toBe(1);
+    expect(html).toContain("resumeJob");
+    // The failed row's retry is now a wipe-and-restart.
+    expect(html).toContain("Wipe partial files and restart this job from 0%");
+    expect(ui2.errors).toEqual([]);
+  });
+
+  test("the row resume action unpauses the job through the API", async () => {
+    insertJob("uicontract-resume", {
+      download_status: "paused",
+      pause_reason: "user",
+      progress: 33,
+    });
+    const ui2 = await loadDashboard(DEFAULT_CONFIG);
+    await ui2.run("resumeJob", "uicontract-resume");
+    const res = await handleRequest(new Request("http://127.0.0.1:3000/api/jobs"), DEFAULT_CONFIG);
+    const payload = await res.json();
+    const row = payload.jobs.find((j: any) => j.id === "uicontract-resume");
+    expect(row.download_status).toBe("pending");
+    expect(row.pause_reason).toBeNull();
+    // Smart pick-up: progress is kept, only the pause is lifted.
+    expect(row.progress).toBe(33);
+    expect(ui2.errors).toEqual([]);
+  });
+
+  test("the detail drawer offers Resume Processing for a paused job", async () => {
+    insertJob("uicontract-drawer", {
+      title: "Drawer Paused",
+      download_status: "paused",
+      pause_reason: "user",
+    });
+    const ui2 = await loadDashboard(DEFAULT_CONFIG);
+    await ui2.run("fetchStatus");
+    await ui2.run("openJobDetailById", "uicontract-drawer");
+    const drawer = String(ui2.el("drawerBody").innerHTML);
+    expect(drawer).toContain("▶️ Resume Processing");
+    expect(drawer).not.toContain("undefined");
+    expect(ui2.errors).toEqual([]);
+  });
+
+  test("the Scan Unconverted Videos action posts to its route and reports the result", async () => {
+    const ui2 = await loadDashboard(DEFAULT_CONFIG);
+    await ui2.run("runUnconvertedScan");
+    const notifications = ui2.el("notifications").children as StubElement[];
+    const text = notifications.map((n) => String(n.textContent)).join("\n");
+    expect(text).toContain("Imported");
+    expect(text).toContain("conversion to MP4");
+    expect(ui2.errors).toEqual([]);
+  });
 });

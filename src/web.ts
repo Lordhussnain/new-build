@@ -8,6 +8,8 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
+
+import { resolve as resolvePath, sep as pathSep } from "node:path";
 import os from "node:os";
 import {
   allowIgnoredVideo,
@@ -35,14 +37,22 @@ import { parseUnavailableMetadataKinds, type MetadataKind } from "./metadata-fil
 import { parseSourceUrl, removeSource, saveSource, SOURCE_KEYS, sourceIdentity, type SourceUrl } from "./sources";
 import { cancelActiveStages, diskUsage, triggerPause, triggerResume, type CancelledStages } from "./resilience";
 import { removeFromArchive } from "./archive";
-import { requeueFailedJobs, stashDownloadedFile, staleClaimCondition, STALE_CLAIM_THRESHOLDS } from "./reconcile";
+import {
+  findPartialFile,
+  requeueFailedJobs,
+  removePartialFiles,
+  stashDownloadedFile,
+  staleClaimCondition,
+  STALE_CLAIM_THRESHOLDS,
+} from "./reconcile";
+import { scanUnconvertedVideos } from "./unconverted-scan";
 import { relocationPendingCount } from "./relocate";
 import { holdsEngineLease, isLeaseExpired, readEngineLease } from "./lease";
 import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
 import { aria2cPath, jsRuntime } from "./tools";
 import { applySettings, readSettings } from "./settings";
-import { effectiveTargetFormat, effectiveVideoQuality, resolveDownloaderEngine } from "./download-args";
+import { effectiveTargetFormat, effectiveVideoQuality, jobFittedBaseFilename, resolveDownloaderEngine } from "./download-args";
 import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-tracks";
 import { formatBytesPerSec, formatDuration } from "./util";
 import { updateWorkerLine } from "./dashboard";
@@ -538,8 +548,24 @@ function persistJobOverride(id: string, override: JobOverride): void {
   db.run(`UPDATE jobs SET ${sets.join(", ")}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [...values, id]);
 }
 
+interface RetryJobResult {
+  changed: number | "in-progress";
+  /** Present when a partial existed but could not be wiped (e.g. locked). */
+  partialWarning: string | null;
+}
+
 /**
  * Re-queue a job with fresh budgets (download + any failed side stages).
+ *
+ * A retry is a FRESH RESTART, not a resume: any partial download state — the
+ * `.part` file with its aria2c `.aria2` control file, or a `.ytdl` fragment
+ * directory — is wiped and `partial_file_path` cleared, so the next attempt
+ * starts from 0% instead of resuming a possibly-broken fragment. (Use
+ * POST /api/jobs/:id/resume to keep the partial and continue where the job
+ * stopped.)
+ *
+ * Active download, conversion, and metadata claims return "in-progress" before
+ * the archive or any media file is touched.
  *
  * A retry of an already-downloaded video is a DELIBERATE re-fetch — the usual
  * reason is a new multi-audio track selection from the dashboard — so two
@@ -550,11 +576,12 @@ function persistJobOverride(id: string, override: JobOverride): void {
  *   • the existing media file is moved aside (.superseded), otherwise
  *     `--no-overwrites` skips the download the same way. The backup is
  *     deleted when the new download succeeds and restored if it fails
- *     permanently (see reconcile.ts).
- * Active download, conversion, and metadata claims return "in-progress" before
- * the archive or any media file is touched.
+ *     (see reconcile.ts).
  */
-function retryJobById(id: string, config: Config, override?: JobOverride): number | "in-progress" {
+async function retryJobById(id: string, config: Config, override?: JobOverride): Promise<RetryJobResult> {
+  let partialPath: string | null = null;
+  let fallbackDir = "";
+  let fallbackBase = "";
   const result = withIdleJobs([id], () => {
     const existing = db.query("SELECT id, target_format, video_quality FROM jobs WHERE id = ?").get(id) as
       | { id: string; target_format: string | null; video_quality: string | null }
@@ -562,12 +589,17 @@ function retryJobById(id: string, config: Config, override?: JobOverride): numbe
     if (!existing) return 0;
     if (override) persistJobOverride(id, override);
 
-    const row = db.query("SELECT id, file_path, target_format, video_quality, conversion_status FROM jobs WHERE id = ?").get(id) as {
+    const row = db.query(`SELECT id, file_path, target_format, video_quality, conversion_status,
+                                  partial_file_path, output_directory, title, "index" FROM jobs WHERE id = ?`).get(id) as {
       id: string;
       file_path: string | null;
       target_format: string | null;
       video_quality: string | null;
       conversion_status: string;
+      partial_file_path: string | null;
+      output_directory: string | null;
+      title: string | null;
+      index: number | null;
     } | null;
     if (!row) return 0;
     removeFromArchive(config.archiveFile, id);
@@ -577,6 +609,17 @@ function retryJobById(id: string, config: Config, override?: JobOverride): numbe
     // cannot be renamed — the route then answers 500 instead of starting a
     // download that would silently no-op.
     stashDownloadedFile(id, row.file_path);
+
+    // Remember the partial for the post-transaction wipe: the row must stop
+    // referencing it first, so a crash between the two steps leaves at worst an
+    // orphaned partial (swept by reconcile), never a re-queued job resuming a
+    // file the operator asked to discard.
+    partialPath = row.partial_file_path;
+    fallbackDir = row.output_directory || "";
+    fallbackBase =
+      row.output_directory && row.title != null && row.index != null
+        ? jobFittedBaseFilename({ id: row.id, index: row.index, title: row.title, output_directory: row.output_directory })
+        : "";
 
     // A per-job format/quality change must pass through conversion even when
     // the previous download needed no post-processing. Otherwise an audio-only
@@ -590,11 +633,13 @@ function retryJobById(id: string, config: Config, override?: JobOverride): numbe
     const conversionStatus = !needsConversion && row.conversion_status === "not_needed" ? "not_needed" : "pending";
 
     // Re-queue download AND any failed side stages. Also clears a user pause and
-    // resets the per-stage retry budgets so a manual retry always gets a fresh budget.
+    // resets the per-stage retry budgets so a manual retry always gets a fresh
+    // budget. partial_file_path goes too: the fresh restart must not resume the
+    // old fragment.
     return db.run(
       `UPDATE jobs SET
          download_status = 'pending', pause_reason = NULL, progress = 0, retry_count = 0,
-         best_progress = 0, resume_count = 0, speed = 0, eta = 0,
+         best_progress = 0, resume_count = 0, speed = 0, eta = 0, partial_file_path = NULL,
          conversion_status = ?, conversion_retry_count = 0,
          metadata_status = CASE
            WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
@@ -613,7 +658,37 @@ function retryJobById(id: string, config: Config, override?: JobOverride): numbe
       [conversionStatus, id],
     ).changes;
   });
-  return result.ok ? result.value : "in-progress";
+
+  if (!result.ok || result.value !== 1) {
+    return { changed: result.ok ? result.value : "in-progress", partialWarning: null };
+  }
+
+  // The job is re-queued and no longer references its partial. Wipe the partial
+  // pair now — control file first, via removePartialFiles, so a stranded
+  // `.aria2` can never wedge aria2c. When no path was recorded, fall back to a
+  // directory scan: the worker resumes through the same finder, so the wipe
+  // must cover exactly what a resume would have found.
+  let partial: string | null = partialPath;
+  if (!partial && fallbackDir && fallbackBase) {
+    partial = await findPartialFile(fallbackDir, fallbackBase);
+  }
+  if (partial) {
+    const removal = await removePartialFiles(partial);
+    if (removal.fatal) {
+      // Locked by another process (an orphaned aria2c, an antivirus scan). The
+      // row no longer references the partial, but if the file survived on disk
+      // the next attempt's directory scan may resume from it — say so instead
+      // of pretending the restart is clean.
+      logError("web", `${id}: retry could not wipe locked partial ${partial}: ${removal.error}`);
+      return {
+        changed: 1,
+        partialWarning:
+          `Partial file is locked (${removal.error}). Close the program holding it — ` +
+          `the next attempt may resume from the leftover partial instead of starting at 0%.`,
+      };
+    }
+  }
+  return { changed: 1, partialWarning: null };
 }
 
 /** Save per-job settings without queuing a download. */
@@ -917,9 +992,15 @@ const ROUTES: Route[] = [
       const retry = (body as Record<string, unknown>).retry === true;
 
       try {
-        const changed = retry
-          ? retryJobById(params.id, config, parsed.value)
-          : saveJobOverrideById(params.id, config, parsed.value);
+        let changed: number | "in-progress";
+        let partialWarning: string | null = null;
+        if (retry) {
+          const result = await retryJobById(params.id, config, parsed.value);
+          changed = result.changed;
+          partialWarning = result.partialWarning;
+        } else {
+          changed = saveJobOverrideById(params.id, config, parsed.value);
+        }
         if (changed === "in-progress") return jobInProgressResponse();
         if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
         if (retry && isPaused() && getPauseReason()?.startsWith("BAD_DOWNLOADER_ARGS")) {
@@ -932,6 +1013,7 @@ const ROUTES: Route[] = [
           targetFormat: saved.target_format,
           videoQuality: saved.video_quality,
           audioTracks: parseSelectionJson(saved.audio_selection),
+          ...(partialWarning ? { warning: partialWarning } : {}),
         });
       } catch (e: any) {
         return Response.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
@@ -941,15 +1023,17 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/jobs/:id/retry",
-    handler: ({ params, config }) => {
+    handler: async ({ params, config }) => {
       try {
-        const changed = retryJobById(params.id, config);
-        if (changed === "in-progress") return jobInProgressResponse();
-        if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+        const result = await retryJobById(params.id, config);
+        if (result.changed === "in-progress") return jobInProgressResponse();
+        if (result.changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
         if (isPaused() && getPauseReason()?.startsWith("BAD_DOWNLOADER_ARGS")) {
           triggerResume();
         }
-        return Response.json({ ok: true });
+        // A retry wipes partial state and restarts from 0% — tell the operator
+        // when the wipe could not complete (locked partial).
+        return Response.json({ ok: true, ...(result.partialWarning ? { warning: result.partialWarning } : {}) });
       } catch (e: any) {
         return Response.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
       }
@@ -1216,6 +1300,44 @@ const ROUTES: Route[] = [
       });
     },
   },
+  {
+    methods: ["POST"],
+    pattern: "/api/jobs/:id/resume",
+    handler: ({ params }) => {
+      // Resume ONE paused job from its last verified state: the partial (.part
+      // + .aria2, or .ytdl fragments) is KEPT, so the download picks up where it
+      // stopped instead of restarting at 0%. This is the counterpart to Retry,
+      // which wipes partial state. Interrupted-after-crash jobs are normally
+      // re-claimed automatically (see claimDownloadJob in db.ts); this endpoint
+      // exists for user pauses, which stay parked until an explicit resume.
+      const row = db
+        .query("SELECT id, download_status, pause_reason FROM jobs WHERE id = ?")
+        .get(params.id) as { id: string; download_status: string; pause_reason: string | null } | null;
+      if (!row) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+      if (row.download_status !== "paused") {
+        return Response.json(
+          {
+            ok: false,
+            error:
+              row.download_status === "failed"
+                ? "Job has failed, not paused — use Retry to re-queue it (partials are wiped)"
+                : `Job is '${row.download_status}', not paused — nothing to resume`,
+          },
+          { status: 409 },
+        );
+      }
+      const changed = db
+        .run(
+          `UPDATE jobs SET download_status = 'pending', pause_reason = NULL, speed = 0, eta = 0,
+             last_error = NULL, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND download_status = 'paused'`,
+          [params.id],
+        )
+        .changes;
+      const fresh = db.query(`SELECT ${JOB_COLUMNS} FROM jobs WHERE id = ?`).get(params.id) as any;
+      return Response.json({ ok: true, resumed: changed === 1, job: mapJobRow(fresh) });
+    },
+  },
   // Static action paths must be listed before the :id routes so GET on them
   // answers 405 (method not allowed) instead of being read as an id.
   {
@@ -1269,15 +1391,15 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/retry/:id",
-    handler: ({ params, config }) => {
+    handler: async ({ params, config }) => {
       try {
-        const changed = retryJobById(params.id, config);
-        if (changed === "in-progress") return jobInProgressResponse();
-        if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+        const result = await retryJobById(params.id, config);
+        if (result.changed === "in-progress") return jobInProgressResponse();
+        if (result.changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
         if (isPaused() && getPauseReason()?.startsWith("BAD_DOWNLOADER_ARGS")) {
           triggerResume();
         }
-        return Response.json({ ok: true });
+        return Response.json({ ok: true, ...(result.partialWarning ? { warning: result.partialWarning } : {}) });
       } catch (e: any) {
         return Response.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
       }
@@ -1437,6 +1559,47 @@ const ROUTES: Route[] = [
           ok: false, saved: true, source: savedSource,
           error: `URL saved to config.json, but the scan failed: ${e?.message || e}`,
         }, { status: 500 });
+      }
+    },
+  },
+  {
+    methods: ["POST"],
+    pattern: "/api/scan/unconverted",
+    handler: async ({ req, config }) => {
+      // "Scan Unconverted Videos": sweep the local output folders for video
+      // files the archive does not track yet and batch-import them into the
+      // conversion queue with the chosen target format pre-selected. Purely
+      // local work (disk walk + INSERTs, ffmpeg remuxes), so it also runs while
+      // offline mode is on.
+      const body = await req.json().catch(() => null);
+      const targetFormat = body?.targetFormat;
+      if (typeof targetFormat !== "string" || !JOB_TARGET_FORMATS.has(targetFormat)) {
+        return Response.json(
+          { ok: false, error: "targetFormat must be mp4, mkv, webm, mp3, or m4a" },
+          { status: 400 },
+        );
+      }
+      let rootDir: string | undefined;
+      if (typeof body?.folder === "string" && body.folder.trim()) {
+        // A caller-supplied folder must stay inside the configured output root —
+        // the web UI must not be able to point the sweep at arbitrary paths.
+        const root = resolvePath(config.outputRoot);
+        const requested = resolvePath(root, body.folder.trim());
+        if (requested !== root && !requested.startsWith(root + pathSep)) {
+          return Response.json(
+            { ok: false, error: "folder must be inside the configured output root" },
+            { status: 400 },
+          );
+        }
+        rootDir = requested;
+      }
+      try {
+        const result = await scanUnconvertedVideos(config, targetFormat, rootDir);
+        return Response.json({ ok: true, ...result });
+      } catch (e: any) {
+        const message = String(e?.message || e);
+        logError("unconverted-scan", `Could not scan for unconverted videos: ${message}`);
+        return Response.json({ ok: false, error: `Could not scan unconverted videos: ${message}` }, { status: 500 });
       }
     },
   },

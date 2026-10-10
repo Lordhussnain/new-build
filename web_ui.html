@@ -331,6 +331,39 @@
     
     .btn-sm { padding: 4px 10px; font-size: 0.74rem; }
     .btn-icon { width: 32px; height: 32px; padding: 0; border-radius: var(--radius-sm); }
+
+    .row-icon-btn {
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: var(--radius-sm);
+      padding: 1px 5px;
+      font-size: 0.8rem;
+      line-height: 1.4;
+      cursor: pointer;
+      color: var(--text-muted);
+      vertical-align: middle;
+    }
+    .row-icon-btn:hover { background: var(--bg-hover); color: var(--text-primary); border-color: var(--border); }
+
+    .row-popover {
+      position: fixed;
+      z-index: 120;
+      display: none;
+      width: 300px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-lg);
+      padding: 14px;
+    }
+    .row-popover.open { display: block; }
+    .row-popover h4 { font-size: 0.85rem; font-weight: 700; margin-bottom: 4px; }
+    .row-popover .popover-hint { font-size: 0.72rem; color: var(--text-muted); margin-bottom: 10px; }
+    .row-popover label { display: block; font-size: 0.74rem; font-weight: 600; margin: 8px 0 4px; }
+    .row-popover select { width: 100%; }
+    .row-popover .popover-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    .row-popover .popover-audio-list { max-height: 160px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 6px 8px; margin-top: 8px; }
+    .row-popover .popover-audio-list label { display: flex; align-items: center; gap: 8px; font-weight: 400; margin: 0; padding: 3px 0; }
     
     .btn-primary {
       background: var(--accent);
@@ -1353,6 +1386,7 @@
       <button class="btn btn-secondary" id="turboBtn" onclick="toggleTurboMode()" title="Toggle Aggressive IDM Mode (32 connections, 64 fragments, 10M chunk, 64K buffer, uncapped)">⚡ Turbo IDM: OFF</button>
       <button class="btn btn-success" onclick="refreshData()">🔄 Refresh</button>
       <button class="btn btn-secondary" id="metadataScanBtn" onclick="scanMissingMetadata()" title="Check every downloaded video and queue missing enabled metadata sidecars">📝 Scan Missing Metadata</button>
+      <button class="btn btn-secondary" id="unconvertedScanBtn" onclick="openUnconvertedScan()" title="Find video files on disk that the archive does not track yet and queue them for conversion">🔄 Scan Unconverted Videos</button>
     </div>
     <div class="controls-group">
       <button class="btn btn-secondary" onclick="openSettings()">⚙️ Settings</button>
@@ -1498,6 +1532,37 @@
     </div>
   </div>
 
+  <div class="modal-backdrop" id="unconvertedModal">
+    <div class="modal" style="max-width: 540px;">
+      <div class="modal-header">
+        <div class="modal-header-left">
+          <h3>🔄 Scan Unconverted Videos</h3>
+          <span class="modal-badge">Imports local files into the conversion queue</span>
+        </div>
+        <button class="btn btn-secondary btn-icon" onclick="closeUnconvertedScan()" title="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 12px;">
+          Scans the download folders for video files that are not tracked yet and queues them for conversion.
+          Files already in the archive are skipped.
+        </p>
+        <label for="unconvertedFormat" style="font-size: 0.8rem; font-weight: 600;">Select your desired target conversion format</label>
+        <select id="unconvertedFormat" style="width: 100%; margin-top: 6px;">
+          <option value="mp4" selected>MP4</option>
+          <option value="mkv">MKV</option>
+          <option value="webm">WebM</option>
+          <option value="mp3">MP3 (audio)</option>
+          <option value="m4a">M4A (audio)</option>
+        </select>
+      </div>
+      <div class="modal-footer">
+        <span style="margin-right: auto; font-size: 0.78rem; color: var(--text-secondary);">Discovered videos are queued with this format pre-selected.</span>
+        <button class="btn btn-secondary" onclick="closeUnconvertedScan()">Cancel</button>
+        <button class="btn btn-primary" id="unconvertedScanRunBtn" onclick="runUnconvertedScan()">🔍 Scan &amp; Import</button>
+      </div>
+    </div>
+  </div>
+
   <div class="drawer-backdrop" id="drawerBackdrop" onclick="closeJobDetail()"></div>
   <div class="drawer" id="jobDrawer">
     <div class="drawer-header">
@@ -1506,6 +1571,7 @@
     </div>
     <div class="drawer-body" id="drawerBody"></div>
   </div>
+  <div class="row-popover" id="rowPopover"></div>
   <div class="notification-container" id="notifications"></div>
   
   <script>
@@ -1527,6 +1593,26 @@
     let reliabilityDetailsExpanded = false;
 
     const STATUS_ORDER = ['downloading', 'pending', 'waiting_live', 'paused', 'failed', 'done'];
+
+    // Shared by the detail drawer and the row popover so the two never drift.
+    const JOB_QUALITY_OPTIONS = [
+      { v: '', l: 'Global default' },
+      { v: 'highest', l: 'Highest available' },
+      { v: '4k', l: '4K (2160p)' },
+      { v: '1440p', l: '1440p (QHD)' },
+      { v: '1080p', l: '1080p (FHD)' },
+      { v: '720p', l: '720p (HD)' },
+      { v: '480p', l: '480p (SD)' },
+      { v: 'audio', l: 'Audio only' },
+    ];
+    const JOB_FORMAT_OPTIONS = [
+      { v: '', l: 'Global default' },
+      { v: 'mp4', l: 'MP4' },
+      { v: 'mkv', l: 'MKV' },
+      { v: 'webm', l: 'WebM' },
+      { v: 'mp3', l: 'MP3 (audio)' },
+      { v: 'm4a', l: 'M4A (audio)' },
+    ];
 
     function toggleReliabilityDetails() {
       reliabilityDetailsExpanded = !reliabilityDetailsExpanded;
@@ -2198,7 +2284,7 @@
           <tr data-job-id="${escapeHtml(job.id)}" onclick="openJobDetailById(this.dataset.jobId, event)" title="Click to view details and options">
             <td><input type="checkbox" class="job-checkbox" data-id="${escapeHtml(job.id)}" ${isChecked} onchange="toggleJobSelection(this.dataset.id)" /></td>
             <td>
-              <strong style="color: var(--text-primary); font-size: 0.86rem;">${escapeHtml(job.title || 'Unknown')}</strong>
+              <strong style="color: var(--text-primary); font-size: 0.86rem;">${escapeHtml(job.title || 'Unknown')}</strong>${isOverridable(job) ? ` <button class="row-icon-btn" data-job-id="${escapeHtml(job.id)}" title="Multi-language audio tracks" onclick="openAudioPopover(this)">🎵</button>` : ''}
               ${location ? `<div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 2px; word-break: break-all;" title="${escapeHtml(location)}">📍 ${escapeHtml(location)}</div>` : ''}
             </td>
             <td>
@@ -2219,9 +2305,11 @@
             <td style="font-size: 0.74rem;">${metaBadge}</td>
             <td>
               <div style="display: flex; gap: 4px; align-items: center;">
-                ${status === 'failed' ? `<button class="btn btn-success btn-sm" onclick="retryJob(this.closest('[data-job-id]').dataset.jobId)">🔄 Retry</button>` : ''}
+                ${isOverridable(job) ? `<button class="row-icon-btn" data-job-id="${escapeHtml(job.id)}" title="Per-job format &amp; quality overrides" onclick="openOverridePopover(this)">⚙️</button>` : ''}
+                ${status === 'paused' ? `<button class="btn btn-primary btn-sm" data-job-id="${escapeHtml(job.id)}" title="Resume from the last saved fragment — the partial file is kept" onclick="resumeJob(this.dataset.jobId)">▶️ Resume</button>` : ''}
+                ${status === 'failed' ? `<button class="btn btn-success btn-sm" title="Wipe partial files and restart this job from 0%" onclick="retryJob(this.closest('[data-job-id]').dataset.jobId)">🔄 Retry</button>` : ''}
                 ${isStoppable(job) ? `<button class="btn btn-warning btn-sm" title="Interrupt this download now — partial is preserved." onclick="stopJob(this.closest('[data-job-id]').dataset.jobId)">⏹️ Stop</button>` : ''}
-                ${status === 'failed' || isStoppable(job) ? '' : '<span style="color: var(--text-muted); font-size: 0.75rem;">–</span>'}
+                ${status === 'done' ? '<span style="color: var(--text-muted); font-size: 0.75rem;">–</span>' : ''}
               </div>
             </td>
           </tr>
@@ -2234,10 +2322,33 @@
         const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
         const data = await res.json();
         if (data.ok) {
-          showNotification('Job re-queued successfully', 'success');
+          showNotification('Job re-queued — partial files wiped, restarting from 0%', 'success');
+          if (data.warning) showNotification(data.warning, 'warning', 9000);
           refreshData();
         } else {
           showNotification(data.error || 'Failed to retry job', 'error');
+        }
+      } catch (err) {
+        showNotification(err.message, 'error');
+      }
+    }
+
+    function isOverridable(job) {
+      // Per-job overrides (format/quality/audio) only make sense while the job
+      // is not finished — a done job has nothing left to configure.
+      return jobStatus(job) !== 'done';
+    }
+
+    async function resumeJob(id) {
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/resume`, { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+          showNotification('Job resumed — continuing from its partial file', 'success');
+          closeJobDetail();
+          refreshData();
+        } else {
+          showNotification(data.error || 'Failed to resume job', 'error');
         }
       } catch (err) {
         showNotification(err.message, 'error');
@@ -2262,6 +2373,215 @@
         }
       } catch (err) {
         showNotification(err.message, 'error');
+      }
+    }
+
+    // --- Row popovers: per-job format/quality override + audio tracks ------
+    let popoverAnchor = null;
+
+    function closeRowPopover() {
+      const pop = document.getElementById('rowPopover');
+      if (pop) pop.classList.remove('open');
+      popoverAnchor = null;
+    }
+
+    function positionRowPopover(anchor) {
+      const pop = document.getElementById('rowPopover');
+      if (!pop || !anchor || !anchor.getBoundingClientRect) return;
+      pop.classList.add('open');
+      const rect = anchor.getBoundingClientRect();
+      const width = pop.offsetWidth || 300;
+      const left = Math.max(8, Math.min(rect.left, (window.innerWidth || 1200) - width - 12));
+      pop.style.left = `${left}px`;
+      pop.style.top = `${rect.bottom + 6}px`;
+    }
+
+    function overridePopoverHtml(job) {
+      const q = job.video_quality ?? '';
+      const f = job.target_format ?? '';
+      return `
+        <h4>⚙️ Format &amp; Quality Override</h4>
+        <div class="popover-hint">Applies to this video only. "Save &amp; Re-Download" wipes partials and restarts from 0%.</div>
+        <label for="popoverQuality">Quality preset</label>
+        <select id="popoverQuality">
+          ${JOB_QUALITY_OPTIONS.map(o => `<option value="${o.v}" ${o.v === q ? 'selected' : ''}>${o.l}</option>`).join('')}
+        </select>
+        <label for="popoverFormat">Container format</label>
+        <select id="popoverFormat">
+          ${JOB_FORMAT_OPTIONS.map(o => `<option value="${o.v}" ${o.v === f ? 'selected' : ''}>${o.l}</option>`).join('')}
+        </select>
+        <div class="popover-actions">
+          <button class="btn btn-primary btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="savePopoverOverride(this.dataset.jobId, true)">💾 Save &amp; Re-Download</button>
+          <button class="btn btn-secondary btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="savePopoverOverride(this.dataset.jobId, false)">Save Only</button>
+        </div>
+      `;
+    }
+
+    function openOverridePopover(btn) {
+      const job = lastJobs.find(j => j.id === btn.dataset.jobId);
+      if (!job) return;
+      popoverAnchor = btn;
+      document.getElementById('rowPopover').innerHTML = overridePopoverHtml(job);
+      positionRowPopover(btn);
+    }
+
+    async function savePopoverOverride(id, retry) {
+      const qEl = document.getElementById('popoverQuality');
+      const fEl = document.getElementById('popoverFormat');
+      const payload = { retry: !!retry };
+      if (qEl) payload.videoQuality = qEl.value === '' ? null : qEl.value;
+      if (fEl) payload.targetFormat = fEl.value === '' ? null : fEl.value;
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/override`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to save overrides');
+        showNotification(retry ? 'Overrides saved — re-download queued from 0%' : 'Overrides saved', 'success');
+        if (data.warning) showNotification(data.warning, 'warning', 9000);
+        closeRowPopover();
+        refreshData();
+      } catch (err) {
+        showNotification(err.message, 'error');
+      }
+    }
+
+    function audioPopoverHtml(job) {
+      const tracks = Array.isArray(job.audio_tracks) ? job.audio_tracks : [];
+      const sel = job.audio_selection;
+      const isCustom = Array.isArray(sel);
+      const selectedSet = new Set(isCustom ? sel : []);
+      if (!tracks.length) {
+        return `
+          <h4>🎵 Multi-Language Audio Tracks</h4>
+          <div class="popover-hint">No audio tracks probed for this video yet. Probing queries YouTube for the available language streams.</div>
+          <div class="popover-actions">
+            <button class="btn btn-primary btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="probePopoverAudioTracks(this.dataset.jobId)">🔍 Probe Tracks</button>
+          </div>
+        `;
+      }
+      const allChecked = isCustom && tracks.every(t => selectedSet.has(t.language));
+      const rows = tracks.map(t => {
+        const checked = isCustom ? selectedSet.has(t.language) : (t.isDefault || t.isOriginal);
+        const sub = [t.label, t.isOriginal ? 'original' : '', t.isDefault ? 'default' : '', t.channels ? `${t.channels}ch` : '']
+          .filter(Boolean).join(' · ');
+        return `
+          <label>
+            <input type="checkbox" class="popover-audio-check" value="${escapeHtml(t.language)}" ${checked ? 'checked' : ''} />
+            <span><strong>${escapeHtml(t.language || 'und')}</strong>${sub ? ` <span style="color: var(--text-muted);">(${escapeHtml(sub)})</span>` : ''}</span>
+          </label>
+        `;
+      }).join('');
+      return `
+        <h4>🎵 Multi-Language Audio Tracks</h4>
+        <div class="popover-hint">Choose which language streams to keep as multi-track audio. "Save &amp; Re-Download" wipes partials and restarts from 0%.</div>
+        <label style="display: flex; align-items: center; gap: 8px; font-weight: 600; margin-top: 10px;">
+          <input type="checkbox" id="popoverAudioAll" ${allChecked ? 'checked' : ''} onchange="togglePopoverAudioAll(this)" />
+          <span>Download all languages</span>
+        </label>
+        <div class="popover-audio-list">${rows}</div>
+        <div class="popover-actions">
+          <button class="btn btn-primary btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="savePopoverAudio(this.dataset.jobId, true)">💾 Save &amp; Re-Download</button>
+          <button class="btn btn-secondary btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="savePopoverAudio(this.dataset.jobId, false)">Save Selection</button>
+        </div>
+      `;
+    }
+
+    function openAudioPopover(btn) {
+      const job = lastJobs.find(j => j.id === btn.dataset.jobId);
+      if (!job) return;
+      popoverAnchor = btn;
+      document.getElementById('rowPopover').innerHTML = audioPopoverHtml(job);
+      positionRowPopover(btn);
+    }
+
+    function togglePopoverAudioAll(checkbox) {
+      document.querySelectorAll('#rowPopover .popover-audio-check').forEach(c => { c.checked = checkbox.checked; });
+    }
+
+    async function savePopoverAudio(id, retry) {
+      const allEl = document.getElementById('popoverAudioAll');
+      const checks = Array.from(document.querySelectorAll('#rowPopover .popover-audio-check'));
+      let tracks;
+      if (allEl && allEl.checked) {
+        tracks = checks.map(c => c.value);
+      } else {
+        tracks = checks.filter(c => c.checked).map(c => c.value);
+      }
+      if (!tracks.length) {
+        if (!confirm('No languages selected — clear the selection and follow the global audio mode?')) return;
+        tracks = null;
+      }
+      await submitJobOverride(
+        id,
+        tracks,
+        retry,
+        retry ? 'Audio tracks saved — re-download queued from 0%' : 'Audio track selection saved',
+        false
+      );
+      closeRowPopover();
+    }
+
+    async function probePopoverAudioTracks(id) {
+      showNotification('Probing audio streams via yt-dlp...', 'info');
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/audio-probe`, { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to probe audio');
+        showNotification(`Probed: ${data.tracks ? data.tracks.length : 0} audio tracks found`, 'success');
+        const fresh = await fetchJob(id);
+        if (fresh) {
+          document.getElementById('rowPopover').innerHTML = audioPopoverHtml(fresh);
+          if (popoverAnchor) positionRowPopover(popoverAnchor);
+        }
+        refreshData();
+      } catch (err) {
+        showNotification(err.message, 'error');
+      }
+    }
+
+    // --- Scan Unconverted Videos --------------------------------------------
+    function openUnconvertedScan() {
+      document.getElementById('unconvertedModal').classList.add('open');
+    }
+
+    function closeUnconvertedScan() {
+      document.getElementById('unconvertedModal').classList.remove('open');
+    }
+
+    async function runUnconvertedScan() {
+      const fmt = (document.getElementById('unconvertedFormat') || {}).value || 'mp4';
+      const button = document.getElementById('unconvertedScanRunBtn');
+      const originalText = button?.textContent || '🔍 Scan & Import';
+      if (button) {
+        button.disabled = true;
+        button.textContent = '⏳ Scanning…';
+      }
+      try {
+        const res = await fetch('/api/scan/unconverted', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetFormat: fmt }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+        closeUnconvertedScan();
+        const parts = [
+          `Imported ${data.imported ?? 0} video(s) for conversion to ${fmt.toUpperCase()}`,
+          `${data.alreadyTracked ?? 0} already tracked`,
+          `${data.videoFiles ?? 0} video file(s) seen`,
+        ];
+        showNotification(parts.join(' · '), data.imported ? 'success' : 'info', 8000);
+        refreshData();
+      } catch (err) {
+        showNotification(err.message || 'Could not scan unconverted videos', 'error', 8000);
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = originalText;
+        }
       }
     }
 
@@ -2963,24 +3283,8 @@
       // the scanner wrote them to — there is no separate "override_*" column.
       const q = job.video_quality ?? '';
       const f = job.target_format ?? '';
-      const qualityOptions = [
-        { v: '', l: 'Global default' },
-        { v: 'highest', l: 'Highest available' },
-        { v: '4k', l: '4K (2160p)' },
-        { v: '1440p', l: '1440p (QHD)' },
-        { v: '1080p', l: '1080p (FHD)' },
-        { v: '720p', l: '720p (HD)' },
-        { v: '480p', l: '480p (SD)' },
-        { v: 'audio', l: 'Audio only' },
-      ];
-      const formatOptions = [
-        { v: '', l: 'Global default' },
-        { v: 'mp4', l: 'MP4' },
-        { v: 'mkv', l: 'MKV' },
-        { v: 'webm', l: 'WebM' },
-        { v: 'mp3', l: 'MP3 (audio)' },
-        { v: 'm4a', l: 'M4A (audio)' },
-      ];
+      const qualityOptions = JOB_QUALITY_OPTIONS;
+      const formatOptions = JOB_FORMAT_OPTIONS;
       return `
         <div class="audio-tracks-box" style="margin-top: 14px;">
           <div style="font-weight: 700; font-size: 0.85rem; margin-bottom: 6px;">⚙️ Per-Job Format &amp; Quality Overrides</div>
@@ -3219,7 +3523,8 @@
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border);">
           <span class="status-badge status-${status}">${escapeHtml(status)}</span>
           <div style="display: flex; gap: 6px;">
-            ${status === 'failed' ? `<button class="btn btn-success btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="retryJob(this.dataset.jobId)">🔄 Retry</button>` : ''}
+            ${status === 'paused' ? `<button class="btn btn-primary btn-sm" data-job-id="${escapeHtml(job.id)}" title="Continue from the last saved fragment — the partial file is kept" onclick="resumeJob(this.dataset.jobId)">▶️ Resume Processing</button>` : ''}
+            ${status === 'failed' ? `<button class="btn btn-success btn-sm" data-job-id="${escapeHtml(job.id)}" title="Wipe partial files and restart this job from 0%" onclick="retryJob(this.dataset.jobId)">🔄 Retry</button>` : ''}
             ${isStoppable(job) ? `<button class="btn btn-warning btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="stopJob(this.dataset.jobId)">⏹️ Stop</button>` : ''}
           </div>
         </div>
@@ -3267,11 +3572,60 @@
       document.getElementById('settingsModal').classList.contains('open') ||
       document.getElementById('jobDrawer').classList.contains('open');
 
+    // Close the row popover on any click outside it (and outside its trigger).
+    document.addEventListener('click', (e) => {
+      const pop = document.getElementById('rowPopover');
+      if (!pop || !pop.classList.contains('open')) return;
+      if (pop.contains(e.target)) return;
+      if (e.target && e.target.closest && e.target.closest('.row-icon-btn')) return;
+      closeRowPopover();
+    });
+
     document.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
 
       if (e.key === 'Escape') {
         if (document.getElementById('settingsModal').classList.contains('open')) { closeSettings(); return; }
+        if (document.getElementById('unconvertedModal').classList.contains('open')) { closeUnconvertedScan(); return; }
+        if (document.getElementById('jobDrawer').classList.contains('open')) { closeJobDetail(); return; }
+        if (document.getElementById('rowPopover').classList.contains('open')) { closeRowPopover(); return; }
+        const s = document.getElementById('searchInput');
+        if (s) s.blur();
+        return;
+      }
+      if (anyOverlayOpen()) return;
+
+      switch(e.key) {
+        case 'p':
+          e.preventDefault(); togglePause();
+          break;
+        case 'r':
+          e.preventDefault(); refreshData();
+          break;
+        case 's':
+          e.preventDefault(); openSettings();
+          break;
+        case 't':
+          e.preventDefault(); toggleTurboMode();
+          break;
+        case '/':
+          e.preventDefault();
+          const s = document.getElementById('searchInput');
+          if (s) s.focus();
+          break;
+      }
+    });
+    
+    // Initial load, then poll every 5s while the tab is visible.
+    refreshData();
+    loadSources();
+    fetchSettingsSnapshot();
+    setInterval(() => { if (!document.hidden) fetchStatus(); }, 5000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) fetchStatus(); });
+  </script>
+</body>
+</html>
+       if (document.getElementById('settingsModal').classList.contains('open')) { closeSettings(); return; }
         if (document.getElementById('jobDrawer').classList.contains('open')) { closeJobDetail(); return; }
         const s = document.getElementById('searchInput');
         if (s) s.blur();
