@@ -182,6 +182,17 @@ beforeEach(() => {
 });
 
 describe("the dashboard's API calls", () => {
+  test("the HTML document ends at its closing tag with no rendered source after it", () => {
+    const html = readFileSync(UI_PATH, "utf8");
+    const lower = html.toLowerCase();
+    const closingTag = "</html>";
+    const closeAt = lower.indexOf(closingTag);
+
+    expect(closeAt).toBeGreaterThanOrEqual(0);
+    expect(lower.lastIndexOf(closingTag)).toBe(closeAt);
+    expect(html.slice(closeAt + closingTag.length).trim()).toBe("");
+  });
+
   test("every /api path web_ui.html fetches still resolves in the route table", async () => {
     const html = readFileSync(UI_PATH, "utf8");
     // String literals and template heads: '/api/status', `/api/jobs/${id}/retry`.
