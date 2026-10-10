@@ -80,8 +80,35 @@ export function parseAria2cSplitSizeBytes(sizeStr: string): number | null {
   return Math.floor(num);
 }
 
-export function buildAria2cArgs(config: Config): string {
-  const n = Math.max(1, Math.floor(config.connectionsPerDownload));
+/**
+ * Engine-wide budget of parallel connections (aria2c) and fragment requests
+ * (native), shared by every active download slot. Each download's own setting
+ * is the ceiling for that download; the budget lowers it as slots are added so
+ * that N slots never open N × 32 connections at once. At up to 4 slots the
+ * Aggressive profile (32 connections, 64 fragments) runs unchanged; past that
+ * each download gets its share. These are judgement values, not a YouTube
+ * limit: raise them if throughput per slot is too low, lower them if the
+ * transfers start failing as the slot count grows.
+ */
+export const CONNECTION_BUDGET = 128;
+export const FRAGMENT_BUDGET = 256;
+/** Floor for a per-download share, so a large pool never degenerates to 1. */
+export const MIN_TRANSFERS_PER_DOWNLOAD = 4;
+
+/**
+ * The transfer count one download may use while `activeSlots` slots run: the
+ * configured value, reduced to its share of `budget` but never below the floor
+ * and never above the configured value.
+ */
+export function perDownloadTransfers(configured: number, activeSlots: number, budget: number): number {
+  const wanted = Math.max(1, Math.floor(configured));
+  const slots = Math.max(1, Math.floor(activeSlots));
+  const share = Math.floor(budget / slots);
+  return Math.max(1, Math.min(wanted, Math.max(MIN_TRANSFERS_PER_DOWNLOAD, share)));
+}
+
+export function buildAria2cArgs(config: Config, activeSlots = 1): string {
+  const n = perDownloadTransfers(config.connectionsPerDownload, activeSlots, CONNECTION_BUDGET);
   const x = Math.min(n, ARIA2C_MAX_CONNECTIONS_PER_SERVER);
   const parts = [`-x ${x}`, `-s ${n}`, `-j ${n}`];
   const split = (config.minSplitSize || "").trim();
@@ -155,6 +182,10 @@ export interface DownloadPlan {
   timeoutMs: number;
   /** Applied `--limit-rate` value in bytes/second, or null when uncapped. */
   perWorkerLimitBytesPerSec: number | null;
+  /** Connections per download actually requested (aria2c) — after the budget. */
+  connectionsPerDownload: number;
+  /** Parallel fragments actually requested (native) — after the budget. */
+  concurrentFragments: number;
   /** Output template (`…/base.%(ext)s`) and the base name without extension. */
   baseFilename: string;
   outTemplate: string;
@@ -207,6 +238,8 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
     audioTracks.length > 0 ? multiAudioFormatSelector(format, audioTracks) : format;
   const baseFilename = jobFittedBaseFilename(job);
   const outTemplate = join(job.output_directory, `${baseFilename}.%(ext)s`);
+  const fragments = perDownloadTransfers(config.concurrentFragments, activeSlots, FRAGMENT_BUDGET);
+  const connections = perDownloadTransfers(config.connectionsPerDownload, activeSlots, CONNECTION_BUDGET);
 
   const args: string[] = [
     // argv[0] is filled in by the caller (the resolved yt-dlp path).
@@ -218,7 +251,7 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
     // Parallel fragments for DASH/HLS (native path). Ignored when aria2c is
     // handling a whole-file transfer, which splits internally instead.
     "--concurrent-fragments",
-    String(Math.max(1, Math.floor(config.concurrentFragments))),
+    String(fragments),
     "-o",
     outTemplate,
     // --newline/--no-colors keep progress lines parseable from a pipe.
@@ -294,7 +327,7 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
     // "Bad number" + exit 28 before transferring a byte — the
     // BAD_DOWNLOADER_ARGS pause. Unquoted, the post-`aria2c:` shlex split
     // yields the right argv on Windows and POSIX alike.
-    args.push("--downloader-args", `aria2c:${buildAria2cArgs(config)}`);
+    args.push("--downloader-args", `aria2c:${buildAria2cArgs(config, activeSlots)}`);
   }
 
   // Native-downloader tuning. Range-based chunking can dramatically improve
@@ -318,6 +351,8 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
       maxMinutes: config.maxDownloadMinutes,
     }),
     perWorkerLimitBytesPerSec,
+    connectionsPerDownload: connections,
+    concurrentFragments: fragments,
     baseFilename,
     outTemplate,
   };

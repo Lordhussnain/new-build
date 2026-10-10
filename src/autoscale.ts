@@ -1,12 +1,18 @@
 // src/autoscale.ts — dynamic download-slot autoscaling.
 //
-// All maxDownloadWorkers processes are supervised and alive, but only the ones
-// whose id is in activeDlSlots may claim jobs. The autoscaler adds/removes slot
-// ids — a slot removed mid-download lets its worker finish the current job and
-// then idle.
+// Every download worker process that exists is supervised and alive, but only
+// the ones whose id is in activeDlSlots may claim jobs. The autoscaler adds and
+// removes slot ids. A slot removed mid-download lets its worker finish the
+// current job, then park. Nothing is ever killed by a scale-down.
+//
+// The decision is made by nextSlotTarget(), a pure function, so the policy can
+// be tested without a database, timers, or a process.
 
 import { db } from "./db";
 import { getConfig } from "./state";
+
+/** Largest slot id the engine will ever use (the schema's maxDownloadWorkers). */
+export const MAX_SLOT_ID = 20;
 
 export const autoscaler = {
   enabled: true,
@@ -16,16 +22,16 @@ export const autoscaler = {
   minWorkers: 1,
   maxWorkers: 5,
   /**
-   * How many download worker processes actually exist (supervised at startup).
-   * The ceiling can be lowered live, but never raised past the pool: extra
-   * slots would have no process to claim work. Raising `maxDownloadWorkers`
-   * therefore takes effect after a restart.
+   * How many download worker processes exist. The engine keeps this equal to
+   * the pool it has supervised and grows it live when the ceiling is raised
+   * (see engine.ts growDownloadPool). The ceiling is always clamped to it, so
+   * a slot never exists without a process to run it.
    */
   poolSize: 5,
   maxBandwidthKBps: 0,
   // Slots added per tick while a backlog exists (1 = the original slow ramp).
   rampStep: 2,
-  /** Timestamp of the last scale-down event, used for hysteresis cooldown. */
+  /** Timestamp of the last bandwidth-driven scale-down, used for hysteresis. */
   lastScaleDownAt: 0,
   workerSpeeds: new Map<number, number>(),
   init(c: {
@@ -61,28 +67,89 @@ export const autoscaler = {
 
 export const activeDlSlots = new Set<number>();
 
+/** Make the active set exactly `target` slots (clamped to 1..MAX_SLOT_ID). */
 export function setActiveSlots(target: number): void {
-  const clamped = Math.max(1, Math.min(Math.round(target), 20));
+  const clamped = Math.max(1, Math.min(Math.round(target), MAX_SLOT_ID));
   if (clamped > activeDlSlots.size) {
-    for (let i = 1; i <= 20 && activeDlSlots.size < clamped; i++) activeDlSlots.add(i);
+    for (let i = 1; i <= MAX_SLOT_ID && activeDlSlots.size < clamped; i++) activeDlSlots.add(i);
   } else if (clamped < activeDlSlots.size) {
-    for (let i = 20; i >= 1 && activeDlSlots.size > clamped; i--) activeDlSlots.delete(i);
+    for (let i = MAX_SLOT_ID; i >= 1 && activeDlSlots.size > clamped; i--) activeDlSlots.delete(i);
   }
 }
 
-// Autoscale tick (every 15s when autoscaleEnabled): grow toward
-// maxDownloadWorkers while the queue has backlog and bandwidth headroom, shed
-// slots when the aggregate speed saturates the configured cap, and fall back
-// to minDownloadWorkers when there is nothing to do. maxConcurrentDownloads is
-// the initial target (and live reset value); with autoscaling disabled it is
-// the fixed slot count.
+export interface SlotTargetInput {
+  /** Slots active right now. */
+  current: number;
+  /** Pending jobs waiting for a slot. */
+  backlog: number;
+  /** Jobs already downloading. Each holds a slot until it finishes. */
+  inFlight: number;
+  minWorkers: number;
+  /** Ceiling, already clamped to the spawned pool by the caller. */
+  maxWorkers: number;
+  rampStep: number;
+  aggBps: number;
+  /** Configured bandwidth cap in bytes/second; 0 = uncapped. */
+  capBps: number;
+  now: number;
+  lastScaleDownAt: number;
+  /** Cooldown after a bandwidth shed before slots may grow again. */
+  cooldownMs?: number;
+}
+
+export interface SlotTargetResult {
+  target: number;
+  /** True when this decision shed a slot for bandwidth (starts the cooldown). */
+  bandwidthShed: boolean;
+}
+
+/**
+ * Pure slot policy, one step per autoscale tick.
+ *
+ *  - Demand = jobs already downloading + jobs waiting. A running job holds its
+ *    slot, so it counts; otherwise the slot of a finishing job would look idle.
+ *  - No demand: collapse to the floor.
+ *  - Bandwidth above 90% of the cap: shed one slot per tick (and start the
+ *    growth cooldown).
+ *  - Demand below the current count: shrink to demand. Idle slots park.
+ *  - Backlog, bandwidth below 70% of the cap, and out of cooldown: grow by the
+ *    ramp step, never past demand or the ceiling.
+ *
+ * A changed floor or ceiling is enforced immediately in every branch.
+ */
+export function nextSlotTarget(input: SlotTargetInput): SlotTargetResult {
+  const floor = Math.max(1, input.minWorkers);
+  const ceiling = Math.max(floor, input.maxWorkers);
+  const demand = Math.max(0, input.inFlight) + Math.max(0, input.backlog);
+  const cooldownMs = input.cooldownMs ?? 30_000;
+  let target = Math.min(ceiling, Math.max(floor, input.current));
+
+  if (demand === 0) return { target: floor, bandwidthShed: false };
+
+  if (input.capBps > 0 && input.aggBps > input.capBps * 0.9 && target > floor) {
+    return { target: target - 1, bandwidthShed: true };
+  }
+
+  const wanted = Math.max(floor, Math.min(ceiling, demand));
+  if (target > wanted) return { target: wanted, bandwidthShed: false };
+
+  const headroom = input.capBps === 0 || input.aggBps < input.capBps * 0.7;
+  const cooled = input.now - input.lastScaleDownAt > cooldownMs;
+  if (input.backlog > 0 && target < ceiling && headroom && cooled) {
+    target = Math.min(target + Math.max(1, input.rampStep), demand, ceiling);
+  }
+  return { target, bandwidthShed: false };
+}
+
+/**
+ * Autoscale tick (every 15s when autoscaleEnabled). Reads the live config so
+ * dashboard edits (toggle, initial slots, floor, ceiling, ramp step) apply on
+ * the next tick. The ceiling is clamped to the spawned pool.
+ */
 export function autoscaleTick(): void {
-  // Read everything from the live config: toggling autoscaling, the starting
-  // slot count, ramp step, and worker floor/ceiling from the dashboard apply on
-  // the next tick (the ceiling is clamped to the supervised pool size).
   const config = getConfig();
-  const minWorkers = Math.max(1, Math.min(20, Math.floor(config.minDownloadWorkers)));
-  const maxWorkers = Math.max(minWorkers, Math.min(20, autoscaler.poolSize, Math.floor(config.maxDownloadWorkers)));
+  const minWorkers = Math.max(1, Math.min(MAX_SLOT_ID, Math.floor(config.minDownloadWorkers)));
+  const maxWorkers = Math.max(minWorkers, Math.min(MAX_SLOT_ID, autoscaler.poolSize, Math.floor(config.maxDownloadWorkers)));
   autoscaler.minWorkers = minWorkers;
   autoscaler.maxWorkers = maxWorkers;
   autoscaler.rampStep = Math.max(1, Math.floor(config.autoscaleRampStep));
@@ -99,34 +166,29 @@ export function autoscaleTick(): void {
   try {
     const q = db
       .query(
-        `SELECT SUM(CASE WHEN download_status = 'pending'
-              OR (download_status = 'paused' AND COALESCE(pause_reason, '') NOT IN ('user', 'waiting_live'))
-            THEN 1 ELSE 0 END) as backlog
+        `SELECT
+           SUM(CASE WHEN download_status = 'pending'
+                 OR (download_status = 'paused' AND COALESCE(pause_reason, '') NOT IN ('user', 'waiting_live'))
+               THEN 1 ELSE 0 END) AS backlog,
+           SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) AS inflight
          FROM jobs`,
       )
-      .get() as any;
-    const backlog = q?.backlog || 0;
-    const aggBps = autoscaler.getAggregateSpeed();
-    const capBps = config.maxBandwidthKBps * 1024;
+      .get() as { backlog: number | null; inflight: number | null } | null;
     const now = Date.now();
-    // Enforce changed floor/ceiling immediately, even under backlog pressure.
-    let target = Math.min(maxWorkers, Math.max(minWorkers, activeDlSlots.size));
-    if (backlog === 0) {
-      target = minWorkers;
-    } else if (capBps > 0 && aggBps > capBps * 0.9 && target > minWorkers) {
-      target--; // bandwidth saturated — fewer slots = more headroom each
-      autoscaler.lastScaleDownAt = now;
-    } else if (
-      backlog > target &&
-      target < maxWorkers &&
-      (capBps === 0 || aggBps < capBps * 0.7) &&
-      now - autoscaler.lastScaleDownAt > 30_000 // 30s hysteresis cooldown
-    ) {
-      // Waiting jobs + bandwidth headroom: grow by the configured ramp step,
-      // but never overshoot either the backlog or the worker ceiling.
-      target = Math.min(target + autoscaler.rampStep, backlog, maxWorkers);
-    }
-    setActiveSlots(target);
+    const result = nextSlotTarget({
+      current: activeDlSlots.size,
+      backlog: q?.backlog || 0,
+      inFlight: q?.inflight || 0,
+      minWorkers,
+      maxWorkers,
+      rampStep: autoscaler.rampStep,
+      aggBps: autoscaler.getAggregateSpeed(),
+      capBps: config.maxBandwidthKBps * 1024,
+      now,
+      lastScaleDownAt: autoscaler.lastScaleDownAt,
+    });
+    if (result.bandwidthShed) autoscaler.lastScaleDownAt = now;
+    setActiveSlots(result.target);
     autoscaler.targetWorkers = activeDlSlots.size;
   } catch {}
 }

@@ -10,7 +10,7 @@
 // settings panel must be able to change the ramp step, the worker floor and the
 // autoscale toggle without a restart. So these tests drive it the way the
 // dashboard does — through setConfig — and `autoscaler.poolSize` stands in for
-// the number of worker processes the supervisor started.
+// the number of worker processes the supervisor has started.
 
 import { describe, expect, test, beforeEach } from "bun:test";
 import { autoscaler, activeDlSlots, autoscaleTick } from "../src/autoscale";
@@ -44,7 +44,7 @@ beforeEach(() => {
   autoscaler.workerSpeeds.clear();
   autoscaler.rampStep = 2;
   // The supervised pool: slots can never exceed it, no matter what the live
-  // config says (a raised maxDownloadWorkers applies after a restart).
+  // config says (the engine grows the pool to match maxDownloadWorkers).
   autoscaler.poolSize = 20;
   activeDlSlots.clear();
 });
@@ -134,10 +134,12 @@ describe("autoscaleTick", () => {
     expect(activeDlSlots.size).toBe(4);
   });
 
-  test("the ceiling is clamped to the supervised pool, so a raise needs a restart", () => {
+  test("the ceiling is clamped to the spawned pool until the engine starts more workers", () => {
     seedBacklog(20);
     // The dashboard can save maxDownloadWorkers 12, but only 6 worker
-    // processes exist in this run: the extra slots would have nobody to claim.
+    // processes exist so far: the extra slots would have nobody to claim. The
+    // engine tops the pool up on its next tick (ensureDownloadWorkers), after
+    // which the ceiling rises to 12 without a restart.
     autoscaler.poolSize = 6;
     configWith({ autoscaleRampStep: 10, maxDownloadWorkers: 12, minDownloadWorkers: 1 });
     activeDlSlots.add(1);

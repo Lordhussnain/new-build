@@ -29,7 +29,7 @@ import { autoscaleTick, autoscaler } from "./autoscale";
 import { networkMonitor, triggerPause } from "./resilience";
 import { scanAndIngest } from "./scanner";
 import { startWebServer } from "./web";
-import { initDashboard, renderDashboard } from "./dashboard";
+import { initDashboard, renderDashboard, setDownloadRows } from "./dashboard";
 import { startRssPolling } from "./rss";
 import { startAutonomousPolling } from "./polling";
 import { startRunHistory, heartbeatRunHistory } from "./history";
@@ -43,6 +43,31 @@ import { getConfig, setConfig } from "./state";
 
 // The web server handle, assigned in main() and stopped during shutdown.
 let webServer: { stop: (closeActive?: boolean) => void } | null = null;
+
+/** Hard upper bound on download worker processes (matches the settings schema). */
+const MAX_DOWNLOAD_PROCESSES = 20;
+/** Download worker processes started so far. The pool only grows; extra workers park. */
+let downloadProcesses = 0;
+
+/**
+ * Start supervised download worker processes until the pool covers the live
+ * maxDownloadWorkers (capped at MAX_DOWNLOAD_PROCESSES). Called at startup and
+ * on every autoscale tick, so raising the setting takes effect without a
+ * restart. Lowering it never stops a process: the autoscaler parks the extra
+ * slots instead, which lets any running download finish.
+ */
+export function ensureDownloadWorkers(): void {
+  const config = getConfig();
+  const wanted = Math.min(MAX_DOWNLOAD_PROCESSES, Math.max(1, Math.floor(config.maxDownloadWorkers)));
+  if (wanted <= downloadProcesses) return;
+  for (let i = downloadProcesses + 1; i <= wanted; i++) {
+    supervise(`download-worker-${i}`, () => downloadWorker(i, getConfig()));
+  }
+  downloadProcesses = wanted;
+  autoscaler.poolSize = wanted;
+  // Reserve dashboard rows for the new workers. Redraws the block if it is on screen.
+  setDownloadRows(wanted);
+}
 
 export async function main(): Promise<void> {
   process.on("SIGINT", () => handleShutdown("SIGINT", webServer));
@@ -266,8 +291,13 @@ export async function main(): Promise<void> {
     // surfacing an unhandled rejection if the DB is mid-shutdown.
     void reapStaleClaims(getConfig()).catch(() => {});
   }, 60_000);
-  // Dynamic download-slot autoscaling (no-op when autoscaleEnabled=false).
-  setInterval(autoscaleTick, 15_000);
+  // Dynamic download-slot autoscaling (no-op when autoscaleEnabled=false). The
+  // pool is topped up first, so a raised maxDownloadWorkers gets its processes
+  // before the autoscaler is allowed to use the new ceiling.
+  setInterval(() => {
+    ensureDownloadWorkers();
+    autoscaleTick();
+  }, 15_000);
   // Failed-job sweep: re-queue transient failures after their cooldown. It also
   // re-queues failed CONVERSIONS, which is exactly what offline mode wants, so
   // the sweep keeps running; download re-queues simply wait for the mode to end.
@@ -281,9 +311,7 @@ export async function main(): Promise<void> {
 
   // 4) Pipeline workers (each supervised — crashed loops restart automatically):
   //    download → metadata → converter, all driven by job status in the DB.
-  for (let i = 1; i <= config.maxDownloadWorkers; i++) {
-    supervise(`download-worker-${i}`, () => downloadWorker(i, config));
-  }
+  ensureDownloadWorkers();
   for (let i = 1; i <= config.maxMetadataWorkers; i++) {
     supervise(`metadata-worker-${i}`, () => metadataWorker(i, config));
   }

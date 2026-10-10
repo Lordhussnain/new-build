@@ -59,7 +59,7 @@ import {
   type AudioTrack,
 } from "../audio-tracks";
 import { findDownloadedFile, formatBytesPerSec, parseSpeedToBytesPerSec } from "../util";
-import { updateAbsoluteLine } from "../dashboard";
+import { updateWorkerLine } from "../dashboard";
 import {
   abortController,
   activeDownloadJobs,
@@ -68,7 +68,6 @@ import {
   isJobCancelled,
   isPaused,
   stats,
-  workerStatuses,
 } from "../state";
 import { logError } from "../logger";
 import type { Config } from "../config";
@@ -119,6 +118,9 @@ function releaseOwned(
 export async function downloadWorker(id: number, config: Config): Promise<void> {
   const workerId = `dl-${id}`;
   aliveDownloadWorkers.add(id);
+  // Whether this slot's "parked" line is already on screen. Written once per
+  // parking, not on every idle poll.
+  let parkedShown = false;
   while (!abortController.signal.aborted) {
     // Re-read the config every iteration so settings changed from the dashboard
     // (POST /api/settings) take effect on the next job without a restart. The
@@ -143,9 +145,17 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
     // Autoscaling gate: a scaled-down slot's worker idles here instead of
     // claiming work (a job already in flight always runs to completion).
     if (!activeDlSlots.has(id)) {
+      if (!parkedShown) {
+        // A parked slot shows that it is parked, and drops its stale speed
+        // reading so the bandwidth total only counts running transfers.
+        updateWorkerLine(id, "⏸️ Parked — slot scaled down", config);
+        autoscaler.clearWorker(id);
+        parkedShown = true;
+      }
       await Bun.sleep(1000);
       continue;
     }
+    parkedShown = false;
 
     const disk = await checkDiskSpace(config.outputRoot, config.minFreeSpaceGB);
     if (!disk.ok) {
@@ -153,6 +163,10 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
       await Bun.sleep(10000);
       continue;
     }
+    // The disk check is an await: the autoscaler may have parked this slot
+    // meanwhile. Re-check here, with no await between this check and the claim,
+    // so a parked slot can never take a job.
+    if (!activeDlSlots.has(id)) continue;
 
     const job = claimDownloadJob(workerId);
     if (!job) {
@@ -221,7 +235,7 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     jsRuntime: jsRuntime(),
   });
   const { baseFilename, timeoutMs } = plan;
-  const engineTag = plan.engine === "aria2c" ? `aria2c×${config.connectionsPerDownload}` : "native";
+  const engineTag = plan.engine === "aria2c" ? `aria2c×${plan.connectionsPerDownload}` : "native";
   const audioTag = audioTracks.length > 0 ? `, ${audioTracks.length} audio track(s)` : "";
 
   // The audio probe above is a network round-trip; the job can be paused,
@@ -1294,7 +1308,3 @@ export function recordSuccess(job: Job, filePath: string, fileSize: number): Dow
   return { ok: true, stayedPaused: row?.pause_reason === "user", lostClaim: false };
 }
 
-function updateWorkerLine(id: number, text: string, _config: Config): void {
-  workerStatuses.set(`DL${id}`, text);
-  updateAbsoluteLine(2 + id, `[DL${id}] ${text}`);
-}

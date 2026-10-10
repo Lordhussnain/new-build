@@ -258,16 +258,16 @@ for explicit format overrides.
 | --- | --- | --- |
 | `useAria2c` | `true` | Download through aria2c for multi-connection transfers. Falls back to yt-dlp's native downloader when the binary is missing, or for HLS/live streams which aria2c cannot serve. |
 | `aria2cPath` | `""` | Where aria2c lives; blank auto-detects (PATH, app folder, winget/scoop/choco). Set to `"none"` to force-disable aria2c even when installed — the engine then always uses yt-dlp's native downloader. |
-| `connectionsPerDownload` | `16` | aria2c `-s`/`-j` — how finely a file is split (1–64). aria2c hard-caps per-server connections (`-x`) at 16; the engine clamps it, so values above 16 split finer without opening impossible connections. |
+| `connectionsPerDownload` | `16` | aria2c `-s`/`-j` — how finely a file is split (1–64). aria2c hard-caps per-server connections (`-x`) at 16; the engine clamps it, so values above 16 split finer without opening impossible connections. Shared across active slots: each download gets at most 128 ÷ active slots connections (floor 4), so the Aggressive profile (32) runs unchanged up to 4 slots and scales down beyond that. |
 | `minSplitSize` | `"1M"` | Smallest file size aria2c will split into multiple connections. A size at or below 1M is clamped to yt-dlp's 1M default; a value that is not a size (`"banana"`) is handed to aria2c, whose rejection pauses the engine (`BAD_DOWNLOADER_ARGS`) rather than failing every download. |
-| `concurrentFragments` | `16` | Parallel DASH/HLS fragments for yt-dlp's native downloader. |
+| `concurrentFragments` | `16` | Parallel DASH/HLS fragments for yt-dlp's native downloader. Shared across active slots: each download gets at most 256 ÷ active slots (floor 4), so the Aggressive profile (64) runs unchanged up to 4 slots and scales down beyond that. |
 | `fragmentRetries` | `10` | Retries per fragment before a download fails. |
 | `httpChunkSize` | `""` | Range-based chunked downloading on the native path (e.g. `"10M"`). Off by default — some CDNs mishandle `Range` requests. |
 | `bufferSize` | `""` | yt-dlp socket buffer size (e.g. `"16K"`); blank uses yt-dlp's default. |
 | `userAgent` | `""` | Optional single-line User-Agent passed to yt-dlp. Blank keeps yt-dlp's own default. |
 | `autoscaleEnabled` | `true` | Grow the download pool toward `maxDownloadWorkers` while work is queued; shrink to `minDownloadWorkers` when idle. |
 | `maxConcurrentDownloads` | `3` | Initial slot count when autoscaling is enabled; changing it while running resets the active pool on the next tick. When autoscaling is disabled it is the fixed slot count. It is not the autoscaler ceiling. |
-| `minDownloadWorkers` / `maxDownloadWorkers` | `1` / `5` | Autoscaler floor and ceiling. `maxDownloadWorkers` is the ceiling; raising it above the already-started worker pool requires a restart, while lowering the ceiling applies live. |
+| `minDownloadWorkers` / `maxDownloadWorkers` | `1` / `5` | Autoscaler floor and ceiling. Both apply live: raising `maxDownloadWorkers` starts the extra worker processes on the next 15s tick (up to 20), and lowering it parks the surplus slots once their current download finishes. |
 | `autoscaleRampStep` | `2` | Download slots added per autoscale tick while the queue has backlog. |
 | `maxBandwidthKBps` | `0` | Per-download yt-dlp rate limit, divided across active slots and forwarded to aria2c. `0` = unlimited. Downloads already running keep the share they started with, so autoscaling can temporarily make the aggregate rate exceed the configured cap; new attempts use the current slot count. |
 

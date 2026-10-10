@@ -367,8 +367,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     min: 1,
     max: 20,
     group: "concurrency",
-    restartRequired: true,
-    help: "Download worker processes started at launch (autoscaler ceiling). Takes effect after a restart.",
+    help: "Autoscaler ceiling. Raising it starts the extra download workers live (up to 20); lowering it parks the surplus slots once their current download finishes. Neither needs a restart.",
   },
   {
     key: "maxConcurrentConverts",
