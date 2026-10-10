@@ -25,6 +25,8 @@ export const autoscaler = {
   maxBandwidthKBps: 0,
   // Slots added per tick while a backlog exists (1 = the original slow ramp).
   rampStep: 2,
+  /** Timestamp of the last scale-down event, used for hysteresis cooldown. */
+  lastScaleDownAt: 0,
   workerSpeeds: new Map<number, number>(),
   init(c: {
     autoscaleEnabled: boolean;
@@ -106,13 +108,20 @@ export function autoscaleTick(): void {
     const backlog = q?.backlog || 0;
     const aggBps = autoscaler.getAggregateSpeed();
     const capBps = config.maxBandwidthKBps * 1024;
+    const now = Date.now();
     // Enforce changed floor/ceiling immediately, even under backlog pressure.
     let target = Math.min(maxWorkers, Math.max(minWorkers, activeDlSlots.size));
     if (backlog === 0) {
       target = minWorkers;
     } else if (capBps > 0 && aggBps > capBps * 0.9 && target > minWorkers) {
       target--; // bandwidth saturated — fewer slots = more headroom each
-    } else if (backlog > target && target < maxWorkers && (capBps === 0 || aggBps < capBps * 0.7)) {
+      autoscaler.lastScaleDownAt = now;
+    } else if (
+      backlog > target &&
+      target < maxWorkers &&
+      (capBps === 0 || aggBps < capBps * 0.7) &&
+      now - autoscaler.lastScaleDownAt > 30_000 // 30s hysteresis cooldown
+    ) {
       // Waiting jobs + bandwidth headroom: grow by the configured ramp step,
       // but never overshoot either the backlog or the worker ceiling.
       target = Math.min(target + autoscaler.rampStep, backlog, maxWorkers);

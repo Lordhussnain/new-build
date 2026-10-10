@@ -236,11 +236,11 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
     "--socket-timeout",
     "15",
     "--retries",
-    "10",
+    String(Math.max(10, Math.floor(config.maxRetryAttempts * 3))),
     "--retry-sleep",
     "5",
     "--fragment-retries",
-    String(Math.max(1, Math.floor(config.fragmentRetries))),
+    String(Math.max(10, Math.floor(config.fragmentRetries))),
     "--extractor-retries",
     "5",
     // --continue is what makes retries cheap: yt-dlp (or aria2c) picks the

@@ -32,7 +32,7 @@ import {
   stats,
   workerStatuses,
 } from "../state";
-import { notePipelineFailure, notePipelineSuccess } from "../resilience";
+import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
 import { logError } from "../logger";
 import { ffmpeg } from "../tools";
 import { effectiveTargetFormat } from "../download-args";
@@ -99,6 +99,12 @@ export async function converterWorker(id: number, config: Config): Promise<void>
     config = getConfig();
     if (isPaused()) {
       await Bun.sleep(2000);
+      continue;
+    }
+    const disk = await checkDiskSpace(config.outputRoot, config.minFreeSpaceGB);
+    if (!disk.ok) {
+      triggerPause(`LOW_DISK_SPACE (${disk.free.toFixed(1)}GB < ${config.minFreeSpaceGB}GB)`);
+      await Bun.sleep(10000);
       continue;
     }
     const job = claimConvertJob(workerId);

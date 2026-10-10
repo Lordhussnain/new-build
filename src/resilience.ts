@@ -247,6 +247,9 @@ const NETWORK_PROBES = [
   "https://www.youtube.com/favicon.ico",
   "https://youtu.be/favicon.ico",
   "https://manifest.googlevideo.com/favicon.ico",
+  "https://1.1.1.1",
+  "https://www.google.com/favicon.ico",
+  "https://cloudflare.com/cdn-cgi/trace",
 ];
 
 export type NetworkProbe = () => Promise<boolean>;

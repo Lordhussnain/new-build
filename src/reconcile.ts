@@ -262,8 +262,13 @@ export async function reapStaleClaims(config: Config): Promise<ReapSummary> {
 
     const total = reaped.downloads + reaped.conversions + reaped.metadata;
     if (total > 0 || reaped.stranded > 0) {
+      const details = [
+        reaped.downloads > 0 ? `${recorded} partial path(s) recorded` : null,
+        reaped.stranded > 0 ? `${reaped.stranded} stranded control file(s) swept` : null,
+      ].filter(Boolean).join(", ");
+      const suffix = details ? ` (${details})` : "";
       console.log(
-        `🧟 Reclaimed ${reaped.downloads} stale download(s) (${recorded} partial path(s) recorded, ${reaped.stranded} stranded control file(s) swept), ${reaped.conversions} conversion(s), ${reaped.metadata} metadata job(s).`,
+        `🧟 Reclaimed ${reaped.downloads} stale download(s)${suffix}, ${reaped.conversions} conversion(s), ${reaped.metadata} metadata job(s).`,
       );
       logError(
         "reaper",
@@ -473,7 +478,7 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
     // --- Downloads -----------------------------------------------------------
     const failedDownloads = db
       .query(
-        `SELECT id, last_error FROM jobs
+        `SELECT id, last_error, output_directory, title, "index", partial_file_path FROM jobs
          WHERE download_status = 'failed' ${modifier}`,
       )
       .all() as any[];
@@ -481,12 +486,19 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
       if (isPermanentDownloadError(row.last_error)) continue;
       // Scheduling a retry is not itself a failed attempt. Reset the current
       // no-progress budget here; the next worker outcome is what spends it.
+      // Reset resume_count = 0 so the job gets a fresh resume budget for this window.
+      let validPartial = row.partial_file_path && existsSync(row.partial_file_path) ? row.partial_file_path : null;
+      if (!validPartial && row.output_directory && row.title) {
+        const found = findPartialFileSync(row.output_directory, jobFittedBaseFilename(row));
+        if (found) validPartial = found;
+      }
       db.run(
-        `UPDATE jobs SET download_status = 'pending', retry_count = 0, pause_reason = NULL,
+        `UPDATE jobs SET download_status = 'pending', retry_count = 0, resume_count = 0,
+           partial_file_path = ?, pause_reason = NULL,
            download_claimed_by = NULL, download_claimed_at = NULL,
            download_claim_token = NULL, download_heartbeat_at = NULL,
            updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-        [row.id],
+        [validPartial, row.id],
       );
       result.downloads++;
     }
@@ -655,13 +667,14 @@ async function removeOne(path: string, opts: { strict?: boolean } = {}): Promise
  */
 export async function findPartialFile(dir: string, baseFilename: string): Promise<string> {
   try {
-    const files = await readdir(dir);
+    const resolvedDir = resolve(dir);
+    const files = await readdir(resolvedDir);
     const matches: { path: string; mtime: number }[] = [];
     for (const f of files) {
       if (!f.startsWith(baseFilename + ".")) continue;
       if (!f.endsWith(".part") && !f.endsWith(".ytdl")) continue;
-      const s = await stat(join(dir, f)).catch(() => null);
-      if (s) matches.push({ path: join(dir, f), mtime: s.mtimeMs });
+      const s = await stat(join(resolvedDir, f)).catch(() => null);
+      if (s) matches.push({ path: join(resolvedDir, f), mtime: s.mtimeMs });
     }
     matches.sort((a, b) => b.mtime - a.mtime);
     // Absolute: the engine, the dashboard, and any post-mortem reader all need
@@ -678,9 +691,10 @@ export async function findPartialFile(dir: string, baseFilename: string): Promis
  * context).
  */
 export function findPartialFileSync(dir: string, baseFilename: string): string {
+  const resolvedDir = resolve(dir);
   let entries: string[];
   try {
-    entries = readdirSync(dir);
+    entries = readdirSync(resolvedDir);
   } catch {
     return "";
   }
@@ -689,7 +703,7 @@ export function findPartialFileSync(dir: string, baseFilename: string): string {
   for (const f of entries) {
     if (!f.startsWith(baseFilename + ".")) continue;
     if (!f.endsWith(".part") && !f.endsWith(".ytdl")) continue;
-    const full = join(dir, f);
+    const full = join(resolvedDir, f);
     let mtime: number;
     try {
       mtime = statSync(full).mtimeMs;
@@ -852,6 +866,18 @@ export async function cleanOrphanedFiles(
       }
     }
 
+    // Protect all partial files belonging to pending, downloading, or paused jobs
+    // even if partial_file_path has not been explicitly populated on their row yet.
+    const activeJobs = db
+      .query(`SELECT id, "index", title, output_directory FROM jobs WHERE download_status IN ('pending', 'downloading', 'paused')`)
+      .all() as any[];
+    const activeBasePrefixes = new Set<string>();
+    for (const j of activeJobs) {
+      if (j.output_directory && j.title) {
+        activeBasePrefixes.add(pathKey(join(resolve(j.output_directory), jobFittedBaseFilename(j))));
+      }
+    }
+
     const files = await readdir(rootDir, { recursive: true });
     let removed = 0;
     for (const file of files) {
@@ -891,8 +917,12 @@ export async function cleanOrphanedFiles(
           if (await removePartialAndReport(fullPath, summary)) removed++;
         }
       } else if (ageMs > ORPHAN_PARTIAL_MAX_AGE_MS) {
-        // Orphan: no job claims it — safe to clean once it is clearly stale.
-        if (await removePartialAndReport(fullPath, summary)) removed++;
+        // Orphan: no job claims it — verify it does not match an active job's prefix before removing.
+        const normalized = pathKey(fullPath);
+        const isBelongingToActiveJob = Array.from(activeBasePrefixes).some((prefix) => normalized.startsWith(prefix));
+        if (!isBelongingToActiveJob && (await removePartialAndReport(fullPath, summary))) {
+          removed++;
+        }
       }
     }
 

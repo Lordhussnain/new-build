@@ -216,16 +216,28 @@ export async function main(): Promise<void> {
   const allLinks = [...config.playlists, ...config.channels, ...config.channelPlaylists];
   if (config.offlineMode) {
     console.log(`📡 Source scan skipped (offline mode) — ${allLinks.length} configured source(s) unchanged.`);
-  } else {
-    for (const url of allLinks) {
-      try {
-        const r = await scanAndIngest(url, config);
-        console.log(`📥 ${url} → found ${r.found}, added ${r.added}, skipped ${r.skipped}`);
-      } catch (e: any) {
-        logError("scan", `${url}: ${e?.message || e}`);
-        console.error(`❌ Failed to scan ${url}:`, e?.message || e);
+  } else if (allLinks.length > 0) {
+    const SCAN_CONCURRENCY = Math.min(4, allLinks.length);
+    console.log(`📡 Scanning ${allLinks.length} configured source(s) with concurrency ${SCAN_CONCURRENCY}...`);
+    let completedSources = 0;
+    const queue = [...allLinks];
+    const runScanWorker = async () => {
+      while (queue.length > 0) {
+        const url = queue.shift();
+        if (!url) break;
+        try {
+          const r = await scanAndIngest(url, config);
+          completedSources++;
+          console.log(`📥 ${url} → found ${r.found}, added ${r.added}, skipped ${r.skipped} (${completedSources}/${allLinks.length})`);
+        } catch (e: any) {
+          completedSources++;
+          logError("scan", `${url}: ${e?.message || e}`);
+          console.error(`❌ Failed to scan ${url}:`, e?.message || e);
+        }
       }
-    }
+    };
+    const workers = Array.from({ length: SCAN_CONCURRENCY }, () => runScanWorker());
+    await Promise.all(workers);
   }
 
   initDashboard(config);

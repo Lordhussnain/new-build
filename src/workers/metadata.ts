@@ -36,7 +36,7 @@ import {
   stats,
   workerStatuses,
 } from "../state";
-import { notePipelineFailure, notePipelineSuccess } from "../resilience";
+import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
 import { logError } from "../logger";
 import type { Config } from "../config";
 
@@ -135,6 +135,12 @@ export async function metadataWorker(id: number, config: Config): Promise<void> 
     if (config.offlineMode) {
       updateMetadataWorkerLine(id, "📴 Offline mode — sidecars need network", config);
       await Bun.sleep(3000);
+      continue;
+    }
+    const disk = await checkDiskSpace(config.outputRoot, config.minFreeSpaceGB);
+    if (!disk.ok) {
+      triggerPause(`LOW_DISK_SPACE (${disk.free.toFixed(1)}GB < ${config.minFreeSpaceGB}GB)`);
+      await Bun.sleep(10000);
       continue;
     }
     const job = claimMetadataJob(workerId);

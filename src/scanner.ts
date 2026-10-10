@@ -13,6 +13,7 @@ import { isSourceBlocked, sourceIdentity } from "./sources";
 import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
 import { sanitizeFolderName } from "./util";
 import { getConfig, stats } from "./state";
+import { logError } from "./logger";
 import type { Config } from "./config";
 
 export interface ListingItem {
@@ -44,6 +45,29 @@ export function normalizeVideoUrl(url: string): string {
 /** Maximum time a flat-playlist listing may keep its pipes and worker occupied. */
 export const PLAYLIST_SCAN_TIMEOUT_MS = 10 * 60 * 1000;
 
+/** How many times a transient scan failure retries before giving up. */
+export const SCAN_MAX_RETRIES = 3;
+/** Base backoff (ms) for transient scan failures — doubles each retry. */
+export const SCAN_BACKOFF_BASE_MS = 5_000;
+
+/** True when a scan error is likely transient (network hiccup) rather than permanent. */
+export function isScanErrorTransient(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes("connection") ||
+    m.includes("timeout") ||
+    m.includes("timed out") ||
+    m.includes("network") ||
+    m.includes("http error 5") ||
+    m.includes("too many requests") ||
+    m.includes("rate limit") ||
+    m.includes("service unavailable") ||
+    m.includes("read error") ||
+    m.includes("ssl") ||
+    m.includes("eof")
+  );
+}
+
 /** Fetch a flat listing of a playlist/channel URL via yt-dlp. */
 export async function getPlaylistItems(
   url: string,
@@ -55,6 +79,12 @@ export async function getPlaylistItems(
     ...cookiesArgs(config),
     ...jsRuntimeArgs(),
     "--flat-playlist",
+    // --ignore-errors: do NOT abort the scan when a video in the playlist is
+    // private, unavailable, or otherwise unfetchable.  Without this flag yt-dlp
+    // stops at the first dead entry and the rest of the playlist is silently
+    // lost — catastrophic for a 1000-video playlist that has a handful of
+    // private uploads. The failure is still visible on individual job rows.
+    "--ignore-errors",
     "--print",
     "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s",
     url,
@@ -125,6 +155,9 @@ export async function getPlaylistItems(
 /**
  * Insert (or skip) a batch of listing items into the jobs table. Shared by the
  * full scanner (yt-dlp flat listing) and the cheap RSS poller.
+ *
+ * Large playlists (1000+ videos) are chunked into bounded transactions to avoid
+ * holding a single enormous write lock and to give the WAL a chance to sync.
  */
 export async function ingestItems(
   items: ListingItem[],
@@ -159,7 +192,12 @@ export async function ingestItems(
 
   let added = 0;
   let skipped = 0;
-  const insertTransaction = db.transaction((batch: ListingItem[]) => {
+
+  // Chunk large playlists into bounded transactions (500 items each) to avoid
+  // holding a single huge write lock. For a 10,000-item playlist this is the
+  // difference between a 10-second stall and a series of fast micro-commits.
+  const CHUNK_SIZE = 500;
+  const insertChunk = db.transaction((batch: ListingItem[]) => {
     const stmt = db.prepare(
       `INSERT OR IGNORE INTO jobs
          (id, url, title, output_directory, target_format, want_subtitles, want_thumbnail, want_description, folder, "index", duration, download_status, conversion_status, metadata_status)
@@ -229,11 +267,20 @@ export async function ingestItems(
       stats.totalQueued++;
     }
   });
-  insertTransaction(items);
+
+  for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+    insertChunk(items.slice(i, i + CHUNK_SIZE));
+  }
+
   return { found: items.length, added, skipped };
 }
 
-/** Full scan of one playlist/channel URL, then ingest. */
+/** Full scan of one playlist/channel URL, then ingest.
+ *
+ * Transient network errors are retried with exponential backoff (up to
+ * SCAN_MAX_RETRIES attempts) so a single HTTP hiccup doesn't permanently
+ * drop an entire source during startup when managing 1000+ playlists.
+ */
 export async function scanAndIngest(
   url: string,
   config: Config,
@@ -243,7 +290,28 @@ export async function scanAndIngest(
   // The callers check offline mode too, but this boundary is authoritative: the
   // setting can change while a daemon/startup scan is between sources.
   if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return empty;
-  const items = await getPlaylistItems(url, config);
-  if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return empty;
-  return ingestItems(items, config, overrideFolderName, url);
+
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= SCAN_MAX_RETRIES; attempt++) {
+    try {
+      const items = await getPlaylistItems(url, config);
+      if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return empty;
+      return ingestItems(items, config, overrideFolderName, url);
+    } catch (err: any) {
+      lastErr = err;
+      const msg = String(err?.message || err);
+      // Permanent errors (bad URL, auth required, source removed) should not
+      // be retried — only transient network failures get the retry budget.
+      if (!isScanErrorTransient(msg) || attempt >= SCAN_MAX_RETRIES) break;
+      const backoffMs = SCAN_BACKOFF_BASE_MS * Math.pow(2, attempt - 1);
+      logError(
+        "scanner",
+        `${url}: transient scan error on attempt ${attempt}/${SCAN_MAX_RETRIES}, retrying in ${Math.round(backoffMs / 1000)}s: ${msg.slice(0, 200)}`,
+      );
+      await Bun.sleep(backoffMs);
+      // Re-check after the sleep: the engine may have gone offline.
+      if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return empty;
+    }
+  }
+  throw lastErr;
 }

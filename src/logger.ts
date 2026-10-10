@@ -22,12 +22,14 @@ export function errorLogPath(): string {
   return process.env.NODE_ENV === "test" ? join(tmpdir(), "yta-test-error.log") : "error.log";
 }
 
+let appendCounter = 0;
+
 export function logError(scope: string, message: string): void {
   try {
     const path = errorLogPath();
     appendFileSync(path, `[${new Date().toISOString()}] [${scope}] ${message}\n`);
-    // Keep the log bounded: when it grows past ~1MB, keep only the last 400 lines.
-    if (existsSync(path) && statSync(path).size > MAX_BYTES) {
+    // Keep the log bounded: check size every 50 appends instead of on every call.
+    if (++appendCounter % 50 === 0 && existsSync(path) && statSync(path).size > MAX_BYTES) {
       const lines = readFileSync(path, "utf-8").split("\n");
       writeFileSync(path, lines.slice(-400).join("\n"));
     }

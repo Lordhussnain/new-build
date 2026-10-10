@@ -593,13 +593,13 @@ export async function cleanupDownloadProcess(
  */
 export async function handleDownloadFailure(id: number, job: Job, config: Config, err: any): Promise<void> {
   if (isUserPaused(job.id)) {
-    parkUserPaused(job);
-    updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
+    const parked = parkUserPaused(job);
+    if (parked) updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
     return;
   }
   if (isPaused()) {
-    parkPaused(job);
-    updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
+    const parked = parkPaused(job);
+    if (parked) updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
     return;
   }
 
@@ -1208,27 +1208,33 @@ function isUserPaused(id: string): boolean {
   return row?.pause_reason === "user";
 }
 
-function parkUserPaused(job: Job): void {
+function parkUserPaused(job: Job): boolean {
   // Only a still-recorded user pause is parked, and only by the claim's owner:
   // the pause may have been resumed (or the claim reaped) since the worker's
   // snapshot was taken.
   const parked = releaseOwned(
     job,
     "parking a user pause",
-    `download_status = 'paused', pause_reason = 'user'`,
+    `download_status = 'paused', pause_reason = 'user', best_progress = MAX(COALESCE(best_progress, 0), COALESCE(progress, 0))`,
     [],
     `pause_reason = 'user'`,
   );
   if (parked) recordJobPartial(job);
+  return parked;
 }
 
-function parkPaused(job: Job): void {
-  const parked = releaseOwned(job, "parking an interrupted download", `download_status = 'paused', pause_reason = 'interrupted'`);
-  if (!parked) return;
+function parkPaused(job: Job): boolean {
+  const parked = releaseOwned(
+    job,
+    "parking an interrupted download",
+    `download_status = 'paused', pause_reason = 'interrupted', best_progress = MAX(COALESCE(best_progress, 0), COALESCE(progress, 0))`,
+  );
+  if (!parked) return false;
   // Freeze the resume point: the .part is on disk, and without recording it the
   // job is paused with no resumable partial, so the next attempt restarts the
   // video from zero instead of continuing.
   recordJobPartial(job);
+  return true;
 }
 
 function resetForRetry(job: Job): boolean {
