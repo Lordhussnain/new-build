@@ -46,6 +46,7 @@ import {
   type SourceUrl,
 } from "./sources";
 import { cancelActiveStages, diskUsage, interruptActiveDownloads, triggerPause, triggerResume, type CancelledStages } from "./resilience";
+import { METADATA_KINDS, listMetadataOnlyTasks, startMetadataOnly } from "./metadata-only";
 import { removeFromArchive } from "./archive";
 import {
   findPartialFile,
@@ -1767,6 +1768,36 @@ const ROUTES: Route[] = [
       triggerResume();
       return Response.json({ ok: true, success: true, paused: false });
     },
+  },
+  {
+    methods: ["POST"],
+    pattern: "/api/metadata-only",
+    handler: async ({ req, config }) => {
+      if (config.offlineMode || getConfig().offlineMode) {
+        return Response.json({ ok: false, error: "Metadata fetching is unavailable while offline" }, { status: 409 });
+      }
+      const body = await req.json().catch(() => null);
+      const singleVideo = Boolean(body?.singleVideo);
+      let source;
+      try {
+        source = parseSourceUrl(body?.url, { singleVideo });
+      } catch (e: any) {
+        return Response.json({ ok: false, error: e.message }, { status: 400 });
+      }
+      // Omitted kinds means every kind; an explicit list keeps only known names.
+      const requested = Array.isArray(body?.kinds) ? body.kinds : METADATA_KINDS;
+      const kinds = METADATA_KINDS.filter((k) => requested.includes(k));
+      if (kinds.length === 0) {
+        return Response.json({ ok: false, error: "Choose at least one kind of metadata" }, { status: 400 });
+      }
+      const task = startMetadataOnly(source.url, kinds, config);
+      return Response.json({ ok: true, task }, { status: 202 });
+    },
+  },
+  {
+    methods: ["GET"],
+    pattern: "/api/metadata-only",
+    handler: () => Response.json({ ok: true, tasks: listMetadataOnlyTasks() }),
   },
   {
     methods: ["POST"],

@@ -1363,6 +1363,7 @@
         <span>Single video only (for <code>watch?v=…&amp;list=…</code> links)</span>
       </label>
       <button class="btn btn-secondary btn-sm" id="batchOpenBtn" onclick="openBatchImport()">📋 Batch Links</button>
+      <button class="btn btn-secondary btn-sm" id="metadataOpenBtn" onclick="openMetadataOnly()">🧾 Metadata Only</button>
     </div>
   </div>
 
@@ -1618,6 +1619,46 @@
         <span style="margin-right: auto; font-size: 0.78rem; color: var(--text-secondary);">Lines that could not be imported stay here so you can fix them.</span>
         <button class="btn btn-secondary" onclick="closeBatchImport()">Close</button>
         <button class="btn btn-primary" id="batchImportBtn" onclick="runBatchImport()">📥 Import &amp; Scan</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="metadataOnlyModal">
+    <div class="modal" style="max-width: 680px;">
+      <div class="modal-header">
+        <div class="modal-header-left">
+          <h3>🧾 Metadata Only</h3>
+          <span class="modal-badge">No videos downloaded</span>
+        </div>
+        <button class="btn btn-secondary btn-icon" onclick="closeMetadataOnly()" title="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 12px;">
+          Paste a video or playlist link to save its sidecar files only. They are written into the folder
+          the videos would use, so a later download lands next to them. Nothing is queued for download.
+        </p>
+        <input type="text" id="metadataUrlInput" class="batch-input" spellcheck="false" placeholder="https://www.youtube.com/playlist?list=… or https://www.youtube.com/watch?v=…" />
+        <div class="batch-grid" style="margin-top: 10px;">
+          <label class="batch-check">
+            <input type="checkbox" id="metadataSingleVideo" />
+            <span>Single video only for <code>watch?v=…&amp;list=…</code> links</span>
+          </label>
+          <div style="display: flex; flex-wrap: wrap; gap: 10px 14px;">
+            <label class="batch-check"><input type="checkbox" id="metadataKindSubtitles" checked /><span>Subtitles</span></label>
+            <label class="batch-check"><input type="checkbox" id="metadataKindThumbnail" checked /><span>Thumbnail</span></label>
+            <label class="batch-check"><input type="checkbox" id="metadataKindDescription" checked /><span>Description</span></label>
+            <label class="batch-check"><input type="checkbox" id="metadataKindInfoJson" checked /><span>info.json</span></label>
+          </div>
+        </div>
+        <div style="margin-top: 14px; font-size: 0.8rem; color: var(--text-secondary);">Recent tasks</div>
+        <div id="metadataTaskList" style="margin-top: 6px; max-height: 300px; overflow-y: auto;">
+          <div style="font-size: 0.85rem; color: var(--text-secondary);">No metadata tasks yet.</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <span style="margin-right: auto; font-size: 0.78rem; color: var(--text-secondary);">Tasks run one at a time, so several links queue up.</span>
+        <button class="btn btn-secondary" onclick="closeMetadataOnly()">Close</button>
+        <button class="btn btn-primary" id="metadataStartBtn" onclick="startMetadataOnlyFromUi()">🧾 Fetch Metadata</button>
       </div>
     </div>
   </div>
@@ -2818,6 +2859,85 @@
       document.getElementById('batchModal').classList.remove('open');
     }
 
+    // --- Metadata Only -------------------------------------------------------
+    let metadataPollTimer = null;
+    const METADATA_KIND_BOXES = [
+      ['subtitles', 'metadataKindSubtitles'],
+      ['thumbnail', 'metadataKindThumbnail'],
+      ['description', 'metadataKindDescription'],
+      ['infoJson', 'metadataKindInfoJson'],
+    ];
+
+    function openMetadataOnly() {
+      document.getElementById('metadataOnlyModal').classList.add('open');
+      loadMetadataTasks();
+      if (!metadataPollTimer) metadataPollTimer = setInterval(loadMetadataTasks, 3000);
+      document.getElementById('metadataUrlInput').focus();
+    }
+
+    function closeMetadataOnly() {
+      document.getElementById('metadataOnlyModal').classList.remove('open');
+      if (metadataPollTimer) { clearInterval(metadataPollTimer); metadataPollTimer = null; }
+    }
+
+    async function startMetadataOnlyFromUi() {
+      const url = document.getElementById('metadataUrlInput').value.trim();
+      if (!url) { showNotification('Paste a YouTube link first', 'error'); return; }
+      const kinds = METADATA_KIND_BOXES.filter(([, box]) => document.getElementById(box).checked).map(([kind]) => kind);
+      if (kinds.length === 0) { showNotification('Choose at least one kind of metadata', 'error'); return; }
+      const btn = document.getElementById('metadataStartBtn');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/metadata-only', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, singleVideo: document.getElementById('metadataSingleVideo').checked, kinds }),
+        });
+        const data = await res.json().catch(() => null);
+        if (res.ok && data?.ok) {
+          showNotification('Metadata task queued', 'success');
+          document.getElementById('metadataUrlInput').value = '';
+          loadMetadataTasks();
+        } else {
+          showNotification(data?.error || `Could not start (HTTP ${res.status})`, 'error');
+        }
+      } catch (e) {
+        showNotification(e.message || 'Request failed', 'error');
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function loadMetadataTasks() {
+      try {
+        const res = await fetch('/api/metadata-only');
+        if (!res.ok) return;
+        const data = await res.json();
+        renderMetadataTasks(data.tasks || []);
+      } catch {}
+    }
+
+    function renderMetadataTasks(tasks) {
+      const list = document.getElementById('metadataTaskList');
+      if (!list) return;
+      if (tasks.length === 0) {
+        list.innerHTML = '<div style="font-size: 0.85rem; color: var(--text-secondary);">No metadata tasks yet.</div>';
+        return;
+      }
+      list.innerHTML = tasks.map(t => {
+        const progress = t.total > 0 ? `${t.done + t.failed}/${t.total}` : '';
+        const errors = (t.errors || []).slice(-3).map(e => `<div style="font-size: 0.75rem; color: #fca5a5;">${escapeHtml(e)}</div>`).join('');
+        return `<div style="padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px;">
+          <div style="display: flex; justify-content: space-between; gap: 10px; font-size: 0.85rem;">
+            <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(t.folder || t.url)}</span>
+            <span style="white-space: nowrap;">${escapeHtml(t.status)} ${progress}</span>
+          </div>
+          <div style="font-size: 0.78rem; color: var(--text-secondary); margin-top: 3px;">${escapeHtml(t.message || '')}</div>
+          ${errors}
+        </div>`;
+      }).join('');
+    }
+
     function batchLinesFrom(text) {
       return String(text || '').split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#'));
     }
@@ -3807,6 +3927,7 @@
         if (document.getElementById('settingsModal').classList.contains('open')) { closeSettings(); return; }
         if (document.getElementById('unconvertedModal').classList.contains('open')) { closeUnconvertedScan(); return; }
         if (document.getElementById('batchModal').classList.contains('open')) { closeBatchImport(); return; }
+        if (document.getElementById('metadataOnlyModal').classList.contains('open')) { closeMetadataOnly(); return; }
         if (document.getElementById('jobDrawer').classList.contains('open')) { closeJobDetail(); return; }
         if (document.getElementById('rowPopover').classList.contains('open')) { closeRowPopover(); return; }
         const s = document.getElementById('searchInput');
