@@ -1452,7 +1452,7 @@
       <button class="btn btn-secondary" id="turboBtn" onclick="toggleTurboMode()" title="Toggle Aggressive IDM Mode (32 connections, 64 fragments, 10M chunk, 64K buffer, uncapped)">⚡ Turbo IDM: OFF</button>
       <button class="btn btn-success" onclick="refreshData()">🔄 Refresh</button>
       <button class="btn btn-secondary" id="metadataScanBtn" onclick="scanMissingMetadata()" title="Check every downloaded video and queue missing enabled metadata sidecars">📝 Scan Missing Metadata</button>
-      <button class="btn btn-secondary" id="unconvertedScanBtn" onclick="openUnconvertedScan()" title="Find video files on disk that the archive does not track yet and queue them for conversion">🔄 Scan Unconverted Videos</button>
+      <button class="btn btn-secondary" id="unconvertedScanBtn" onclick="openUnconvertedScan()" title="Queue videos for conversion: files on disk the archive does not track yet, plus archived downloads whose file is not in the selected target format (e.g. MKV files from MP4-requested downloads)">🔄 Scan Unconverted Videos</button>
     </div>
     <div class="controls-group">
       <button class="btn btn-secondary" onclick="openSettings()">⚙️ Settings</button>
@@ -1692,7 +1692,8 @@
       <div class="modal-body">
         <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 12px;">
           Scans the download folders for video files that are not tracked yet and queues them for conversion.
-          Files already in the archive are skipped.
+          Archived videos whose file is not in the selected format (e.g. MKV files downloaded when MP4 was
+          requested) are re-queued for conversion too — they are converted in place, never re-downloaded.
         </p>
         <label for="unconvertedFormat" style="font-size: 0.8rem; font-weight: 600;">Select your desired target conversion format</label>
         <select id="unconvertedFormat" style="width: 100%; margin-top: 6px;">
@@ -2549,7 +2550,7 @@
       const f = job.target_format ?? '';
       return `
         <h4>⚙️ Format &amp; Quality Override</h4>
-        <div class="popover-hint">Applies to this video only. "Save &amp; Re-Download" wipes partials and restarts from 0%.</div>
+        <div class="popover-hint">Applies to this video only. "Save &amp; Re-Download" restarts the download from 0% — unless only the format changed, in which case the existing file is converted in place.</div>
         <label for="popoverQuality">Quality preset</label>
         <select id="popoverQuality">
           ${JOB_QUALITY_OPTIONS.map(o => `<option value="${o.v}" ${o.v === q ? 'selected' : ''}>${o.l}</option>`).join('')}
@@ -2587,7 +2588,12 @@
         });
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to save overrides');
-        showNotification(retry ? 'Overrides saved — re-download queued from 0%' : 'Overrides saved', 'success');
+        showNotification(
+          data.convertedOnly
+            ? 'Overrides saved — existing file queued for conversion (no re-download)'
+            : retry ? 'Overrides saved — re-download queued from 0%' : 'Overrides saved',
+          'success'
+        );
         if (data.warning) showNotification(data.warning, 'warning', 9000);
         closeRowPopover();
         refreshData();
@@ -2716,12 +2722,14 @@
         const data = await res.json().catch(() => null);
         if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
         closeUnconvertedScan();
+        const converted = (data.imported ?? 0) + (data.requeued ?? 0);
         const parts = [
-          `Imported ${data.imported ?? 0} video(s) for conversion to ${fmt.toUpperCase()}`,
+          `Imported ${data.imported ?? 0} untracked video(s)`,
+          `Re-queued ${data.requeued ?? 0} archived file(s) not in ${fmt.toUpperCase()}`,
           `${data.alreadyTracked ?? 0} already tracked`,
           `${data.videoFiles ?? 0} video file(s) seen`,
         ];
-        showNotification(parts.join(' · '), data.imported ? 'success' : 'info', 8000);
+        showNotification(parts.join(' · '), converted ? 'success' : 'info', 8000);
         refreshData();
       } catch (err) {
         showNotification(err.message || 'Could not scan unconverted videos', 'error', 8000);
@@ -3629,6 +3637,8 @@
           <div style="font-weight: 700; font-size: 0.85rem; margin-bottom: 6px;">⚙️ Per-Job Format &amp; Quality Overrides</div>
           <div style="font-size: 0.72rem; color: var(--text-secondary); margin-bottom: 8px;">
             Set format and quality overrides for this specific video.
+            Changing only the format converts the already-downloaded file in place (no re-download);
+            changing the quality or audio tracks re-downloads the video.
           </div>
           <div class="override-fields">
             <div class="override-field">
@@ -3715,7 +3725,12 @@
         });
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to update overrides');
-        showNotification(successText, 'success');
+        showNotification(
+          data.convertedOnly
+            ? 'Saved overrides — existing file queued for conversion (no re-download)'
+            : successText,
+          'success'
+        );
         closeJobDetail();
         refreshData();
       } catch (err) {

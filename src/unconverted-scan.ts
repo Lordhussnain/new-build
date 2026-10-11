@@ -1,20 +1,27 @@
 // src/unconverted-scan.ts — find local video files that are not tracked yet
-// and batch-import them into the processing queue with a chosen target format.
+// and batch-import them into the processing queue with a chosen target format,
+// and re-queue tracked files that finished in some other container.
 //
 // This backs the dashboard's "Scan Unconverted Videos" action: an operator who
 // dropped raw downloads (or files fetched outside the engine) into the output
 // root can sweep the folders once, pick the container they want, and have every
 // discovered file queued for conversion — the conversion worker claims jobs
 // with `download_status = 'downloaded' AND conversion_status = 'pending'`, so
-// an imported row needs no download stage at all, just a file_path.
+// an imported row needs no download stage at all, just a file_path. The same
+// claim contract is what lets the sweep REPAIR an existing archive: a finished
+// job whose file is not in the chosen container (e.g. an mkv download when mp4
+// was requested — yt-dlp does not promise the container) only needs its
+// conversion_status flipped back to 'pending'.
 
 import { createHash } from "node:crypto";
 import { readdir, stat } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { db } from "./db";
 import type { Config } from "./config";
 import { hardenName, sanitizeFolderName } from "./util";
+import { parseSelectionJson, parseTracksJson, selectAudioTracks } from "./audio-tracks";
 
 /** Containers treated as convertible video sources. Anything else (sidecars,
  * partials, control files, metadata dumps) is not a candidate. */
@@ -41,6 +48,10 @@ export interface UnconvertedScanResult {
   videoFiles: number;
   /** Rows actually inserted (re-runs import nothing new). */
   imported: number;
+  /** Tracked, already-finished jobs re-queued because their file is NOT in the target container. */
+  requeued: number;
+  /** Tracked jobs left alone because they are multi-audio archives (their MKV is retained by design). */
+  keptMultiTrack: number;
   /** Video files skipped because the jobs table already tracks their path. */
   alreadyTracked: number;
   /** Video files skipped for being (near-)empty. */
@@ -78,6 +89,90 @@ function trackedPaths(): Set<string> {
   return tracked;
 }
 
+/** Containers the tracked-job pass may re-queue: videos plus audio containers. */
+const REQUEUEABLE_EXTENSIONS = new Set([
+  ...VIDEO_EXTENSIONS,
+  ".mp3", ".m4a", ".opus", ".ogg", ".flac", ".wav",
+]);
+
+/**
+ * How many audio tracks a job's download carries, as far as the cached probe
+ * and per-job selection can tell. 1 when nothing is cached — the safe default,
+ * since single-track files are the common case.
+ */
+function effectiveAudioTrackCount(
+  row: { audio_tracks: string | null; audio_selection: string | null },
+  config: Config,
+): number {
+  const discovered = parseTracksJson(row.audio_tracks);
+  if (!discovered || discovered.length === 0) return 1;
+  const selected = selectAudioTracks(
+    discovered,
+    config.multiAudioMode,
+    config.audioTrackLanguages,
+    parseSelectionJson(row.audio_selection),
+  );
+  return Math.max(1, selected.length);
+}
+
+/**
+ * Re-queue finished jobs whose recorded media is NOT in the requested target
+ * container.
+ *
+ * This is the repair path for an archive that predates the download worker's
+ * container check: yt-dlp does not promise the requested container (VP9/Opus
+ * presets merge into webm/mkv, and --embed-thumbnail turns a .webm into .mkv),
+ * and jobs whose target was mp4 were historically marked `not_needed`, so
+ * those files never went through the conversion stage. The sweep flips such a
+ * job's conversion_status back to 'pending' — the converter then remuxes the
+ * file exactly as it would for a fresh download (video copied, audio to AAC
+ * for mp4) — and is idempotent: once converted, the file's container matches
+ * and the next sweep skips it.
+ *
+ * Multi-audio archives are left alone: keeping their MKV when the target is
+ * mp4 is the documented behavior (AGENTS.md, multi-audio), matching the
+ * download worker's exemption. Scope is the scanned root only — a file the
+ * relocation pass already moved into secondary storage is outside it, and
+ * re-converting would drag it back into the output tree.
+ */
+function requeueWrongContainerJobs(
+  config: Config,
+  targetFormat: string,
+  root: string,
+  result: UnconvertedScanResult,
+): void {
+  const rows = db
+    .query(
+      `SELECT id, file_path, audio_tracks, audio_selection FROM jobs
+       WHERE download_status = 'downloaded' AND conversion_status IN ('done', 'not_needed')`,
+    )
+    .all() as { id: string; file_path: string | null; audio_tracks: string | null; audio_selection: string | null }[];
+  for (const row of rows) {
+    if (!row.file_path) continue;
+    const key = pathKey(row.file_path);
+    if (key !== root && !key.startsWith(root + sep)) continue;
+    const ext = extname(key).toLowerCase();
+    if (!REQUEUEABLE_EXTENSIONS.has(ext)) continue;
+    if (ext.replace(/^\./, "") === targetFormat) continue;
+    if (!existsSync(row.file_path)) continue; // missing-file sweep owns that repair
+    if (effectiveAudioTrackCount(row, config) >= 2) {
+      result.keptMultiTrack++;
+      continue;
+    }
+    // The IN-guard keeps a job that flipped to a claimable/failed state since
+    // the SELECT from being clobbered mid-sweep.
+    const changes = db
+      .run(
+        `UPDATE jobs SET conversion_status = 'pending', conversion_retry_count = 0,
+           last_error = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND conversion_status IN ('done', 'not_needed')`,
+        [row.id],
+      )
+      .changes;
+    if (changes === 1) result.requeued++;
+  }
+}
+
 async function walk(root: string, depth: number, out: string[]): Promise<boolean> {
   if (depth > MAX_DEPTH) return false;
   let entries;
@@ -105,7 +200,9 @@ async function walk(root: string, depth: number, out: string[]): Promise<boolean
 /**
  * Scan `rootDir` (default: the configured output root) for video files that
  * are not tracked in the jobs table and insert one conversion-queued job per
- * file, with `targetFormat` pre-selected.
+ * file, with `targetFormat` pre-selected. Tracked jobs whose finished media is
+ * NOT in `targetFormat` are re-queued for conversion as well (their conversion
+ * stage re-opens; nothing is re-downloaded).
  *
  * The work is purely local (disk walk + INSERTs) — no network — so it is safe
  * to run while offline mode is on; the conversions themselves are ffmpeg remuxes
@@ -127,10 +224,17 @@ export async function scanUnconvertedVideos(
     filesSeen: files.length,
     videoFiles: 0,
     imported: 0,
+    requeued: 0,
+    keptMultiTrack: 0,
     alreadyTracked: 0,
     tooSmall: 0,
     truncated,
   };
+
+  // Pass 1: tracked jobs already finished in the wrong container get their
+  // conversion stage re-opened (see requeueWrongContainerJobs — this is how an
+  // archive of mkv/webm downloads requested as mp4 gets repaired in place).
+  requeueWrongContainerJobs(config, targetFormat, root, result);
 
   interface Candidate {
     id: string;

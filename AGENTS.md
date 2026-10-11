@@ -113,6 +113,7 @@ src/
   resilience.ts  pause/resume, circuit breaker, network + disk guards (diskUsage = the only statfs caller)
   reconcile.ts   self-healing sweeps (crashes, stale claims, missing files, failed jobs) + partial-file housekeeping
   relocate.ts    secondary-storage relocation pass (finished files that need no conversion still move)
+  unconverted-scan.ts  "Scan Unconverted Videos": imports untracked local media + re-queues finished jobs whose file is not in the chosen target container
   sources.ts     Web UI URL validation/canonicalization + durable source-list additions
   scanner.ts     playlist/channel listing + deduplicated ingestion
   autoscale.ts   dynamic download-slot management
@@ -275,7 +276,10 @@ ingest ──► pending ──claim──► downloading ──success──►
 
 downloaded ──► metadata worker ──► metadata: pending → in_progress → done | failed
 downloaded ──► convert worker ──► conversion: pending → in_progress → done | failed
-                                      (skipped when conversion_status = 'not_needed')
+                                      (skipped when conversion_status = 'not_needed',
+                                       which recordSuccess re-opens when yt-dlp's
+                                       actual output container differs from the
+                                       requested one — see "Container contract")
 ```
 
 **Claims are the concurrency primitive.** Each stage claims work with a single
@@ -362,6 +366,7 @@ re-queues a failed sidecar pass on an already-converted job.
 | Transient vs permanent errors | `retry.ts isTransientDownloadError / isPermanentDownloadError` | permanent = private/removed/unavailable/members-only/age-gated/paid/geo-blocked/404/410/copyright. The classifier also *labels* the reason (`classifyTerminalDownloadError` → `Private video`, `Video unavailable`, `Not available in your region`, …) for the dashboard, `last_error`, `/api/failed` and the run report |
 | Terminal skips stay skipped | `retry.ts TERMINAL_ERROR_MARKER` + `workers/download.ts parkTerminal()` | A permanent failure is written as `[terminal] <label> — skipped, it will not be retried automatically. yt-dlp: <tail>`, so the reason survives a truncated tail and every requeue path (`requeueFailedJobs`, `POST /api/failed/requeue`, `/api/reliability`'s `resumableFailed`, the orphan-partial sweep) reads the same predicate. The raw tail is kept for diagnosis; the skip writes **no** `error.log` line and spends no retry budget (a playlist full of dead videos must not trip the circuit breaker). Only an unclassified permanent message still logs |
 | Format fallback ladder | `retry.ts nextFormatFallback()` + `workers/download.ts` format branch | `Requested format is not available` → clear a stale pinned audio probe if there is one, else persist the next lower `video_quality` override (`4k → 1440p → 1080p → 720p → 480p → highest`) and retry immediately with a readable message. The ladder is **monotonic**, so it cannot loop and needs no retry budget; `highest` is `bv+ba/b` (any stream), so failing there is a genuine terminal `No format available` skip. `audio` never falls back to a video preset |
+
 | Bad downloader arguments | `retry.ts isDownloaderArgsError` → pause in `workers/download.ts` | aria2c exit 28 + option help block; parks the job, pauses the engine (`BAD_DOWNLOADER_ARGS`) |
 | Retry-budget forgiveness | `workers/download.ts handleDownloadFailure()` + `retry.ts progressAwareRetryState()` | `retry_count` only increments when `progress <= best_progress`; `best_progress` is committed at a failure boundary, not every progress update |
 | Resume budget | `workers/download.ts` corrupt branch | `.part` kept until `resume_count >= maxResumeAttempts`, then discarded |
@@ -539,7 +544,32 @@ Dynamic Range Compression duplicates. `src/audio-tracks.ts` owns this:
   MKV is retained. If a per-job/global target format explicitly requests
   conversion, `workers/convert.ts` maps every audio stream; MP4 re-encodes each
   stream as AAC. `countAudioStreams()` drives that choice/logging — it does not
-  bypass a requested container conversion.
+  bypass a requested container conversion. The download worker's container
+  check (below) applies the same exemption: a ≥2-track download is never
+  flipped to conversion just for being MKV.
+
+#### Container contract (why conversion runs for mp4 targets)
+
+The scanner pre-marks jobs whose target is mp4 `conversion_status =
+'not_needed'` — a fast path that trusts yt-dlp to produce mp4. yt-dlp makes no
+such promise: the QUALITY_FORMATS presets prefer VP9/Opus at most resolutions,
+those codecs merge into webm/mkv, and `--embed-thumbnail` remuxes a `.webm`
+into `.mkv` because WebM cannot hold attached art. An archive built on the
+fast path alone therefore ends up MKV while the dashboard says mp4 — the
+"selected mp4, got mkv" bug.
+
+The contract is now: **the produced container is checked once the download is
+final** (after every yt-dlp postprocessor ran, i.e. on the `after_move:` path
+`recordSuccess` records). When the file's extension differs from
+`effectiveTargetFormat(job, config)` and the download is single-track,
+`recordSuccess` flips `conversion_status` from `not_needed` to `pending` in
+the same atomic claim-CAS update; the converter then remuxes (video copied,
+audio to AAC for mp4) and skips files already in the target container. Rows
+already `pending`/`failed` are untouched. The sweep equivalent for an archive
+built before this check is `requeueWrongContainerJobs` (src/unconverted-scan.ts,
+the dashboard's "Scan Unconverted Videos"): it re-opens the conversion stage of
+finished jobs whose file is not in the chosen target — in place, never
+re-downloading — and exempts multi-track MKVs for the same reason.
 
 Dashboard: `/api/jobs` returns `audio_tracks` / `audio_selection` as parsed
 arrays; `POST /api/jobs/<id>/audio-probe` refreshes the list;
@@ -567,6 +597,18 @@ must get past two yt-dlp gates, and the engine does both in `retryJobById`
    of a file nothing points at. If the rename itself fails the row is put back
    and the retry aborts with a 500 instead of starting a download yt-dlp would
    skip.
+
+**Exception — a format-only override converts in place.** When the override
+changed ONLY `targetFormat` (the quality preset and audio-track selection are
+untouched — different streams would require a real download) and the job is
+`downloaded` with its file still on disk, `retryJobById` takes the
+convert-in-place shortcut instead of the flow above: the override is persisted,
+`conversion_status` re-opens (`not_needed`/`done` → `pending`), and neither the
+archive nor the media file is touched — the converter remuxes the file already
+in hand (video copied, audio to AAC for mp4, full encode for mp3). The route
+answers `convertedOnly: true` and the dashboard says so. When the file is
+already in the requested container there is nothing to convert either, and the
+retry falls through to the literal re-download the button promises.
 
 The backup is the safety net: the download worker deletes it on success
 (`dropSupersededFile`) and — if the re-download fails permanently — restores
@@ -718,6 +760,7 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | File | Focus |
 | --- | --- |
 | `tests/retry.test.ts` | backoff math, watchdog scaling, error classification, the terminal reason table + `[terminal]` record round-trip (including the wordings that used to loop: `This video is private`, `This video is unavailable`), and the format fallback ladder (strictly descending, bottoms out at `highest`, `audio`/unknown never fall back) |
+
 | `tests/util.test.ts` | formatters, Windows filename hardening, `fitBaseFilename`, hashing |
 | `tests/config.test.ts` | defaults, validation, cross-field refinements, atomic load/save |
 | `tests/sources.test.ts` | URL classification, canonicalization, persisted source lists, cross-playlist archive dedupe after source cleanup, concurrent saves/settings, validation/auth/write failures |

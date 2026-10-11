@@ -23,6 +23,7 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Disk-full failures pause the engine** — ENOSPC and common Windows/POSIX “disk full” errors preserve the partial and pause all workers for operator action instead of burning retries against an unwritable drive
 - **Unavailable videos are skipped, not retried** — private, deleted, members-only, age-gated, paid or geo-blocked videos are attempted **once**, classified with a plain-language reason (`Private video`, `Video unavailable`, `Not available in your region`, …), and parked as a terminal skip: no retry budget, no cooldown requeue, no `error.log` line per dead video, and no circuit-breaker trip for a whole playlist of them. The rest of the playlist keeps downloading, and the reason stays readable in the dashboard, the Failed tab, `/api/failed` and the run report
 - **An unavailable format is switched, not retried** — when yt-dlp answers `Requested format is not available`, the engine steps the quality down one rung (`4k → 1440p → 1080p → 720p → 480p → highest`), persists it as that job's quality override, and says so: `🎚️ Format 1080p not available — switched to 720p`. The ladder only ever moves down, so it cannot loop, and a stale multi-audio probe is cleared and re-probed first. Only a job that fails at every rung — a video with no usable formats — is parked, with `No format available` recorded as its reason
+
 - **Self-healing sweeps** — crashed jobs resume, stale claims are reclaimed, deleted downloads are re-fetched, and failed jobs are retried after a cooldown. With aria2c these sweeps resume from the download's `.aria2` control file, and a discarded partial always takes its control file with it
 - **Delete means don't re-download** — videos removed with Delete Selected or the per-job delete action are remembered in SQLite and skipped by all later source scans, including after restart. The dashboard's Ignored Videos panel lets you allow a video again.
 - **Resume state is protected, not aged away** — the startup sweep only deletes a `.part` once nothing will resume it: a `pending`, `paused`, or `waiting_live` job keeps its partial as long as the job exists, and a crash in the deliberate-re-download hand-off (`.superseded`) is rolled back or finished at the next start instead of leaving the old file unmanaged
@@ -246,7 +247,7 @@ Edit these interactively with `bun run config` → **Change Reliability & Resume
 | Key | Default | Options | What it controls |
 | --- | --- | --- | --- |
 | `videoQuality` | `"1080p"` | `highest`, `4k`, `1440p`, `1080p`, `720p`, `480p`, `audio` | Selects the stream quality. `audio` downloads audio only and produces MP3 output. |
-| `targetFormat` | `"mp4"` | `mp4`, `mkv`, `webm`, `mp3`, `m4a` | Final media container for newly queued jobs. The selected value is stored on each job; changing it does not rewrite existing jobs or files. |
+| `targetFormat` | `"mp4"` | `mp4`, `mkv`, `webm`, `mp3`, `m4a` | Final media container for newly queued jobs. The selected value is stored on each job; changing it does not rewrite existing jobs or files. After each download the engine checks the file's actual container and queues a remux when yt-dlp produced something else (VP9/Opus picks often land as MKV/WebM, and thumbnail embedding turns WebM into MKV), so MP4-requested downloads really end up MP4. Files already on disk in the wrong container can be repaired with **Scan Unconverted Videos** (converts in place, never re-downloads). Multi-audio downloads are the one exception — their MKV is retained so the tracks stay switchable. |
 
 Use `bun run config` → **Change Download Settings** or the dashboard's global
 Settings editor to change the defaults. The per-video detail drawer can override
@@ -312,7 +313,10 @@ language and bitrate), checkboxes pick what the next attempt keeps, and *Use
 global setting* returns the job to the mode above. For a video that is already
 downloaded, **Save & re-download** applies the selection immediately: the
 engine scrubs the video from the yt-dlp download archive, moves the old file
-aside (`.superseded`), and downloads again with the new tracks. The previous
+aside (`.superseded`), and downloads again with the new tracks. Changing only
+the container format (same quality, same tracks) never re-downloads — the
+already-downloaded file is converted in place with ffmpeg instead; a quality or
+audio-track change is what triggers a fresh download. The previous
 file is kept until the new download succeeds and is restored automatically if
 the re-download fails permanently — a retry never destroys what is already
 archived. The hand-off is crash-safe: the backup is recorded in the database
@@ -534,8 +538,10 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
    the quality down the fallback ladder instead of re-running the same command
    — both are described in `jobs.last_error` and never auto-requeued.
 4. **Metadata workers** — fetch subtitles, thumbnails, and descriptions per video, based on config flags
-5. **Converter workers** — convert completed downloads into the target format,
-   optionally moving them (with sidecars) to a secondary storage path. The move
+5. **Converter workers** — convert completed downloads into the target format
+   (queued whenever a finished file's container differs from the requested one,
+   e.g. an MKV from yt-dlp when MP4 was selected), optionally moving them (with
+   sidecars) to a secondary storage path. The move
    is copy-then-remove: if the destination copy fails (full disk, unwritable
    share, cross-volume copy error) both copies are kept and the job is retried,
    so a broken secondary store can never delete the only copy

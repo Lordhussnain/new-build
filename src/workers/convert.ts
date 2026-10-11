@@ -324,6 +324,11 @@ export async function moveToSecondaryStorage(
  * Returns false when the move did not happen. `required` turns that into a
  * thrown error — the media itself must land in secondary storage or the job
  * must stay retryable, while a sidecar is worth only a warning.
+ *
+ * A source that already IS the destination (an in-place conversion of media
+ * relocated earlier: the convert writes the new container next to the old one,
+ * both under the secondary root) needs no move at all — on Windows the
+ * self-rename fails and the self-copy errors, which would fail the job.
  */
 async function moveFile(
   src: string,
@@ -331,6 +336,7 @@ async function moveFile(
   job: Pick<Job, "id" | "title">,
   opts: { required?: boolean } = {},
 ): Promise<boolean> {
+  if (src === dest) return true;
   try {
     await rename(src, dest);
     return true;

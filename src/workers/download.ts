@@ -8,6 +8,7 @@
 
 import { stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { extname } from "node:path";
 import {
   claimDownloadJob,
   claimRef,
@@ -49,7 +50,7 @@ import {
   progressAwareRetryState,
   type TerminalErrorInfo,
 } from "../retry";
-import { buildDownloadPlan, effectiveVideoQuality, jobFittedBaseFilename } from "../download-args";
+import { buildDownloadPlan, effectiveTargetFormat, effectiveVideoQuality, jobFittedBaseFilename } from "../download-args";
 import { parseAria2cReadout, parseDownloadPath, readProcessOutput } from "../download-output";
 import {
   parseSelectionJson,
@@ -397,7 +398,20 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
       throw new Error("Download finished but output file could not be located");
     }
     const fileSize = (await stat(filePath)).size;
-    const recorded = recordSuccess(job, filePath, fileSize);
+    // Container check: yt-dlp does NOT promise the requested container. With
+    // the quality presets it prefers VP9/Opus (webm/mkv) at most resolutions,
+    // and --embed-thumbnail remuxes a .webm into .mkv because WebM cannot hold
+    // attached art. Jobs whose global target is mp4 are pre-marked
+    // conversion_status = 'not_needed' (scanner.ts), so without this check the
+    // mkv/webm output would be final. Queue the conversion stage whenever the
+    // produced container differs from the requested one — the converter remuxes
+    // (video copied, audio to AAC for mp4) and skips files already in the
+    // target container. Multi-track downloads are exempt: their MKV is retained
+    // by design (see AGENTS.md, multi-audio).
+    const targetFmt = effectiveTargetFormat(job, config);
+    const downloadedExt = extname(filePath).replace(/^\./, "").toLowerCase();
+    const queueConversion = downloadedExt.length > 0 && downloadedExt !== targetFmt && audioTracks.length < 2;
+    const recorded = recordSuccess(job, filePath, fileSize, { queueConversion });
     if (recorded.lostClaim) {
       updateWorkerLine(id, `⚠️ Claim lost — output belongs to another worker | ${job.title}`, config);
       return;
@@ -1334,8 +1348,20 @@ export interface DownloadSuccessResult {
  * The write is a claim-token CAS, so a stale worker whose claim was reclaimed
  * (or taken over by a second engine process) cannot record its output over the
  * new owner's row — it reports `lostClaim` and walks away.
+ *
+ * `opts.queueConversion` flips a pre-declared `conversion_status = 'not_needed'`
+ * to 'pending' in the SAME atomic update: the produced container is only known
+ * for certain here (after every yt-dlp postprocessor ran), and the scanner's
+ * mp4 fast path ('not_needed') must not silently finalize a file that landed
+ * in some other container. The CASE guard leaves rows that already go through
+ * conversion ('pending'/'failed') exactly as they were.
  */
-export function recordSuccess(job: Job, filePath: string, fileSize: number): DownloadSuccessResult {
+export function recordSuccess(
+  job: Job,
+  filePath: string,
+  fileSize: number,
+  opts: { queueConversion?: boolean } = {},
+): DownloadSuccessResult {
   const changes = releaseClaimedJob(
     "download",
     job.id,
@@ -1344,11 +1370,12 @@ export function recordSuccess(job: Job, filePath: string, fileSize: number): Dow
      pause_reason = CASE WHEN pause_reason = 'user' THEN 'user' ELSE NULL END,
      file_path = ?, file_size = ?, partial_file_path = NULL,
      progress = 100, best_progress = 100, last_error = NULL,
+     conversion_status = CASE WHEN ? = 1 AND conversion_status = 'not_needed' THEN 'pending' ELSE conversion_status END,
      -- A fresh download writes into the output tree, so the media is no longer
      -- in secondary storage: the relocation pass must be allowed to move it
      -- again once conversion finishes (src/relocate.ts).
      relocated_to = NULL`,
-    [filePath, fileSize],
+    [filePath, fileSize, opts.queueConversion ? 1 : 0],
   );
   if (changes !== 1) {
     // A deleted row is the expected outcome of a dashboard delete/purge: the

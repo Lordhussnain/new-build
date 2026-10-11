@@ -108,3 +108,73 @@ describe("per-job user pause preservation", () => {
     expect(row.download_claim_token).toBe("other-token");
   });
 });
+
+/**
+ * Post-download container check (tests/download-output contract): the scanner
+ * pre-marks mp4-target jobs `conversion_status = 'not_needed'`, but yt-dlp does
+ * not promise the requested container — VP9/Opus presets merge into webm/mkv
+ * and `--embed-thumbnail` remuxes a .webm into .mkv. `recordSuccess` must flip
+ * such a job to 'pending' in the same atomic update, and leave every other
+ * conversion stage state untouched.
+ */
+function insertDownloadingJob(id: string, conversionStatus: string): void {
+  db.run(
+    `INSERT INTO jobs (id, title, output_directory, "index", download_status, conversion_status,
+       download_claimed_by, download_claimed_at, download_claim_token, download_heartbeat_at)
+     VALUES (?, ?, ?, 1, 'downloading', ?, 'dl-1', CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP)`,
+    [id, `Video ${id}`, join(tmpdir(), `yta-container-${id}`), conversionStatus, HELD_TOKEN],
+  );
+}
+
+describe("post-download container check", () => {
+  test("an output in the wrong container re-opens the conversion stage", () => {
+    const id = "container-mkv";
+    insertDownloadingJob(id, "not_needed");
+
+    const recorded = recordSuccess(staleJobSnapshot(id), "/tmp/yta-out/001 - Video.mkv", 10, {
+      queueConversion: true,
+    });
+
+    expect(recorded.ok).toBe(true);
+    const row = db
+      .query("SELECT download_status, file_path, conversion_status FROM jobs WHERE id = ?")
+      .get(id) as any;
+    expect(row.download_status).toBe("downloaded");
+    expect(row.file_path).toBe("/tmp/yta-out/001 - Video.mkv");
+    expect(row.conversion_status).toBe("pending");
+  });
+
+  test("an output already in the target container keeps the not_needed fast path", () => {
+    const id = "container-mp4";
+    insertDownloadingJob(id, "not_needed");
+
+    recordSuccess(staleJobSnapshot(id), "/tmp/yta-out/001 - Video.mp4", 10, { queueConversion: false });
+
+    const row = db.query("SELECT conversion_status FROM jobs WHERE id = ?").get(id) as any;
+    expect(row.conversion_status).toBe("not_needed");
+  });
+
+  test("a stage that already has its own state (pending/failed) is never clobbered", () => {
+    const id = "container-pending";
+    insertDownloadingJob(id, "pending");
+    db.run(`UPDATE jobs SET conversion_retry_count = 1 WHERE id = ?`, [id]);
+
+    recordSuccess(staleJobSnapshot(id), "/tmp/yta-out/001 - Video.webm", 10, { queueConversion: true });
+
+    const row = db
+      .query("SELECT conversion_status, conversion_retry_count FROM jobs WHERE id = ?")
+      .get(id) as any;
+    expect(row.conversion_status).toBe("pending");
+    expect(row.conversion_retry_count).toBe(1);
+  });
+
+  test("the legacy three-argument call stays neutral", () => {
+    const id = "container-legacy";
+    insertDownloadingJob(id, "not_needed");
+
+    recordSuccess(staleJobSnapshot(id), "/tmp/yta-out/001 - Video.mp4", 10);
+
+    const row = db.query("SELECT conversion_status FROM jobs WHERE id = ?").get(id) as any;
+    expect(row.conversion_status).toBe("not_needed");
+  });
+});

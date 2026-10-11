@@ -447,7 +447,10 @@ describe("the dashboard renders the queue", () => {
     const notifications = ui2.el("notifications").children as StubElement[];
     const text = notifications.map((n) => String(n.textContent)).join("\n");
     expect(text).toContain("Imported");
-    expect(text).toContain("conversion to MP4");
+    // The report now covers BOTH halves of the sweep: untracked imports and
+    // tracked jobs re-queued because their file is not in the target container.
+    expect(text).toContain("untracked video(s)");
+    expect(text).toContain("Re-queued 0 archived file(s) not in MP4");
     expect(ui2.errors).toEqual([]);
   });
 });

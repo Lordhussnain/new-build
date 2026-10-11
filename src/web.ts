@@ -9,7 +9,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 
-import { resolve as resolvePath, sep as pathSep } from "node:path";
+import { extname, resolve as resolvePath, sep as pathSep } from "node:path";
 import os from "node:os";
 import {
   allowIgnoredVideo,
@@ -563,8 +563,14 @@ interface RetryJobResult {
   changed: number | "in-progress";
   /** Present when a partial existed but could not be wiped (e.g. locked). */
   partialWarning: string | null;
+  /**
+   * True when the retry became an in-place CONVERSION instead of a re-download:
+   * the override changed only the target format (quality and audio tracks are
+   * untouched) and the downloaded file is still on disk, so the converter can
+   * remux what is already there.
+   */
+  convertedOnly: boolean;
 }
-
 /**
  * Re-queue a job with fresh budgets (download + any failed side stages).
  *
@@ -594,10 +600,67 @@ async function retryJobById(id: string, config: Config, override?: JobOverride):
   let fallbackDir = "";
   let fallbackBase = "";
   const result = withIdleJobs([id], () => {
-    const existing = db.query("SELECT id, target_format, video_quality FROM jobs WHERE id = ?").get(id) as
-      | { id: string; target_format: string | null; video_quality: string | null }
+    const existing = db
+      .query(
+        "SELECT id, target_format, video_quality, audio_selection, download_status, file_path FROM jobs WHERE id = ?",
+      )
+      .get(id) as
+      | {
+          id: string;
+          target_format: string | null;
+          video_quality: string | null;
+          audio_selection: string | null;
+          download_status: string;
+          file_path: string | null;
+        }
       | null;
     if (!existing) return 0;
+
+    // Convert-in-place shortcut: the override changed ONLY the target format
+    // (quality and audio-track selection untouched — a different quality or
+    // track list needs different streams, i.e. a real download) and the
+    // downloaded file is still on disk. Then there is nothing to re-fetch: the
+    // file already in hand is a valid conversion source, so re-opening the
+    // conversion stage remuxes it locally (video copied, audio to AAC for mp4,
+    // full encode for mp3) instead of spending the bandwidth again. The file is
+    // deliberately NOT stashed and the archive NOT scrubbed — no download will
+    // run. When the file is already in the requested container there is nothing
+    // to convert either, so the flow falls through to the literal re-download
+    // the button promises.
+    if (override) {
+      const qualityChanged =
+        Object.hasOwn(override, "videoQuality") && override.videoQuality !== existing.video_quality;
+      const storedTracks = parseSelectionJson(existing.audio_selection) ?? null;
+      const tracksChanged =
+        Object.hasOwn(override, "audioTracks") &&
+        JSON.stringify(override.audioTracks ?? null) !== JSON.stringify(storedTracks);
+      if (
+        !qualityChanged &&
+        !tracksChanged &&
+        existing.download_status === "downloaded" &&
+        !!existing.file_path &&
+        existsSync(existing.file_path)
+      ) {
+        persistJobOverride(id, override);
+        const fresh = db.query("SELECT target_format, video_quality FROM jobs WHERE id = ?").get(id) as
+          | { target_format: string | null; video_quality: string | null }
+          | null;
+        const targetFmt = effectiveTargetFormat(fresh ?? existing, config);
+        const fileExt = extname(existing.file_path).replace(/^\./, "").toLowerCase();
+        if (fileExt && fileExt !== targetFmt) {
+          db.run(
+            `UPDATE jobs SET conversion_status = 'pending', conversion_retry_count = 0,
+               last_error = NULL,
+               conversion_claimed_by = NULL, conversion_claimed_at = NULL,
+               conversion_claim_token = NULL, conversion_heartbeat_at = NULL,
+               updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            [id],
+          );
+          return { changed: 1, partialWarning: null, convertedOnly: true };
+        }
+      }
+    }
+
     if (override) persistJobOverride(id, override);
 
     const row = db.query(`SELECT id, file_path, target_format, video_quality, conversion_status,
@@ -670,8 +733,14 @@ async function retryJobById(id: string, config: Config, override?: JobOverride):
     ).changes;
   });
 
-  if (!result.ok || result.value !== 1) {
-    return { changed: result.ok ? result.value : "in-progress", partialWarning: null };
+  if (!result.ok) {
+    return { changed: "in-progress", partialWarning: null, convertedOnly: false };
+  }
+  // The convert-in-place branch returns its full result from the transaction —
+  // no partial wipe follows (no download was queued, so there is no partial).
+  if (typeof result.value === "object") return result.value;
+  if (result.value !== 1) {
+    return { changed: result.value, partialWarning: null, convertedOnly: false };
   }
 
   // The job is re-queued and no longer references its partial. Wipe the partial
@@ -696,10 +765,11 @@ async function retryJobById(id: string, config: Config, override?: JobOverride):
         partialWarning:
           `Partial file is locked (${removal.error}). Close the program holding it — ` +
           `the next attempt may resume from the leftover partial instead of starting at 0%.`,
+        convertedOnly: false,
       };
     }
   }
-  return { changed: 1, partialWarning: null };
+  return { changed: 1, partialWarning: null, convertedOnly: false };
 }
 
 /** Save per-job settings without queuing a download. */
@@ -1005,10 +1075,12 @@ const ROUTES: Route[] = [
       try {
         let changed: number | "in-progress";
         let partialWarning: string | null = null;
+        let convertedOnly = false;
         if (retry) {
           const result = await retryJobById(params.id, config, parsed.value);
           changed = result.changed;
           partialWarning = result.partialWarning;
+          convertedOnly = result.convertedOnly;
         } else {
           changed = saveJobOverrideById(params.id, config, parsed.value);
         }
@@ -1021,6 +1093,7 @@ const ROUTES: Route[] = [
         return Response.json({
           ok: true,
           queued: retry,
+          ...(convertedOnly ? { convertedOnly: true } : {}),
           targetFormat: saved.target_format,
           videoQuality: saved.video_quality,
           audioTracks: parseSelectionJson(saved.audio_selection),

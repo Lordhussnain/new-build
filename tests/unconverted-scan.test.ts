@@ -146,3 +146,111 @@ describe("scanUnconvertedVideos", () => {
     expect(result.videoFiles).toBe(1);
   });
 });
+
+/**
+ * The repair pass: an archive built before the download worker's container
+ * check (or under a different global target) holds finished jobs whose file is
+ * not in the requested container. The sweep must re-open exactly those
+ * conversion stages — in place, never re-downloading — and leave everything
+ * else untouched.
+ */
+function insertDownloadedJob(
+  id: string,
+  filePath: string,
+  conversionStatus: string,
+  extra: { audioTracks?: string; audioSelection?: string } = {},
+): void {
+  db.run(
+    `INSERT INTO jobs (id, url, title, output_directory, file_path, download_status,
+       conversion_status, audio_tracks, audio_selection)
+     VALUES (?, ?, ?, ?, ?, 'downloaded', ?, ?, ?)`,
+    [id, `https://www.youtube.com/watch?v=${id}`, `Video ${id}`, root, filePath, conversionStatus, extra.audioTracks ?? null, extra.audioSelection ?? null],
+  );
+}
+
+describe("scanUnconvertedVideos: tracked jobs in the wrong container", () => {
+  test("re-queues a finished not_needed job whose file is not the target container", async () => {
+    const file = write("001 - Video.mkv");
+    insertDownloadedJob("wrongext", file, "not_needed");
+
+    const result = await scanUnconvertedVideos(config, "mp4");
+
+    expect(result.requeued).toBe(1);
+    expect(result.keptMultiTrack).toBe(0);
+    expect(result.imported).toBe(0);
+    const row = db
+      .query("SELECT conversion_status, file_path, download_status, conversion_retry_count FROM jobs WHERE id = ?")
+      .get("wrongext") as any;
+    // The existing row is repaired, not duplicated or re-downloaded.
+    expect(row.conversion_status).toBe("pending");
+    expect(row.conversion_retry_count).toBe(0);
+    expect(row.file_path).toBe(file);
+    expect(row.download_status).toBe("downloaded");
+    expect((db.query("SELECT COUNT(*) AS n FROM jobs").get() as any).n).toBe(1);
+
+    // Idempotent: once converted (file + status done) the sweep skips it.
+    db.run(`UPDATE jobs SET conversion_status = 'done', file_path = replace(file_path, '.mkv', '.mp4') WHERE id = ?`, ["wrongext"]);
+    write("001 - Video.mp4");
+    const second = await scanUnconvertedVideos(config, "mp4");
+    expect(second.requeued).toBe(0);
+  });
+
+  test("a file already in the target container is left alone", async () => {
+    const file = write("001 - Video.mp4");
+    insertDownloadedJob("rightext", file, "not_needed");
+
+    const result = await scanUnconvertedVideos(config, "mp4");
+
+    expect(result.requeued).toBe(0);
+    const row = db.query("SELECT conversion_status FROM jobs WHERE id = ?").get("rightext") as any;
+    expect(row.conversion_status).toBe("not_needed");
+  });
+
+  test("multi-audio archives keep their MKV (documented behavior)", async () => {
+    const file = write("002 - Dubs.mkv");
+    const tracks = JSON.stringify([
+      { formatId: "251-0", language: "en" },
+      { formatId: "251-1", language: "es" },
+    ]);
+    insertDownloadedJob("dubs", file, "not_needed", { audioTracks: tracks });
+    const allMode = { ...config, multiAudioMode: "all" as const };
+
+    const result = await scanUnconvertedVideos(allMode, "mp4");
+
+    expect(result.keptMultiTrack).toBe(1);
+    expect(result.requeued).toBe(0);
+    const row = db.query("SELECT conversion_status FROM jobs WHERE id = ?").get("dubs") as any;
+    expect(row.conversion_status).toBe("not_needed");
+  });
+
+  test("a failed conversion stage keeps its retry budget", async () => {
+    const file = write("003 - Video.webm");
+    insertDownloadedJob("convfail", file, "failed");
+    db.run(`UPDATE jobs SET conversion_retry_count = 2 WHERE id = ?`, ["convfail"]);
+
+    const result = await scanUnconvertedVideos(config, "mp4");
+
+    expect(result.requeued).toBe(0);
+    const row = db
+      .query("SELECT conversion_status, conversion_retry_count FROM jobs WHERE id = ?")
+      .get("convfail") as any;
+    expect(row.conversion_status).toBe("failed");
+    expect(row.conversion_retry_count).toBe(2);
+  });
+
+  test("files outside the scanned root are out of scope", async () => {
+    const outside = join(root, "..", "outside-scope.mkv");
+    writeFileSync(outside, Buffer.alloc(4096, 7));
+    try {
+      insertDownloadedJob("elsewhere", outside, "not_needed");
+
+      const result = await scanUnconvertedVideos(config, "mp4");
+
+      expect(result.requeued).toBe(0);
+      const row = db.query("SELECT conversion_status FROM jobs WHERE id = ?").get("elsewhere") as any;
+      expect(row.conversion_status).toBe("not_needed");
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
+});

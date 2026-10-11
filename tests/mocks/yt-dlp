@@ -195,7 +195,11 @@ const multiAudio = flag("--audio-multistreams");
 const stressOutput = process.env.FAKE_OUTPUT_STRESS === "1";
 // Different basename prevents directory fallback from hiding a broken parser.
 const finalBase = stressOutput ? join(dirname(base), `final-${basename(base)}-数学 🧮`) : base;
-const finalPath = multiAudio ? `${finalBase}.mkv` : `${finalBase}.mp4`;
+// FAKE_OUTPUT_EXT simulates yt-dlp honoring the codecs rather than the
+// requested container: VP9/Opus picks merge into webm/mkv, and a thumbnail
+// embed remuxes a .webm into .mkv. Default stays .mp4 (the common mock case).
+const forcedExt = (process.env.FAKE_OUTPUT_EXT || "").replace(/^\./, "");
+const finalPath = multiAudio ? `${finalBase}.mkv` : `${finalBase}.${forcedExt || "mp4"}`;
 const partPath = `${base}.f137.mp4.part`;
 // Record the argv so tests can assert which format selector / flags arrived.
 // JSON.stringify preserves argument boundaries — one string with spaces vs

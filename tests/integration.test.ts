@@ -36,7 +36,7 @@ import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import type { Subprocess } from "bun";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 // Seeding an archive before the engine starts (offline-mode scenario) goes
 // through the engine's own schema, so the seed can never drift from it.
 import { db as seedDb, initDatabase as initSeedDatabase } from "../src/db";
@@ -1628,6 +1628,99 @@ describe("integration: multi-audio tracks", () => {
       const resolved = String(j.file_path).startsWith("/") ? j.file_path : join(dir, j.file_path);
       expect(existsSync(resolved)).toBe(true);
       expect(String(j.file_path).endsWith(".superseded")).toBe(false);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
+describe("integration: target container is honored", () => {
+  test("yt-dlp output in another container is remuxed to the requested mp4", async () => {
+    // The real-world shape of the bug: with the quality presets yt-dlp prefers
+    // VP9/Opus, whose merge lands in webm/mkv (and --embed-thumbnail remuxes a
+    // .webm into .mkv), even though the operator asked for mp4. Historically
+    // such jobs were pre-marked conversion 'not_needed' and the mkv was final.
+    // FAKE_OUTPUT_EXT=mkv makes the mock produce exactly that output; the
+    // download worker must notice the mismatch and queue the remux instead.
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 3999, BASE_CONFIG(3999), { FAKE_OUTPUT_EXT: "mkv" });
+    const folder = join(dir, "downloads", "Mock Playlist");
+
+    try {
+      await waitFor("every job downloaded and converted into the requested container", async () => {
+        const rows = await getJobs(engine);
+        return (
+          rows.length === 3 &&
+          rows.every((j) => j.download_status === "downloaded" && j.conversion_status === "done")
+        );
+      });
+
+      const jobs = await getJobs(engine);
+      for (const j of jobs as any[]) {
+        expect(String(j.file_path).endsWith(".mp4")).toBe(true);
+      }
+      // The mkv sources are gone (deleteSourceAfterConvert) — only mp4s remain.
+      const files = await readdir(folder);
+      expect(files.filter((f) => f.endsWith(".mkv"))).toHaveLength(0);
+      expect(files.filter((f) => f.endsWith(".mp4"))).toHaveLength(3);
+
+      // A single-track mp4 target adds no merge override: the container is
+      // enforced AFTER the download, not by yt-dlp.
+      const args = JSON.parse(await Bun.file(join(folder, "001 - First Mock Video.ytdlp-args")).text());
+      expect(args).not.toContain("--merge-output-format");
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("a format-only override converts the downloaded file in place instead of re-downloading", async () => {
+    // The dashboard's "Save & Re-Download" with only the container changed must
+    // NOT spend the bandwidth again: the file in hand is the conversion source.
+    // Proof that yt-dlp never ran again: the mock rewrites its `.ytdlp-args`
+    // sidecar on every invocation, so an unchanged mtime after the conversion
+    // means no download attempt happened.
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 3990, BASE_CONFIG(3990));
+    const folder = join(dir, "downloads", "Mock Playlist");
+    const argsFile = join(folder, "001 - First Mock Video.ytdlp-args");
+
+    try {
+      await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+      );
+      const argsStatBefore = statSync(argsFile);
+
+      // Format-only override (quality select unchanged, i.e. null → null).
+      const res = await engine.api("/api/jobs/mockvid001/override", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targetFormat: "mkv", videoQuality: null, retry: true }),
+      });
+      expect(res.ok).toBe(true);
+      expect(res.convertedOnly).toBe(true);
+
+      await waitFor("job converted to mkv in place", async () => {
+        const rows = await getJobs(engine);
+        const j = rows.find((r: any) => r.id === "mockvid001") as any;
+        return j && j.conversion_status === "done" && String(j.file_path || "").endsWith(".mkv");
+      });
+
+      // No re-download: yt-dlp was never invoked for this job again.
+      const argsStatAfter = statSync(argsFile);
+      expect(argsStatAfter.mtimeMs).toBe(argsStatBefore.mtimeMs);
+
+      // The remux replaced the file: mkv in, old mp4 gone.
+      const j = (await getJobs(engine)).find((r: any) => r.id === "mockvid001") as any;
+      const resolved = String(j.file_path).startsWith("/") ? j.file_path : join(dir, j.file_path);
+      expect(existsSync(resolved)).toBe(true);
+      const files = await readdir(folder);
+      expect(files.filter((f) => f === "001 - First Mock Video.mkv")).toHaveLength(1);
+      expect(files.filter((f) => f === "001 - First Mock Video.mp4")).toHaveLength(0);
+      // The other two jobs were not touched.
+      expect(files.filter((f) => f.endsWith(".mp4"))).toHaveLength(2);
+      expect(files.filter((f) => f.endsWith(".superseded"))).toHaveLength(0);
     } finally {
       await engine.stop();
     }

@@ -452,6 +452,123 @@ describe("POST /api/jobs/:id/override", () => {
     expect((await readFile(archive, "utf-8")).trim()).toBe("youtube keep01");
   });
 
+  test("a format-only override retry converts the downloaded file in place (no re-download)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-job-convert-place-"));
+    const archive = join(dir, "downloaded_videos.txt");
+    const media = join(dir, "001 - Video.mkv");
+    await writeFile(archive, "youtube over09\n");
+    await writeFile(media, "downloaded media bytes");
+    // A job that follows the global settings (null overrides) whose download
+    // landed as MKV — the exact shape the container check was added for.
+    insertJob("over09", {
+      download_status: "downloaded",
+      file_path: media,
+      conversion_status: "not_needed",
+      target_format: null,
+      video_quality: null,
+    });
+
+    // The dashboard's format/quality section always sends both selects; the
+    // quality is UNCHANGED here (null → null), so only the format differs.
+    const res = await apiWith("/api/jobs/over09/override", cfgWith({ archiveFile: archive }), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetFormat: "mp4", videoQuality: null, retry: true }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, queued: true, convertedOnly: true, targetFormat: "mp4" });
+
+    // The file was converted, not re-fetched: still downloaded, still on disk,
+    // only the conversion stage re-opened with a fresh budget.
+    expect(getJob("over09")).toMatchObject({
+      download_status: "downloaded",
+      conversion_status: "pending",
+      conversion_retry_count: 0,
+      target_format: "mp4",
+      video_quality: null,
+      file_path: media,
+      superseded_file: null,
+    });
+    expect(existsSync(media)).toBe(true);
+    expect(existsSync(`${media}.superseded`)).toBe(false);
+    // The yt-dlp archive was not scrubbed: nothing will be downloaded.
+    expect((await readFile(archive, "utf-8")).trim()).toBe("youtube over09");
+
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("a quality change still re-downloads (the file cannot be converted into another quality)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-job-quality-retry-"));
+    const media = join(dir, "001 - Video.mp4");
+    await writeFile(media, "downloaded media bytes");
+    insertJob("over10", {
+      download_status: "downloaded",
+      file_path: media,
+      conversion_status: "not_needed",
+      target_format: null,
+      video_quality: null,
+    });
+
+    const res = await apiWith("/api/jobs/over10/override", cfgWith({}), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetFormat: "mp4", videoQuality: "720p", retry: true }),
+    });
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.convertedOnly).toBeUndefined();
+    expect(getJob("over10")).toMatchObject({
+      download_status: "pending",
+      file_path: null,
+      superseded_file: `${media}.superseded`,
+    });
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("a format-only retry falls back to a re-download when the file is already in that container", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-job-same-container-"));
+    const media = join(dir, "001 - Video.mp4");
+    await writeFile(media, "downloaded media bytes");
+    insertJob("over11", {
+      download_status: "downloaded",
+      file_path: media,
+      conversion_status: "not_needed",
+      target_format: null,
+      video_quality: null,
+    });
+
+    const res = await apiWith("/api/jobs/over11/override", cfgWith({}), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetFormat: "mp4", videoQuality: null, retry: true }),
+    });
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.convertedOnly).toBeUndefined(); // nothing to convert → real re-download
+    expect(getJob("over11")).toMatchObject({ download_status: "pending", file_path: null });
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("a missing file falls back to a re-download instead of converting", async () => {
+    insertJob("over12", {
+      download_status: "downloaded",
+      file_path: join(tmpdir(), "yta-gone-001 - Video.mkv"),
+      conversion_status: "not_needed",
+      target_format: null,
+      video_quality: null,
+    });
+
+    const res = await api("/api/jobs/over12/override", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetFormat: "mp4", videoQuality: null, retry: true }),
+    });
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.convertedOnly).toBeUndefined();
+    expect(getJob("over12")).toMatchObject({ download_status: "pending" });
+  });
+
   test("retry:true alone retries the job with its current overrides", async () => {
     insertJob("over06", { download_status: "failed", retry_count: 3, last_error: "network" });
     const res = await api("/api/jobs/over06/override", {
