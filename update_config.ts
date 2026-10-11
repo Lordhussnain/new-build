@@ -8,7 +8,7 @@
 import { createInterface } from "node:readline/promises";
 import { existsSync } from "node:fs";
 import { Database } from "bun:sqlite";
-import { CONFIG_PATH, loadConfigSafe, saveConfig, type Config } from "./src/config";
+import { COOKIE_BROWSER_NAMES, CONFIG_PATH, loadConfigSafe, saveConfig, type Config } from "./src/config";
 import { associateExistingJobsWithSource, db, initDatabase, pruneJobsForUnconfiguredSources } from "./src/db";
 import { getPlaylistItems } from "./src/scanner";
 import { resolvedTools } from "./src/tools";
@@ -391,6 +391,20 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   );
   if (config.cookiesFile && !existsSync(config.cookiesFile)) {
     console.log(`   ⚠️ ${config.cookiesFile} does not exist yet — age-gated videos will fail until it does.`);
+  }
+  // Browser fallback: used only when cookies.txt is missing or fails validation.
+  const browsersAns = await ask(
+    `   Browsers to read cookies from, in order, when cookies.txt is missing or invalid (comma-separated: ${COOKIE_BROWSER_NAMES.join(", ")}; blank = keep, "-" = none) [current: ${config.cookieBrowsers.join(", ") || "none"}]: `,
+  );
+  if (browsersAns.trim() === "-") {
+    config.cookieBrowsers = [];
+  } else if (browsersAns.trim() !== "") {
+    const wanted = browsersAns.split(",").map((b) => b.trim().toLowerCase()).filter(Boolean);
+    const unknown = wanted.filter((b) => !(COOKIE_BROWSER_NAMES as readonly string[]).includes(b));
+    if (unknown.length > 0) {
+      console.log(`   ⚠️ Unknown browser(s) ignored: ${unknown.join(", ")}`);
+    }
+    config.cookieBrowsers = wanted.filter((b) => (COOKIE_BROWSER_NAMES as readonly string[]).includes(b)) as Config["cookieBrowsers"];
   }
 
   console.log("\n— External Tools (Windows-friendly auto-detect) —");

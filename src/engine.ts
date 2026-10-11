@@ -7,7 +7,7 @@
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { lanOverrideFromRuntime, loadConfig, offlineOverrideFromRuntime, webPortOverrideFromRuntime } from "./config";
-import { aria2cPath, checkDependencies, validateCookies } from "./tools";
+import { COOKIE_SOURCE_RECHECK_MS, aria2cPath, checkDependencies, resolveCookieSource } from "./tools";
 import { initDatabase, pruneJobsForUnconfiguredSources } from "./db";
 import {
   acquireEngineLease,
@@ -244,14 +244,10 @@ export async function main(): Promise<void> {
   cookiesWatch(config);
   if (config.offlineMode) {
     console.log("🍪 Cookies: not used (offline mode).");
-  } else if (config.validateCookiesOnStart && existsSync(config.cookiesFile)) {
-    const valid = await validateCookies(config.cookiesFile);
-    if (!valid) console.warn("⚠️ Cookies may be invalid or expired.");
-    else console.log("✅ Cookies validated.");
-  } else if (!existsSync(config.cookiesFile)) {
-    console.log(
-      `ℹ️ No ${config.cookiesFile} yet — downloads run anonymously. Drop the file in while the engine runs and it is picked up within a minute.`,
-    );
+  } else {
+    // cookies.txt first (if present and valid), then the browsers in
+    // cookieBrowsers, then anonymous. See resolveCookieSource().
+    await resolveCookieSource(config);
   }
 
   // 3) Load every link from config.json, fetch video details, store in DB.
@@ -323,7 +319,12 @@ export async function main(): Promise<void> {
   setInterval(() => requeueFailedJobs(getConfig()), 60_000);
   // Cookies sweep is local filesystem observation (not a network fetch), so it
   // stays registered through offline mode and is ready if the mode ends live.
-  setInterval(() => cookiesWatch(getConfig()), 60_000);
+  setInterval(() => {
+    if (cookiesWatch(getConfig())) void resolveCookieSource(getConfig(), { force: true });
+  }, 60_000);
+  // Browser cookies can expire or the browser can be closed/unlocked later on,
+  // so the chosen source is re-checked periodically.
+  setInterval(() => void resolveCookieSource(getConfig()), COOKIE_SOURCE_RECHECK_MS);
   // Secondary-storage relocation: files that need no conversion still have to
   // reach secondary storage (src/relocate.ts).
   startRelocation();

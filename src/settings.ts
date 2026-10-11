@@ -529,6 +529,13 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     group: "storage",
     help: "Netscape cookies.txt used for authenticated downloads. The engine notices the file appearing or changing while it runs.",
   },
+  {
+    key: "cookieBrowsers",
+    label: "Browser cookies (fallback)",
+    type: "list",
+    group: "storage",
+    help: "Browsers read in this order when cookies.txt is missing or invalid, e.g. firefox, chrome, brave. The first one that works is used. Empty = cookies.txt only. Changes apply at the next cookie check (within 30 minutes) or on restart.",
+  },
   // --- watching -------------------------------------------------------------
   {
     key: "rssEnabled",

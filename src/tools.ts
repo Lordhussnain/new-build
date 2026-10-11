@@ -92,10 +92,39 @@ export function cookiesState(config: { cookiesFile: string }): CookiesState {
   }
 }
 
-/** `--cookies <file>` when the file exists and is non-empty, else nothing. */
+/** How often browser cookies are re-probe (and the file re-validated) while running. */
+export const COOKIE_SOURCE_RECHECK_MS = 30 * 60_000;
+
+/**
+ * Cookie source resolved by `resolveCookieSource()`.
+ *
+ *   • `fileCookieValid`: result of the last cookies.txt probe (null = not probed).
+ *   • `browserCookieSource`: the first browser in `cookieBrowsers` whose cookies
+ *     passed the probe, or null when none did.
+ */
+let fileCookieValid: boolean | null = null;
+let browserCookieSource: string | null = null;
+let browserCheckedAt = 0;
+let resolving: Promise<void> | null = null;
+
+/**
+ * The cookie arguments for a yt-dlp call. Order of preference:
+ *   1. cookies.txt, when it exists and has not failed validation;
+ *   2. the browser that was resolved from `cookieBrowsers`;
+ *   3. cookies.txt even though it failed validation (the old behaviour);
+ *   4. nothing (anonymous).
+ * Stays synchronous and cheap: it only reads cached state and stats the file.
+ */
 export function cookiesArgs(config: { cookiesFile: string }): string[] {
   const s = cookiesState(config);
+  if (s.present && fileCookieValid !== false) return ["--cookies", s.file];
+  if (browserCookieSource) return ["--cookies-from-browser", browserCookieSource];
   return s.present ? ["--cookies", s.file] : [];
+}
+
+/** The browser currently supplying cookies, or null. For logs and the dashboard. */
+export function activeBrowserCookieSource(): string | null {
+  return browserCookieSource;
 }
 
 export type CookiesChange = "appeared" | "disappeared" | "updated" | null;
@@ -192,27 +221,140 @@ export function resetCookiesBaseline(): void {
   cookiesBaseline = null;
 }
 
+/**
+ * Cheap validity probe for any yt-dlp cookie source (one metadata call):
+ * `["--cookies", file]` or `["--cookies-from-browser", "firefox"]`.
+ * A browser that cannot be read (not installed, database locked, no profile)
+ * makes yt-dlp exit non-zero, which counts as "not usable".
+ */
+/**
+ * Upper bound for one cookie probe. Startup waits for the probes, so a yt-dlp
+ * that hangs (a stalled network, a browser database that never unlocks) must
+ * not stall the engine: the probe is killed and counts as "not usable".
+ */
+export const COOKIE_PROBE_TIMEOUT_MS = 30_000;
+
+export async function validateCookieArgs(source: string[]): Promise<boolean> {
+  try {
+    const child = Bun.spawn(
+      [
+        ytDlp(),
+        ...source,
+        ...jsRuntimeArgs(),
+        "--no-warnings",
+        "--dump-single-json",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => {
+        try {
+          child.kill();
+        } catch {
+          // already exited
+        }
+        resolve("timeout");
+      }, COOKIE_PROBE_TIMEOUT_MS);
+    });
+    try {
+      const finished = Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]).then(([, stderr, code]) => ({ stderr, code }));
+      const result = await Promise.race([finished, timedOut]);
+      if (result === "timeout") return false;
+      return result.code === 0 && !result.stderr.toLowerCase().includes("login required");
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return false;
+  }
+}
+
 /** Cheap validity probe for a cookies file (one yt-dlp metadata call). */
 export async function validateCookies(cookiesFile: string): Promise<boolean> {
   if (!existsSync(cookiesFile)) return false;
-  const proc = Bun.spawn(
-    [
-      ytDlp(),
-      "--cookies",
-      cookiesFile,
-      ...jsRuntimeArgs(),
-      "--no-warnings",
-      "--dump-single-json",
-      "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    ],
-    { stdout: "pipe", stderr: "pipe" },
-  );
-  const [, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return code === 0 && !stderr.toLowerCase().includes("login required");
+  return validateCookieArgs(["--cookies", cookiesFile]);
+}
+
+/**
+ * Decide where cookies come from for this run, and remember the answer:
+ *
+ *   1. cookies.txt, if present and (when validateCookiesOnStart) it passes the probe;
+ *   2. otherwise the first browser in `cookieBrowsers` whose cookies pass the probe;
+ *   3. otherwise anonymous downloads.
+ *
+ * Browser probes are re-run at most every COOKIE_SOURCE_RECHECK_MS unless `force`
+ * is set (the engine forces a re-run when cookies.txt appears, changes or goes).
+ * Offline mode does no network work, so nothing is probed then.
+ */
+export function resolveCookieSource(
+  config: {
+    cookiesFile: string;
+    validateCookiesOnStart: boolean;
+    cookieBrowsers: string[];
+    offlineMode: boolean;
+  },
+  opts: { force?: boolean; log?: (msg: string) => void } = {},
+): Promise<void> {
+  if (config.offlineMode) return Promise.resolve();
+  if (resolving) return resolving;
+  resolving = doResolve(config, opts).finally(() => {
+    resolving = null;
+  });
+  return resolving;
+}
+
+async function doResolve(
+  config: { cookiesFile: string; validateCookiesOnStart: boolean; cookieBrowsers: string[] },
+  opts: { force?: boolean; log?: (msg: string) => void },
+): Promise<void> {
+  const log = opts.log ?? ((msg: string) => console.log(msg));
+  const s = cookiesState(config);
+
+  if (s.present && config.validateCookiesOnStart) {
+    fileCookieValid = await validateCookies(s.file);
+    if (fileCookieValid) {
+      browserCookieSource = null;
+      log("✅ Cookies validated (cookies.txt).");
+      return;
+    }
+    log("⚠️ cookies.txt is invalid or expired — trying browser cookies.");
+  } else if (s.present) {
+    // Validation switched off: trust the file as before, never probe browsers.
+    fileCookieValid = null;
+    browserCookieSource = null;
+    return;
+  } else {
+    fileCookieValid = null;
+  }
+
+  if (!opts.force && Date.now() - browserCheckedAt < COOKIE_SOURCE_RECHECK_MS) return;
+  browserCheckedAt = Date.now();
+
+  const tried: string[] = [];
+  for (const browser of config.cookieBrowsers) {
+    tried.push(browser);
+    if (await validateCookieArgs(["--cookies-from-browser", browser])) {
+      browserCookieSource = browser;
+      log(`🍪 Using cookies from ${browser} (${s.present ? "cookies.txt invalid" : "no cookies.txt"}).`);
+      return;
+    }
+  }
+  browserCookieSource = null;
+  if (tried.length === 0) {
+    log(
+      `ℹ️ No ${config.cookiesFile} and no cookieBrowsers configured — downloads run anonymously. Drop the file in while the engine runs and it is picked up within a minute.`,
+    );
+  } else {
+    log(
+      `ℹ️ No usable cookies (cookies.txt missing, browsers tried: ${tried.join(", ")}) — downloads run anonymously. Drop cookies.txt in while the engine runs and it is picked up within a minute.`,
+    );
+  }
 }
 
 /**

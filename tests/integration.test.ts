@@ -293,6 +293,8 @@ const BASE_CONFIG = (port: number, overrides: Record<string, unknown> = {}) => (
   outputRoot: "./downloads",
   archiveFile: "downloaded_videos.txt",
   cookiesFile: "cookies.txt",
+  // Hermetic: never read a real browser profile on the test machine.
+  cookieBrowsers: [],
   minFreeSpaceGB: 1,
   webPort: port,
   webBind: "127.0.0.1",

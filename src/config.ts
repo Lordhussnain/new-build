@@ -11,6 +11,11 @@ import { z } from "zod";
 
 export const CONFIG_PATH = "./config.json";
 
+// Browsers yt-dlp can read cookies from (`--cookies-from-browser`).
+export const COOKIE_BROWSER_NAMES = [
+  "firefox", "chrome", "brave", "edge", "chromium", "opera", "vivaldi", "safari",
+] as const;
+
 export const ConfigSchema = z
   .object({
     // --- Sources -------------------------------------------------------------
@@ -67,6 +72,9 @@ export const ConfigSchema = z
     outputRoot: z.string(),
     archiveFile: z.string(),
     cookiesFile: z.string(),
+    // Browsers tried in order when cookies.txt is missing or invalid. Empty = never
+    // read browser cookies (cookies.txt only).
+    cookieBrowsers: z.array(z.enum(COOKIE_BROWSER_NAMES)),
     deleteSourceAfterConvert: z.boolean(),
         // Every preset in QUALITY_FORMATS is selectable, globally and per job.
     videoQuality: z.enum(["highest", "4k", "1440p", "1080p", "720p", "480p", "audio"]),
@@ -176,6 +184,7 @@ export const DEFAULT_CONFIG: Config = {
   outputRoot: "./downloads",
   archiveFile: "downloaded_videos.txt",
   cookiesFile: "cookies.txt",
+  cookieBrowsers: ["firefox", "chrome", "brave"],
   deleteSourceAfterConvert: true,
   videoQuality: "1080p",
   targetFormat: "mp4",
