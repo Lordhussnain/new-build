@@ -406,3 +406,46 @@ function parseCliPort(raw: string): number {
   }
   return port;
 }
+
+// ---------------------------------------------------------------------------
+// LAN exposure of the web UI: `--lan` / YTA_LAN
+// ---------------------------------------------------------------------------
+
+/**
+ * The LAN exposure requested by this RUN, independent of config.json:
+ *
+ *   `--lan`            web UI listens on 0.0.0.0 (reachable from the LAN)
+ *   `--lan=false`      web UI listens on 127.0.0.1 (this machine only)
+ *   `--no-lan`         same as `--lan=false`
+ *   `YTA_LAN=1`        same as `--lan` (scheduled task / shortcut)
+ *   `YTA_LAN=false`    same as `--lan=false`
+ *
+ * Returns `null` when neither source says anything, in which case the stored
+ * `webBind` setting stands. The command line wins over the environment and the
+ * LAST flag wins among several. An unparsable value is ignored, never guessed.
+ *
+ * Pure on purpose: the engine passes the result straight to the server and
+ * never writes it into config.json.
+ */
+export function lanOverrideFromRuntime(
+  argv: readonly string[] = process.argv.slice(2),
+  env: Record<string, string | undefined> = process.env,
+): boolean | null {
+  let fromArgv: boolean | null = null;
+  for (const raw of argv) {
+    const arg = String(raw).trim().toLowerCase();
+    if (arg === "--lan") {
+      fromArgv = true;
+    } else if (arg === "--no-lan") {
+      fromArgv = false;
+    } else if (arg.startsWith("--lan=")) {
+      const parsed = parseOfflineSwitch(arg.slice("--lan=".length));
+      if (parsed !== null) fromArgv = parsed;
+    }
+  }
+  if (fromArgv !== null) return fromArgv;
+  if (env.YTA_LAN !== undefined && env.YTA_LAN !== null) {
+    return parseOfflineSwitch(String(env.YTA_LAN));
+  }
+  return null;
+}

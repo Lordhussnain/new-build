@@ -6,7 +6,7 @@
 
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { loadConfig, offlineOverrideFromRuntime, webPortOverrideFromRuntime } from "./config";
+import { lanOverrideFromRuntime, loadConfig, offlineOverrideFromRuntime, webPortOverrideFromRuntime } from "./config";
 import { aria2cPath, checkDependencies, validateCookies } from "./tools";
 import { initDatabase, pruneJobsForUnconfiguredSources } from "./db";
 import {
@@ -105,6 +105,25 @@ export async function main(): Promise<void> {
   if (webPortOverride !== null) {
     console.log(`🌐 Web UI port overridden for this run by --port: ${webPortOverride} (config.json is left unchanged).`);
   }
+  // `--lan` / YTA_LAN decide the bind address for THIS run only. The result is
+  // passed straight to the server and never written into config.json (the
+  // dashboard's settings save writes config, so an override stored there would
+  // leak into the file).
+  const lanOverride = lanOverrideFromRuntime();
+  const bindHost = lanOverride === null ? config.webBind || "127.0.0.1" : lanOverride ? "0.0.0.0" : "127.0.0.1";
+  if (lanOverride === true && !config.webToken) {
+    console.error(
+      "❌ --lan refused: the web UI would be reachable from the LAN without a login.\n" +
+        "   Set a strong \"webToken\" in config.json first, then start again.\n" +
+        "   Or drop --lan to keep the UI on this machine only.",
+    );
+    process.exit(1);
+  }
+  if (lanOverride !== null) {
+    console.log(
+      `🌐 LAN access ${lanOverride ? "ON" : "OFF"} for this run by --lan / YTA_LAN: web UI binds to ${bindHost} (config.json is left unchanged).`,
+    );
+  }
   setConfig(config);
   await checkDependencies(config);
 
@@ -173,7 +192,7 @@ export async function main(): Promise<void> {
   // 2b) HTTP gate: the port stays the lock for the dashboard and API. It is
   //     acquired second, so a refused start never leaves the port held.
   try {
-    webServer = startWebServer(listenPort, config);
+    webServer = startWebServer(listenPort, config, bindHost);
   } catch (err: any) {
     if (err?.code === "EADDRINUSE" || String(err?.message || "").includes("in use")) {
       console.error(
@@ -266,9 +285,9 @@ export async function main(): Promise<void> {
   }
 
   initDashboard(config);
-  const uiHost = !config.webBind || config.webBind === "0.0.0.0" ? "127.0.0.1" : config.webBind;
+  const uiHost = !bindHost || bindHost === "0.0.0.0" ? "127.0.0.1" : bindHost;
   console.log(
-    `Web UI: http://${uiHost}:${listenPort}${config.webToken ? "  (token required)" : ""}${config.webBind === "0.0.0.0" ? "  — listening on ALL interfaces" : ""}`,
+    `Web UI: http://${uiHost}:${listenPort}${config.webToken ? "  (token required)" : ""}${bindHost === "0.0.0.0" ? "  — listening on ALL interfaces (LAN)" : ""}`,
   );
 
   // These services are registered even when the engine starts offline; each

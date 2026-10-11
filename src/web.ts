@@ -215,12 +215,12 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 </script>
 </body></html>`;
 
-export function startWebServer(port: number, config: Config) {
+export function startWebServer(port: number, config: Config, hostname: string = config.webBind || "127.0.0.1") {
   return Bun.serve({
     // LAN-safe default: listen on loopback unless webBind is explicitly set
     // (e.g. 0.0.0.0 to reach the UI from other devices on the LAN).
     port,
-    hostname: config.webBind || "127.0.0.1",
+    hostname,
     async fetch(req) {
       // Every request is wrapped: a handler crash returns JSON 500 instead of
       // hanging the socket, and the error lands in error.log.
