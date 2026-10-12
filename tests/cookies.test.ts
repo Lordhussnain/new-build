@@ -53,7 +53,8 @@ describe("cookiesArgs", () => {
 
   test("passes the file once it has content", async () => {
     await writeFile(cookiesFile, "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tx\n");
-    expect(cookiesArgs(cfg())).toEqual(["--cookies", cookiesFile]);
+    // yt-dlp gets the private working copy, never the operator's export.
+    expect(cookiesArgs(cfg())).toEqual(["--cookies", `${cookiesFile}.working`]);
   });
 });
 

@@ -6,6 +6,7 @@
 /config.json
 /config.json.*.tmp
 /cookies.txt
+/cookies.txt.working
 
 # Runtime database, download archive, logs, and default output tree
 /archive.db*

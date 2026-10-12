@@ -5,7 +5,7 @@
 // installs (exe next to the app, scoop, choco, winget, or an explicit config
 // path) all work without touching PATH.
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, dirname, basename } from "node:path";
 import os from "node:os";
@@ -108,6 +108,47 @@ let browserCheckedAt = 0;
 let resolving: Promise<void> | null = null;
 
 /**
+ * yt-dlp does not only READ `--cookies FILE`: on exit it dumps its cookie jar
+ * back into that file (its help says "read cookies from and dump cookie jar
+ * in"). Every engine run that pointed yt-dlp at the operator's export therefore
+ * rewrote it, which the watcher then reported as "cookies.txt updated" every
+ * minute, and which overwrote the browser export itself.
+ *
+ * So yt-dlp is given a private working copy, `<cookiesFile>.working`, that the
+ * engine refreshes from the export whenever the export changes. The export is
+ * only ever read.
+ */
+export function cookieWorkingCopyPath(cookiesFile: string): string {
+  return `${cookiesFile}.working`;
+}
+
+let workingCopySource: { mtimeMs: number; size: number } | null = null;
+
+/**
+ * Path to hand yt-dlp for the cookies file. Re-copies the export when it is
+ * new or has changed since the last copy. Falls back to the export itself if
+ * the copy cannot be made, so the old behaviour is the worst case.
+ */
+export function cookieWorkingCopy(cookiesFile: string): string {
+  const working = cookieWorkingCopyPath(cookiesFile);
+  try {
+    const src = statSync(cookiesFile);
+    const same =
+      existsSync(working) &&
+      workingCopySource !== null &&
+      workingCopySource.mtimeMs === src.mtimeMs &&
+      workingCopySource.size === src.size;
+    if (!same) {
+      copyFileSync(cookiesFile, working);
+      workingCopySource = { mtimeMs: src.mtimeMs, size: src.size };
+    }
+    return working;
+  } catch {
+    return cookiesFile;
+  }
+}
+
+/**
  * The cookie arguments for a yt-dlp call. Order of preference:
  *   1. cookies.txt, when it exists and has not failed validation;
  *   2. the browser that was resolved from `cookieBrowsers`;
@@ -117,9 +158,9 @@ let resolving: Promise<void> | null = null;
  */
 export function cookiesArgs(config: { cookiesFile: string }): string[] {
   const s = cookiesState(config);
-  if (s.present && fileCookieValid !== false) return ["--cookies", s.file];
+  if (s.present && fileCookieValid !== false) return ["--cookies", cookieWorkingCopy(s.file)];
   if (browserCookieSource) return ["--cookies-from-browser", browserCookieSource];
-  return s.present ? ["--cookies", s.file] : [];
+  return s.present ? ["--cookies", cookieWorkingCopy(s.file)] : [];
 }
 
 /** The browser currently supplying cookies, or null. For logs and the dashboard. */
@@ -278,7 +319,7 @@ export async function validateCookieArgs(source: string[]): Promise<boolean> {
 /** Cheap validity probe for a cookies file (one yt-dlp metadata call). */
 export async function validateCookies(cookiesFile: string): Promise<boolean> {
   if (!existsSync(cookiesFile)) return false;
-  return validateCookieArgs(["--cookies", cookiesFile]);
+  return validateCookieArgs(["--cookies", cookieWorkingCopy(cookiesFile)]);
 }
 
 /**
