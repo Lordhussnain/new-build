@@ -282,6 +282,15 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
     "--no-overwrites",
   ];
 
+  // Politeness pause before each download. Only emitted when configured, so the
+  // default argv is unchanged.
+  if (config.sleepInterval > 0) {
+    args.push("--sleep-interval", String(config.sleepInterval));
+    if (config.maxSleepInterval > config.sleepInterval) {
+      args.push("--max-sleep-interval", String(config.maxSleepInterval));
+    }
+  }
+
   // Real bandwidth cap. yt-dlp translates --limit-rate into the external
   // downloader's own rate limit, so this works for both engines.
   const perWorkerLimitBytesPerSec = computePerWorkerLimitBytesPerSec(config, activeSlots);

@@ -48,6 +48,10 @@ export const ConfigSchema = z
     // fallback path): parallel fragments, fragment retries, HTTP range
     // chunking, and the socket buffer size.
     concurrentFragments: z.number().min(1).max(64),
+    // yt-dlp --sleep-interval / --max-sleep-interval: pause before each download.
+    // Capped at 60 s, well under the 180 s stall watchdog. 0 = off.
+    sleepInterval: z.number().min(0).max(60),
+    maxSleepInterval: z.number().min(0).max(60),
     fragmentRetries: z.number().min(1).max(50),
     httpChunkSize: z.string(),
     bufferSize: z.string(),
@@ -172,6 +176,8 @@ export const DEFAULT_CONFIG: Config = {
   connectionsPerDownload: 16,
   minSplitSize: "1M",
   concurrentFragments: 16,
+  sleepInterval: 0,
+  maxSleepInterval: 0,
   fragmentRetries: 10,
   httpChunkSize: "",
   bufferSize: "",

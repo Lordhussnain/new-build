@@ -288,6 +288,18 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
     64,
   );
   config.fragmentRetries = await askNumber("Fragment retries", config.fragmentRetries, 1, 50);
+  config.sleepInterval = await askNumber(
+    "Seconds to sleep before each download (0 = off, max 60)",
+    config.sleepInterval,
+    0,
+    60,
+  );
+  config.maxSleepInterval = await askNumber(
+    "Maximum random sleep in seconds (0 = fixed sleep, max 60)",
+    config.maxSleepInterval,
+    0,
+    60,
+  );
   const chunkAns = await ask(
     `   HTTP chunk size for range-based chunked downloads (blank = off, e.g. 10M) [current: ${config.httpChunkSize || "off"}]: `,
   );
