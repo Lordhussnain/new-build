@@ -298,7 +298,7 @@ describe("applySettings", () => {
 
   test("reports no change when the value is already current", async () => {
     const dir = await makeConfigDir();
-    const result = await applySettings(baseConfig(), { concurrentFragments: 16 }, join(dir, "config.json"));
+    const result = await applySettings(baseConfig(), { concurrentFragments: 8 }, join(dir, "config.json"));
     expect(result.ok).toBe(true);
     expect(result.changed).toEqual([]);
   });

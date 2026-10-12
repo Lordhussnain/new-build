@@ -53,8 +53,8 @@ describe("resolveDownloaderEngine", () => {
 });
 
 describe("buildAria2cArgs", () => {
-  test("defaults to 16 connections and omits the split size (yt-dlp already uses 1M)", () => {
-    expect(buildAria2cArgs(cfg())).toBe("-x 16 -s 16 -j 16");
+  test("defaults to 8 connections and omits the split size (yt-dlp already uses 1M)", () => {
+    expect(buildAria2cArgs(cfg())).toBe("-x 8 -s 8 -j 8");
   });
 
   test("honours a custom connection count", () => {
@@ -65,7 +65,7 @@ describe("buildAria2cArgs", () => {
   test("adds --min-split-size only when it differs from yt-dlp's default", () => {
     expect(buildAria2cArgs(cfg({ minSplitSize: "1M" }))).not.toContain("--min-split-size");
     expect(buildAria2cArgs(cfg({ minSplitSize: "512K" }))).not.toContain("--min-split-size");
-    expect(buildAria2cArgs(cfg({ minSplitSize: "4M" }))).toBe("-x 16 -s 16 -j 16 --min-split-size 4M");
+    expect(buildAria2cArgs(cfg({ minSplitSize: "4M" }))).toBe("-x 8 -s 8 -j 8 --min-split-size 4M");
   });
 
   test("hands an unparsable size to aria2c instead of dropping it silently", () => {
@@ -74,9 +74,9 @@ describe("buildAria2cArgs", () => {
     // BAD_DOWNLOADER_ARGS pause. Dropping the value here would leave the
     // operator believing a setting was in effect that never was.
     expect(buildAria2cArgs(cfg({ minSplitSize: "banana" }))).toBe(
-      "-x 16 -s 16 -j 16 --min-split-size banana",
+      "-x 8 -s 8 -j 8 --min-split-size banana",
     );
-    expect(buildAria2cArgs(cfg({ minSplitSize: " 5X " }))).toBe("-x 16 -s 16 -j 16 --min-split-size 5X");
+    expect(buildAria2cArgs(cfg({ minSplitSize: " 5X " }))).toBe("-x 8 -s 8 -j 8 --min-split-size 5X");
     // "1 MB" is not junk: the parser accepts whitespace between number and unit,
     // and the value equals the 1M floor — the satisfiable case, so it is omitted
     // rather than handed over (nothing for aria2c to reject).
@@ -154,7 +154,7 @@ describe("buildDownloadPlan", () => {
     });
     expect(flagValue(plan.args, "--downloader")).toBe(join("C:\\tools", "aria2c.exe"));
     // The downloader args are unchanged — only the binary reference differs.
-    expect(flagValue(plan.args, "--downloader-args")).toBe("aria2c:-x 16 -s 16 -j 16");
+    expect(flagValue(plan.args, "--downloader-args")).toBe("aria2c:-x 8 -s 8 -j 8");
   });
 
   test("falls back to the bare name when no binary was resolved", () => {
