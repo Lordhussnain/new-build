@@ -68,7 +68,7 @@ import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-t
 import { formatBytesPerSec, formatDuration } from "./util";
 import { updateWorkerLine } from "./dashboard";
 import { errorLogPath, logError } from "./logger";
-import { QUALITY_FORMATS, withConfigWriteLock, type Config } from "./config";
+import { QUALITY_FORMATS, effectiveWebToken, withConfigWriteLock, type Config } from "./config";
 
 // --- Web UI auth (optional shared-secret token) ------------------------------
 // When webToken is set, every request except POST /api/auth must present it —
@@ -106,7 +106,7 @@ export function timingSafeEq(a: string, b: string): boolean {
 }
 
 export function isAuthorized(req: Request, url: URL, config: Config): boolean {
-  const expected = config.webToken;
+  const expected = effectiveWebToken(config);
   if (!expected) return true;
   return presentedWebTokens(req, url).some((presented) => timingSafeEq(presented, expected));
 }
@@ -137,7 +137,7 @@ function tokenCookie(token: string, url: URL): string {
 }
 
 async function exchangeToken(req: Request, config: Config, url: URL): Promise<Response> {
-  const expected = config.webToken;
+  const expected = effectiveWebToken(config);
   if (!expected) return Response.json({ ok: false, error: "Token authentication is not configured" }, { status: 404 });
   let body: unknown;
   try {
@@ -246,7 +246,7 @@ export async function handleRequest(req: Request, config: Config): Promise<Respo
 
   if (url.pathname === "/") {
     const queryToken = url.searchParams.get("token");
-    const expected = config.webToken;
+    const expected = effectiveWebToken(config);
     const validQueryToken = !!queryToken && !!expected && timingSafeEq(queryToken.trim(), expected);
     if (expected && !isAuthorized(req, url, config)) {
       // Missing/wrong token → the sign-in page (401 so browsers don't treat it

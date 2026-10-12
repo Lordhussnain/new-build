@@ -6,7 +6,15 @@
 
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { lanOverrideFromRuntime, loadConfig, offlineOverrideFromRuntime, webPortOverrideFromRuntime } from "./config";
+import {
+  effectiveWebToken,
+  lanOverrideFromRuntime,
+  loadConfig,
+  offlineOverrideFromRuntime,
+  setRuntimeWebToken,
+  webPortOverrideFromRuntime,
+  webTokenOverrideFromRuntime,
+} from "./config";
 import { COOKIE_SOURCE_RECHECK_MS, aria2cPath, checkDependencies, resolveCookieSource } from "./tools";
 import { initDatabase, pruneJobsForUnconfiguredSources } from "./db";
 import {
@@ -109,12 +117,21 @@ export async function main(): Promise<void> {
   // passed straight to the server and never written into config.json (the
   // dashboard's settings save writes config, so an override stored there would
   // leak into the file).
+  // `--webtoken` works the same way: it is kept out of config.json (see
+  // setRuntimeWebToken) and only protects this run.
+  const webTokenOverride = webTokenOverrideFromRuntime();
+  if (webTokenOverride !== null) {
+    setRuntimeWebToken(webTokenOverride);
+    console.log("🔑 Web UI token set for this run by --webtoken (config.json is left unchanged; the token is not shown).");
+  }
   const lanOverride = lanOverrideFromRuntime();
   const bindHost = lanOverride === null ? config.webBind || "127.0.0.1" : lanOverride ? "0.0.0.0" : "127.0.0.1";
-  if (lanOverride === true && !config.webToken) {
+  const webToken = effectiveWebToken(config);
+  if (lanOverride === true && !webToken) {
     console.error(
       "❌ --lan refused: the web UI would be reachable from the LAN without a login.\n" +
-        "   Set a strong \"webToken\" in config.json first, then start again.\n" +
+        "   Add a token for this run:  --webtoken <your-secret>\n" +
+        "   or set a strong \"webToken\" in config.json, then start again.\n" +
         "   Or drop --lan to keep the UI on this machine only.",
     );
     process.exit(1);
@@ -283,7 +300,7 @@ export async function main(): Promise<void> {
   initDashboard(config);
   const uiHost = !bindHost || bindHost === "0.0.0.0" ? "127.0.0.1" : bindHost;
   console.log(
-    `Web UI: http://${uiHost}:${listenPort}${config.webToken ? "  (token required)" : ""}${bindHost === "0.0.0.0" ? "  — listening on ALL interfaces (LAN)" : ""}`,
+    `Web UI: http://${uiHost}:${listenPort}${webToken ? "  (token required)" : ""}${bindHost === "0.0.0.0" ? "  — listening on ALL interfaces (LAN)" : ""}`,
   );
 
   // These services are registered even when the engine starts offline; each

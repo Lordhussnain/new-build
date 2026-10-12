@@ -420,6 +420,58 @@ function parseCliPort(raw: string): number {
 // LAN exposure of the web UI: `--lan` / YTA_LAN
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Web token for this run: `--webtoken <value>` (or `--webtoken=<value>`)
+// ---------------------------------------------------------------------------
+
+/**
+ * The token supplied on the command line for THIS run. It is kept beside the
+ * config object on purpose: the dashboard's settings save writes the whole
+ * in-memory config to config.json, so a token stored in that object would be
+ * written to disk on the next save.
+ */
+let runtimeWebToken: string | null = null;
+
+export function setRuntimeWebToken(token: string | null): void {
+  runtimeWebToken = token;
+}
+
+/** The token that actually protects the web UI: the CLI value when given, else config.json. */
+export function effectiveWebToken(config: { webToken: string }): string {
+  return runtimeWebToken ?? config.webToken;
+}
+
+/**
+ * Parse `--webtoken <value>` / `--webtoken=<value>` from the command line.
+ * The last occurrence wins. A missing or blank value throws rather than being
+ * ignored: silently running without the token the operator asked for would
+ * expose the UI unprotected. The value keeps its case and is trimmed.
+ */
+export function webTokenOverrideFromRuntime(argv: readonly string[] = process.argv.slice(2)): string | null {
+  let override: string | null = null;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = String(argv[i]).trim();
+    const lower = arg.toLowerCase();
+    if (lower === "--webtoken") {
+      const next = argv[i + 1];
+      if (next === undefined || String(next).trim().startsWith("--")) {
+        throw new Error("Missing value for --webtoken (example: --webtoken 789654).");
+      }
+      override = parseWebToken(String(next));
+      i++;
+    } else if (lower.startsWith("--webtoken=")) {
+      override = parseWebToken(arg.slice("--webtoken=".length));
+    }
+  }
+  return override;
+}
+
+function parseWebToken(raw: string): string {
+  const value = raw.trim();
+  if (!value) throw new Error("Invalid value for --webtoken: the token must not be empty.");
+  return value;
+}
+
 /**
  * The LAN exposure requested by this RUN, independent of config.json:
  *
