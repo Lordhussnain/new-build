@@ -26,6 +26,12 @@ export interface ListingItem {
    * channel listings, where `playlist` is the tab title ("Name - Shorts").
    */
   channel?: string;
+  /**
+   * A playlist entry inside the listing (a channel's /playlists tab), not a
+   * video. `id` is the playlist id and `title` its name. These are expanded into
+   * their own scans, never queued as videos.
+   */
+  isPlaylist?: boolean;
 }
 
 /** Trailing tab name yt-dlp appends to a channel tab's title: "Name - Videos". */
@@ -59,12 +65,25 @@ export function isShortsTabItem(item: ListingItem): boolean {
 }
 
 /**
- * yt-dlp lists a channel's /playlists tab, or a playlist that appears inside a
- * tab, as an entry whose id is a playlist/channel id (PL…, UU…, UC…), not an
- * 11-character video id. Those are not videos and must never become jobs.
+ * What a listing entry's id names. yt-dlp lists a channel's /playlists tab as
+ * playlist ids (PL…, UU…), not 11-character video ids. A playlist entry is
+ * expanded into its own scan; a channel entry (UC…) is not downloadable this way.
  */
-export function isPlaylistLikeId(id: string): boolean {
-  return id.length > 11 && /^(?:PL|UU|OL|FL|LL|RD|UC|VL|EL)/.test(id);
+export function listingEntryKind(id: string): "video" | "playlist" | "channel" {
+  if (id.length <= 11) return "video";
+  if (/^UC/.test(id)) return "channel";
+  if (/^(?:PL|UU|OL|FL|LL|RD|VL|EL)/.test(id)) return "playlist";
+  return "video";
+}
+
+/** A channel URL's root (no tab), so its playlists can be scanned too. */
+export function isChannelRootUrl(url: string): boolean {
+  try {
+    const parsed = parseSourceUrl(url);
+    return parsed.key === "channels" && !/\/(?:videos|shorts|streams|live|featured)$/.test(parsed.url);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -151,8 +170,11 @@ export function parseListingLine(line: string): ListingItem | null {
   };
   const uploader = (channel || "").trim();
   if (uploader && uploader !== "NA") item.channel = uploader;
-  if (isPlaylistLikeId(item.id)) return null;
-  return item.id ? item : null;
+  if (!item.id) return null;
+  const kind = listingEntryKind(item.id);
+  if (kind === "channel") return null;
+  if (kind === "playlist") item.isPlaylist = true;
+  return item;
 }
 
 /** Read yt-dlp's stdout incrementally, emitting batches of parsed items. */
@@ -422,48 +444,60 @@ export async function ingestItems(
     }
   });
 
-  for (let i = 0; i < items.length; i += CHUNK_SIZE) {
-    insertChunk(items.slice(i, i + CHUNK_SIZE));
+  // Playlist entries are expanded by scanAndIngest, never queued as videos.
+  const videos = items.filter((item) => !item.isPlaylist);
+  for (let i = 0; i < videos.length; i += CHUNK_SIZE) {
+    insertChunk(videos.slice(i, i + CHUNK_SIZE));
   }
 
   return { found: items.length, added, skipped };
 }
 
-/** Full scan of one playlist/channel URL, then ingest.
- *
- * Videos are ingested batch by batch while yt-dlp is still listing the source,
- * so the download workers start on the first videos of a large playlist at once.
- * Batches are idempotent (already-known videos are skipped), so a retried
- * attempt never queues a video twice.
- *
- * Transient network errors are retried with exponential backoff (up to
- * SCAN_MAX_RETRIES attempts) so a single HTTP hiccup doesn't permanently
- * drop an entire source during startup when managing 1000+ playlists.
- */
-export async function scanAndIngest(
-  url: string,
-  config: Config,
-  overrideFolderName?: string,
-): Promise<{ found: number; added: number; skipped: number }> {
-  const totals = { found: 0, added: 0, skipped: 0 };
-  // The callers check offline mode too, but this boundary is authoritative: the
-  // setting can change while a daemon/startup scan is between sources.
-  if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return totals;
+export interface ScanTotals {
+  found: number;
+  added: number;
+  skipped: number;
+  /** Playlists a channel (or /playlists tab) listed and that were scanned. */
+  playlists?: number;
+}
 
+/** Options for one listing URL. */
+interface ListingScanOptions {
+  /** Folder for every video of this listing; otherwise derived from the listing. */
+  folder?: string;
+  /** Configured source the jobs belong to (the channel, for its playlists). */
+  owner: string;
+}
+
+/**
+ * Scan one listing URL and ingest its videos under `owner`. Playlist entries
+ * found in the listing are returned, not queued, so the caller can expand them.
+ */
+async function scanListing(
+  listingUrl: string,
+  config: Config,
+  opts: ListingScanOptions,
+): Promise<{ totals: ScanTotals; playlists: ListingItem[] }> {
+  const totals: ScanTotals = { found: 0, added: 0, skipped: 0 };
+  const playlists: ListingItem[] = [];
+  const channel = isChannelSource(opts.owner);
   // A channel's tabs all share one folder, named after the channel. Resolved
   // from the first batch, since every item in a channel listing carries it.
-  const channel = isChannelSource(url);
   let channelFolder: string | undefined;
+  const blocked = () => config.offlineMode || getConfig().offlineMode || isSourceBlocked(opts.owner);
 
   const ingestBatch = async (items: ListingItem[]) => {
     // Re-check per batch: offline mode or a source removal can land mid-listing.
-    if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return;
-    let folder = overrideFolderName;
-    if (!folder && channel && items.length > 0) {
-      channelFolder ??= channelFolderName(items[0]) || undefined;
+    if (blocked()) return;
+    const videos = items.filter((item) => !item.isPlaylist);
+    playlists.push(...items.filter((item) => item.isPlaylist));
+    if (videos.length === 0) return;
+    let folder = opts.folder;
+    if (!folder && channel) {
+      channelFolder ??= channelFolderName(videos[0]) || undefined;
       folder = channelFolder;
     }
-    const result = await ingestItems(items, config, folder, url);
+    const result = await ingestItems(videos, config, folder, opts.owner);
     totals.found += result.found;
     totals.added += result.added;
     totals.skipped += result.skipped;
@@ -472,8 +506,8 @@ export async function scanAndIngest(
   let lastErr: unknown;
   for (let attempt = 1; attempt <= SCAN_MAX_RETRIES; attempt++) {
     try {
-      await getPlaylistItems(url, config, { onItems: ingestBatch, idle: channel });
-      return totals;
+      await getPlaylistItems(listingUrl, config, { onItems: ingestBatch, idle: channel });
+      return { totals, playlists };
     } catch (err: any) {
       lastErr = err;
       const msg = String(err?.message || err);
@@ -483,14 +517,86 @@ export async function scanAndIngest(
       const backoffMs = SCAN_BACKOFF_BASE_MS * Math.pow(2, attempt - 1);
       logError(
         "scanner",
-        `${url}: transient scan error on attempt ${attempt}/${SCAN_MAX_RETRIES}, retrying in ${Math.round(backoffMs / 1000)}s: ${msg.slice(0, 200)}`,
+        `${listingUrl}: transient scan error on attempt ${attempt}/${SCAN_MAX_RETRIES}, retrying in ${Math.round(backoffMs / 1000)}s: ${msg.slice(0, 200)}`,
       );
       await Bun.sleep(backoffMs);
       // Re-check after the sleep: the engine may have gone offline.
-      if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return totals;
+      if (blocked()) return { totals, playlists };
     }
   }
   throw lastErr;
+}
+
+/**
+ * Scan each playlist entry into its own folder named after the playlist, owned
+ * by `owner`. One failing playlist (private, removed, …) is logged and never
+ * stops the rest.
+ */
+async function expandPlaylists(entries: ListingItem[], config: Config, owner: string): Promise<ScanTotals> {
+  const totals: ScanTotals = { found: 0, added: 0, skipped: 0, playlists: 0 };
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(owner)) break;
+    if (seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    const url = `https://www.youtube.com/playlist?list=${entry.id}`;
+    try {
+      const { totals: part } = await scanListing(url, config, {
+        folder: entry.title || undefined,
+        owner,
+      });
+      totals.found += part.found;
+      totals.added += part.added;
+      totals.skipped += part.skipped;
+      totals.playlists = (totals.playlists ?? 0) + 1;
+    } catch (err: any) {
+      logError("scan", `${url} (playlist of ${owner}): ${String(err?.message || err)}`);
+    }
+  }
+  return totals;
+}
+
+/**
+ * Full scan of one saved source, then ingest.
+ *
+ * - A playlist: its videos.
+ * - A channel (`@handle`, `/channel/…`, …): all its uploads, live streams and
+ *   Shorts into one channel folder, then every playlist on its /playlists tab,
+ *   each into a folder named after that playlist.
+ * - A channel's /playlists tab: every playlist on it.
+ *
+ * Videos are ingested batch by batch while yt-dlp is still listing the source.
+ * Batches are idempotent (already-known videos are skipped), so a retried
+ * attempt never queues a video twice. Transient network errors are retried
+ * with exponential backoff (up to SCAN_MAX_RETRIES attempts).
+ */
+export async function scanAndIngest(url: string, config: Config, overrideFolderName?: string): Promise<ScanTotals> {
+  // The callers check offline mode too, but this boundary is authoritative: the
+  // setting can change while a daemon/startup scan is between sources.
+  if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) {
+    return { found: 0, added: 0, skipped: 0 };
+  }
+  const { totals, playlists } = await scanListing(url, config, { folder: overrideFolderName, owner: url });
+  const expanded = [...playlists];
+  // A channel root also owns its /playlists tab. A channel with no playlists
+  // tab is normal, so a failure there is logged and never fails the scan.
+  if (isChannelRootUrl(url)) {
+    const tabUrl = `${url.replace(/\/+$/, "")}/playlists`;
+    try {
+      const tab = await scanListing(tabUrl, config, { owner: url });
+      expanded.push(...tab.playlists);
+    } catch (err: any) {
+      logError("scan", `${tabUrl}: ${String(err?.message || err)}`);
+    }
+  }
+  if (expanded.length === 0) return totals;
+  const more = await expandPlaylists(expanded, config, url);
+  return {
+    found: totals.found + more.found,
+    added: totals.added + more.added,
+    skipped: totals.skipped + more.skipped,
+    playlists: more.playlists,
+  };
 }
 
 export interface SourceScanOutcome {

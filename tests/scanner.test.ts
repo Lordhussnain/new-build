@@ -8,7 +8,8 @@ import {
   channelFolderName,
   getPlaylistItems,
   isChannelSource,
-  isPlaylistLikeId,
+  isChannelRootUrl,
+  listingEntryKind,
   isShortsTabItem,
   LISTING_BATCH_SIZE,
   parseListingLine,
@@ -32,7 +33,31 @@ const WIN = process.platform === "win32";
  */
 const TEST_TIMEOUT_MS = WIN ? 30_000 : 10_000;
 
-type FakeMode = "ok" | "empty" | "fail" | "hang" | "many" | "channel" | "slow" | "playlists-tab";
+type FakeMode = "ok" | "empty" | "fail" | "hang" | "many" | "channel" | "slow";
+
+/**
+ * What yt-dlp prints for a channel, keyed by the listing URL it was given: the
+ * channel root (uploads, Shorts, live), its /playlists tab, and each playlist.
+ * A channel entry (UC…) must be dropped; a playlist entry must not become a video.
+ */
+const CHANNEL_LISTINGS: Record<string, string[]> = {
+  root: [
+    "LearnGandC - Videos|||vid00000001|||Lesson 1|||600|||LearnGandC",
+    "LearnGandC - Videos|||vid00000002|||Lesson 2|||720|||LearnGandC",
+    "LearnGandC - Shorts|||shrt0000001|||Quick tip|||NA|||LearnGandC",
+    "LearnGandC - Live|||live0000001|||Live Q and A|||3600|||LearnGandC",
+    "LearnGandC - Videos|||UCabcdefghijklmnopqrstuvw|||Some other channel|||NA|||LearnGandC",
+  ],
+  tab: [
+    "LearnGandC - Playlists|||PLAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|||Season 1|||NA|||LearnGandC",
+    "LearnGandC - Playlists|||PLBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB|||Season 2|||NA|||LearnGandC",
+  ],
+  PLAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA: [
+    "Season 1|||pl1vid0001a|||S1 E1|||300|||LearnGandC",
+    "Season 1|||vid00000001|||Lesson 1|||600|||LearnGandC",
+  ],
+  PLBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB: ["Season 2|||pl2vid0001b|||S2 E1|||300|||LearnGandC"],
+};
 
 const originalYtDlp = resolvedTools.ytDlp;
 let fixtureDir = "";
@@ -85,17 +110,8 @@ beforeAll(async () => {
       `if (mode === "hang") await new Promise(() => {});`,
       `if (mode === "fail") { console.error("ERROR: Failed to extract playlist: scanner test error"); process.exit(7); }`,
       `if (mode === "many") { const rows = []; for (let i = 1; i <= 120; i++) rows.push("Mock Playlist|||many" + String(i).padStart(3, "0") + "|||Video " + i + "|||60"); console.log(rows.join("\\n")); }`,
-      // A channel listing as yt-dlp prints it: each tab's entries are named
-      // "<Channel> - <Tab>", and the fifth field is the channel's display name.
-      // The /playlists tab's entry carries a playlist id, not a video id.
-      `if (mode === "channel") console.log([`,
-      `  "LearnGandC - Videos|||vid00000001|||Lesson 1|||600|||LearnGandC",`,
-      `  "LearnGandC - Videos|||vid00000002|||Lesson 2|||720|||LearnGandC",`,
-      `  "LearnGandC - Shorts|||shrt0000001|||Quick tip|||NA|||LearnGandC",`,
-      `  "LearnGandC - Live|||live0000001|||Live Q and A|||3600|||LearnGandC",`,
-      `  "LearnGandC - Videos|||PLabcdefghijklmnopqrstuvwxyz012345|||A playlist|||NA|||LearnGandC",`,
-      `].join("\\n"));`,
-      `if (mode === "playlists-tab") console.log("LearnGandC - Playlists|||PLabcdefghijklmnopqrstuvwxyz012345|||Season 1|||NA|||LearnGandC");`,
+      // A channel listing as yt-dlp prints it, chosen by the URL it was given.
+      `if (mode === "channel") { const url = process.argv.at(-1); const tables = ${JSON.stringify(CHANNEL_LISTINGS)}; const key = url.endsWith("/playlists") ? "tab" : url.includes("list=") ? url.split("list=")[1] : "root"; console.log((tables[key] || []).join("\\n")); }`,
       // Prints a line every 200ms for about a second: slow, but never silent.
       `if (mode === "slow") { for (let i = 1; i <= 5; i++) { console.log("Slow Channel - Videos|||slow00000" + i + "|||Slow " + i + "|||60|||Slow Channel"); await Bun.sleep(200); } }`,
       `if (mode === "ok") console.log("Mock Playlist|||scan001|||First Video|||120\\nMock Playlist|||scan002|||Second Video|||NaN");`,
@@ -145,9 +161,13 @@ describe("channel listings", () => {
     expect(items.map((item) => channelFolderName(item))).toEqual(["LearnGandC", "LearnGandC", "LearnGandC", "LearnGandC"]);
   }, TEST_TIMEOUT_MS);
 
-  test("a channel's /playlists tab yields no videos instead of playlist ids", async () => {
-    await useScanner("playlists-tab");
-    expect(await getPlaylistItems("https://www.youtube.com/@LearnGandC/playlists", DEFAULT_CONFIG)).toEqual([]);
+  test("a channel's /playlists tab lists its playlists, not videos", async () => {
+    await useScanner("channel");
+    const items = await getPlaylistItems("https://www.youtube.com/@LearnGandC/playlists", DEFAULT_CONFIG);
+    expect(items.map((item) => [item.id, item.title, item.isPlaylist])).toEqual([
+      ["PLAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "Season 1", true],
+      ["PLBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "Season 2", true],
+    ]);
   }, TEST_TIMEOUT_MS);
 
   test("an idle limit lets a slow but progressing listing finish, while a total limit does not", async () => {
@@ -184,6 +204,16 @@ describe("channel helpers", () => {
     expect(channelFolderName({ id: "a", title: "", playlist: "Plain Playlist", duration: NaN })).toBe("Plain Playlist");
   });
 
+  test("listing entry kinds and channel root detection", () => {
+    expect(listingEntryKind("vid00000001")).toBe("video");
+    expect(listingEntryKind("PLabcdefghijklmnopqrstuvwxyz012345")).toBe("playlist");
+    expect(listingEntryKind("UCabcdefghijklmnopqrstuvw")).toBe("channel");
+    expect(isChannelRootUrl("https://www.youtube.com/@LearnGandC/")).toBe(true);
+    expect(isChannelRootUrl("https://www.youtube.com/@LearnGandC/shorts")).toBe(false);
+    expect(isChannelRootUrl("https://www.youtube.com/@LearnGandC/playlists")).toBe(false);
+    expect(isChannelRootUrl("https://www.youtube.com/playlist?list=PLabcdefghijklmnopqrstuvwxyz012345")).toBe(false);
+  });
+
   test("source and entry classification", () => {
     expect(isChannelSource("https://www.youtube.com/@LearnGandC/")).toBe(true);
     expect(isChannelSource("https://www.youtube.com/@LearnGandC/shorts")).toBe(true);
@@ -191,9 +221,6 @@ describe("channel helpers", () => {
     expect(isChannelSource("https://www.youtube.com/playlist?list=PLabcdefghijklmnopqrstuvwxyz012345")).toBe(false);
     expect(isShortsTabItem({ id: "a", title: "", playlist: "LearnGandC - Shorts", duration: NaN })).toBe(true);
     expect(isShortsTabItem({ id: "a", title: "", playlist: "LearnGandC - Videos", duration: NaN })).toBe(false);
-    expect(isPlaylistLikeId("vid00000001")).toBe(false);
-    expect(isPlaylistLikeId("PLabcdefghijklmnopqrstuvwxyz012345")).toBe(true);
-    expect(isPlaylistLikeId("UCabcdefghijklmnopqrstuvw")).toBe(true);
   });
 });
 
@@ -208,17 +235,36 @@ describe("channel scans", () => {
     await removeTempDir(outputRoot);
   });
 
-  test("every tab of a channel lands in one channel folder, and Shorts follow skipShorts", async () => {
+  test("a channel's tabs share one folder and its playlists get their own", async () => {
     await useScanner("channel");
     const config: Config = { ...DEFAULT_CONFIG, outputRoot, skipShorts: true, downloadShorts: false };
     setConfig(config);
     const result = await scanAndIngest("https://www.youtube.com/@LearnGandC/", config);
-    expect(result).toMatchObject({ found: 4, added: 3, skipped: 1 });
+    expect(result.playlists).toBe(2);
     const rows = db.query("SELECT id, folder FROM jobs ORDER BY id").all() as { id: string; folder: string }[];
     expect(rows).toEqual([
       { id: "live0000001", folder: "LearnGandC" },
+      { id: "pl1vid0001a", folder: "Season 1" },
+      { id: "pl2vid0001b", folder: "Season 2" },
       { id: "vid00000001", folder: "LearnGandC" },
       { id: "vid00000002", folder: "LearnGandC" },
+    ]);
+    // Playlist jobs belong to the channel, so removing the channel removes them.
+    const owners = db.query("SELECT DISTINCT source_url FROM job_sources WHERE job_id = 'pl1vid0001a'").all();
+    expect(owners).toEqual([{ source_url: "https://www.youtube.com/@LearnGandC" }]);
+  }, TEST_TIMEOUT_MS);
+
+  test("a channel's /playlists tab downloads each playlist into its own folder", async () => {
+    await useScanner("channel");
+    const config: Config = { ...DEFAULT_CONFIG, outputRoot };
+    setConfig(config);
+    const result = await scanAndIngest("https://www.youtube.com/@LearnGandC/playlists", config);
+    expect(result.playlists).toBe(2);
+    const rows = db.query("SELECT id, folder FROM jobs ORDER BY id").all();
+    expect(rows).toEqual([
+      { id: "pl1vid0001a", folder: "Season 1" },
+      { id: "pl2vid0001b", folder: "Season 2" },
+      { id: "vid00000001", folder: "Season 1" },
     ]);
   }, TEST_TIMEOUT_MS);
 
@@ -226,8 +272,7 @@ describe("channel scans", () => {
     await useScanner("channel");
     const config: Config = { ...DEFAULT_CONFIG, outputRoot, skipShorts: false };
     setConfig(config);
-    const result = await scanAndIngest("https://www.youtube.com/@LearnGandC", config);
-    expect(result).toMatchObject({ found: 4, added: 4, skipped: 0 });
+    await scanAndIngest("https://www.youtube.com/@LearnGandC", config);
     expect(db.query("SELECT folder FROM jobs WHERE id = 'shrt0000001'").get()).toEqual({ folder: "LearnGandC" });
   }, TEST_TIMEOUT_MS);
 });

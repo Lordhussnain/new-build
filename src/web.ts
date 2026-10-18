@@ -1639,7 +1639,8 @@ const ROUTES: Route[] = [
         const result = await scanAndIngest(source.url, liveConfig, body.folder?.trim() || undefined);
         const summary = result.found === 0
           ? `No videos found at ${source.url} (check the URL, network, or cookies)`
-          : `Scanned ${result.found} video(s): ${result.added} added, ${result.skipped} skipped`;
+          : `Scanned ${result.found} video(s): ${result.added} added, ${result.skipped} skipped` +
+            (result.playlists ? `; ${result.playlists} playlist(s) scanned` : "");
         const message = `Saved to config.json (${savedSource.key}). ${summary}`;
         return Response.json({ ok: true, saved: true, source: savedSource, message, ...result });
       } catch (e: any) {

@@ -184,8 +184,15 @@ and RSS uploads go to the same folder. Shorts follow `skipShorts`: a Shorts entr
 has no duration in the listing, so its tab decides, and it is skipped by default.
 A channel listing is only stopped after 30 minutes with no output, so very large
 channels finish instead of hitting the 10-minute limit used for playlists. Playlist
-entries inside a listing (for example from a `/playlists` tab) are not queued as
-videos.
+entries inside a listing are not queued as videos.
+
+**All playlists of a channel**: a channel link also downloads every playlist on
+its `/playlists` tab. Each playlist gets its own folder named after the playlist
+(for example `downloads/Season 1/`), and the playlist's jobs belong to the channel,
+so removing the channel removes them too. A video that is both in an uploads tab
+and a playlist stays in the channel folder it was queued into first. Pasting a
+channel's `/playlists` link on its own does the same thing without the uploads.
+A channel with no playlists tab is fine; the uploads still download.
 
 **Single video only** (the checkbox under the URL box) changes that one case:
 a `watch?v=…&list=…&index=…` link saves only the video `v=` and drops the
