@@ -176,6 +176,17 @@ Videos are queued as yt-dlp lists them, so a large playlist starts downloading
 while the rest of it is still being scanned. The request returns once the whole
 listing has been read.
 
+**Downloading a whole channel** (`https://www.youtube.com/@Handle`, with or without
+a trailing `/`): the channel's uploads, live streams and Shorts are all listed.
+Every video goes into **one folder named after the channel** (for example
+`downloads/LearnGandC/`), not a separate `… - Videos` / `… - Shorts` folder per tab,
+and RSS uploads go to the same folder. Shorts follow `skipShorts`: a Shorts entry
+has no duration in the listing, so its tab decides, and it is skipped by default.
+A channel listing is only stopped after 30 minutes with no output, so very large
+channels finish instead of hitting the 10-minute limit used for playlists. Playlist
+entries inside a listing (for example from a `/playlists` tab) are not queued as
+videos.
+
 **Single video only** (the checkbox under the URL box) changes that one case:
 a `watch?v=…&list=…&index=…` link saves only the video `v=` and drops the
 playlist. Links without a video id are unaffected.

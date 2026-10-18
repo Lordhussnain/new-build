@@ -9,7 +9,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { readArchiveIds } from "./archive";
 import { db, getNextIndex, isVideoIgnored, isVideoInDb, takeReservedFileIndex } from "./db";
-import { isSourceBlocked, sourceIdentity } from "./sources";
+import { isSourceBlocked, parseSourceUrl, sourceIdentity } from "./sources";
 import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
 import { sanitizeFolderName } from "./util";
 import { getConfig, stats } from "./state";
@@ -21,6 +21,50 @@ export interface ListingItem {
   title: string;
   playlist: string;
   duration: number;
+  /**
+   * The uploading channel's display name (yt-dlp `playlist_channel`). Set for
+   * channel listings, where `playlist` is the tab title ("Name - Shorts").
+   */
+  channel?: string;
+}
+
+/** Trailing tab name yt-dlp appends to a channel tab's title: "Name - Videos". */
+const CHANNEL_TAB_SUFFIX = /\s+-\s+(?:Videos|Shorts|Live|Streams|Playlists|Home|Featured|Posts|Community|Releases)$/i;
+
+/**
+ * The one folder every video of a channel is saved into, whichever tab it came
+ * from (uploads, Shorts, live). yt-dlp names each tab "<Channel> - Videos",
+ * "<Channel> - Shorts", … — without this, one channel would be split across
+ * several folders, and the RSS watcher (which only sees the channel name) would
+ * create yet another one.
+ */
+export function channelFolderName(item: ListingItem): string {
+  const channel = item.channel?.trim();
+  if (channel) return channel;
+  return (item.playlist || "").replace(CHANNEL_TAB_SUFFIX, "").trim();
+}
+
+/** True for a channel source (@handle, /channel/, /c/, /user/), any tab. */
+export function isChannelSource(url: string): boolean {
+  try {
+    return parseSourceUrl(url).key === "channels";
+  } catch {
+    return false;
+  }
+}
+
+/** Items listed from a channel's Shorts tab (they report no duration). */
+export function isShortsTabItem(item: ListingItem): boolean {
+  return /\s+-\s+Shorts$/i.test(item.playlist || "");
+}
+
+/**
+ * yt-dlp lists a channel's /playlists tab, or a playlist that appears inside a
+ * tab, as an entry whose id is a playlist/channel id (PL…, UU…, UC…), not an
+ * 11-character video id. Those are not videos and must never become jobs.
+ */
+export function isPlaylistLikeId(id: string): boolean {
+  return id.length > 11 && /^(?:PL|UU|OL|FL|LL|RD|UC|VL|EL)/.test(id);
 }
 
 /**
@@ -44,6 +88,13 @@ export function normalizeVideoUrl(url: string): string {
 
 /** Maximum time a flat-playlist listing may keep its pipes and worker occupied. */
 export const PLAYLIST_SCAN_TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * Channel listings get an inactivity limit instead of a total one: a channel
+ * with thousands of uploads legitimately runs far longer than 10 minutes, but
+ * yt-dlp keeps printing (or fetching) as it goes. A listing is only stopped
+ * after this long without any output.
+ */
+export const CHANNEL_SCAN_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
 /** How many times a transient scan failure retries before giving up. */
 export const SCAN_MAX_RETRIES = 3;
@@ -72,7 +123,10 @@ export function isScanErrorTransient(message: string): boolean {
 export const LISTING_BATCH_SIZE = 50;
 
 export interface PlaylistListingOptions {
+  /** Total limit (or, with `idle`, the limit between outputs). */
   timeoutMs?: number;
+  /** Use an inactivity limit that resets on every line of output. */
+  idle?: boolean;
   /**
    * Called with each batch of items as yt-dlp prints them, while the listing is
    * still running. Ingesting here lets downloads start before the rest of a
@@ -83,9 +137,9 @@ export interface PlaylistListingOptions {
 }
 
 /** Parse one `--print` line; null for blank lines and entries without an id. */
-function parseListingLine(line: string): ListingItem | null {
+export function parseListingLine(line: string): ListingItem | null {
   if (!line.trim()) return null;
-  const [playlist, id, title, duration] = line.split("|||");
+  const [playlist, id, title, duration, channel] = line.split("|||");
   const item: ListingItem = {
     title: (title || "video").trim(),
     id: (id || "").trim(),
@@ -95,6 +149,9 @@ function parseListingLine(line: string): ListingItem | null {
     playlist: (playlist || "").trim() === "NA" ? "" : (playlist || "").trim(),
     duration: parseFloat(duration ?? "NaN"),
   };
+  const uploader = (channel || "").trim();
+  if (uploader && uploader !== "NA") item.channel = uploader;
+  if (isPlaylistLikeId(item.id)) return null;
   return item.id ? item : null;
 }
 
@@ -104,6 +161,7 @@ async function streamListing(
   items: ListingItem[],
   onItems: PlaylistListingOptions["onItems"],
   onSinkError: (error: unknown) => void,
+  onActivity: () => void = () => {},
 ): Promise<void> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -133,6 +191,7 @@ async function streamListing(
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
+    onActivity();
     carry += decoder.decode(value, { stream: true });
     let newline = carry.indexOf("\n");
     while (newline !== -1) {
@@ -169,14 +228,14 @@ export async function getPlaylistItems(
     // private uploads. The failure is still visible on individual job rows.
     "--ignore-errors",
     "--print",
-    "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s",
+    "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s|||%(playlist_channel)s",
     url,
   ];
   const ctl = new AbortController();
-  const timeoutMs = opts.timeoutMs ?? PLAYLIST_SCAN_TIMEOUT_MS;
+  const limitMs = opts.timeoutMs ?? (opts.idle ? CHANNEL_SCAN_IDLE_TIMEOUT_MS : PLAYLIST_SCAN_TIMEOUT_MS);
   let proc: Bun.Subprocess | null = null;
   let timedOut = false;
-  const timer = setTimeout(() => {
+  const expire = () => {
     timedOut = true;
     ctl.abort();
     // Do not leave a stubborn yt-dlp process or open output pipes behind.
@@ -185,7 +244,14 @@ export async function getPlaylistItems(
         proc.kill("SIGKILL");
       } catch {}
     }
-  }, timeoutMs);
+  };
+  let timer = setTimeout(expire, limitMs);
+  // Idle mode re-arms the limit on every chunk of output, so only a stall stops it.
+  const onActivity = () => {
+    if (!opts.idle) return;
+    clearTimeout(timer);
+    timer = setTimeout(expire, limitMs);
+  };
   const items: ListingItem[] = [];
   let stderr = "";
   let code = -1;
@@ -193,6 +259,9 @@ export async function getPlaylistItems(
   // is not a yt-dlp failure; keep it intact instead of wrapping it as a spawn error.
   let sinkFailed = false;
   let sinkError: unknown;
+  const timeoutMessage = opts.idle
+    ? `yt-dlp playlist scan timed out after ${limitMs}ms without new output`
+    : `yt-dlp playlist scan timed out after ${limitMs}ms`;
   try {
     // PYTHONUNBUFFERED: yt-dlp is Python, and a piped Python process otherwise
     // holds its output in an 8 KB block, delaying the first batches.
@@ -207,7 +276,7 @@ export async function getPlaylistItems(
       streamListing(child.stdout, items, opts.onItems, (error) => {
         sinkFailed = true;
         sinkError = error;
-      }),
+      }, onActivity),
       new Response(child.stderr).text(),
       child.exited,
     ]);
@@ -219,12 +288,12 @@ export async function getPlaylistItems(
       await proc.exited.catch(() => {});
     }
     if (sinkFailed) throw sinkError;
-    if (timedOut) throw new Error(`yt-dlp playlist scan timed out after ${timeoutMs}ms`);
+    if (timedOut) throw new Error(timeoutMessage);
     throw new Error(`Could not start yt-dlp playlist scan: ${error instanceof Error ? error.message : error}`);
   } finally {
     clearTimeout(timer);
   }
-  if (timedOut) throw new Error(`yt-dlp playlist scan timed out after ${timeoutMs}ms`);
+  if (timedOut) throw new Error(timeoutMessage);
   if (code !== 0) {
     const detail = stderr
       .split(/\r?\n/)
@@ -301,13 +370,11 @@ export async function ingestItems(
         stats.skipped++;
         continue;
       }
-      if (
-        config.skipShorts &&
-        !config.downloadShorts &&
-        Number.isFinite(item.duration) &&
-        item.duration > 0 &&
-        item.duration < 60
-      ) {
+      // A Shorts-tab entry carries no duration, so the tab itself marks it.
+      const short = Number.isFinite(item.duration) && item.duration > 0
+        ? item.duration < 60
+        : isShortsTabItem(item);
+      if (config.skipShorts && !config.downloadShorts && short) {
         skipped++;
         stats.skipped++;
         continue;
@@ -383,10 +450,20 @@ export async function scanAndIngest(
   // setting can change while a daemon/startup scan is between sources.
   if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return totals;
 
+  // A channel's tabs all share one folder, named after the channel. Resolved
+  // from the first batch, since every item in a channel listing carries it.
+  const channel = isChannelSource(url);
+  let channelFolder: string | undefined;
+
   const ingestBatch = async (items: ListingItem[]) => {
     // Re-check per batch: offline mode or a source removal can land mid-listing.
     if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return;
-    const result = await ingestItems(items, config, overrideFolderName, url);
+    let folder = overrideFolderName;
+    if (!folder && channel && items.length > 0) {
+      channelFolder ??= channelFolderName(items[0]) || undefined;
+      folder = channelFolder;
+    }
+    const result = await ingestItems(items, config, folder, url);
     totals.found += result.found;
     totals.added += result.added;
     totals.skipped += result.skipped;
@@ -395,7 +472,7 @@ export async function scanAndIngest(
   let lastErr: unknown;
   for (let attempt = 1; attempt <= SCAN_MAX_RETRIES; attempt++) {
     try {
-      await getPlaylistItems(url, config, { onItems: ingestBatch });
+      await getPlaylistItems(url, config, { onItems: ingestBatch, idle: channel });
       return totals;
     } catch (err: any) {
       lastErr = err;
