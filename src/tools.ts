@@ -6,6 +6,7 @@
 // path) all work without touching PATH.
 
 import { copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
+import { diagnoseCookiesText, ytDlpFailureReason } from "./cookie-file";
 import { createHash } from "node:crypto";
 import { join, dirname, basename } from "node:path";
 import os from "node:os";
@@ -275,9 +276,16 @@ export function resetCookiesBaseline(): void {
  */
 export const COOKIE_PROBE_TIMEOUT_MS = 30_000;
 
-export async function validateCookieArgs(source: string[]): Promise<boolean> {
+/** Outcome of one cookie probe, with the reason it failed (empty when ok). */
+export interface CookieProbe {
+  ok: boolean;
+  reason: string;
+}
+
+export async function probeCookieArgs(source: string[]): Promise<CookieProbe> {
+  let child: Bun.PipedSubprocess;
   try {
-    const child = Bun.spawn(
+    child = Bun.spawn(
       [
         ytDlp(),
         ...source,
@@ -288,31 +296,53 @@ export async function validateCookieArgs(source: string[]): Promise<boolean> {
       ],
       { stdout: "pipe", stderr: "pipe" },
     );
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => {
-        try {
-          child.kill();
-        } catch {
-          // already exited
-        }
-        resolve("timeout");
-      }, COOKIE_PROBE_TIMEOUT_MS);
-    });
-    try {
-      const finished = Promise.all([
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
-        child.exited,
-      ]).then(([, stderr, code]) => ({ stderr, code }));
-      const result = await Promise.race([finished, timedOut]);
-      if (result === "timeout") return false;
-      return result.code === 0 && !result.stderr.toLowerCase().includes("login required");
-    } finally {
-      clearTimeout(timer);
+  } catch (error: any) {
+    return { ok: false, reason: `could not start yt-dlp: ${error?.message || error}` };
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        // already exited
+      }
+      resolve("timeout");
+    }, COOKIE_PROBE_TIMEOUT_MS);
+  });
+  try {
+    const finished = Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]).then(([, stderr, code]) => ({ stderr, code }));
+    const result = await Promise.race([finished, timedOut]);
+    if (result === "timeout") {
+      return { ok: false, reason: `yt-dlp did not answer within ${COOKIE_PROBE_TIMEOUT_MS / 1000}s` };
     }
+    if (result.stderr.toLowerCase().includes("login required")) {
+      return { ok: false, reason: "YouTube asked for a login, so these cookies were not accepted" };
+    }
+    if (result.code === 0) return { ok: true, reason: "" };
+    return { ok: false, reason: ytDlpFailureReason(result.stderr) };
+  } catch (error: any) {
+    return { ok: false, reason: `yt-dlp probe failed: ${error?.message || error}` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Boolean form of probeCookieArgs(), for callers that do not need the reason. */
+export async function validateCookieArgs(source: string[]): Promise<boolean> {
+  return (await probeCookieArgs(source)).ok;
+}
+
+/** Cookies file text for diagnosis; an unreadable file gives an empty string. */
+export function readCookiesTextSafely(file: string): string {
+  try {
+    return readFileSync(file, "utf8");
   } catch {
-    return false;
+    return "";
   }
 }
 
@@ -358,13 +388,18 @@ async function doResolve(
   const s = cookiesState(config);
 
   if (s.present && config.validateCookiesOnStart) {
-    fileCookieValid = await validateCookies(s.file);
+    const probe = await probeCookieArgs(["--cookies", cookieWorkingCopy(s.file)]);
+    fileCookieValid = probe.ok;
     if (fileCookieValid) {
       browserCookieSource = null;
       log("✅ Cookies validated (cookies.txt).");
       return;
     }
-    log("⚠️ cookies.txt is invalid or expired — trying browser cookies.");
+    // Say WHY, so a bad export is fixable: a format problem, a signed-out
+    // browser, or a real expiry look different in the log.
+    const diagnosis = diagnoseCookiesText(readCookiesTextSafely(s.file));
+    log(`⚠️ cookies.txt is invalid or expired — trying browser cookies.`);
+    log(`   cookies.txt: ${diagnosis.problem ?? probe.reason}`);
   } else if (s.present) {
     // Validation switched off: trust the file as before, never probe browsers.
     fileCookieValid = null;
@@ -379,12 +414,13 @@ async function doResolve(
 
   const tried: string[] = [];
   for (const browser of config.cookieBrowsers) {
-    tried.push(browser);
-    if (await validateCookieArgs(["--cookies-from-browser", browser])) {
+    const probe = await probeCookieArgs(["--cookies-from-browser", browser]);
+    if (probe.ok) {
       browserCookieSource = browser;
       log(`🍪 Using cookies from ${browser} (${s.present ? "cookies.txt invalid" : "no cookies.txt"}).`);
       return;
     }
+    tried.push(`${browser} — ${probe.reason}`);
   }
   browserCookieSource = null;
   if (tried.length === 0) {
@@ -392,8 +428,9 @@ async function doResolve(
       `ℹ️ No ${config.cookiesFile} and no cookieBrowsers configured — downloads run anonymously. Drop the file in while the engine runs and it is picked up within a minute.`,
     );
   } else {
+    for (const line of tried) log(`   browser ${line}`);
     log(
-      `ℹ️ No usable cookies (cookies.txt missing, browsers tried: ${tried.join(", ")}) — downloads run anonymously. Drop cookies.txt in while the engine runs and it is picked up within a minute.`,
+      `ℹ️ No usable cookies (cookies.txt missing or rejected; browsers tried: ${config.cookieBrowsers.join(", ")}) — downloads run anonymously. Drop cookies.txt in while the engine runs and it is picked up within a minute.`,
     );
   }
 }

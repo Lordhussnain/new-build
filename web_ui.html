@@ -1455,6 +1455,7 @@
       <button class="btn btn-secondary" id="unconvertedScanBtn" onclick="openUnconvertedScan()" title="Queue videos for conversion: files on disk the archive does not track yet, plus archived downloads whose file is not in the selected target format (e.g. MKV files from MP4-requested downloads)">🔄 Scan Unconverted Videos</button>
     </div>
     <div class="controls-group">
+      <button class="btn btn-secondary" onclick="openCookieExport()" title="Read the YouTube/Google cookies of a browser you are signed in to and save them as cookies.txt">🍪 Save Browser Cookies</button>
       <button class="btn btn-secondary" onclick="openSettings()">⚙️ Settings</button>
       <button class="btn btn-secondary" onclick="openIgnoredVideos()">🚫 Ignored Videos</button>
       <button class="btn btn-danger" onclick="purgeQueue()">🗑️ Purge Queue</button>
@@ -1676,6 +1677,43 @@
       <div class="modal-footer">
         <span style="margin-right: auto; font-size: 0.78rem; color: var(--text-secondary);">Use “Allow again” to let a later source scan queue the video.</span>
         <button class="btn btn-secondary" onclick="closeIgnoredVideos()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="cookieExportModal">
+    <div class="modal" style="max-width: 540px;">
+      <div class="modal-header">
+        <div class="modal-header-left">
+          <h3>🍪 Save Browser Cookies</h3>
+          <span class="modal-badge">Writes cookies.txt</span>
+        </div>
+        <button class="btn btn-secondary btn-icon" onclick="closeCookieExport()" title="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 12px;">
+          Reads the YouTube and Google cookies of a browser you are signed in to, and saves them as
+          <code>cookies.txt</code>. The current file is kept as <code>cookies.txt.bak</code>, and nothing is
+          replaced unless the export contains a signed-in session. If the export says the browser store is
+          locked, close that browser completely and try again.
+        </p>
+        <label for="cookieExportBrowser" style="font-size: 0.8rem; font-weight: 600;">Browser</label>
+        <select id="cookieExportBrowser" style="width: 100%; margin-top: 6px;">
+          <option value="firefox" selected>Firefox</option>
+          <option value="chrome">Chrome</option>
+          <option value="edge">Edge</option>
+          <option value="brave">Brave</option>
+          <option value="opera">Opera</option>
+          <option value="vivaldi">Vivaldi</option>
+          <option value="chromium">Chromium</option>
+          <option value="safari">Safari (macOS)</option>
+        </select>
+        <div id="cookieExportResult" role="status" style="font-size: 0.85rem; margin-top: 12px; white-space: pre-wrap;"></div>
+      </div>
+      <div class="modal-footer">
+        <span style="margin-right: auto; font-size: 0.78rem; color: var(--text-secondary);">Reading a browser can take up to two minutes.</span>
+        <button class="btn btn-secondary" onclick="closeCookieExport()">Close</button>
+        <button class="btn btn-primary" id="cookieExportRunBtn" onclick="runCookieExport()">🍪 Save cookies.txt</button>
       </div>
     </div>
   </div>
@@ -2693,6 +2731,49 @@
         refreshData();
       } catch (err) {
         showNotification(err.message, 'error');
+      }
+    }
+
+    // --- Save Browser Cookies -----------------------------------------------
+    function openCookieExport() {
+      document.getElementById('cookieExportResult').textContent = '';
+      document.getElementById('cookieExportModal').classList.add('open');
+    }
+
+    function closeCookieExport() {
+      document.getElementById('cookieExportModal').classList.remove('open');
+    }
+
+    async function runCookieExport() {
+      const browser = document.getElementById('cookieExportBrowser').value;
+      const button = document.getElementById('cookieExportRunBtn');
+      const result = document.getElementById('cookieExportResult');
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = '⏳ Reading ' + browser + '…';
+      result.textContent = '';
+      try {
+        const res = await fetch('/api/cookies/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ browser }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) {
+          result.style.color = 'var(--danger, #c0392b)';
+          result.textContent = data?.error || ('HTTP ' + res.status);
+          return;
+        }
+        result.style.color = '';
+        result.textContent = data.message;
+        showNotification(data.message, 'success', 8000);
+        refreshData();
+      } catch (err) {
+        result.style.color = 'var(--danger, #c0392b)';
+        result.textContent = err.message || 'Could not save browser cookies';
+      } finally {
+        button.disabled = false;
+        button.textContent = originalText;
       }
     }
 

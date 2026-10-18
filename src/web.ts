@@ -61,7 +61,8 @@ import { relocationPendingCount } from "./relocate";
 import { holdsEngineLease, isLeaseExpired, readEngineLease } from "./lease";
 import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
-import { aria2cPath, jsRuntime } from "./tools";
+import { aria2cPath, jsRuntime, resolveCookieSource } from "./tools";
+import { exportBrowserCookies } from "./cookies-export";
 import { applySettings, readSettings } from "./settings";
 import { effectiveTargetFormat, effectiveVideoQuality, jobFittedBaseFilename, resolveDownloaderEngine } from "./download-args";
 import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-tracks";
@@ -858,6 +859,9 @@ async function deleteJobsBulk(req: Request): Promise<Response> {
     return Response.json({ ok: false, error: `Could not delete selected jobs: ${message}` }, { status: 500 });
   }
 }
+
+/** True while a browser cookie export is reading a browser store. */
+let cookieExportRunning = false;
 
 const ROUTES: Route[] = [
   {
@@ -1798,6 +1802,43 @@ const ROUTES: Route[] = [
         const message = String(e?.message || e);
         logError("unconverted-scan", `Could not scan for unconverted videos: ${message}`);
         return Response.json({ ok: false, error: `Could not scan unconverted videos: ${message}` }, { status: 500 });
+      }
+    },
+  },
+  {
+    methods: ["POST"],
+    pattern: "/api/cookies/export",
+    handler: async ({ req }) => {
+      // Save a browser's YouTube cookies as cookies.txt (see cookies-export.ts).
+      // Only one export at a time: each one starts a browser-store read.
+      const body = await req.json().catch(() => null);
+      const browser = typeof body?.browser === "string" ? body.browser.trim().toLowerCase() : "";
+      if (!browser) {
+        return Response.json({ ok: false, error: "Choose a browser (for example firefox)." }, { status: 400 });
+      }
+      const live = getConfig();
+      if (live.offlineMode) {
+        return Response.json(
+          { ok: false, error: "Offline mode is on, and reading browser cookies needs a YouTube check. Turn offline mode off, then export." },
+          { status: 409 },
+        );
+      }
+      if (cookieExportRunning) {
+        return Response.json({ ok: false, error: "A cookie export is already running." }, { status: 409 });
+      }
+      cookieExportRunning = true;
+      try {
+        const result = await exportBrowserCookies(browser, live.cookiesFile);
+        if (!result.ok) return Response.json({ ...result, saved: false }, { status: 422 });
+        // Re-check sources now so the new file is used by the next download.
+        void resolveCookieSource(getConfig(), { force: true });
+        return Response.json({
+          ...result,
+          saved: true,
+          message: `Saved ${result.cookies} YouTube/Google cookie(s) from ${browser} to ${result.file}.${result.backup ? ` The previous file is at ${result.backup}.` : ""}`,
+        });
+      } finally {
+        cookieExportRunning = false;
       }
     },
   },
