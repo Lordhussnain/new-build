@@ -274,7 +274,7 @@ export function resetCookiesBaseline(): void {
  * that hangs (a stalled network, a browser database that never unlocks) must
  * not stall the engine: the probe is killed and counts as "not usable".
  */
-export const COOKIE_PROBE_TIMEOUT_MS = 30_000;
+export const COOKIE_PROBE_TIMEOUT_MS = 120_000;
 
 /** Outcome of one cookie probe, with the reason it failed (empty when ok). */
 export interface CookieProbe {
@@ -318,7 +318,10 @@ export async function probeCookieArgs(source: string[]): Promise<CookieProbe> {
     ]).then(([, stderr, code]) => ({ stderr, code }));
     const result = await Promise.race([finished, timedOut]);
     if (result === "timeout") {
-      return { ok: false, reason: `yt-dlp did not answer within ${COOKIE_PROBE_TIMEOUT_MS / 1000}s` };
+      return {
+        ok: false,
+        reason: `yt-dlp did not answer within ${COOKIE_PROBE_TIMEOUT_MS / 1000}s (a slow first run, a busy network, or a browser store still being read). It is retried at the next cookie check.`,
+      };
     }
     if (result.stderr.toLowerCase().includes("login required")) {
       return { ok: false, reason: "YouTube asked for a login, so these cookies were not accepted" };
