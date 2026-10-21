@@ -7,6 +7,7 @@
 
 import { copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
 import { diagnoseCookiesText, ytDlpFailureReason } from "./cookie-file";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join, dirname, basename } from "node:path";
 import os from "node:os";
@@ -274,7 +275,99 @@ export function resetCookiesBaseline(): void {
  * that hangs (a stalled network, a browser database that never unlocks) must
  * not stall the engine: the probe is killed and counts as "not usable".
  */
-export const COOKIE_PROBE_TIMEOUT_MS = 120_000;
+export const COOKIE_PROBE_TIMEOUT_MS = 60_000;
+
+/**
+ * URL used only to make yt-dlp load a browser's cookies and exit. It refuses
+ * the connection at once, so yt-dlp never runs the slow video extraction (player
+ * JavaScript, challenge solver) that a real video URL costs. yt-dlp reads the
+ * cookie store before it looks at the URL, and writes the cookie jar on exit.
+ */
+export const COOKIE_JAR_URL = "https://127.0.0.1:9/cookie-check";
+
+/** Result of reading one browser's cookie store into a Netscape jar. */
+export interface BrowserCookieJar {
+  /** The jar text, or null when yt-dlp wrote no file (the store was never read). */
+  jar: string | null;
+  stderr: string;
+  timedOut: boolean;
+}
+
+/** Read `browser`'s cookies with yt-dlp into a temp jar. Never throws. */
+export async function readBrowserCookieJar(
+  browser: string,
+  opts: { ytDlp?: string; timeoutMs?: number } = {},
+): Promise<BrowserCookieJar> {
+  const dir = await mkdtemp(join(os.tmpdir(), "yta-cookies-"));
+  const jarPath = join(dir, "jar.txt");
+  try {
+    let child: Bun.PipedSubprocess;
+    try {
+      child = Bun.spawn(
+        [
+          opts.ytDlp ?? ytDlp(),
+          "--cookies-from-browser",
+          browser,
+          "--cookies",
+          jarPath,
+          "--skip-download",
+          "--socket-timeout",
+          "5",
+          "--retries",
+          "0",
+          "--extractor-retries",
+          "0",
+          COOKIE_JAR_URL,
+        ],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+    } catch (error: any) {
+      return { jar: null, stderr: `could not start yt-dlp: ${error?.message || error}`, timedOut: false };
+    }
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // already exited
+      }
+    }, opts.timeoutMs ?? COOKIE_PROBE_TIMEOUT_MS);
+    let stderr = "";
+    try {
+      [stderr] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+    } finally {
+      clearTimeout(timer);
+    }
+    const jar = await readFile(jarPath, "utf8").catch(() => null);
+    return { jar, stderr, timedOut };
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Is `browser` signed in to YouTube? Reads its cookie store (about a second)
+ * and checks for a live session cookie. No video is fetched.
+ */
+export async function probeBrowserCookies(browser: string): Promise<CookieProbe> {
+  const read = await readBrowserCookieJar(browser);
+  if (read.timedOut) {
+    return { ok: false, reason: `reading ${browser} cookies did not finish within ${COOKIE_PROBE_TIMEOUT_MS / 1000}s; retried at the next cookie check` };
+  }
+  if (read.jar === null) {
+    return { ok: false, reason: `could not read ${browser} cookies: ${ytDlpFailureReason(read.stderr)}` };
+  }
+  const diagnosis = diagnoseCookiesText(read.jar);
+  if (diagnosis.problem !== null) return { ok: false, reason: diagnosis.problem };
+  return { ok: true, reason: "" };
+}
+
+/** Is cookies.txt a signed-in YouTube export? Local check, no network. */
+export function probeCookieFile(file: string): CookieProbe {
+  const problem = diagnoseCookiesText(readCookiesTextSafely(file)).problem;
+  return problem === null ? { ok: true, reason: "" } : { ok: false, reason: problem };
+}
 
 /** Outcome of one cookie probe, with the reason it failed (empty when ok). */
 export interface CookieProbe {
@@ -391,18 +484,17 @@ async function doResolve(
   const s = cookiesState(config);
 
   if (s.present && config.validateCookiesOnStart) {
-    const probe = await probeCookieArgs(["--cookies", cookieWorkingCopy(s.file)]);
+    const probe = probeCookieFile(s.file);
     fileCookieValid = probe.ok;
     if (fileCookieValid) {
       browserCookieSource = null;
-      log("✅ Cookies validated (cookies.txt).");
+      log("✅ cookies.txt has a signed-in YouTube session (checked locally).");
       return;
     }
     // Say WHY, so a bad export is fixable: a format problem, a signed-out
-    // browser, or a real expiry look different in the log.
-    const diagnosis = diagnoseCookiesText(readCookiesTextSafely(s.file));
-    log(`⚠️ cookies.txt is invalid or expired — trying browser cookies.`);
-    log(`   cookies.txt: ${diagnosis.problem ?? probe.reason}`);
+    // browser, or an expired session look different in the log.
+    log("⚠️ cookies.txt is invalid or expired — trying browser cookies.");
+    log(`   cookies.txt: ${probe.reason}`);
   } else if (s.present) {
     // Validation switched off: trust the file as before, never probe browsers.
     fileCookieValid = null;
@@ -417,7 +509,7 @@ async function doResolve(
 
   const tried: string[] = [];
   for (const browser of config.cookieBrowsers) {
-    const probe = await probeCookieArgs(["--cookies-from-browser", browser]);
+    const probe = await probeBrowserCookies(browser);
     if (probe.ok) {
       browserCookieSource = browser;
       log(`🍪 Using cookies from ${browser} (${s.present ? "cookies.txt invalid" : "no cookies.txt"}).`);

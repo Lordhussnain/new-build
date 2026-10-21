@@ -21,8 +21,13 @@ export interface CookieFileDiagnosis {
 /** Netscape cookie lines have exactly 7 TAB-separated fields. */
 const NETSCAPE_FIELDS = 7;
 
-/** Parse the text of a cookies.txt file. Never throws. */
-export function diagnoseCookiesText(text: string): CookieFileDiagnosis {
+/**
+ * Parse the text of a cookies.txt file. Never throws.
+ *
+ * Checked locally, with no network: a signed-in session is a session cookie
+ * whose expiry (field 5, seconds; 0 = browser-session cookie) is still ahead.
+ */
+export function diagnoseCookiesText(text: string, nowMs: number = Date.now()): CookieFileDiagnosis {
   const trimmed = text.trim();
   if (!trimmed) {
     return { entries: 0, siteEntries: 0, signedIn: false, problem: "cookies.txt is empty." };
@@ -40,6 +45,7 @@ export function diagnoseCookiesText(text: string): CookieFileDiagnosis {
   let entries = 0;
   let siteEntries = 0;
   let signedIn = false;
+  let expiredSession = false;
   for (const raw of text.split(/\r?\n/)) {
     // #HttpOnly_ marks HttpOnly cookies and is still a cookie line.
     const line = raw.startsWith("#HttpOnly_") ? raw.slice("#HttpOnly_".length) : raw;
@@ -51,7 +57,10 @@ export function diagnoseCookiesText(text: string): CookieFileDiagnosis {
     const onSite = domain.endsWith("youtube.com") || domain.endsWith("google.com");
     if (!onSite) continue;
     siteEntries++;
-    if ((SESSION_COOKIE_NAMES as readonly string[]).includes(fields[5])) signedIn = true;
+    if (!(SESSION_COOKIE_NAMES as readonly string[]).includes(fields[5])) continue;
+    const expires = Number(fields[4]);
+    if (!Number.isFinite(expires) || expires === 0 || expires * 1000 > nowMs) signedIn = true;
+    else expiredSession = true;
   }
 
   let problem: string | null = null;
@@ -60,6 +69,8 @@ export function diagnoseCookiesText(text: string): CookieFileDiagnosis {
       "No cookie lines found. Each cookie must be one line with 7 fields separated by TAB characters (not spaces).";
   } else if (siteEntries === 0) {
     problem = "The file has cookies, but none for youtube.com or google.com.";
+  } else if (!signedIn && expiredSession) {
+    problem = "The YouTube/Google session cookies have expired. Sign in to YouTube again and export again.";
   } else if (!signedIn) {
     problem = "The file has YouTube/Google cookies, but no session cookie (SID / __Secure-3PSID). Sign in to YouTube and export again.";
   }

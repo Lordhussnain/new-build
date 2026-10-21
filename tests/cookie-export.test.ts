@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { diagnoseCookiesText, ytDlpFailureReason } from "../src/cookie-file";
 import { exportBrowserCookies } from "../src/cookies-export";
+import { probeBrowserCookies, probeCookieFile, resolvedTools } from "../src/tools";
 
 const WIN = process.platform === "win32";
 const dir = await mkdtemp(join(tmpdir(), "cookie-export-"));
@@ -52,6 +53,68 @@ describe("diagnoseCookiesText", () => {
   });
 });
 
+describe("session expiry (checked locally)", () => {
+  const now = Date.UTC(2026, 9, 21);
+  const session = (expires: string) => ["# Netscape HTTP Cookie File", tab(".youtube.com", "TRUE", "/", "TRUE", expires, "SID", "x")].join("\n");
+
+  test("a session cookie that expires in the future counts as signed in", () => {
+    const future = String(Math.floor(now / 1000) + 86400);
+    expect(diagnoseCookiesText(session(future), now).signedIn).toBe(true);
+  });
+
+  test("a browser-session cookie (expiry 0) counts as signed in", () => {
+    expect(diagnoseCookiesText(session("0"), now).signedIn).toBe(true);
+  });
+
+  test("an expired session cookie is reported as expired, not as missing", () => {
+    const past = String(Math.floor(now / 1000) - 86400);
+    const diagnosis = diagnoseCookiesText(session(past), now);
+    expect(diagnosis.signedIn).toBe(false);
+    expect(diagnosis.problem).toContain("have expired");
+  });
+});
+
+describe("probeCookieFile", () => {
+  test("a signed-in file is ok without any network call", async () => {
+    const file = join(dir, "probe-ok.txt");
+    await writeFile(file, SIGNED_IN);
+    expect(probeCookieFile(file)).toEqual({ ok: true, reason: "" });
+  });
+
+  test("a missing file reports why", () => {
+    expect(probeCookieFile(join(dir, "nope.txt")).reason).toBe("cookies.txt is empty.");
+  });
+});
+
+describe("probeBrowserCookies", () => {
+  test.skipIf(WIN)("a browser whose jar has a live session is ok; one with no session is not", async () => {
+    const signedIn = await fakeYtDlp("probe-in", `await Bun.write(argValue("--cookies"), ${JSON.stringify(SIGNED_IN)}); process.exit(1);`);
+    const signedOut = await fakeYtDlp("probe-out", `await Bun.write(argValue("--cookies"), ${JSON.stringify(ANONYMOUS)}); process.exit(1);`);
+    const original = resolvedTools.ytDlp;
+    try {
+      resolvedTools.ytDlp = signedIn;
+      expect(await probeBrowserCookies("firefox")).toEqual({ ok: true, reason: "" });
+      resolvedTools.ytDlp = signedOut;
+      expect((await probeBrowserCookies("firefox")).ok).toBe(false);
+    } finally {
+      resolvedTools.ytDlp = original;
+    }
+  });
+
+  test.skipIf(WIN)("a browser store that cannot be read reports yt-dlp's reason", async () => {
+    const original = resolvedTools.ytDlp;
+    try {
+      resolvedTools.ytDlp = await fakeYtDlp("probe-locked", `console.error("ERROR: Could not copy Chrome cookie database"); process.exit(1);`);
+      expect(await probeBrowserCookies("chrome")).toEqual({
+        ok: false,
+        reason: "could not read chrome cookies: Could not copy Chrome cookie database",
+      });
+    } finally {
+      resolvedTools.ytDlp = original;
+    }
+  });
+});
+
 describe("ytDlpFailureReason", () => {
   test("prefers the real cause over yt-dlp's generic last line", () => {
     const stderr = [
@@ -93,7 +156,7 @@ describe("exportBrowserCookies", () => {
     const fake = await fakeYtDlp("signed-out", `await Bun.write(argValue("--cookies"), ${JSON.stringify(ANONYMOUS)});`);
     const result = await exportBrowserCookies("firefox", target, { ytDlp: fake });
     expect(result.ok).toBe(false);
-    expect(result.error).toContain("not signed in to YouTube");
+    expect(result.error).toContain("no session cookie");
     expect(await readFile(target, "utf8")).toBe(SIGNED_IN);
   });
 
