@@ -530,17 +530,25 @@ async function changeFeatureToggles(config: Config): Promise<Config> {
   console.clear();
   console.log("🎛️  Feature Toggles\n");
 
-  config.downloadSubtitles = await askYesNo("Download & embed subtitles?", config.downloadSubtitles);
-  if (config.downloadSubtitles) {
+  config.downloadSubtitles = await askYesNo("Download subtitle files?", config.downloadSubtitles);
+  if (config.downloadSubtitles || config.embedSubtitles) {
     const langsAns = await ask(
       `   Subtitle languages — comma-separated codes (e.g. en, es, ja), regexes like en.* work, or "all" for every language [current: ${config.subtitleLanguages}]: `,
     );
     if (langsAns.trim()) config.subtitleLanguages = langsAns.trim();
   }
-  config.embedMetadata = await askYesNo("Embed metadata, chapters & thumbnail?", config.embedMetadata);
+  config.embedSubtitles = await askYesNo(
+    "Embed subtitles in the video (selectable tracks)?",
+    config.embedSubtitles,
+  );
+  config.writeThumbnail = await askYesNo("Write .jpg thumbnail sidecar files?", config.writeThumbnail);
+  config.embedThumbnail = await askYesNo(
+    "Embed the thumbnail as cover art (survives conversion)?",
+    config.embedThumbnail,
+  );
+  config.embedMetadata = await askYesNo("Embed metadata tags & chapters?", config.embedMetadata);
   config.writeInfoJson = await askYesNo("Write .info.json sidecar files?", config.writeInfoJson);
   config.writeDescription = await askYesNo("Write .description sidecar files?", config.writeDescription);
-  config.writeThumbnail = await askYesNo("Write .jpg thumbnail sidecar files?", config.writeThumbnail);
   config.verifyIntegrity = await askYesNo("Verify file integrity (SHA256) after download?", config.verifyIntegrity);
   config.skipShorts = await askYesNo("Skip YouTube Shorts (< 60s)?", config.skipShorts);
   config.downloadShorts = await askYesNo(

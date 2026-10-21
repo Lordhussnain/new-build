@@ -294,7 +294,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     label: "Download subtitles",
     type: "boolean",
     group: "media",
-    help: "Default for new jobs. Existing jobs keep their per-video Sidecar Files choice; change it in the job detail panel, then use Scan Missing Metadata to backfill selected sidecars without re-downloading media.",
+    help: "Default for new jobs. Existing jobs keep their per-video Sidecar Files choice; change it in the job detail panel, then use Scan Missing Metadata to backfill selected sidecars without re-downloading media. Embedding subtitles in the video is controlled separately below.",
   },
   {
     key: "subtitleLanguages",
@@ -304,11 +304,25 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     help: "Which subtitle languages to fetch: comma-separated codes (en, es, ja — regexes like en.* work), or \"all\" for every available language including auto-generated ones.",
   },
   {
+    key: "embedSubtitles",
+    label: "Embed subtitles in the video",
+    type: "boolean",
+    group: "media",
+    help: "Mux the downloaded subtitle files into the video as selectable tracks (MP4/MKV/WebM) during post-processing. Sidecar files are still saved next to the media. Implies downloading subtitles for new jobs.",
+  },
+  {
+    key: "embedThumbnail",
+    label: "Embed thumbnail as cover art",
+    type: "boolean",
+    group: "media",
+    help: "Attach the saved thumbnail to the media file as cover art (MP4/MKV/MP3/M4A) after the container conversion, so it survives a webm/mkv → mp4 remux. Implies downloading the thumbnail file for new jobs.",
+  },
+  {
     key: "embedMetadata",
     label: "Embed metadata & chapters",
     type: "boolean",
     group: "media",
-    help: "Embed thumbnail, metadata tags, and chapters into the downloaded file (yt-dlp --embed-*).",
+    help: "Embed tags and chapters into the downloaded file (yt-dlp --embed-metadata --embed-chapters). Thumbnails and subtitles have their own toggles above.",
   },
   {
     key: "writeThumbnail",

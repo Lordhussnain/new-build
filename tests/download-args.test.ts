@@ -256,9 +256,15 @@ describe("buildDownloadPlan", () => {
     expect(flagValue(live.args, "--match-filters")).toBe("!is_live");
   });
 
-  test("embeds metadata only when enabled", () => {
-    expect(build().args).toContain("--embed-thumbnail");
-    expect(build({ embedMetadata: false }).args).not.toContain("--embed-thumbnail");
+  test("embeds tags and chapters on the download, but never the thumbnail", () => {
+    // Thumbnails (and subtitles) are embedded by the converter, after the
+    // metadata worker has written the sidecars and the container is final —
+    // asking yt-dlp to embed them here lost them on the next remux.
+    expect(build().args).toContain("--embed-metadata");
+    expect(build().args).toContain("--embed-chapters");
+    expect(build().args).not.toContain("--embed-thumbnail");
+    expect(build().args).not.toContain("--embed-subs");
+    expect(build({ embedMetadata: false }).args).not.toContain("--embed-metadata");
   });
 
   test("uses the format selector for the configured quality", () => {

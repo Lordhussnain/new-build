@@ -320,8 +320,12 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
 
   // Sidecar files (subs/thumbnail/description/info.json) are fetched by the
   // metadata worker once the download completes; the download phase only
-  // enriches the container itself (embedded art/metadata/chapters).
-  if (config.embedMetadata) args.push("--embed-thumbnail", "--embed-metadata", "--embed-chapters");
+  // enriches the container itself (tags/chapters). Embedding the thumbnail or
+  // subtitles is deliberately NOT done here: yt-dlp acts on the file it just
+  // wrote, and the converter then remuxes that file into the requested
+  // container. The converter is the one place that can add both while also
+  // preserving them across the remux (src/media-embed.ts).
+  if (config.embedMetadata) args.push("--embed-metadata", "--embed-chapters");
 
   // Multi-connection downloader. HLS/live streams fall back to the native
   // downloader inside yt-dlp automatically.

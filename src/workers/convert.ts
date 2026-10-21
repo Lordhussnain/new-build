@@ -7,7 +7,7 @@
 
 import { cp, mkdir, readdir, rename, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import {
   claimConvertJob,
   claimRef,
@@ -36,6 +36,19 @@ import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause 
 import { logError } from "../logger";
 import { ffmpeg } from "../tools";
 import { effectiveTargetFormat } from "../download-args";
+import { findSidecarFiles } from "../metadata-files";
+import {
+  buildMp3Args,
+  buildRemuxArgs,
+  coverNeedsJpeg,
+  coverToJpegArgs,
+  parseMediaStreamProbe,
+  supportsCoverArt,
+  type MediaStreamProbe,
+  type SubtitleEmbedInput,
+} from "../media-embed";
+import { isEmbeddableSubtitleFile, parseSubtitleLanguage } from "../subtitles";
+import { parseSelectionJson, parseTracksJson, selectAudioTracks } from "../audio-tracks";
 import type { Config } from "../config";
 
 /**
@@ -64,12 +77,15 @@ export async function runFfmpeg(
 }
 
 /**
- * How many audio streams a media file carries (ffprobe-style via ffmpeg's
- * banner). Used to identify multi-audio archives while honoring the requested
- * target container: the conversion command maps every audio stream, and MP4
- * re-encodes each one as AAC. 0 on any probe failure.
+ * What the source file actually carries, read from ffmpeg's `-i` banner.
+ *
+ * The remux needs this to avoid two opposite bugs: dropping tracks the file
+ * already has (the old `-map 0:v:0 -map 0:a` lost subtitle tracks and cover
+ * art), and adding a second copy of a cover/subtitle set that is already
+ * embedded. A probe failure yields an empty probe — the remux then falls back
+ * to mapping everything ffmpeg can see.
  */
-export async function countAudioStreams(path: string, workerId?: number): Promise<number> {
+export async function probeMediaStreams(path: string, workerId?: number): Promise<MediaStreamProbe> {
   try {
     const proc = Bun.spawn([ffmpeg(), "-hide_banner", "-i", path], {
       stdout: "pipe",
@@ -82,12 +98,88 @@ export async function countAudioStreams(path: string, workerId?: number): Promis
       proc.exited,
     ]);
     const banner = `${out}\n${err}`;
-    return (banner.match(/^\s*Stream #\d+:\d+[^\n]*:\s*Audio/gm) || []).length;
+    return parseMediaStreamProbe(banner);
   } catch {
-    return 0;
+    return {
+      videoStreams: 0,
+      audioStreams: 0,
+      subtitleStreams: 0,
+      attachmentStreams: 0,
+      hasAttachedPicture: false,
+      hasCoverAttachment: false,
+    };
   } finally {
     if (workerId !== undefined) activeConvertProcs.delete(workerId);
   }
+}
+
+/**
+ * How many audio streams a media file carries. Used to identify multi-audio
+ * archives while honoring the requested target container: the conversion
+ * command maps every audio stream, and MP4 re-encodes each one as AAC.
+ * 0 on any probe failure.
+ */
+export async function countAudioStreams(path: string, workerId?: number): Promise<number> {
+  return (await probeMediaStreams(path, workerId)).audioStreams;
+}
+
+interface EmbedInputs {
+  /** Subtitle sidecars to mux in (empty when none were requested/found). */
+  subtitles: SubtitleEmbedInput[];
+  /** Thumbnail sidecar to attach as cover art, or null. */
+  coverPath: string | null;
+}
+
+/**
+ * Which sidecars the finished file should carry, honoring both the global
+ * embed switches and the per-job sidecar flags (a job whose thumbnail was
+ * turned off in the drawer must not suddenly gain one).
+ */
+async function collectEmbedInputs(job: Job, config: Config, sourcePath: string): Promise<EmbedInputs> {
+  const mediaName = basename(sourcePath);
+  const mediaBase = mediaName.replace(/\.[^.]+$/, "");
+  const mediaDir = dirname(sourcePath);
+  const entries = await readdir(mediaDir).catch(() => [] as string[]);
+  const sidecars = findSidecarFiles(entries, mediaBase, mediaName);
+
+  const wantSubtitles =
+    config.embedSubtitles && (job.want_subtitles == null ? config.downloadSubtitles : Boolean(job.want_subtitles));
+  const wantThumbnail =
+    config.embedThumbnail && (job.want_thumbnail == null ? config.writeThumbnail : Boolean(job.want_thumbnail));
+
+  const subtitles: SubtitleEmbedInput[] = wantSubtitles
+    ? sidecars
+        .filter(isEmbeddableSubtitleFile)
+        .sort()
+        .map((name) => ({ path: join(mediaDir, name), language: parseSubtitleLanguage(name, mediaBase) }))
+    : [];
+  const thumbName = wantThumbnail
+    ? sidecars.find((name) => /\.(?:jpe?g|png|webp|gif)$/i.test(name))
+    : undefined;
+  return { subtitles, coverPath: thumbName ? join(mediaDir, thumbName) : null };
+}
+
+/**
+ * Normalise whatever image the source uses to a single JPEG frame, because
+ * WebP is not a legal cover picture in MP4/MKV/MP3. Returns the original path
+ * when it already is a JPEG, or null when the conversion failed (embedding
+ * without a cover is better than failing the whole job over its picture).
+ */
+async function prepareCoverImage(
+  coverPath: string,
+  outputDir: string,
+  workerId: number,
+): Promise<string | null> {
+  if (!coverNeedsJpeg(coverPath)) return coverPath;
+  const target = join(outputDir, `.yta-cover-${process.pid}-${workerId}.jpg`);
+  const res = await runFfmpeg(coverToJpegArgs(coverPath, target), 30_000, workerId);
+  if (res.code !== 0 || !existsSync(target)) {
+    try {
+      await unlink(target);
+    } catch {}
+    return null;
+  }
+  return target;
 }
 
 export async function converterWorker(id: number, config: Config): Promise<void> {
@@ -396,50 +488,120 @@ async function convertJob(job: Job, config: Config, id: number): Promise<void> {
     }
     throw new Error(`Source file missing: ${sourcePath || "(null)"}`);
   }
+  const mediaDir = dirname(sourcePath);
+  const probe = await probeMediaStreams(sourcePath, id);
+  // Multi-audio archives land as MKV holding every selected track. If an
+  // explicit output-format setting requests conversion, map every stream;
+  // MP4 re-encodes each audio track to AAC instead of dropping the dubs.
+  if (probe.audioStreams >= 2) {
+    updateConvertWorkerLine(id, `🎧 Preserving ${probe.audioStreams} audio tracks | ${job.title}`, config);
+  }
+  // AGENTS.md (multi-audio): an MKV that carries several audio tracks is kept
+  // as MKV even when the target is mp4. The scanner cannot know the track count
+  // at ingest, so the exemption is applied here — otherwise the converter would
+  // now (since embedding routes every job through it) happily remux the dubs
+  // away. Embedding still runs, remuxing mkv → mkv.
+  //
+  // The decision uses the job's cached track selection, not the ffmpeg probe:
+  // a plain MKV reports one audio stream, and the mock/tests deliberately
+  // report two for a multi-audio archive. `selectAudioTracks` is the same
+  // function the download worker used to choose what to mux in.
+  const sourceContainer = extname(sourcePath).replace(/^\./, "").toLowerCase();
+  const selectedTracks = Math.max(
+    1,
+    selectAudioTracks(
+      parseTracksJson(job.audio_tracks) ?? [],
+      config.multiAudioMode,
+      config.audioTrackLanguages,
+      parseSelectionJson(job.audio_selection),
+    ).length,
+  );
+  const container =
+    !wantsMp3 && targetFmt === "mp4" && selectedTracks >= 2 && sourceContainer
+      ? sourceContainer
+      : targetFmt;
+  const embed = await collectEmbedInputs(job, config, sourcePath);
+  const preparedCover = embed.coverPath ? await prepareCoverImage(embed.coverPath, mediaDir, id) : null;
+
   let finalPath = sourcePath;
-  if (wantsMp3 && !sourcePath.endsWith(".mp3")) {
-    // Audio archive: encode to the target .mp3 instead of leaving the
-    // source container (webm/m4a) untouched.
-    const mp3Path = sourcePath.replace(/\.[^.]+$/, ".mp3");
-    const res = await runFfmpeg(
-      ["-y", "-i", sourcePath, "-vn", "-map", "0:a:0", "-c:a", "libmp3lame", "-q:a", "2", mp3Path],
-      60 * 60 * 1000,
-      id,
-    );
-    if (res.code !== 0) {
-      throw new Error(
-        `FFmpeg mp3 encode ${res.timedOut ? "timed out" : "failed"}: ${res.stderr.split("\n").filter((l) => l.trim()).slice(-2).join(" ")}`,
+  try {
+    if (wantsMp3 && !sourcePath.endsWith(".mp3")) {
+      // Audio archive: encode to the target .mp3 instead of leaving the
+      // source container (webm/m4a) untouched. The cover is carried over (or
+      // added from the sidecar) rather than thrown away by `-vn`.
+      const mp3Path = sourcePath.replace(/\.[^.]+$/, ".mp3");
+      const res = await runFfmpeg(
+        buildMp3Args({ sourcePath, outputPath: mp3Path, probe, coverPath: preparedCover }),
+        60 * 60 * 1000,
+        id,
       );
+      if (res.code !== 0) {
+        throw new Error(
+          `FFmpeg mp3 encode ${res.timedOut ? "timed out" : "failed"}: ${res.stderr.split("\n").filter((l) => l.trim()).slice(-2).join(" ")}`,
+        );
+      }
+      finalPath = mp3Path;
+      // Claim-checked: a stale worker must not point the row at a file the new
+      // owner is not converting.
+      updateClaimedJob("conversion", job.id, claimRef("conversion", job), `file_path = ?`, [finalPath]);
+      await deleteConvertedSource(job, config, sourcePath);
+    } else if (!wantsMp3) {
+      const alreadyTarget = sourceContainer === container;
+      const cover = preparedCover && supportsCoverArt(container) ? preparedCover : null;
+      // A fresh sidecar cover replaces the source's own art; never add a second.
+      const addCover = Boolean(cover) && !probe.hasAttachedPicture && !probe.hasCoverAttachment;
+      // A sidecar subtitle set replaces whatever the source carries, so a
+      // retried embed cannot duplicate tracks.
+      const addSubtitles = embed.subtitles.length > 0;
+      // The remux is not only a container change any more: an mp4 that is
+      // already mp4 still needs a pass when subtitles or the cover are missing.
+      const needsRemux = !alreadyTarget || addSubtitles || addCover;
+      if (needsRemux) {
+        const targetPath = sourcePath.replace(/\.[^.]+$/, `.${container}`);
+        const samePath = resolve(targetPath) === resolve(sourcePath);
+        // Writing over the file ffmpeg is reading is not allowed, and the old
+        // file must survive a failed pass: same-container work goes to a temp
+        // sibling that is renamed into place only after ffmpeg succeeds.
+        const outputPath = samePath ? `${sourcePath}.yta-tmp.${container}` : targetPath;
+        const ffmpegArgs = buildRemuxArgs({
+          sourcePath,
+          outputPath,
+          container,
+          probe,
+          subtitles: embed.subtitles,
+          coverPath: addCover ? cover : null,
+        });
+        const res = await runFfmpeg(ffmpegArgs, 30 * 60 * 1000, id);
+        if (res.code !== 0) {
+          // A failed/timed-out pass must not leave a half-written temp that a
+          // later adoption probe could mistake for a finished conversion.
+          if (samePath) await unlink(outputPath).catch(() => {});
+          throw new Error(
+            `FFmpeg remux to .${container} ${res.timedOut ? "timed out" : "failed"}: ${res.stderr.split("\n").filter((l) => l.trim()).slice(-2).join(" ")}`,
+          );
+        }
+        if (!stillOwnsConversion(job)) {
+          if (samePath) await unlink(outputPath).catch(() => {});
+          logError("conversion", `${job.id} ${job.title}: conversion claim lost mid-remux — leaving the source untouched`);
+          return;
+        }
+        if (samePath) {
+          // Replace the source atomically-ish: the finished file only appears
+          // at the recorded path once it is complete.
+          await rename(outputPath, targetPath);
+        } else {
+          finalPath = targetPath;
+          // Claim-checked: a stale worker must not point the row at a file the
+          // new owner is not converting.
+          updateClaimedJob("conversion", job.id, claimRef("conversion", job), `file_path = ?`, [finalPath]);
+          await deleteConvertedSource(job, config, sourcePath);
+        }
+      }
     }
-    finalPath = mp3Path;
-    // Claim-checked: a stale worker must not point the row at a file the new
-    // owner is not converting.
-    updateClaimedJob("conversion", job.id, claimRef("conversion", job), `file_path = ?`, [finalPath]);
-    await deleteConvertedSource(job, config, sourcePath);
-  } else if (!wantsMp3 && !sourcePath.endsWith(`.${targetFmt}`)) {
-    // Multi-audio archives land as MKV holding every selected track. If an
-    // explicit output-format setting requests conversion, map every stream;
-    // MP4 re-encodes each audio track to AAC instead of dropping the dubs.
-    const audioStreams = await countAudioStreams(sourcePath, id);
-    if (audioStreams >= 2) {
-      updateConvertWorkerLine(id, `🎧 Preserving ${audioStreams} audio tracks | ${job.title}`, config);
+  } finally {
+    if (preparedCover && preparedCover !== embed.coverPath) {
+      await unlink(preparedCover).catch(() => {});
     }
-    const targetPath = sourcePath.replace(/\.[^.]+$/, `.${targetFmt}`);
-    const ffmpegArgs =
-      targetFmt === "mp4"
-        ? ["-y", "-i", sourcePath, "-map", "0:v:0?", "-map", "0:a?", "-map_metadata", "0", "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart", targetPath]
-        : ["-y", "-i", sourcePath, "-map", "0:v:0?", "-map", "0:a?", "-map_metadata", "0", "-c:v", "copy", "-c:a", "copy", targetPath];
-    const res = await runFfmpeg(ffmpegArgs, 30 * 60 * 1000, id);
-    if (res.code !== 0) {
-      throw new Error(
-        `FFmpeg remux to .${targetFmt} ${res.timedOut ? "timed out" : "failed"}: ${res.stderr.split("\n").filter((l) => l.trim()).slice(-2).join(" ")}`,
-      );
-    }
-    finalPath = targetPath;
-    // Claim-checked: a stale worker must not point the row at a file the new
-    // owner is not converting.
-    updateClaimedJob("conversion", job.id, claimRef("conversion", job), `file_path = ?`, [finalPath]);
-    await deleteConvertedSource(job, config, sourcePath);
   }
   await finalizeConversion(job, config, id, finalPath);
 }

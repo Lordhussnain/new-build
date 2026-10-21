@@ -359,10 +359,18 @@ export async function ingestItems(
   // playlist cannot re-queue the same completed video ID.
   const archivedIds = readArchiveIds(config.archiveFile);
   const targetFormat = config.videoQuality === "audio" ? "mp3" : (config.targetFormat || "mp4");
-  const wantSubs = config.downloadSubtitles ? 1 : 0;
-  const wantThumb = config.writeThumbnail ? 1 : 0;
+  // Embedding needs the sidecar file even when the operator turned the
+  // corresponding "save sidecars" switch off: the thumbnail is the cover art
+  // and the subtitle file is the track that gets muxed in.
+  const wantSubs = config.downloadSubtitles || config.embedSubtitles ? 1 : 0;
+  const wantThumb = config.writeThumbnail || config.embedThumbnail ? 1 : 0;
   const wantDesc = config.writeDescription ? 1 : 0;
-  const conversionStatus = config.videoQuality === "audio" || targetFormat !== "mp4" ? "pending" : "not_needed";
+  // Embedding happens in the converter (after metadata has written the
+  // sidecars), so a job that asks for it must reach the conversion stage even
+  // when yt-dlp already produced the requested container.
+  const embedWanted = config.embedSubtitles || config.embedThumbnail;
+  const conversionStatus =
+    config.videoQuality === "audio" || targetFormat !== "mp4" || embedWanted ? "pending" : "not_needed";
   // Sidecar metadata (subs/thumbnail/description/info.json) is fetched by the
   // metadata worker after the download completes.
   const metadataStatus = wantSubs || wantThumb || wantDesc || config.writeInfoJson ? "pending" : "not_needed";

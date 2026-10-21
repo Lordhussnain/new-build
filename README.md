@@ -36,6 +36,7 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Terminal UI (TUI)** with live progress across all workers
 - Correct format selection across VP9/AV1 containers (fixes yt-dlp/ffmpeg mismatches)
 - **Multi-audio tracks** — YouTube's multi-language audio (the player's *Audio track* menu: original + auto-dubbed tracks). Keep every track, or just the languages you want, muxed into one MKV whose audio is switchable in any player — plus a per-video track picker in the dashboard
+- **Subtitles and cover art embedded in the video** — the converter muxes the downloaded subtitle files into the finished file as selectable tracks (MP4 `mov_text`, MKV `copy`, WebM `webvtt`) and attaches the saved thumbnail as cover art, in the same pass that remuxes to the target container. The tracks therefore survive a webm/mkv → mp4 conversion, which used to drop both (the old remux mapped only the first video stream and the audio). Sidecar files are still written next to the media. Two independent switches (`embedSubtitles`, `embedThumbnail`) control it; turning either on also makes new jobs fetch the file it needs. Subtitle tracks are tagged with ISO 639-2 language codes (`en` → `eng`) so players show the right language, and live-chat "subtitles" are excluded from the fetch.
 - Compatible with authenticated downloads (`--cookies`) and YouTube's n-challenge (a JS runtime — Deno, Node, or Bun — is discovered at startup and passed to yt-dlp)
 - **cookies.txt is watched while the engine runs** — export it from your browser after startup (or replace it when it expires) and the next download attempt uses it; the engine logs the switch and tells you how many credential-blocked jobs it may rescue
 - **Save Browser Cookies** — the dashboard's 🍪 button (or `POST /api/cookies/export`) reads a browser you are signed in to and saves its YouTube/Google cookies as `cookies.txt`. The export is staged first and only replaces `cookies.txt` when it contains a signed-in session; the previous file is kept as `cookies.txt.bak`. Close the browser if it reports that its cookie store is locked. When `cookies.txt` is rejected, the log now says why (JSON instead of Netscape format, fields not TAB-separated, no YouTube session, or expired), and each browser fallback logs yt-dlp's actual reason instead of a generic "no usable cookies"
@@ -106,7 +107,9 @@ For example (omitted keys use their defaults):
   "outputRoot": "D:/Downloads/YT",
   "targetFormat": "mp4",
   "downloadSubtitles": true,
+  "embedSubtitles": true,
   "writeThumbnail": true,
+  "embedThumbnail": true,
   "writeDescription": false
 }
 ```
@@ -349,8 +352,11 @@ the stale format ids, re-probes, and retries instead of parking the job.
 | Key | Default | What it does |
 | --- | --- | --- |
 | `downloadSubtitles` | `true` | Fetch subtitle files for newly added videos. |
-| `subtitleLanguages` | `"all"` | Which subtitle languages to fetch: comma-separated codes (`"en, es, ja"` — regexes like `en.*` work), or `"all"` for every available language including auto-generated captions. |
+| `subtitleLanguages` | `"all"` | Which subtitle languages to fetch: comma-separated codes (`"en, es, ja"` — regexes like `en.*` work), or `"all"` for every available language including auto-generated captions. Live chat is always excluded (it is not a subtitle track, and a busy chat easily blows the metadata timeout). |
 | `subtitleFormat` | `"srt"` | Container for the fetched subtitles (converted by yt-dlp). |
+| `embedSubtitles` | `true` | Mux the fetched subtitle files into the media as selectable tracks during conversion. Turning it on also makes new jobs fetch subtitles. |
+| `embedThumbnail` | `true` | Attach the saved thumbnail as cover art during conversion (MP4/MKV/MP3/M4A; WebM cannot carry one). Turning it on also makes new jobs fetch the thumbnail. |
+| `embedMetadata` | `true` | Pass `--embed-metadata --embed-chapters` to yt-dlp so tags and chapters are part of the download. Thumbnails and subtitles are embedded by the converter, not by yt-dlp. |
 | `writeThumbnail` / `writeDescription` | `true` | Thumbnail / description sidecars requested for newly added jobs; per-video choices persist for existing jobs. |
 | `writeInfoJson` | `true` | Global `.info.json` sidecar setting; the manual scan checks every downloaded job against its current value. |
 
@@ -560,8 +566,10 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
 4. **Metadata workers** — fetch subtitles, thumbnails, and descriptions per video, based on config flags
 5. **Converter workers** — convert completed downloads into the target format
    (queued whenever a finished file's container differs from the requested one,
-   e.g. an MKV from yt-dlp when MP4 was selected), optionally moving them (with
-   sidecars) to a secondary storage path. The move
+   e.g. an MKV from yt-dlp when MP4 was selected, and also when `embedSubtitles`
+   / `embedThumbnail` ask for sidecars to be muxed into a file whose container is
+   already correct), embedding subtitle tracks and cover art in the same pass,
+   optionally moving them (with sidecars) to a secondary storage path. The move
    is copy-then-remove: if the destination copy fails (full disk, unwritable
    share, cross-volume copy error) both copies are kept and the job is retried,
    so a broken secondary store can never delete the only copy

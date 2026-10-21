@@ -97,6 +97,13 @@ export const ConfigSchema = z
     // yt-dlp --sub-langs value (e.g. "en,es,ja" — regexes like "en.*" work),
     // or "all" for every available language including auto-generated ones.
     subtitleLanguages: z.string(),
+    // Mux the subtitle sidecars into the video as selectable tracks (in the
+    // converter, so the tracks survive a container change). Independent of
+    // downloadSubtitles: turning it on makes new jobs want subtitles too.
+    embedSubtitles: z.boolean(),
+    // Attach the thumbnail sidecar as cover art. Independent of writeThumbnail:
+    // turning it on makes new jobs want the thumbnail file.
+    embedThumbnail: z.boolean(),
     embedMetadata: z.boolean(),
     writeInfoJson: z.boolean(),
     writeDescription: z.boolean(),
@@ -199,6 +206,8 @@ export const DEFAULT_CONFIG: Config = {
   audioTrackLanguages: [],
   downloadSubtitles: true,
   subtitleLanguages: "all",
+  embedSubtitles: true,
+  embedThumbnail: true,
   embedMetadata: true,
   writeInfoJson: true,
   writeDescription: true,

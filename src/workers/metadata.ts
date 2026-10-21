@@ -26,6 +26,7 @@ import {
   updateUnavailableMetadataKinds,
   type MetadataKind,
 } from "../metadata-files";
+import { subtitleArgs } from "../subtitles";
 import { updateAbsoluteLine } from "../dashboard";
 import {
   abortController,
@@ -41,20 +42,26 @@ import { logError } from "../logger";
 import type { Config } from "../config";
 
 /**
- * The yt-dlp subtitle flags for one metadata pass (pure, unit-tested).
+ * The yt-dlp subtitle flags for one metadata pass.
  *
- * `subtitleLanguages` is the operator's --sub-langs value: "all" (or blank)
- * keeps the legacy behaviour of fetching every language including
- * auto-generated captions (`all.*`); anything else is passed through as a
- * comma-separated list of codes/regexes (e.g. "en,es,ja" or "en.*").
+ * Re-exported from `src/subtitles.ts` (a pure module shared with the
+ * converter) so existing tests and callers keep their import, while the
+ * live-chat exclusion and language parsing live in one place.
  */
-export function subtitleArgs(config: {
-  subtitleLanguages: string;
-  subtitleFormat: string;
-}): string[] {
-  const langs = (config.subtitleLanguages || "").trim();
-  const selector = !langs || langs.toLowerCase() === "all" ? "all.*" : langs;
-  return ["--write-subs", "--write-auto-subs", "--sub-langs", selector, "--convert-subs", config.subtitleFormat || "srt"];
+export { subtitleArgs };
+
+/**
+ * How long one metadata pass may run.
+ *
+ * Subtitles are the only sidecar that can take minutes: with the legacy "all"
+ * setting yt-dlp fetches every manual *and* auto-generated language and runs
+ * ffmpeg over each one. The flat ten minutes this used to use routinely killed
+ * a half-finished subtitle fetch, and the retry started over from the first
+ * language — the job never finished and the media sat without sidecars. A
+ * thumbnails-only pass keeps the short timeout.
+ */
+export function metadataTimeoutMs(missing: readonly MetadataKind[]): number {
+  return missing.includes("subtitles") ? 30 * 60_000 : 10 * 60_000;
 }
 
 /** Only ask yt-dlp for sidecar types confirmed missing on disk. */
@@ -259,6 +266,7 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
   ];
   args.push(...missingSidecarArgs(config, missing));
 
+  const timeoutMs = metadataTimeoutMs(missing);
   const ctl = new AbortController();
   let proc: Bun.Subprocess | null = null;
   const timer = setTimeout(() => {
@@ -270,7 +278,7 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
         proc.kill("SIGKILL");
       } catch {}
     }
-  }, 10 * 60 * 1000);
+  }, timeoutMs);
   let stdoutText = "";
   let stderrText = "";
   let code = -1;
@@ -294,8 +302,26 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
     releaseClaimedJob("metadata", job.id, metadataClaim(job), `metadata_status = 'pending'`);
     return;
   }
-  if (ctl.signal.aborted) throw new Error("Metadata fetch timed out (10m)");
+  if (ctl.signal.aborted) {
+    throw new Error(`Metadata fetch timed out (${Math.round(timeoutMs / 60_000)}m)`);
+  }
   if (code !== 0) {
+    // yt-dlp exits non-zero when ONE requested sidecar fails while the others
+    // were written — a single caption language answering 403 is the common
+    // case. Throwing here discarded that success and retried the whole pass,
+    // burning the per-video budget against files that were already on disk.
+    // If everything this pass asked for landed, record it (and say so).
+    const afterFailure = await readdir(mediaDir).catch(() => [] as string[]);
+    const landedSidecars = findSidecarFiles(afterFailure, mediaBase, mediaFilename);
+    const stillMissing = missingMetadataKinds(
+      landedSidecars,
+      Object.fromEntries(missing.map((kind) => [kind, true])),
+    );
+    if (stillMissing.length === 0) {
+      updateMetadataWorkerLine(id, `⚠️ Metadata wrote all files despite a yt-dlp error | ${job.title}`, config);
+      recordMetadataSuccess(job, config, id, landedSidecars, false, missing);
+      return;
+    }
     const tail = [stderrText, stdoutText]
       .filter(Boolean)
       .join("\n")

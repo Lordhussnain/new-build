@@ -399,9 +399,10 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     }
     const fileSize = (await stat(filePath)).size;
     // Container check: yt-dlp does NOT promise the requested container. With
-    // the quality presets it prefers VP9/Opus (webm/mkv) at most resolutions,
-    // and --embed-thumbnail remuxes a .webm into .mkv because WebM cannot hold
-    // attached art. Jobs whose global target is mp4 are pre-marked
+    // the quality presets it prefers VP9/Opus (webm/mkv) at most resolutions.
+    // (Thumbnail/subtitle embedding no longer runs inside yt-dlp at all — the
+    // converter muxes them after this check, see src/media-embed.ts.) Jobs
+    // whose global target is mp4 are pre-marked
     // conversion_status = 'not_needed' (scanner.ts), so without this check the
     // mkv/webm output would be final. Queue the conversion stage whenever the
     // produced container differs from the requested one — the converter remuxes

@@ -733,9 +733,46 @@ describe("ingestItems", () => {
     expect(job.duration).toBe(120);
     expect(job.download_status).toBe("pending");
     expect(job.metadata_status).toBe("pending"); // writeInfoJson is on
-    expect(job.conversion_status).toBe("not_needed"); // mp4 target
+    // mp4 target, but the default config embeds subtitles/thumbnail in the
+    // converter, so the job must pass through the conversion stage.
+    expect(job.conversion_status).toBe("pending");
     expect(job["index"]).toBe(1);
     expect(getJob("vid002")["index"]).toBe(2);
+  });
+
+  test("with embedding switched off, an mp4 target keeps the not_needed fast path", async () => {
+    const r = await ingestItems(
+      [{ id: "vid-plain", title: "Plain", playlist: "My Playlist", duration: 60 }],
+      testConfig({
+        outputRoot: "./downloads",
+        videoQuality: "1080p",
+        writeInfoJson: true,
+        embedSubtitles: false,
+        embedThumbnail: false,
+      }),
+    );
+    expect(r.added).toBe(1);
+    expect(getJob("vid-plain").conversion_status).toBe("not_needed");
+  });
+
+  test("embedding alone makes a new job want the sidecar it needs", async () => {
+    await ingestItems(
+      [{ id: "vid-embed", title: "Embed", playlist: "My Playlist", duration: 60 }],
+      testConfig({
+        outputRoot: "./downloads",
+        videoQuality: "1080p",
+        writeInfoJson: false,
+        downloadSubtitles: false,
+        writeThumbnail: false,
+        embedSubtitles: true,
+        embedThumbnail: true,
+      }),
+    );
+    const job = getJob("vid-embed");
+    expect(job.want_subtitles).toBe(1);
+    expect(job.want_thumbnail).toBe(1);
+    expect(job.metadata_status).toBe("pending");
+    expect(job.conversion_status).toBe("pending");
   });
 
   test("dedupes on video id across scans", async () => {

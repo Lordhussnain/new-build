@@ -338,9 +338,16 @@ while (!abortController.signal.aborted) {
   case-insensitive sidecar classification; `metadata-scan.ts` backs the
   dashboard's manual `POST /api/metadata/scan` action, which checks all
   database-tracked downloaded jobs and queues only missing requested types.
-- **converterWorker** — ffmpeg mp3 transcode or mp4 remux (`-c:v copy`), then
-  optionally moves the media file **and its sidecars** to
-  `secondaryStoragePath/<folder>/`, then hashes it.
+- **converterWorker** — ffmpeg mp3 transcode or remux (`-c:v copy`) that also
+  muxes subtitle sidecars and cover art from the metadata stage
+  (`src/media-embed.ts` owns the argv, `src/subtitles.ts` the language tags),
+  then optionally moves the media file **and its sidecars** to
+  `secondaryStoragePath/<folder>/`, then hashes it. The remux maps `0:v?`,
+  `0:a?`, and the source's own `0:s?`/`0:t?`; a sidecar subtitle set is
+  authoritative, and a sidecar cover replaces the source's attached picture, so
+  a retry can never duplicate tracks. Same-container work (mp4 → mp4 just to
+  embed) writes a `.yta-tmp.<ext>` sibling and renames it over the source only
+  after ffmpeg succeeds.
 
 Workers are supervised (`lifecycle.ts supervise()`): a crashed loop is logged
 and restarted after 5s. Never let a worker loop exit on error.
@@ -463,6 +470,18 @@ Relocation key: `secondaryStoragePath` pairs with the jobs table's
 `relocated_to` column — the secondary-storage root each file was moved under.
 NULL means "still in the output tree".
 
+Embedding keys: `embedSubtitles` (default true) and `embedThumbnail` (default
+true) are applied by the converter, not by yt-dlp: `--embed-subs` /
+`--embed-thumbnail` act on the file yt-dlp just wrote, and the converter's
+remux used to discard the resulting tracks (the old map was `0:v:0` + `0:a`
+only; an MKV cover is an attachment). `embedMetadata` still adds
+`--embed-metadata --embed-chapters` to the download itself. At ingest,
+`embedSubtitles`/`embedThumbnail` force `want_subtitles`/`want_thumbnail` on
+and set `conversion_status = 'pending'`, which is what routes an mp4-target job
+through the converter at all (`scanner.ts`). A multi-audio MKV is still kept as
+MKV: `convertJob` re-derives the effective container from the job's cached
+audio selection when the target is mp4 and two or more tracks are selected.
+
 Reliability keys: `maxResumeAttempts`, `retryBackoffBaseSeconds`,
 `retryBackoffMaxSeconds`, `requeueFailedAfterMinutes`, `verifyExistingFiles`,
 `downloadTimeoutMinutes`, `maxDownloadMinutes`.
@@ -553,10 +572,17 @@ Dynamic Range Compression duplicates. `src/audio-tracks.ts` owns this:
 The scanner pre-marks jobs whose target is mp4 `conversion_status =
 'not_needed'` — a fast path that trusts yt-dlp to produce mp4. yt-dlp makes no
 such promise: the QUALITY_FORMATS presets prefer VP9/Opus at most resolutions,
-those codecs merge into webm/mkv, and `--embed-thumbnail` remuxes a `.webm`
-into `.mkv` because WebM cannot hold attached art. An archive built on the
-fast path alone therefore ends up MKV while the dashboard says mp4 — the
-"selected mp4, got mkv" bug.
+those codecs merge into webm/mkv (`--embed-thumbnail` used to force a
+`.webm` → `.mkv` remux too, but embedding now happens in the converter). An
+archive built on the fast path alone therefore ends up MKV while the dashboard
+says mp4 — the "selected mp4, got mkv" bug.
+
+Embedding extends the same contract: a job that asks for a subtitle track or a
+cover (`embedSubtitles` / `embedThumbnail`) is `conversion_status = 'pending'`
+from ingest even when the produced container already matches, because the
+embedding pass lives in the converter. The converter skips ffmpeg entirely when
+there is nothing to add (target container already correct, no sidecar subtitle
+set, no missing cover), so the extra stage is a claim + finalize in that case.
 
 The contract is now: **the produced container is checked once the download is
 final** (after every yt-dlp postprocessor ran, i.e. on the `after_move:` path
@@ -1296,6 +1322,7 @@ Windows — an environment assumption is still a broken test:
 | Add a run-level CLI override | Pure parser in `src/config.ts` → apply to the in-memory config in `src/engine.ts` before `setConfig()` → focused `tests/config.test.ts`; document in README |
 | Change relocation | `src/relocate.ts` (+ the `RELOCATION_WHERE` predicate and `relocated_to` in `src/db.ts`, written by `workers/convert.ts finalizeConversion` and `workers/download.ts recordSuccess`) → `tests/offline-mode.test.ts` |
 | Add a worker | `src/workers/<name>.ts` → claim fn in `db.ts` → `supervise()` in `engine.ts` → TUI line in `dashboard.ts` |
+| Change subtitle/cover embedding | pure argv in `src/media-embed.ts` → `workers/convert.ts` `collectEmbedInputs`/`convertJob` → `tests/media-embed.test.ts` + the `integration: subtitle and thumbnail embedding` scenario |
 | Support a new site/URL shape | `src/sources.ts parseSourceUrl()` (Web UI validation/source identity) + `src/scanner.ts normalizeVideoUrl()` (job URL canonicalization) |
 | Probe the OS (disk space, …) | `src/resilience.ts diskUsage()` — statfs + PowerShell fallback + degraded mode in one place; never call `statfs` directly (gotcha 22) |
 

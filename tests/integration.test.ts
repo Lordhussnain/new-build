@@ -31,7 +31,7 @@
 //                              ends as a terminal "No format available" skip
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { copyFile, mkdir, mkdtemp, readdir, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
@@ -1349,7 +1349,10 @@ describe("integration: durable partial and superseded recovery", () => {
     try {
       const jobs = await waitForAllJobs(
         engine,
-        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+        (j) =>
+          j.download_status === "downloaded" &&
+          j.metadata_status === "done" &&
+          j.conversion_status === "done",
       );
       targetId = jobs[0].id;
       const mediaAbs = resolve(dir, jobs[0].file_path!);
@@ -1404,7 +1407,10 @@ describe("integration: durable partial and superseded recovery", () => {
     try {
       const jobs = await waitForAllJobs(
         engine,
-        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+        (j) =>
+          j.download_status === "downloaded" &&
+          j.metadata_status === "done" &&
+          j.conversion_status === "done",
       );
       targetId = jobs[0].id;
       mediaAbs = resolve(dir, jobs[0].file_path!);
@@ -2028,7 +2034,14 @@ describe("integration: per-job sidecars from the Web UI", () => {
     const engine = await startEngine(
       dir,
       4001,
-      BASE_CONFIG(4001, { downloadSubtitles: false, writeThumbnail: false, writeDescription: false, writeInfoJson: false }),
+      BASE_CONFIG(4001, {
+        downloadSubtitles: false,
+        writeThumbnail: false,
+        writeDescription: false,
+        writeInfoJson: false,
+        embedSubtitles: false,
+        embedThumbnail: false,
+      }),
     );
     const folder = join(dir, "downloads", "Mock Playlist");
 
@@ -2067,6 +2080,66 @@ describe("integration: per-job sidecars from the Web UI", () => {
       for (const other of rows.filter((r: any) => r.id !== "mockvid001")) {
         expect(other.metadata_status).toBe("not_needed");
       }
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
+describe("integration: subtitle and thumbnail embedding", () => {
+  test("the converter muxes subtitle sidecars and the cover into the finished mp4", async () => {
+    const dir = await makeRunDir();
+    const log = join(dir, "ffmpeg-args.log");
+    // mp4 in, mp4 target: the only reason the converter runs is embedding, so
+    // this scenario proves the embedding path itself (not a container change).
+    const engine = await startEngine(dir, 4029, BASE_CONFIG(4029), { FAKE_FFMPEG_LOG: log });
+
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) =>
+          j.download_status === "downloaded" &&
+          j.metadata_status === "done" &&
+          j.conversion_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+      for (const job of jobs) expect(job.file_path!.endsWith(".mp4")).toBe(true);
+
+      const calls = (await readFile(log, "utf8"))
+        .split("\n")
+        .filter((line) => line.trim())
+        .map((line) => JSON.parse(line) as string[]);
+
+      // The remux call for the first video: it must carry the subtitle sidecar
+      // and the thumbnail as inputs, and ask for a subtitle track + cover art.
+      const remux = calls.find(
+        (args) =>
+          args.includes("-map") &&
+          args.includes("-c:v") &&
+          args.some((a) => a.endsWith("001 - First Mock Video.en.vtt")),
+      );
+      expect(remux).toBeTruthy();
+      const args = remux!;
+      const maps = args.flatMap((a, i) => (a === "-map" ? [args[i + 1]] : []));
+      expect(maps).toContain("0:a?");
+      expect(maps).toContain("1:s:0");
+      expect(args[args.indexOf("-c:s") + 1]).toBe("mov_text");
+      expect(args).toContain("attached_pic");
+      expect(args[args.indexOf("-disposition:v:1") + 1]).toBe("attached_pic");
+      // The subtitle language tag reaches the muxer (ISO 639-2).
+      expect(args).toContain("language=eng");
+      // The cover came from the saved thumbnail sidecar, in the same pass.
+      expect(args.some((a) => a.endsWith("001 - First Mock Video.jpg"))).toBe(true);
+      expect(args[args.length - 1].endsWith(".yta-tmp.mp4")).toBe(true);
+
+      // Sidecars survive embedding: the operator still gets the files.
+      const folder = join(dir, "downloads", "Mock Playlist");
+      const files = await readdir(folder);
+      expect(files.some((f) => f === "001 - First Mock Video.en.vtt")).toBe(true);
+      expect(files.some((f) => f === "001 - First Mock Video.jpg")).toBe(true);
+      // No half-written temp left behind by the same-path remux.
+      expect(files.filter((f) => f.includes(".yta-tmp."))).toHaveLength(0);
     } finally {
       await engine.stop();
     }

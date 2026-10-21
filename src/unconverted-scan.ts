@@ -121,9 +121,9 @@ function effectiveAudioTrackCount(
  *
  * This is the repair path for an archive that predates the download worker's
  * container check: yt-dlp does not promise the requested container (VP9/Opus
- * presets merge into webm/mkv, and --embed-thumbnail turns a .webm into .mkv),
- * and jobs whose target was mp4 were historically marked `not_needed`, so
- * those files never went through the conversion stage. The sweep flips such a
+ * presets merge into webm/mkv), and jobs whose target was mp4 were historically
+ * marked `not_needed`, so those files never went through the conversion stage.
+ * The sweep flips such a
  * job's conversion_status back to 'pending' — the converter then remuxes the
  * file exactly as it would for a fresh download (video copied, audio to AAC
  * for mp4) — and is idempotent: once converted, the file's container matches

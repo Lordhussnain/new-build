@@ -9,11 +9,19 @@
 //   FAKE_FFMPEG_FAIL=1   exit 1 with an error message (conversion failure)
 //   FAKE_FFMPEG_HANG=1   hang forever (timeout test)
 
+import { appendFile } from "node:fs/promises";
+
 const argv = process.argv.slice(2);
 
 if (argv[0] === "-version") {
   console.log("ffmpeg version 7.0.2-mock https://example.invalid/ffmpeg");
   process.exit(0);
+}
+
+// Record argv (one JSON array per line) so integration tests can assert what
+// the converter actually asked ffmpeg to mux — streams, codecs, dispositions.
+if (process.env.FAKE_FFMPEG_LOG) {
+  await appendFile(process.env.FAKE_FFMPEG_LOG, `${JSON.stringify(argv)}\n`);
 }
 
 if (process.env.FAKE_FFMPEG_HANG === "1") {

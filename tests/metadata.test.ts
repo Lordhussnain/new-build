@@ -7,7 +7,7 @@ import {
   parseUnavailableMetadataKinds,
   updateUnavailableMetadataKinds,
 } from "../src/metadata-files";
-import { missingSidecarArgs, subtitleArgs } from "../src/workers/metadata";
+import { metadataTimeoutMs, missingSidecarArgs, subtitleArgs } from "../src/workers/metadata";
 
 describe("subtitleArgs", () => {
   test('"all" keeps the legacy fetch-everything behaviour', () => {
@@ -15,14 +15,14 @@ describe("subtitleArgs", () => {
       "--write-subs",
       "--write-auto-subs",
       "--sub-langs",
-      "all.*",
+      "all.*,-live_chat",
       "--convert-subs",
       "srt",
     ]);
   });
 
   test("blank falls back to every language", () => {
-    expect(subtitleArgs({ subtitleLanguages: "  ", subtitleFormat: "vtt" })[3]).toBe("all.*");
+    expect(subtitleArgs({ subtitleLanguages: "  ", subtitleFormat: "vtt" })[3]).toBe("all.*,-live_chat");
   });
 
   test("an explicit list is passed through verbatim", () => {
@@ -31,7 +31,7 @@ describe("subtitleArgs", () => {
       "--write-subs",
       "--write-auto-subs",
       "--sub-langs",
-      "en, es , ja",
+      "en, es , ja,-live_chat",
       "--convert-subs",
       "ass",
     ]);
@@ -40,6 +40,15 @@ describe("subtitleArgs", () => {
   test("missing subtitle format defaults to srt", () => {
     const args = subtitleArgs({ subtitleLanguages: "en", subtitleFormat: "" });
     expect(args[args.length - 1]).toBe("srt");
+  });
+});
+
+describe("metadataTimeoutMs", () => {
+  test("a subtitle pass gets the long timeout; other sidecars keep the short one", () => {
+    expect(metadataTimeoutMs(["subtitles"])).toBe(30 * 60_000);
+    expect(metadataTimeoutMs(["subtitles", "thumbnail"])).toBe(30 * 60_000);
+    expect(metadataTimeoutMs(["thumbnail", "infoJson"])).toBe(10 * 60_000);
+    expect(metadataTimeoutMs([])).toBe(10 * 60_000);
   });
 });
 
