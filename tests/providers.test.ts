@@ -2,6 +2,7 @@
 // URL a job is downloaded from. Everything here is pure — no I/O, no yt-dlp.
 import { describe, expect, test } from "bun:test";
 import {
+  canonicalVideoUrl,
   channelFolderFallback,
   classifySourceUrl,
   cookieProbeUrls,
@@ -100,6 +101,48 @@ describe("classifySourceUrl — Bilibili videos", () => {
       .toBe("https://www.bilibili.com/cheese/play/ep229832");
     expect(classifySourceUrl("https://www.bilibili.com/audio/au1234567")?.url)
       .toBe("https://www.bilibili.com/audio/au1234567");
+  });
+
+  test("the international layout on the main host is the same source underneath", () => {
+    // bilibili.com also serves its pages under a UI-language prefix
+    // (`/en/video/BV…`); yt-dlp's BiliBiliIE pattern is the un-prefixed path, so
+    // the prefix is presentation and must never become part of a source's
+    // identity — pasting either spelling has to land on the same saved source.
+    for (const url of [
+      "https://www.bilibili.com/en/video/BV1WTnozqEd3/",
+      "https://www.bilibili.com/en/video/BV1WTnozqEd3",
+      "https://m.bilibili.com/ja/video/BV1WTnozqEd3/",
+      "https://www.bilibili.com/EN/video/BV1WTnozqEd3/",
+    ]) {
+      expect(classifySourceUrl(url, { singleVideo: false })).toEqual({
+        provider: "bilibili",
+        shape: "video",
+        url: "https://www.bilibili.com/video/BV1WTnozqEd3",
+      });
+    }
+    expect(canonicalVideoUrl("https://www.bilibili.com/en/video/BV1WTnozqEd3/")).toBe(
+      "https://www.bilibili.com/video/BV1WTnozqEd3",
+    );
+    // The prefix is dropped for the other shapes too, and `?p=` still wins.
+    expect(classifySourceUrl("https://www.bilibili.com/en/bangumi/play/ep21495", { singleVideo: false })).toEqual({
+      provider: "bilibili",
+      shape: "video",
+      url: "https://www.bilibili.com/bangumi/play/ep21495",
+    });
+    expect(classifySourceUrl("https://www.bilibili.com/en/list/ml999?sid=456&bvid=BV1x411c7mD", { singleVideo: false })).toEqual({
+      provider: "bilibili",
+      shape: "playlist",
+      url: "https://www.bilibili.com/list/ml999?sid=456",
+    });
+    expect(classifySourceUrl("https://www.bilibili.com/en/video/BV1WTnozqEd3/?p=4", { singleVideo: false })).toEqual({
+      provider: "bilibili",
+      shape: "video",
+      url: "https://www.bilibili.com/video/BV1WTnozqEd3?p=4",
+    });
+    // A two-letter segment in front of an unknown shape is still not a source,
+    // and a bare language root is nothing at all.
+    expect(classifySourceUrl("https://www.bilibili.com/en/nonexistent/BV1x411c7mD", { singleVideo: false })).toBeNull();
+    expect(classifySourceUrl("https://www.bilibili.com/en", { singleVideo: false })).toBeNull();
   });
 
   test("a b23.tv share link is kept verbatim — only yt-dlp can follow it", () => {

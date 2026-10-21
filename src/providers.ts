@@ -185,6 +185,27 @@ function isB23Host(host: string): boolean {
   return host === "b23.tv" || host.endsWith(".b23.tv");
 }
 
+/**
+ * Drop bilibili.com's optional UI-language prefix (`/en/video/BV…`,
+ * `/ja/bangumi/play/ep…`): the main host serves the international layout under a
+ * two-letter segment, but the page — and yt-dlp's BiliBiliIE pattern — is the
+ * un-prefixed one, so the prefix is presentation, never identity. Only a segment
+ * followed by another path segment (or nothing) is a candidate, and only known
+ * shapes match afterwards, so `/video/…` and every other path is untouched.
+ */
+function stripBilibiliLangPrefix(path: string): string {
+  if (!/^\/[a-zA-Z]{2}(?:\/|$)/.test(path)) return path;
+  return path.slice(3) || "/";
+}
+
+/** The same URL with that prefix removed, for matching against known shapes. */
+function withoutBilibiliLangPrefix(parsed: URL): URL {
+  const path = parsed.pathname.replace(/\/+$/, "");
+  const bare = stripBilibiliLangPrefix(path);
+  if (bare === path) return parsed;
+  return new URL(`${parsed.origin}${bare}${parsed.search}`);
+}
+
 function isIntlHost(host: string): boolean {
   return (
     host === "bilibili.tv" || host.endsWith(".bilibili.tv") ||
@@ -250,7 +271,11 @@ function canonicalBilibiliVideo(parsed: URL): string | null {
   // knowable by following it — leave that to yt-dlp and keep the link verbatim.
   if (isB23Host(host)) return null;
 
-  const video = path.match(/^\/video\/([A-Za-z0-9]+)$/);
+  // The international layout on the main host: /en/video/BV… is /video/BV…
+  parsed = withoutBilibiliLangPrefix(parsed);
+  const barePath = parsed.pathname.replace(/\/+$/, "");
+
+  const video = barePath.match(/^\/video\/([A-Za-z0-9]+)$/);
   if (video && BILIBILI_VIDEO_ID.test(video[1])) {
     // `?p=N` selects one page of an anthology and MUST survive: without it
     // yt-dlp treats the URL as the whole anthology and downloads every page
@@ -259,15 +284,15 @@ function canonicalBilibiliVideo(parsed: URL): string | null {
     return `https://www.bilibili.com/video/${video[1]}${page ? `?p=${page}` : ""}`;
   }
   const bvid = parsed.searchParams.get("bvid");
-  if (/^\/festival\/[^/]+$/.test(path) && bvid && BILIBILI_VIDEO_ID.test(bvid)) {
+  if (/^\/festival\/[^/]+$/.test(barePath) && bvid && BILIBILI_VIDEO_ID.test(bvid)) {
     // Same video through a campaign page: one identity, the plain video URL.
     return `https://www.bilibili.com/video/${bvid}`;
   }
-  const bangumi = path.match(/^\/bangumi\/play\/ep(\d{1,20})$/i);
+  const bangumi = barePath.match(/^\/bangumi\/play\/ep(\d{1,20})$/i);
   if (bangumi) return `https://www.bilibili.com/bangumi/play/ep${bangumi[1]}`;
-  const cheese = path.match(/^\/cheese\/play\/ep(\d{1,20})$/i);
+  const cheese = barePath.match(/^\/cheese\/play\/ep(\d{1,20})$/i);
   if (cheese) return `https://www.bilibili.com/cheese/play/ep${cheese[1]}`;
-  const audio = path.match(/^\/audio\/au(\d{1,20})$/i);
+  const audio = barePath.match(/^\/audio\/au(\d{1,20})$/i);
   if (audio) return `https://www.bilibili.com/audio/au${audio[1]}`;
   return null;
 }
@@ -513,12 +538,17 @@ function classifyBilibiliSource(parsed: URL, opts: ClassifySourceOptions): Class
     return shape("video", `https://b23.tv/${code}`);
   }
 
+  // The international layout on the main host is the same source underneath:
+  // strip the language prefix once, for the video gate and every list shape.
+  parsed = withoutBilibiliLangPrefix(parsed);
+  const barePath = parsed.pathname.replace(/\/+$/, "");
+
   const video = canonicalBilibiliVideo(parsed);
   if (video) return shape("video", video);
 
   // "Single video only" for the series players, which carry the video id in the
   // query: /list/<mid>?sid=<sid>&oid=<aid>&bvid=<BV…>
-  if (opts.singleVideo && /^\/(?:list|medialist\/play)\/[\w-]+$/.test(path)) {
+  if (opts.singleVideo && /^\/(?:list|medialist\/play)\/[\w-]+$/.test(barePath)) {
     const bvid = parsed.searchParams.get("bvid");
     const oid = parsed.searchParams.get("oid");
     if (bvid && BILIBILI_VIDEO_ID.test(bvid)) return shape("video", `https://www.bilibili.com/video/${bvid}`);
@@ -555,18 +585,18 @@ function classifyBilibiliSource(parsed: URL, opts: ClassifySourceOptions): Class
   }
 
   // Main-site lists.
-  const bangumiSeason = path.match(/^\/bangumi\/play\/ss(\d{1,20})$/i);
+  const bangumiSeason = barePath.match(/^\/bangumi\/play\/ss(\d{1,20})$/i);
   if (bangumiSeason) return shape("playlist", `https://www.bilibili.com/bangumi/play/ss${bangumiSeason[1]}`);
-  const bangumiMedia = path.match(/^\/bangumi\/media\/md(\d{1,20})$/i);
+  const bangumiMedia = barePath.match(/^\/bangumi\/media\/md(\d{1,20})$/i);
   if (bangumiMedia) return shape("playlist", `https://www.bilibili.com/bangumi/media/md${bangumiMedia[1]}`);
-  const cheeseSeason = path.match(/^\/cheese\/play\/ss(\d{1,20})$/i);
+  const cheeseSeason = barePath.match(/^\/cheese\/play\/ss(\d{1,20})$/i);
   if (cheeseSeason) return shape("playlist", `https://www.bilibili.com/cheese/play/ss${cheeseSeason[1]}`);
-  const audioAlbum = path.match(/^\/audio\/am(\d{1,20})$/i);
+  const audioAlbum = barePath.match(/^\/audio\/am(\d{1,20})$/i);
   if (audioAlbum) return shape("playlist", `https://www.bilibili.com/audio/am${audioAlbum[1]}`);
-  const medialist = path.match(/^\/medialist\/detail\/ml(\d{1,20})$/i);
+  const medialist = barePath.match(/^\/medialist\/detail\/ml(\d{1,20})$/i);
   if (medialist) return shape("playlist", `https://www.bilibili.com/medialist/detail/ml${medialist[1]}`);
-  if (/^\/watchlater$/.test(path)) return shape("playlist", "https://www.bilibili.com/watchlater");
-  if (/^\/(?:list|medialist\/play)\/[\w-]+$/.test(path)) {
+  if (/^\/watchlater$/.test(barePath)) return shape("playlist", "https://www.bilibili.com/watchlater");
+  if (/^\/(?:list|medialist\/play)\/[\w-]+$/.test(barePath)) {
     // `sid` (and `business`, which tells the player which series it is) decide
     // what is listed; `oid`/`bvid` only point at the video the share link
     // happened to open, so dropping them keeps one identity per list. Kept
@@ -577,7 +607,7 @@ function classifyBilibiliSource(parsed: URL, opts: ClassifySourceOptions): Class
       if (keep.has(key.toLowerCase()) && value && !kept.some(([k]) => k === key)) kept.push([key, value]);
     }
     const query = kept.length > 0 ? `?${new URLSearchParams(kept).toString()}` : "";
-    return shape("playlist", `https://www.bilibili.com${path}${query}`);
+    return shape("playlist", `https://www.bilibili.com${barePath}${query}`);
   }
   return null;
 }

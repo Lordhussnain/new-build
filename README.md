@@ -252,7 +252,7 @@ page's `?bvid=`).
 
 | Paste this | Saved as | Queued from |
 | --- | --- | --- |
-| `bilibili.com/video/BV…` (also `av…`, `m.bilibili.com`, `b23.tv/…`, `/festival/…?bvid=…`) | `playlists` | that one video (one job per part when `?p=` selects one) |
+| `bilibili.com/video/BV…` (also `av…`, `m.bilibili.com`, `b23.tv/…`, `/festival/…?bvid=…`, and the `/en/` language prefix) | `playlists` | every part of a multi-part video as its own job, or just the selected part with `?p=N` |
 | `space.bilibili.com/<mid>/favlist?fid=…` (favourites) | `playlists` | every video in that favourites list |
 | `bilibili.com/list/<sid>`, `/medialist/play/<id>`, `/medialist/detail/ml…`, `/watchlater` | `playlists` | the series/album/watchlater list |
 | `space.bilibili.com/<mid>/lists/<sid>` (`?type=season` or `series`), `/channel/collectiondetail?sid=…`, `/channel/seriesdetail?sid=…` | `playlists` | the collection or series |
