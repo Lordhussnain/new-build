@@ -19,6 +19,7 @@
 
 import { Database } from "bun:sqlite";
 import type { Config } from "./config";
+import { fallbackVideoUrl } from "./providers";
 import { clearJobCancelled } from "./state";
 
 export interface Job {
@@ -666,7 +667,7 @@ export function deleteJobsAndIgnore(ids: Iterable<string>): { deleted: number; i
       const sources = sourceQuery.all(job.id) as { source_url: string }[];
       ignore.run(
         job.id,
-        job.url || `https://www.youtube.com/watch?v=${job.id}`,
+        job.url || fallbackVideoUrl(job.id),
         job.title || job.id,
         JSON.stringify(sources.map((source) => source.source_url)),
       );

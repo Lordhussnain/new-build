@@ -138,7 +138,7 @@ export const ConfigSchema = z
     rssEnabled: z.boolean(),
     rssPollIntervalMinutes: z.number().min(1),
     rescanIntervalHours: z.number().min(0),
-    // Resilience: network connectivity monitor. When enabled, probes YouTube
+    // Resilience: network connectivity monitor. When enabled, probes the sites
     // periodically and pauses the engine after consecutive failures.
     networkMonitorEnabled: z.boolean(),
   })

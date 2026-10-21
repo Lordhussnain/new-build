@@ -347,7 +347,16 @@ describe("GET/DELETE /api/sources", () => {
       );
 
       const listed = await handleRequest(new Request("http://x/api/sources"), getConfig());
-      expect((await listed.json()).sources).toEqual([{ key: "playlists", url: playlist, trackedJobs: 1 }]);
+      expect((await listed.json()).sources).toEqual([
+        {
+          key: "playlists",
+          url: playlist,
+          trackedJobs: 1,
+          provider: "youtube",
+          providerLabel: "YouTube",
+          shape: "playlist",
+        },
+      ]);
 
       const removed = await handleRequest(new Request("http://x/api/sources", {
         method: "DELETE",
@@ -358,6 +367,62 @@ describe("GET/DELETE /api/sources", () => {
       expect(await removed.json()).toMatchObject({ ok: true, deletedJobs: 1, retainedJobs: 0 });
       expect((await loadConfig()).playlists).toEqual([]);
       expect(db.query("SELECT id FROM jobs WHERE id = 'api001'").get()).toBeNull();
+    } finally {
+      process.chdir(cwd);
+    }
+  });
+
+  test("reports which site each configured source points at", async () => {
+    const dir = await makeDir();
+    const cwd = process.cwd();
+    process.chdir(dir);
+    try {
+      const config = baseConfig({
+        playlists: ["https://space.bilibili.com/3546702659488348/favlist?fid=3707880948"],
+        channels: ["https://space.bilibili.com/55/upload/video", "https://www.youtube.com/@SomeChannel/videos"],
+        outputRoot: join(dir, "out"),
+      });
+      // A URL nobody can classify — an entry put there by hand, before this UI
+      // validated anything. It must still be listed, with provider null.
+      (config as { playlists: string[] }).playlists.push("https://example.com/some-legacy-entry");
+      setConfig(config);
+      await saveConfig(config);
+
+      const listed = await handleRequest(new Request("http://x/api/sources"), getConfig());
+      expect((await listed.json()).sources).toEqual([
+        {
+          key: "playlists",
+          url: "https://space.bilibili.com/3546702659488348/favlist?fid=3707880948",
+          trackedJobs: 0,
+          provider: "bilibili",
+          providerLabel: "Bilibili",
+          shape: "playlist",
+        },
+        {
+          key: "playlists",
+          url: "https://example.com/some-legacy-entry",
+          trackedJobs: 0,
+          provider: null,
+          providerLabel: null,
+          shape: "unknown",
+        },
+        {
+          key: "channels",
+          url: "https://space.bilibili.com/55/upload/video",
+          trackedJobs: 0,
+          provider: "bilibili",
+          providerLabel: "Bilibili",
+          shape: "channel",
+        },
+        {
+          key: "channels",
+          url: "https://www.youtube.com/@SomeChannel/videos",
+          trackedJobs: 0,
+          provider: "youtube",
+          providerLabel: "YouTube",
+          shape: "channel",
+        },
+      ]);
     } finally {
       process.chdir(cwd);
     }
@@ -517,5 +582,60 @@ describe("POST /api/scan/batch validation", () => {
     expect(data).toMatchObject({ ok: false, valid: 0, invalid: 2, scanning: 0 });
     expect(data.errors.map((e: { line: number }) => e.line)).toEqual([1, 2]);
     expect(getConfig().playlists).toEqual([]);
+  });
+
+  test("a mixed batch counts each shape and each site, and saves offline without scanning", async () => {
+    const dir = await makeDir();
+    const cwd = process.cwd();
+    process.chdir(dir);
+    try {
+      const config = baseConfig({ offlineMode: true, outputRoot: join(dir, "out") });
+      setConfig(config);
+      await saveConfig(config);
+      const urls = [
+        "https://www.youtube.com/playlist?list=PL_saved",
+        "https://youtu.be/AbCdEf12345?si=share",
+        "https://www.youtube.com/@Teacher/videos",
+        "https://space.bilibili.com/3546702659488348/favlist?fid=3707880948&spm_id_from=333.999",
+        "https://www.bilibili.com/video/BV1GJ411x7h7?spm_id_from=333.999.0.0",
+        "https://space.bilibili.com/55/upload/video",
+        "not a link",
+      ].join("\n");
+
+      const response = await handleRequest(new Request("http://x/api/scan/batch", {
+        method: "POST", body: JSON.stringify({ urls }),
+      }), getConfig());
+      expect(response.status).toBe(200);
+      const data = await response.json();
+      expect(data).toMatchObject({ ok: true, total: 7, valid: 6, invalid: 1, duplicates: 0, scanning: 0 });
+      expect(data.errors).toEqual([{ line: 7, input: "not a link", error: expect.any(String) }]);
+      // The buckets are counted from what each canonical URL points at, so both
+      // sites land in the same three; `byProvider` is the additive per-site view.
+      expect(data.sources).toEqual({
+        total: 6,
+        added: 6,
+        existing: 0,
+        videos: 2,
+        playlists: 2,
+        channels: 2,
+        byProvider: { youtube: 3, bilibili: 3 },
+      });
+
+      const saved = await loadConfig();
+      expect(saved.playlists).toEqual([
+        "https://www.youtube.com/playlist?list=PL_saved",
+        "https://www.youtube.com/watch?v=AbCdEf12345",
+        "https://space.bilibili.com/3546702659488348/favlist?fid=3707880948",
+        "https://www.bilibili.com/video/BV1GJ411x7h7",
+      ]);
+      expect(saved.channels).toEqual([
+        "https://www.youtube.com/@Teacher/videos",
+        // `/upload/video` and `/video` are the same tab, so one identity is kept.
+        "https://space.bilibili.com/55/video",
+      ]);
+      expect(saved.channelPlaylists).toEqual([]);
+    } finally {
+      process.chdir(cwd);
+    }
   });
 });

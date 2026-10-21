@@ -280,6 +280,11 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
     // existing .part file up instead of starting the transfer over.
     "--continue",
     "--no-overwrites",
+    // A job is ONE video, so its URL must never expand into a playlist: a
+    // Bilibili anthology page (`/video/BV…`) without its `?p=N`, or any URL
+    // yt-dlp decides is a list, would otherwise download every entry into this
+    // job's single output template. The audio-track probe already does this.
+    "--no-playlist",
   ];
 
   // Politeness pause before each download. Only emitted when configured, so the

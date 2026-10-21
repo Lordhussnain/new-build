@@ -22,6 +22,7 @@ import {
   progressAwareRetryState,
   TERMINAL_ERROR_MARKER,
 } from "../src/retry";
+import { isScanErrorTransient } from "../src/scanner";
 
 describe("computeBackoffMs", () => {
   test("grows exponentially from the base", () => {
@@ -491,5 +492,84 @@ describe("format fallback ladder", () => {
     expect(nextFormatFallback("")).toBeNull();
     expect(nextFormatFallback(null)).toBeNull();
     expect(nextFormatFallback("240p")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bilibili fails in its own words. Getting the split wrong is expensive in both
+// directions: a risk-control throttle parked as terminal is a video silently
+// never archived, and a supporter-only video treated as transient burns its
+// retry budget forever (the loop the terminal classes exist to stop).
+describe("Bilibili wordings", () => {
+  const RISK_CONTROL = [
+    "ERROR: [BiliBili] BV1x411c7mD: Request is blocked by server (412), please wait and try later.",
+    "ERROR: [BiliBili] BV1x411c7mD: Request rejected by server (352)",
+    "ERROR: [BiliBili] BV1x411c7mD: You have exceeded the rate limit. Try again later",
+    "ERROR: [BiliBili] BV1x411c7mD: Unable to download video info: HTTP Error 412: Precondition Failed",
+  ];
+
+  test("risk control is transient in the download worker and in the scanner", () => {
+    for (const wording of RISK_CONTROL) {
+      expect(isPermanentDownloadError(wording)).toBe(false);
+      expect(classifyTerminalDownloadError(wording)).toBeNull();
+      expect(isTransientDownloadError(wording)).toBe(true);
+      // A throttled LISTING must be retried with backoff, not reported as a dead
+      // source (which would drop the whole collection for this run).
+      expect(isScanErrorTransient(wording)).toBe(true);
+    }
+  });
+
+  test("a supporter-only video is terminal, and says why", () => {
+    const wording = "ERROR: [BiliBili] BV1x411c7mD: This is a supporter-only video";
+    expect(isPermanentDownloadError(wording)).toBe(true);
+    const info = classifyTerminalDownloadError(wording)!;
+    expect(info.code).toBe("members_only");
+    expect(info.label).toBe("Supporter-only video");
+    expect(formatTerminalErrorMessage(info, wording)).toContain("Supporter-only video");
+  });
+
+  test("a paid course episode is terminal", () => {
+    const wording = "ERROR: [BiliCheese] ep21495: You need to purchase the course to download this episode";
+    expect(isPermanentDownloadError(wording)).toBe(true);
+    expect(classifyTerminalDownloadError(wording)!.code).toBe("payment_required");
+  });
+
+  test("a -404 names both possibilities instead of promising a VPN will fix it", () => {
+    const wording = "ERROR: [BiliBili] BV1x411c7mD: This video may be deleted or geo-restricted.";
+    expect(isPermanentDownloadError(wording)).toBe(true);
+    const info = classifyTerminalDownloadError(wording)!;
+    expect(info.code).toBe("unavailable");
+    expect(info.label).toBe("Deleted or region-locked");
+    // The generic geo rule also matches this wording, so the specific one must
+    // come first in the table.
+    expect(isTransientDownloadError(wording)).toBe(false);
+    expect(isScanErrorTransient(wording)).toBe(false);
+  });
+
+  test("a login gate stays retryable: dropping in cookies.txt must rescue it", () => {
+    // Parking these terminally would make the cookies watcher's rescue path
+    // (which requeues credential-blocked jobs) useless for Bilibili, where a
+    // private favourites list or the watchlater list needs exactly that.
+    const gated = [
+      "ERROR: [BiliBili] BV1x411c7mD: This is a private favorites list. You need to log in as its owner",
+      "ERROR: [BiliBili] BV1x411c7mD: You need to login to access your watchlater list",
+      "ERROR: [BiliBili] BV1x411c7mD: This video is only available to logged-in users",
+      "ERROR: [BiliBili] BV1x411c7mD: This course episode is not yet available.",
+    ];
+    for (const wording of gated) {
+      expect(isPermanentDownloadError(wording)).toBe(false);
+      expect(classifyTerminalDownloadError(wording)).toBeNull();
+    }
+  });
+
+  test("Bilibili never reaches YouTube's signature/n-challenge self-update path", () => {
+    // A `-U` self-update is triggered by decipher failures only; a Bilibili
+    // error must never be read as one.
+    for (const wording of RISK_CONTROL) {
+      expect(isNChallengeError(wording)).toBe(false);
+      expect(isSignatureChallengeError(wording)).toBe(false);
+    }
+    expect(isNChallengeError("ERROR: [BiliBili] BV1x411c7mD: This is a supporter-only video")).toBe(false);
+    expect(isSignatureChallengeError("ERROR: [BiliBili] BV1x411c7mD: Request is blocked by server (412)")).toBe(false);
   });
 });

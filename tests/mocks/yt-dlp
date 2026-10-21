@@ -4,10 +4,16 @@
 // Speaks just enough of yt-dlp's CLI surface for the engine to run its whole
 // pipeline against it:
 //   • --version
-//   • --flat-playlist --print "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s"
+//   • --flat-playlist --print "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s
+//                              |||%(playlist_channel)s|||%(webpage_url)s|||%(url)s"
+//     A YouTube list prints titles and durations; a Bilibili list prints NA for
+//     both (which is what the real extractor answers) and puts the entry's page
+//     URL in %(url)s — that pair is what makes the engine's pre-download
+//     title/duration probe necessary and testable.
 //   • download mode (-o TEMPLATE …): writes a fake media file, prints
 //     PROGRESS lines and the final path; honours --download-archive (skips
 //     ids already recorded with yt-dlp's real message, records successes)
+//   • --skip-download --print "%(title)s|||%(duration)s" (one video's summary)
 //   • --skip-download (metadata): writes sidecar files
 //   • -U (self-update)
 //
@@ -40,6 +46,12 @@
 //   FAKE_KEEP_ALIVE=1       keep the aria2c readout window open for
 //                           FAKE_DELAY_MS instead of ending it when the
 //                           transfer finishes (progress-visibility tests)
+//   FAKE_SUMMARY_TITLE=…    the title the summary probe answers with
+//   FAKE_SUMMARY_DURATION=900 its duration, in seconds
+//   FAKE_SUMMARY_NA=1       answer NA for both (the probe found nothing usable)
+//   FAKE_SUMMARY_FAIL=1     fail the probe with Bilibili's risk-control wording
+//   FAKE_SUMMARY_HANG=1     never answer (the probe watchdog must fire)
+//   FAKE_SUMMARY_LOG=path   append every probed URL (probe-once assertions)
 //
 // The aria2c branch forwards the fake downloader's stdout to this process's
 // stdout (the engine reads what the real yt-dlp leaves inherited) and turns the
@@ -71,6 +83,26 @@ const num = (name: string, dflt: number): number => {
   const n = v ? parseInt(v, 10) : NaN;
   return Number.isFinite(n) ? n : dflt;
 };
+/** The extractor a URL belongs to, as yt-dlp names it in its own log lines. */
+function providerOf(url: string): "youtube" | "bilibili" {
+  return /(?:^|[./])(?:bilibili\.com|b23\.tv|bilibili\.tv|biliintl\.com)\//i.test(url) ? "bilibili" : "youtube";
+}
+/** The video id in a URL, including a Bilibili anthology page suffix (`BV…_p2`). */
+function idOf(url: string): string {
+  const youtube = url.match(/(?:youtube\.com\/watch\?[^#]*v=|youtu\.be\/)([A-Za-z0-9_-]{4,})/);
+  if (youtube) return youtube[1];
+  const bilibili = url.match(/bilibili\.(?:com|tv)\/(?:video\/|festival\/[^#?]*\?bvid=)([A-Za-z0-9]+)/i);
+  if (bilibili) {
+    const page = url.match(/[?&]p=(\d+)/);
+    return page ? `${bilibili[1]}_p${page[1]}` : bilibili[1];
+  }
+  const episode = url.match(/\/(?:bangumi|cheese)\/play\/(ep\d+)/i);
+  if (episode) return episode[1];
+  const audio = url.match(/\/audio\/(au\d+)/i);
+  if (audio) return audio[1];
+  const intl = url.match(/bilibili\.tv\/[a-z]{2}\/play\/\d+\/(\d+)/i);
+  return intl ? intl[1] : "";
+}
 
 if (flag("--version")) {
   console.log("2026.01.01-mock");
@@ -124,6 +156,26 @@ if (flag("--dump-single-json")) {
   process.exit(0);
 }
 
+// --- one video's title/duration (the pre-download summary probe) --------------
+// A Bilibili flat listing carries neither, so the download worker asks before it
+// builds its plan. Distinguished from the sidecar pass by the --print template.
+if (flag("--skip-download") && (flagValue("--print") || "").includes("%(title)s")) {
+  const probeUrl = argv[0] && !argv[0].startsWith("-") ? String(argv[0]) : "";
+  if (process.env.FAKE_SUMMARY_LOG) await appendFile(process.env.FAKE_SUMMARY_LOG, `${probeUrl}\n`);
+  if (process.env.FAKE_SUMMARY_HANG === "1") await new Promise(() => {}); // watchdog must fire
+  if (process.env.FAKE_SUMMARY_FAIL === "1") {
+    console.error("ERROR: [BiliBili] Request is blocked by server (412), please wait and try later.");
+    process.exit(1);
+  }
+  const template = (flagValue("--print") || "").replace(/^after_move:/, "");
+  const title =
+    process.env.FAKE_SUMMARY_NA === "1" ? "NA" : process.env.FAKE_SUMMARY_TITLE || `Mock Summary ${idOf(probeUrl) || "video"}`;
+  const duration =
+    process.env.FAKE_SUMMARY_NA === "1" ? "NA" : process.env.FAKE_SUMMARY_DURATION || "900";
+  console.log(template.replace("%(title)s", title).replace("%(duration)s", duration));
+  process.exit(0);
+}
+
 // --- metadata-only pass (sidecar fetching) -----------------------------------
 if (flag("--skip-download")) {
   const outTemplate = flagValue("-o") || "./video.%(ext)s";
@@ -143,13 +195,27 @@ if (flag("--skip-download")) {
 
 // --- flat playlist listing ----------------------------------------------------
 if (flag("--flat-playlist")) {
-  if (process.env.FAKE_SCAN_LOG) await appendFile(process.env.FAKE_SCAN_LOG, `${argv.at(-1)}\n`);
+  const listingUrl = argv.at(-1) && !String(argv.at(-1)).startsWith("-") ? String(argv.at(-1)) : "";
+  if (process.env.FAKE_SCAN_LOG) await appendFile(process.env.FAKE_SCAN_LOG, `${listingUrl}\n`);
   if (process.env.FAKE_EMPTY_SCAN === "1") process.exit(0);
-  const lines = [
-    "Mock Playlist|||mockvid001|||First Mock Video|||125",
-    "Mock Playlist|||mockvid002|||Second Mock Video|||640",
-    "Mock Playlist|||mockvid003|||Third Mock Video (long)|||7320",
-  ];
+  // Field order is the engine's LISTING_PRINT_TEMPLATE. A flat entry has no
+  // webpage_url (yt-dlp prints NA) but its %(url)s is the entry's page URL —
+  // for a full extraction instead, %(url)s is the selected format's expiring
+  // CDN URL, which is why the engine only trusts it when it canonicalizes.
+  const line = (playlist: string, id: string, title: string, duration: string, channel: string, page: string, url: string) =>
+    [playlist, id, title, duration, channel, page, url].join("|||");
+  const lines =
+    providerOf(listingUrl) === "bilibili"
+      ? [
+          line("Mock Bilibili List", "BV1x411c7mD", "NA", "NA", "NA", "NA", "https://www.bilibili.com/video/BV1x411c7mD"),
+          line("Mock Bilibili List", "BV1GJ411x7h7", "NA", "NA", "NA", "NA", "https://www.bilibili.com/video/BV1GJ411x7h7"),
+          line("Mock Bilibili List", "BV1uv411q7Mv", "NA", "NA", "NA", "NA", "https://www.bilibili.com/video/BV1uv411q7Mv"),
+        ]
+      : [
+          line("Mock Playlist", "mockvid001", "First Mock Video", "125", "NA", "NA", "https://www.youtube.com/watch?v=mockvid001"),
+          line("Mock Playlist", "mockvid002", "Second Mock Video", "640", "NA", "NA", "https://www.youtube.com/watch?v=mockvid002"),
+          line("Mock Playlist", "mockvid003", "Third Mock Video (long)", "7320", "NA", "NA", "https://www.youtube.com/watch?v=mockvid003"),
+        ];
   console.log(lines.join("\n"));
   process.exit(0);
 }
@@ -163,6 +229,8 @@ try {
   videoId =
     (u.hostname === "youtu.be" ? u.pathname.slice(1).split("/")[0] : u.searchParams.get("v")) || "";
 } catch {}
+if (!videoId) videoId = idOf(url);
+const provider = providerOf(url);
 
 // --download-archive fidelity: ids already recorded are skipped with yt-dlp's
 // real message and exit 0 — NO file is written, NO progress is printed. This
@@ -178,7 +246,7 @@ if (archiveFile && videoId) {
         return parts.length > 0 && parts[parts.length - 1] === videoId;
       });
     if (alreadyRecorded) {
-      console.log(`[youtube] ${videoId}: has already been recorded in the archive`);
+      console.log(`[${provider}] ${videoId}: has already been recorded in the archive`);
       process.exit(0);
     }
   } catch {
@@ -432,7 +500,9 @@ console.log(`PROGRESS:100.0|2.5MiB|0|10485760|10485760`);
 await Bun.write(finalPath, "fake-mp4-bytes");
 // Record the successful download in the archive, like real yt-dlp does.
 if (archiveFile && videoId) {
-  await appendFile(archiveFile, `youtube ${videoId}\n`);
+  // Real yt-dlp writes the extractor prefix, and the engine reads only the last
+  // field of each line — so a Bilibili entry has to look like a Bilibili entry.
+  await appendFile(archiveFile, `${provider} ${videoId}\n`);
 }
 // Clean up the bookkeeping file so reruns start fresh.
 try {

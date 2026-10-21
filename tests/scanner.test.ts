@@ -7,6 +7,7 @@ import { db, initDatabase } from "../src/db";
 import {
   channelFolderName,
   getPlaylistItems,
+  ingestItems,
   isChannelSource,
   isPlaylistLikeId,
   isShortsTabItem,
@@ -32,7 +33,17 @@ const WIN = process.platform === "win32";
  */
 const TEST_TIMEOUT_MS = WIN ? 30_000 : 10_000;
 
-type FakeMode = "ok" | "empty" | "fail" | "hang" | "many" | "channel" | "slow" | "playlists-tab";
+type FakeMode =
+  | "ok"
+  | "empty"
+  | "fail"
+  | "hang"
+  | "many"
+  | "channel"
+  | "slow"
+  | "playlists-tab"
+  | "bilibili-list"
+  | "bilibili-space";
 
 const originalYtDlp = resolvedTools.ytDlp;
 let fixtureDir = "";
@@ -99,6 +110,20 @@ beforeAll(async () => {
       // Prints a line every 200ms for about a second: slow, but never silent.
       `if (mode === "slow") { for (let i = 1; i <= 5; i++) { console.log("Slow Channel - Videos|||slow00000" + i + "|||Slow " + i + "|||60|||Slow Channel"); await Bun.sleep(200); } }`,
       `if (mode === "ok") console.log("Mock Playlist|||scan001|||First Video|||120\\nMock Playlist|||scan002|||Second Video|||NaN");`,
+      // A Bilibili listing exactly as yt-dlp's flat entries print it: no title,
+      // no duration, no webpage_url, the page URL in %(url)s — and a nested
+      // collection ({mid}_{sid}) that is a list, not a video.
+      `if (mode === "bilibili-list") console.log([`,
+      `  "收藏|||BV1x411c7mD|||NA|||NA|||NA|||NA|||https://www.bilibili.com/video/BV1x411c7mD",`,
+      `  "收藏|||BV1GJ411x7h7|||NA|||NA|||NA|||NA|||https://www.bilibili.com/video/BV1GJ411x7h7",`,
+      `  "收藏|||3546702659488348_1234|||NA|||NA|||NA|||NA|||https://space.bilibili.com/3546702659488348/lists/1234?type=season",`,
+      `].join("\\n"));`,
+      // An uploader's space: yt-dlp builds these entries from the numeric id
+      // alone, so not even the list is named.
+      `if (mode === "bilibili-space") console.log([`,
+      `  "NA|||BV1x411c7mD|||NA|||NA|||NA|||NA|||https://www.bilibili.com/video/BV1x411c7mD",`,
+      `  "NA|||BV1GJ411x7h7|||NA|||NA|||NA|||NA|||https://www.bilibili.com/video/BV1GJ411x7h7",`,
+      `].join("\\n"));`,
     ].join("\n") + "\n",
     "utf8",
   );
@@ -176,6 +201,60 @@ describe("channel helpers", () => {
     expect(parseListingLine("NA|||vid00000001|||Solo|||NA|||NA")).toEqual({
       playlist: "", id: "vid00000001", title: "Solo", duration: Number.NaN,
     });
+  });
+
+  test("parseListingLine reads a Bilibili flat entry: a page URL, and no title or duration", () => {
+    // What yt-dlp actually prints for a Bilibili list: %(webpage_url)s is NA on a
+    // flat entry, %(url)s is the entry's page URL, and the entry carries neither
+    // a title nor a duration.
+    expect(
+      parseListingLine(
+        "Mock Bilibili List|||BV1x411c7mD|||NA|||NA|||NA|||NA|||https://www.bilibili.com/video/BV1x411c7mD",
+        "bilibili",
+      ),
+    ).toEqual({
+      playlist: "Mock Bilibili List",
+      id: "BV1x411c7mD",
+      title: "video",
+      duration: Number.NaN,
+      printedUrl: "https://www.bilibili.com/video/BV1x411c7mD",
+    });
+    // An anthology entry keeps the part it selects, and a full extraction (which
+    // does have a webpage_url) carries it through.
+    expect(
+      parseListingLine(
+        "合集|||BV1x411c7mD_p2|||第二集|||615|||NA|||https://www.bilibili.com/video/BV1x411c7mD?p=2|||https://www.bilibili.com/video/BV1x411c7mD?p=2",
+        "bilibili",
+      ),
+    ).toEqual({
+      playlist: "合集",
+      id: "BV1x411c7mD_p2",
+      title: "第二集",
+      duration: 615,
+      webpageUrl: "https://www.bilibili.com/video/BV1x411c7mD?p=2",
+      printedUrl: "https://www.bilibili.com/video/BV1x411c7mD?p=2",
+    });
+    // A printed %(url)s that is a CDN stream (what a FULL extraction prints for
+    // the selected format, and it expires) is stored but never trusted as a page
+    // URL — resolveListingVideoUrl rejects it and falls back to the id.
+    expect(
+      parseListingLine(
+        "List|||BV1x411c7mD|||NA|||NA|||NA|||NA|||https://upos-sz-mirror.bilivideo.com/upgcxcode/xx.m4s?deadline=1",
+        "bilibili",
+      )!.printedUrl,
+    ).toContain("bilivideo.com");
+  });
+
+  test("which site a listing came from decides which entry ids are videos", () => {
+    // A Bilibili list of lists (a hidden-mode collection) yields `{mid}_{sid}`
+    // entries: nested lists, not videos, so no job may be created for them.
+    expect(parseListingLine("Lists|||3546702659488348_1234|||NA|||NA", "bilibili")).toBeNull();
+    expect(parseListingLine("Audio|||au1234567|||NA|||NA", "bilibili")).toMatchObject({ id: "au1234567" });
+    expect(parseListingLine("Legacy|||av170001|||NA|||NA", "bilibili")).toMatchObject({ id: "av170001" });
+    // YouTube keeps its historical leniency (a fixture id like `v1` is fine), so
+    // an 11-character video id is still a video and a playlist id still is not.
+    expect(parseListingLine("P|||PLabcdefghijklmnopqrstuvwxyz012345|||T|||1", "youtube")).toBeNull();
+    expect(parseListingLine("P|||vid00000001|||T|||1", "youtube")).toMatchObject({ id: "vid00000001" });
   });
 
   test("channelFolderName prefers the channel name and strips a tab suffix otherwise", () => {
@@ -311,4 +390,148 @@ describe("getPlaylistItems", () => {
     },
     TEST_TIMEOUT_MS,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Ingesting a Bilibili listing. A flat entry carries no title, no duration and
+// no webpage_url, and its id is not YouTube-shaped — so the job URL has to be
+// rebuilt from the id and the source, the placeholder title has to survive until
+// the download worker probes the real one, and a channel-shaped source needs a
+// folder name of its own.
+describe("Bilibili ingest", () => {
+  let outputRoot = "";
+  beforeEach(async () => {
+    initDatabase(":memory:");
+    outputRoot = await mkdtemp(join(tmpdir(), "yta-bilibili-out-"));
+  });
+  afterEach(async () => {
+    setConfig(DEFAULT_CONFIG);
+    await removeTempDir(outputRoot);
+  });
+
+  const rows = () =>
+    db.query("SELECT id, url, title, folder, duration FROM jobs ORDER BY id").all() as {
+      id: string;
+      url: string;
+      title: string;
+      folder: string;
+      duration: number | null;
+    }[];
+
+  test("a favourites list queues page URLs, the placeholder title and no duration", async () => {
+    const config: Config = { ...DEFAULT_CONFIG, outputRoot };
+    setConfig(config);
+    const source = "https://space.bilibili.com/3546702659488348/favlist?fid=3707880948";
+    const items = [
+      parseListingLine(`收藏|||BV1x411c7mD|||NA|||NA|||NA|||NA|||https://www.bilibili.com/video/BV1x411c7mD`, "bilibili")!,
+      parseListingLine(`收藏|||BV1GJ411x7h7|||NA|||NA|||NA|||NA|||https://www.bilibili.com/video/BV1GJ411x7h7`, "bilibili")!,
+    ];
+    const result = await ingestItems(items, config, undefined, source);
+    expect(result).toMatchObject({ found: 2, added: 2, skipped: 0 });
+    expect(rows()).toEqual([
+      {
+        id: "BV1GJ411x7h7",
+        url: "https://www.bilibili.com/video/BV1GJ411x7h7",
+        title: "video",
+        folder: "收藏",
+        duration: null,
+      },
+      {
+        id: "BV1x411c7mD",
+        url: "https://www.bilibili.com/video/BV1x411c7mD",
+        title: "video",
+        folder: "收藏",
+        duration: null,
+      },
+    ]);
+  });
+
+  test("an uploader's space gets one folder of its own instead of sharing Single Videos", async () => {
+    await useScanner("bilibili-space");
+    const config: Config = { ...DEFAULT_CONFIG, outputRoot };
+    setConfig(config);
+    // A space listing names neither a channel nor a playlist (yt-dlp builds the
+    // entries from the uploader's numeric id alone), so the folder is derived
+    // from the source itself — and a space is a channel source, which also means
+    // the listing is watched with the idle timeout rather than a total one.
+    const result = await scanAndIngest("https://space.bilibili.com/55/upload/video", config);
+    expect(result).toMatchObject({ found: 2, added: 2, skipped: 0 });
+    expect(rows()).toEqual([
+      {
+        id: "BV1GJ411x7h7",
+        url: "https://www.bilibili.com/video/BV1GJ411x7h7",
+        title: "video",
+        folder: "Bilibili UP 55",
+        duration: null,
+      },
+      {
+        id: "BV1x411c7mD",
+        url: "https://www.bilibili.com/video/BV1x411c7mD",
+        title: "video",
+        folder: "Bilibili UP 55",
+        duration: null,
+      },
+    ]);
+  }, TEST_TIMEOUT_MS);
+
+  test("a scanned favourites list drops the nested collection inside it", async () => {
+    await useScanner("bilibili-list");
+    const config: Config = { ...DEFAULT_CONFIG, outputRoot };
+    setConfig(config);
+    const result = await scanAndIngest(
+      "https://space.bilibili.com/3546702659488348/favlist?fid=3707880948",
+      config,
+    );
+    // Three lines printed, two videos queued: `{mid}_{sid}` is another list, so
+    // parseListingLine drops it before ingest ever counts it as found.
+    expect(result).toMatchObject({ found: 2, added: 2, skipped: 0 });
+    expect(rows().map((row) => row.id)).toEqual(["BV1GJ411x7h7", "BV1x411c7mD"]);
+  }, TEST_TIMEOUT_MS);
+
+  test("a nested list is dropped, an anthology entry keeps the page it selects", async () => {
+    const config: Config = { ...DEFAULT_CONFIG, outputRoot };
+    setConfig(config);
+    const source = "https://www.bilibili.com/video/BV1x411c7mD";
+    const items = [
+      // `{mid}_{sid}`: a hidden-mode collection inside a space listing — a list,
+      // not a video, so no job may ever be created for it.
+      parseListingLine("Lists|||3546702659488348_1234|||NA|||NA", "bilibili"),
+      parseListingLine("合集|||BV1x411c7mD_p3|||NA|||NA|||NA|||NA|||NA", "bilibili")!,
+    ].filter(Boolean) as ListingItem[];
+    expect(items).toHaveLength(1);
+    await ingestItems(items, config, undefined, source);
+    expect(rows()).toEqual([
+      {
+        id: "BV1x411c7mD_p3",
+        url: "https://www.bilibili.com/video/BV1x411c7mD?p=3",
+        title: "video",
+        folder: "合集",
+        duration: null,
+      },
+    ]);
+  });
+
+  test("a CDN stream URL printed as %(url)s is never stored as the job URL", async () => {
+    const config: Config = { ...DEFAULT_CONFIG, outputRoot };
+    setConfig(config);
+    const source = "https://www.bilibili.com/video/BV1GJ411x7h7";
+    // A FULL extraction prints the selected format's expiring CDN URL in
+    // %(url)s. Storing that would leave a job whose URL dies in minutes.
+    const items = [
+      parseListingLine(
+        "List|||BV1GJ411x7h7|||真实标题|||600|||NA|||NA|||https://upos-sz-mirror.bilivideo.com/upgcxcode/xx.m4s?deadline=1",
+        "bilibili",
+      )!,
+    ];
+    await ingestItems(items, config, undefined, source);
+    expect(rows()).toEqual([
+      {
+        id: "BV1GJ411x7h7",
+        url: "https://www.bilibili.com/video/BV1GJ411x7h7",
+        title: "真实标题",
+        folder: "List",
+        duration: 600,
+      },
+    ]);
+  });
 });

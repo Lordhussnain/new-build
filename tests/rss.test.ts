@@ -7,7 +7,14 @@ import { join } from "node:path";
 import { DEFAULT_CONFIG } from "../src/config";
 import { db, initDatabase } from "../src/db";
 import { getConfig, setConfig } from "../src/state";
-import { parseRssFeed, resolveChannelId, startRssPolling, type ResolveChannelIdOptions } from "../src/rss";
+import {
+  isRssWatchable,
+  parseRssFeed,
+  pollChannelRss,
+  resolveChannelId,
+  startRssPolling,
+  type ResolveChannelIdOptions,
+} from "../src/rss";
 
 const SAMPLE_FEED = `<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns:media="http://search.yahoo.com/mrss/" xmlns="http://www.w3.org/2005/Atom">
@@ -171,6 +178,76 @@ describe("parseRssFeed", () => {
   });
 });
 
+
+
+describe("which channels RSS can watch", () => {
+  test("only YouTube has a per-channel Atom feed", () => {
+    expect(isRssWatchable("https://www.youtube.com/channel/UC1234567890abcdefghij")).toBe(true);
+    expect(isRssWatchable("https://www.youtube.com/@SomeChannel/videos")).toBe(true);
+    // A Bilibili space is watched by the daemon's full rescan instead: there is
+    // no feed URL to poll, and no `UC…`-shaped id to build one from.
+    expect(isRssWatchable("https://space.bilibili.com/55/upload/video")).toBe(false);
+    expect(isRssWatchable("https://space.bilibili.com/55/audio")).toBe(false);
+    expect(isRssWatchable("https://www.bilibili.com/video/BV1x411c7mD")).toBe(false);
+    expect(isRssWatchable("https://space.bilibili.com/55/favlist?fid=1")).toBe(false);
+    expect(isRssWatchable("https://example.com/feed")).toBe(false);
+  });
+
+  test("polling a Bilibili space answers 0 without resolving an id or fetching a feed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-rss-bilibili-"));
+    initDatabase(":memory:");
+    const config = { ...DEFAULT_CONFIG, outputRoot: dir, rssEnabled: true, skipShorts: false };
+    setConfig(config);
+    const fetchFeed = spyOn(globalThis, "fetch").mockResolvedValue(new Response(SAMPLE_FEED));
+    try {
+      await expect(pollChannelRss("https://space.bilibili.com/55/upload/video", config)).resolves.toBe(0);
+      expect(fetchFeed).not.toHaveBeenCalled();
+      expect(db.query("SELECT COUNT(*) AS n FROM jobs").get()).toEqual({ n: 0 });
+    } finally {
+      fetchFeed.mockRestore();
+      setConfig({ ...DEFAULT_CONFIG });
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a scheduled tick polls the YouTube channels and leaves the Bilibili ones to the rescan", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-rss-mixed-"));
+    initDatabase(":memory:");
+    const initial = {
+      ...DEFAULT_CONFIG,
+      outputRoot: dir,
+      channels: [
+        "https://www.youtube.com/channel/UC1234567890abcdefghij",
+        "https://space.bilibili.com/55/upload/video",
+      ],
+      rssEnabled: true,
+      skipShorts: false,
+    };
+    setConfig(initial);
+    const ticks: Array<() => Promise<void>> = [];
+    const captureTick = (fn: unknown) => {
+      ticks.push(fn as () => Promise<void>);
+      return 0;
+    };
+    const timeout = spyOn(globalThis, "setTimeout").mockImplementation(captureTick as unknown as typeof setTimeout);
+    const interval = spyOn(globalThis, "setInterval").mockImplementation(captureTick as unknown as typeof setInterval);
+    const fetchFeed = spyOn(globalThis, "fetch").mockResolvedValue(new Response(SAMPLE_FEED));
+    try {
+      startRssPolling(initial);
+      await ticks[0]();
+      // One feed fetched (the YouTube channel), no failed yt-dlp channel-id
+      // resolution for the space, and the feed's three videos ingested.
+      expect(fetchFeed).toHaveBeenCalledTimes(1);
+      expect(db.query("SELECT COUNT(*) AS n FROM jobs").get()).toEqual({ n: 3 });
+    } finally {
+      timeout.mockRestore();
+      interval.mockRestore();
+      fetchFeed.mockRestore();
+      setConfig({ ...DEFAULT_CONFIG });
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("RSS polling after Web UI source changes", () => {
   test("starts with no channels and reads live channels on the next scheduled tick", async () => {

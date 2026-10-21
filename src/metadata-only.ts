@@ -5,12 +5,13 @@
 // the folder the videos would use, so a later download lands next to them. No
 // job rows are created: this is a one-off background task, shown in the web UI
 // until it finishes. Tasks run one at a time so several pasted links do not
-// hit YouTube in parallel.
+// hit the source site in parallel.
 
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
 import { getPlaylistItems, PLAYLIST_SCAN_TIMEOUT_MS, type ListingItem } from "./scanner";
+import { listingProvider, resolveListingVideoUrl } from "./providers";
 import { missingSidecarArgs } from "./workers/metadata";
 import type { MetadataKind } from "./metadata-files";
 import { sanitizeFolderName } from "./util";
@@ -110,13 +111,24 @@ async function runTask(task: MetadataOnlyTask, config: Config): Promise<void> {
     await mkdir(outputDir, { recursive: true });
 
     task.status = "running";
+    // Sidecars are fetched from each video's own page URL, resolved exactly the
+    // way the scanner resolves a job URL: what yt-dlp printed for the entry when
+    // that is a page URL, else the pasted link, else the id.
+    const provider = listingProvider(task.url);
     for (const item of items) {
+      const videoUrl = resolveListingVideoUrl({
+        id: item.id,
+        provider,
+        sourceUrl: task.url,
+        webpageUrl: item.webpageUrl,
+        printedUrl: item.printedUrl,
+      });
       if (getConfig().offlineMode) {
         finish(task, "failed", `Stopped: offline mode turned on after ${task.done + task.failed} of ${task.total}`);
         return;
       }
       const naming = resolveNaming(item, folder, outputDir);
-      const error = await fetchSidecars(item, naming.outputDir, naming.base, config, task.kinds);
+      const error = await fetchSidecars(item, videoUrl, naming.outputDir, naming.base, config, task.kinds);
       if (error) {
         task.failed++;
         task.errors.push(`${item.title}: ${error}`);
@@ -160,6 +172,7 @@ function resolveNaming(item: ListingItem, folder: string, outputDir: string): { 
 /** Fetch the requested sidecars for one video. Returns an error string, or null on success. */
 async function fetchSidecars(
   item: ListingItem,
+  videoUrl: string,
   outputDir: string,
   base: string,
   config: Config,
@@ -167,7 +180,7 @@ async function fetchSidecars(
 ): Promise<string | null> {
   const args = [
     ytDlp(),
-    `https://www.youtube.com/watch?v=${item.id}`,
+    videoUrl || item.id,
     ...cookiesArgs(config),
     ...jsRuntimeArgs(),
     "--skip-download",

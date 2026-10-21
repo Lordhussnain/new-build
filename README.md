@@ -1,13 +1,15 @@
 # YT Playlist Downloader
 
-Batch YouTube playlist downloader and converter, built with Bun + TypeScript.
-Feed it a list of playlist or video links and it handles fetching, format
-selection, subtitle/thumbnail/description extraction, and conversion — with
-a terminal UI and a web dashboard to watch it all happen.
+Batch **YouTube and Bilibili** playlist downloader and converter, built with
+Bun + TypeScript. Feed it a list of playlist, collection, channel or video links
+and it handles fetching, format selection, subtitle/thumbnail/description
+extraction, and conversion — with a terminal UI and a web dashboard to watch it
+all happen.
 
 ## Features
 
-- **Batch downloads** from a list of YouTube playlist or video URLs defined in `config.json`
+- **Batch downloads** from a list of YouTube or Bilibili playlist, collection, channel/space or video URLs defined in `config.json`
+- **Bilibili is a first-class source** — videos (including multi-part anthologies, bangumi and cheese episodes, audio tracks, `b23.tv` share links and the international `bilibili.tv` site), and lists (favourites, collections, series, seasons, albums, the watchlater list, and an uploader's whole space). Because a Bilibili listing carries no titles or durations, each video's real title and length are fetched once before its first download, so files are named properly and the duration-aware watchdog is sized correctly
 - **Cross-playlist deduplication by video ID** — different playlist/channel URLs
   that contain the same video share one queued job; if source cleanup removes
   its row after download, the configured yt-dlp archive still prevents another
@@ -55,6 +57,10 @@ a terminal UI and a web dashboard to watch it all happen.
 - `yt-dlp` and `ffmpeg` available on `PATH` (or configured explicitly)
 - [aria2c](https://aria2.github.io/) **optional** — enables multi-connection downloads; without it the engine uses yt-dlp's native downloader
 - A JavaScript runtime for YouTube's n-challenge: [Deno](https://deno.com) (recommended; yt-dlp's default), Node.js ≥ 22, or Bun. The engine discovers one at startup and passes `--js-runtimes` to every yt-dlp call. Without a runtime, YouTube downloads fail with "n challenge solving failed" — that is retried, never parked as a permanent video error. See [yt-dlp EJS](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
+- A recent `yt-dlp` for Bilibili: the JavaScript runtime above is YouTube-only, but Bilibili's extractors
+  (uploader spaces, collections/series, favourites, bangumi and cheese, `bilibili.tv`) change often, so an
+  out-of-date yt-dlp is the usual reason a Bilibili source lists nothing or answers `-412`/`-352`. Update it
+  with `yt-dlp -U`; the engine's own self-update stays deliberately limited to YouTube signature failures.
 - Tested on Windows 11
 
 Dependencies are checked automatically on startup; the app exits with a clear
@@ -98,8 +104,12 @@ For example (omitted keys use their defaults):
 
 ```json
 {
-  "playlists": ["https://www.youtube.com/playlist?list=..."],
-  "channels": ["https://www.youtube.com/@SomeChannel"],
+  "playlists": [
+    "https://www.youtube.com/playlist?list=...",
+    "https://www.bilibili.com/video/BV1GJ411x7h7",
+    "https://space.bilibili.com/3546702659488348/favlist?fid=3707880948"
+  ],
+  "channels": ["https://www.youtube.com/@SomeChannel", "https://space.bilibili.com/55/video"],
   "channelPlaylists": ["https://www.youtube.com/@SomeChannel/playlists"],
   "offlineMode": false,
   "outputRoot": "D:/Downloads/YT",
@@ -121,7 +131,7 @@ downloaded**, and the only work left is the work that needs no network.
 
 | Stage | Offline mode |
 | --- | --- |
-| Scans, RSS watching, daemon rescans | **idle** — no YouTube requests while offline; scheduled watchers resume when the mode ends |
+| Scans, RSS watching, daemon rescans | **idle** — no requests to any source site while offline; scheduled watchers resume when the mode ends |
 | Downloads (yt-dlp / aria2c) | **off** — queued jobs stay `pending`, unclaimed, with their `.part` files intact |
 | Metadata sidecars (subs/thumbnail/description/info.json) | **off** — every sidecar is a network fetch; `pending` stays `pending` |
 | Conversion (ffmpeg) | **on** — files that still need conversion are converted |
@@ -165,12 +175,15 @@ Reliability panel lists that relocation pass like the other sweeps.
 ### Adding sources from the Web UI
 
 **Save & Scan** saves the pasted URL to the appropriate list in `config.json`
-**before** scanning/queuing videos in `archive.db`. Playlist links go in
-`playlists`, channel links in `channels`, and a channel's `/playlists` tab in
-`channelPlaylists`. Single-video links also use the existing `playlists` list.
-Share/tracking parameters are removed; a watch link with `list=` keeps the
-playlist, not just the currently selected video. Repeated scans do not append
-duplicate sources or duplicate jobs, even if all videos were already queued.
+**before** scanning/queuing videos in `archive.db`. Playlist and collection links
+go in `playlists`, channel and uploader-space links in `channels`, and a
+channel's `/playlists` tab in `channelPlaylists`. Single-video links also use the
+existing `playlists` list. Share/tracking parameters are removed; a watch link
+with `list=` keeps the playlist, not just the currently selected video. Repeated
+scans do not append duplicate sources or duplicate jobs, even if all videos were
+already queued. Both sites are accepted everywhere a URL can be pasted (Save &
+Scan, Batch Links, Metadata Only, `bun run config`), and each saved source is
+listed with the site it points at.
 
 Videos are queued as yt-dlp lists them, so a large playlist starts downloading
 while the rest of it is still being scanned. The request returns once the whole
@@ -195,8 +208,8 @@ playlist. Links without a video id are unaffected.
 uploaded `.txt` file. Blank lines and lines starting with `#` are ignored. All
 valid links are saved to `config.json` in one write, then scanned in the
 background with four workers, so a long list does not hold the page open. The
-result shows counts by kind (playlists, single videos, channels), duplicates,
-and each invalid line with its line number. Invalid lines stay in the box so
+result shows counts by kind (playlists, single videos, channels) and by site
+(YouTube, Bilibili), duplicates, and each invalid line with its line number. Invalid lines stay in the box so
 you can fix them and import again.
 
 **🧾 Metadata Only** fetches sidecar files (subtitles, thumbnail, description, `info.json`) for a pasted video or playlist without downloading any video. Files are written into the folder the videos would use and named exactly as the download will name them (`NNN - Title`), so a later download reuses them instead of fetching them again. Tasks run one at a time in the background and appear in the modal with per-video progress and errors. Tick *Single video only* for `watch?v=…&list=…` links to fetch just that video.
@@ -227,6 +240,56 @@ you can fix them and import again.
   cleanup when saving removed sources (stop the engine before
   using the terminal manager). Purging the queue alone does not remove sources
   from future scans.
+
+### Bilibili sources
+
+Bilibili links are accepted anywhere a YouTube link is: **Save & Scan**, **📋
+Batch Links**, **🧾 Metadata Only**, `config.json`, and `bun run config`. Every
+URL is canonicalized before it is saved, so one video or one list has exactly one
+identity no matter how it was shared (`m.bilibili.com`, `b23.tv` short links,
+`spm_id_from`/`vd_source`/`share_*` tracking, an anthology's `?p=`, a festival
+page's `?bvid=`).
+
+| Paste this | Saved as | Queued from |
+| --- | --- | --- |
+| `bilibili.com/video/BV…` (also `av…`, `m.bilibili.com`, `b23.tv/…`, `/festival/…?bvid=…`) | `playlists` | that one video (one job per part when `?p=` selects one) |
+| `space.bilibili.com/<mid>/favlist?fid=…` (favourites) | `playlists` | every video in that favourites list |
+| `bilibili.com/list/<sid>`, `/medialist/play/<id>`, `/medialist/detail/ml…`, `/watchlater` | `playlists` | the series/album/watchlater list |
+| `space.bilibili.com/<mid>/lists/<sid>` (`?type=season` or `series`), `/channel/collectiondetail?sid=…`, `/channel/seriesdetail?sid=…` | `playlists` | the collection or series |
+| `bilibili.com/bangumi/play/ep…` or `ss…`, `/bangumi/media/md…`, `/cheese/play/ep…` or `ss…`, `/audio/au…`, `/audio/am…` | `playlists` | that episode/season/album |
+| `space.bilibili.com/<mid>` (also `/upload/video`, `/audio`) | `channels` | the uploader's whole uploads or audio tab |
+| `bilibili.tv/<lang>/video/…`, `/play/<season>/<ep>`, `/media/<id>` (international) | as above | the international site's video/series |
+
+**Titles and durations.** yt-dlp lists Bilibili entries without opening their
+pages, so a listing carries ids and URLs but no titles or durations. Before its
+first download attempt, each such video gets one bounded metadata call
+(`--skip-download --print`, 60 s cap) that supplies the real title — which is
+what names the file — and the real duration, which is what sizes the
+duration-aware watchdog. The probe never runs once bytes exist on disk (a rename
+would orphan the `.part` the resume depends on), and a probe that fails only
+costs the placeholder name: the video still downloads, and the failure is logged
+once per job.
+
+**Cookies.** Bilibili needs a logged-in `cookies.txt` (exported from a browser
+signed in to bilibili.com) for anything above 1080P, for private favourites and
+the watchlater list, for supporter-only ("充电专属") videos, and for cheese
+courses. The same `cookiesFile` is used for both sites, and cookie validation
+probes **the sites you configured** rather than YouTube alone — so a Bilibili
+archive on a network that cannot reach YouTube keeps its cookies instead of
+discarding them. The network monitor probes your sites first for the same reason.
+
+**Failures are classified in Bilibili's own words.** Risk control (`Request is
+blocked by server (412)`, `Request rejected by server (352)`, `You have exceeded
+the rate limit`) is transient: the video keeps its retry budget and the listing
+is retried with backoff. Supporter-only videos and paid course episodes are
+terminal skips with a plain-language reason, as is a video Bilibili reports as
+deleted or region-locked. A login gate is deliberately *not* terminal: dropping
+in a `cookies.txt` while the engine runs rescues those jobs.
+
+**RSS.** YouTube's per-channel Atom feed has no Bilibili equivalent, so a Bilibili
+space is picked up by the daemon's full rescans (`daemonMode` +
+`rescanIntervalHours`) instead; the startup line says how many channels are
+watched by RSS and how many are not.
 
 ### Reliability settings
 
@@ -644,6 +707,7 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
       auto-requeued) and unavailable formats switched automatically down the
       quality ladder instead of retried
 - [x] Modular architecture with a unit + end-to-end test suite
+- [x] Bilibili sources (videos, collections, favourites, spaces) alongside YouTube
 - [ ] Deduplicate identical videos across playlists by content hash
 - [ ] Per-link quality/format overrides in the web dashboard
 - [ ] Desktop notifications (Discord/webhook) on completion and failures

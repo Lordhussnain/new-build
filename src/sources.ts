@@ -1,8 +1,13 @@
 // src/sources.ts — validate, classify and remember Web UI source URLs.
 // User data belongs in config.json, never in src/config.ts's shipped defaults.
+//
+// Which sites are understood, and which of their URL shapes mean a video / a
+// list / a channel, is src/providers.ts's business; this module turns that
+// answer into the config.json bucket the source is saved in.
 
 import { CONFIG_PATH, saveConfig, withConfigWriteLock, type Config } from "./config";
 import { removeSourceJobsFromDatabase, type SourceJobCleanup } from "./db";
+import { classifySourceUrl, providerOfUrl, type ProviderId, type SourceShape } from "./providers";
 import { getConfig, setConfig } from "./state";
 
 export const SOURCE_KEYS = ["playlists", "channels", "channelPlaylists"] as const;
@@ -12,12 +17,31 @@ export interface SourceUrl {
   key: SourceKey;
 }
 
+/**
+ * Which config.json list a source shape belongs in. `playlists` is the general
+ * bucket: it holds real playlists AND single videos of every supported site,
+ * exactly as it always has.
+ */
+function sourceKeyFor(shape: SourceShape): SourceKey {
+  if (shape === "channel") return "channels";
+  if (shape === "channelPlaylists") return "channelPlaylists";
+  return "playlists";
+}
+
+/** Which site a saved source points at, or null for a manual/legacy entry. */
+export function sourceProvider(url: string): ProviderId | null {
+  return providerOfUrl(url);
+}
+
+const SUPPORTED_SITES = "YouTube or Bilibili";
+
 export interface ParseSourceOptions {
   /**
-   * A watch/short link that carries both a video id and a playlist id
-   * (`watch?v=ID&list=PL…&index=8`) normally means the playlist. With
-   * `singleVideo`, the video id wins and the list is dropped, so only that
-   * one video is saved. Links without a video id are unaffected.
+   * A link that carries both a video and a list — YouTube's
+   * `watch?v=ID&list=PL…&index=8`, or Bilibili's shared series player
+   * `/list/<mid>?sid=…&bvid=…` — normally means the list. With `singleVideo`
+   * the video wins and the list is dropped, so only that one video is saved.
+   * Links without a video id are unaffected.
    */
   singleVideo?: boolean;
 }
@@ -36,57 +60,23 @@ export interface BatchSourceError {
 
 /** Canonical identities ignore share/tracking params, not playlist/video ids. */
 export function parseSourceUrl(input: unknown, opts: ParseSourceOptions = {}): SourceUrl {
-  if (typeof input !== "string" || !input.trim()) throw new Error("YouTube URL required");
+  if (typeof input !== "string" || !input.trim()) throw new Error(`${SUPPORTED_SITES} URL required`);
   const text = input.trim();
-  if (text.length > 8192 || /[\x00-\x20\x7f]/.test(text)) throw new Error("Invalid YouTube URL");
+  if (text.length > 8192 || /[\x00-\x20\x7f]/.test(text)) throw new Error(`Invalid ${SUPPORTED_SITES} URL`);
   let parsed: URL;
   try {
     parsed = new URL(text);
   } catch {
-    throw new Error("Enter a full YouTube URL starting with https://");
+    throw new Error(`Enter a full ${SUPPORTED_SITES} URL starting with https://`);
   }
-  const host = parsed.hostname.toLowerCase();
-  const short = host === "youtu.be" || host === "www.youtu.be";
-  const youtube = host === "youtube.com" || host.endsWith(".youtube.com");
-  if ((!short && !youtube) || !["https:", "http:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.port) {
-    throw new Error("Enter a YouTube playlist, channel or video URL");
+  // Credentials, a non-HTTP scheme or an explicit port are never a share link:
+  // refusing them here keeps them out of config.json and out of a spawned argv.
+  if (!["https:", "http:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.port) {
+    throw new Error(`Enter a ${SUPPORTED_SITES} playlist, channel or video URL`);
   }
-
-  const path = parsed.pathname.replace(/\/+$/, "");
-  const video = short
-    ? path.slice(1)
-    : path === "/watch"
-      ? parsed.searchParams.get("v")
-      : path.match(/^\/(?:shorts|live|embed)\/([\w-]+)$/)?.[1];
-  const hasVideo = Boolean(video && /^[\w-]{6,}$/.test(video));
-
-  // Explicit "single video only": keep the video id and ignore the playlist
-  // id. Never run it through normalizeVideoUrl() here; the canonical watch URL
-  // is what gets saved and later matched by sourceIdentity().
-  if (opts.singleVideo && hasVideo) {
-    return { key: "playlists", url: `https://www.youtube.com/watch?v=${video}` };
-  }
-
-  // A watch/share link with a list id refers to the playlist, not just its
-  // currently selected video. Never run it through normalizeVideoUrl(), which
-  // deliberately strips the list id when recording individual jobs.
-  const list = parsed.searchParams.get("list");
-  if (list !== null) {
-    if (!/^[\w-]+$/.test(list)) throw new Error("Invalid YouTube playlist id");
-    return { key: "playlists", url: `https://www.youtube.com/playlist?list=${list}` };
-  }
-  if (hasVideo) {
-    // The existing playlists collection also accepts single-video sources.
-    return { key: "playlists", url: `https://www.youtube.com/watch?v=${video}` };
-  }
-  const channelPath = path.match(/^\/(?:@[^/]+|(?:channel|c|user)\/[^/]+)(?:\/(featured|videos|shorts|streams|playlists|live))?$/);
-  if (youtube && channelPath) {
-    return {
-      key: channelPath[1] === "playlists" ? "channelPlaylists" : "channels",
-      url: `https://www.youtube.com${path}`,
-    };
-  }
-  throw new Error("Enter a YouTube playlist, channel or video URL");
+  const source = classifySourceUrl(text, { singleVideo: opts.singleVideo });
+  if (!source) throw new Error(`Enter a ${SUPPORTED_SITES} playlist, channel or video URL`);
+  return { key: sourceKeyFor(source.shape), url: source.url };
 }
 
 /** Stable key used to connect a config URL to its video jobs in SQLite. */
@@ -158,7 +148,7 @@ export async function saveSource(
 export interface BatchSaveResult {
   /** Unique valid sources in input order; `added` is false when already saved. */
   saved: (SourceUrl & { added: boolean })[];
-  /** Lines that were not valid YouTube sources, with their line numbers. */
+  /** Lines that were not valid sources, with their line numbers. */
   errors: BatchSourceError[];
   /** Valid lines before de-duplication (a playlist pasted twice counts twice). */
   valid: number;
@@ -184,7 +174,7 @@ export async function saveBatchSources(
       valid++;
       if (!parsed.has(source.url)) parsed.set(source.url, source);
     } catch (error: any) {
-      errors.push({ line: entry.line, input: entry.input, error: error?.message || "Invalid YouTube URL" });
+      errors.push({ line: entry.line, input: entry.input, error: error?.message || `Invalid ${SUPPORTED_SITES} URL` });
     }
   }
   if (parsed.size === 0) return { saved: [], errors, valid };

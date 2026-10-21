@@ -13,6 +13,7 @@ import { associateExistingJobsWithSource, db, initDatabase, pruneJobsForUnconfig
 import { getPlaylistItems } from "./src/scanner";
 import { resolvedTools } from "./src/tools";
 import { SOURCE_KEYS, sourceIdentity } from "./src/sources";
+import { classifySourceUrl } from "./src/providers";
 import { STALE_CLAIM_THRESHOLDS } from "./src/reconcile";
 import { describeEngineLease, hasLiveLeaseOwner, holdsEngineLease, readEngineLease } from "./src/lease";
 
@@ -75,10 +76,16 @@ async function askMultiLine(prompt: string): Promise<string[]> {
   return links;
 }
 
+/**
+ * Is this a LIST on one of the supported sites? The engine's own classifier is
+ * the single source of truth for that (src/providers.ts), so a Bilibili
+ * favourites list, collection or watchlater list is accepted here exactly when
+ * the web UI accepts it — and a single video or a channel still belongs in its
+ * own list.
+ */
 function isValidPlaylistUrl(url: string): boolean {
   try {
-    const u = new URL(url);
-    return u.hostname.includes("youtube.com") && u.searchParams.has("list");
+    return classifySourceUrl(url, { singleVideo: true })?.shape === "playlist";
   } catch {
     return false;
   }
@@ -109,7 +116,7 @@ async function manageUrlList(
       let added = 0;
       for (const link of newLinks) {
         if (key === "playlists" && !isValidPlaylistUrl(link)) {
-          console.log(`   ⚠️ Skipping invalid playlist URL: ${link}`);
+          console.log(`   ⚠️ Skipping (not a YouTube or Bilibili playlist URL): ${link}`);
           continue;
         }
         if (!list.includes(link)) {
@@ -505,7 +512,7 @@ async function changeReliabilitySettings(config: Config): Promise<Config> {
 
   console.log("\n— Network monitor —");
   config.networkMonitorEnabled = await askYesNo(
-    "Probe YouTube periodically and pause the engine after repeated network failures?",
+    "Probe the network periodically (the sites you configured first) and pause the engine after repeated failures?",
     config.networkMonitorEnabled,
   );
 

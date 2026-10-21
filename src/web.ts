@@ -32,6 +32,7 @@ import {
   workerStatuses,
 } from "./state";
 import { getPlaylistItems, scanAndIngest, scanSourcesBatch } from "./scanner";
+import { PROVIDER_IDS, PROVIDER_LABELS, sourceShape } from "./providers";
 import { scanDownloadedMetadata } from "./metadata-scan";
 import { parseUnavailableMetadataKinds, type MetadataKind } from "./metadata-files";
 import {
@@ -41,6 +42,7 @@ import {
   saveSource,
   SOURCE_KEYS,
   sourceIdentity,
+  sourceProvider,
   type BatchSaveResult,
   type BatchSourceEntry,
   type SourceUrl,
@@ -1513,7 +1515,19 @@ const ROUTES: Route[] = [
             const row = db
               .query("SELECT COUNT(*) AS count FROM job_sources WHERE source_url = ?")
               .get(identity) as { count: number };
-            return [{ key, url: sourceUrl, trackedJobs: row?.count || 0 }];
+            // `provider`/`shape` are additive keys (the dashboard reads response
+            // keys by name): which site a source points at, and whether it is a
+            // single video, a list or a channel — for a manual/legacy entry that
+            // this UI would not accept, both are null/"unknown".
+            const provider = sourceProvider(sourceUrl);
+            return [{
+              key,
+              url: sourceUrl,
+              trackedJobs: row?.count || 0,
+              provider,
+              providerLabel: provider ? PROVIDER_LABELS[provider] : null,
+              shape: sourceShape(sourceUrl),
+            }];
           }),
         );
         return Response.json({ ok: true, sources });
@@ -1713,9 +1727,17 @@ const ROUTES: Route[] = [
         total: saved.length,
         added,
         existing: saved.length - added,
-        videos: saved.filter((source) => source.url.startsWith("https://www.youtube.com/watch?v=")).length,
-        playlists: saved.filter((source) => source.url.startsWith("https://www.youtube.com/playlist?list=")).length,
+        // Counted by what each canonical URL points at, so a Bilibili video,
+        // favourites list or uploader space lands in the same buckets as its
+        // YouTube counterpart.
+        videos: saved.filter((source) => sourceShape(source.url) === "video").length,
+        playlists: saved.filter((source) => sourceShape(source.url) === "playlist").length,
         channels: saved.filter((source) => source.key === "channels" || source.key === "channelPlaylists").length,
+        byProvider: Object.fromEntries(
+          PROVIDER_IDS
+            .map((provider) => [provider, saved.filter((source) => sourceProvider(source.url) === provider).length] as const)
+            .filter(([, count]) => count > 0),
+        ),
       };
       if (saved.length === 0) {
         return Response.json({
@@ -1726,7 +1748,7 @@ const ROUTES: Route[] = [
           errors,
           sources,
           scanning: 0,
-          error: `None of the ${entries.length} line(s) is a valid YouTube playlist, channel or video link.`,
+          error: `None of the ${entries.length} line(s) is a valid YouTube or Bilibili playlist, channel or video link.`,
         }, { status: 400 });
       }
 

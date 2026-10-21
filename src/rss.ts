@@ -8,9 +8,21 @@
 
 import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
 import { ingestItems, type ListingItem } from "./scanner";
+import { providerOfUrl } from "./providers";
 import { logError } from "./logger";
 import { getConfig } from "./state";
 import type { Config } from "./config";
+
+/**
+ * RSS is a YouTube feature: the per-channel Atom feed at
+ * `youtube.com/feeds/videos.xml?channel_id=UC…` has no Bilibili equivalent, so a
+ * Bilibili space is picked up by the daemon's full rescan instead. Polling one
+ * would spend a yt-dlp call per tick resolving a channel id that can never look
+ * like `UC…`, then log the same failure forever.
+ */
+export function isRssWatchable(channelUrl: string): boolean {
+  return providerOfUrl(channelUrl) === "youtube";
+}
 
 const channelIdCache = new Map<string, string>();
 export const CHANNEL_ID_RESOLVE_TIMEOUT_MS = 60_000;
@@ -134,6 +146,7 @@ export async function pollChannelRss(channelUrl: string, config: Config): Promis
   // makes a direct/manual call safe and catches a live toggle between channels.
   const initial = getConfig();
   if (config.offlineMode || !config.rssEnabled || initial.offlineMode || !initial.rssEnabled) return 0;
+  if (!isRssWatchable(channelUrl)) return 0;
   const channelId = await resolveChannelId(channelUrl, config);
   if (!channelId) throw new Error(`could not resolve channel id for ${channelUrl}`);
   const beforeFetch = getConfig();
@@ -155,7 +168,12 @@ export function startRssPolling(config: Config): void {
   // Start even without channels; a later Web UI save can add the first one.
   const intervalMs = Math.max(1, config.rssPollIntervalMinutes) * 60_000;
   if (config.rssEnabled && !config.offlineMode) {
-    console.log(`RSS polling enabled: ${config.channels.length} channel(s), every ${config.rssPollIntervalMinutes} min.`);
+    const watchable = config.channels.filter(isRssWatchable).length;
+    const skipped = config.channels.length - watchable;
+    console.log(
+      `RSS polling enabled: ${watchable} YouTube channel(s), every ${config.rssPollIntervalMinutes} min.` +
+        (skipped > 0 ? ` ${skipped} non-YouTube channel(s) are watched by the full rescan instead.` : ""),
+    );
   }
   // First pass shortly after startup (ingest dedup makes it harmless), then
   // once per configured interval. The in-flight guard keeps a slow poll (dead
@@ -166,7 +184,7 @@ export function startRssPolling(config: Config): void {
     if (inFlight || !current.rssEnabled || current.offlineMode) return;
     inFlight = true;
     try {
-      for (const channel of current.channels) {
+      for (const channel of current.channels.filter(isRssWatchable)) {
         const live = getConfig();
         if (!live.rssEnabled || live.offlineMode) break;
         try {

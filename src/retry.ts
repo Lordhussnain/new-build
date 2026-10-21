@@ -55,6 +55,11 @@ const PERMANENT_ERROR_PATTERNS: RegExp[] = [
   /premium members/i,
   /requires payment/i,
   /members[- ]only/i,
+  // Bilibili: an uploader-exclusive ("充电专属") video, a paid course episode,
+  // and the -404 answer that means the video is gone or region-locked.
+  /supporter[- ]only video/i,
+  /need to purchase/i,
+  /may be deleted or geo[- ]?restricted/i,
   /sign in to confirm your age/i,
   /age[- ]restricted/i,
   /age verification required/i,
@@ -249,7 +254,14 @@ const TERMINAL_ERROR_RULES: ReadonlyArray<{ code: TerminalErrorCode; label: stri
   {
     code: "payment_required",
     label: "Paid video",
-    pattern: /requires payment|payment required|available for rent or purchase|rent or buy/i,
+    pattern: /requires payment|payment required|available for rent or purchase|rent or buy|need to purchase|purchase the course/i,
+  },
+  {
+    // Bilibili's uploader-exclusive ("充电专属") videos: only a supporter account
+    // can download them, and yt-dlp says so in as many words.
+    code: "members_only",
+    label: "Supporter-only video",
+    pattern: /supporter[- ]only video|upower[- ]exclusive/i,
   },
   { code: "copyright", label: "Blocked by a copyright claim", pattern: /copyright/i },
   {
@@ -261,6 +273,15 @@ const TERMINAL_ERROR_RULES: ReadonlyArray<{ code: TerminalErrorCode; label: stri
     code: "removed",
     label: "Removed by the uploader",
     pattern: /removed by the uploader|video has been removed|been removed for violating|community guidelines|video (?:has been|was) deleted/i,
+  },
+  {
+    // Bilibili answers -404 with "This video may be deleted or geo-restricted"
+    // when a video is gone OR the request comes from outside its region. Before
+    // the geo rule, which its wording also matches: the honest reason names both
+    // possibilities instead of promising a VPN will fix it.
+    code: "unavailable",
+    label: "Deleted or region-locked",
+    pattern: /may be deleted or geo[- ]?restricted/i,
   },
   {
     code: "geo_blocked",
@@ -432,6 +453,14 @@ export function isTransientDownloadError(message: string): boolean {
     "too many requests",
     "rate limit",
     "rate-limit",
+    // Bilibili's risk-control answers (HTTP 412 / API codes -352 and -401) are
+    // a "slow down and come back", never a dead video: yt-dlp appends "please
+    // wait and try later" to all of them.
+    "blocked by server",
+    "rejected by server",
+    "please wait and try later",
+    "risk control",
+    "http error 412",
     "http error 408",
     "http error 425",
     "http error 429",

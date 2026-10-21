@@ -11,10 +11,11 @@ touching the database, workers, or config.
 
 ## 1. What this software is
 
-A long-running **archival engine**: you give it YouTube playlist/channel URLs,
-it downloads every video, fetches sidecar metadata (subtitles, thumbnails,
-descriptions, info.json), converts to a target container, and keeps going
-forever — watching RSS feeds for new uploads and rescanning on a schedule.
+A long-running **archival engine**: you give it YouTube or Bilibili
+playlist/collection/channel/space URLs, it downloads every video, fetches sidecar
+metadata (subtitles, thumbnails, descriptions, info.json), converts to a target
+container, and keeps going forever — watching RSS feeds for new YouTube uploads
+and rescanning every source on a schedule.
 
 It is designed to survive **crashes, hard kills, network drops, full disks, and
 files deleted behind its back**. Every state transition is persisted in SQLite,
@@ -114,6 +115,9 @@ src/
   reconcile.ts   self-healing sweeps (crashes, stale claims, missing files, failed jobs) + partial-file housekeeping
   relocate.ts    secondary-storage relocation pass (finished files that need no conversion still move)
   unconverted-scan.ts  "Scan Unconverted Videos": imports untracked local media + re-queues finished jobs whose file is not in the chosen target container
+  providers.ts   PURE per-site URL facts: which sites exist, what each URL shape means,
+                 canonical video/list URLs, listing-entry ids, cookie + network probe hosts
+  video-summary.ts  the pre-download title/duration probe (a listing that named nothing)
   sources.ts     Web UI URL validation/canonicalization + durable source-list additions
   scanner.ts     playlist/channel listing + deduplicated ingestion
   autoscale.ts   dynamic download-slot management
@@ -137,25 +141,28 @@ tests/           bun test suite (see section 9)
 ```
 state.ts → config defaults/types ──────────────┐ (shared runtime-state leaf)
 config.ts, util.ts, logger.ts, retry.ts,
-archive.ts, tools.ts, download-output.ts         │ (leaf modules, zero deps)
+archive.ts, tools.ts, download-output.ts,
+providers.ts                                     │ (leaf modules, zero deps)
 audio-tracks.ts → config (types), tools          │ (pure parsing/selection + -J probe)
-db.ts → config                                  │
+video-summary.ts → tools                        │ (the title/duration probe; scanner imports its placeholder title, so it must never import scanner)
+db.ts → config, providers                       │
 lease.ts → db, logger                           │ (the engine lease; db must never import it)
-resilience.ts → config, db, logger, state       │
+resilience.ts → config, db, logger, providers, state│
 reconcile.ts → archive, config, db, download-args, lease, logger, retry, state, tools│
 relocate.ts → config, db, lease, logger, state, util, workers/convert    │ (relocation pass)
-sources.ts → config, state                     │
-scanner.ts → config, db, state, tools, util     │
+sources.ts → config, db, providers, state       │
+scanner.ts → archive, config, db, logger, providers, sources, state, tools, util, video-summary│
+metadata-only.ts → config, db, download-args, logger, metadata-files, providers, scanner, state, tools, util│
 autoscale.ts → db, state                        │
 dashboard.ts → autoscale, config, db, state, util│
 report.ts → autoscale, db, state, util          │
 download-args.ts → audio-tracks, config, db (types), download-output, retry, tools, util    │ (pure)
-web.ts → audio-tracks, autoscale, config, db, download-args, lease, logger, reconcile, report, resilience, retry, scanner, sources, state, tools, util
-rss.ts → config, logger, scanner, state, tools   │
+web.ts → archive, audio-tracks, autoscale, config, dashboard, db, download-args, lease, logger, metadata-files, metadata-only, metadata-scan, providers, reconcile, relocate, report, resilience, retry, scanner, settings, sources, state, tools, unconverted-scan, util
+rss.ts → config, logger, providers, scanner, state, tools│
 polling.ts → config, logger, scanner, state     │
 history.ts → db, logger, state                  │
 lifecycle.ts → dashboard, db, history, lease, logger, resilience, state
-workers/* → config, dashboard, db, download-args, download-output, logger, resilience, retry, state, tools, util (+ autoscale/archive/reconcile; download.ts also audio-tracks)
+workers/* → config, dashboard, db, download-args, download-output, logger, resilience, retry, state, tools, util (+ autoscale/archive/reconcile; download.ts also audio-tracks and video-summary)
 engine.ts → everything (composition root)
 ```
 
@@ -210,18 +217,18 @@ dependency-free — it is the module that breaks every import cycle.
 
 ## 4. Data model
 
-### The `jobs` table (one row per video, keyed by YouTube video id)
+### The `jobs` table (one row per video, keyed by its site's video id)
 
 | Field | Meaning |
 | --- | --- |
-| `id` | YouTube video id (primary key → natural dedupe) |
-| `url` | canonical `https://www.youtube.com/watch?v=<id>` |
+| `id` | the site's video id (primary key → natural dedupe): YouTube's 11-char id, or Bilibili's `BV…`/`av…`/`au…`/episode id — with `_pN` when one part of a multi-part video is its own job. The shapes cannot collide, so the id stays global (gotcha 44) |
+| `url` | canonical page URL for that site (`https://www.youtube.com/watch?v=<id>`, `https://www.bilibili.com/video/<BV…>`, …) — never a CDN/stream URL, which expires |
 | `title`, `folder`, `index` | display name, output folder, `001`-style ordering |
 | `output_directory` | absolute-ish path where files land |
 | `target_format` | `mp4` \| `mkv` \| `webm` \| `mp3` \| `m4a`; editable per job (NULL follows the live global format) |
 | `video_quality` | nullable per-job override (`highest`, `4k`, `1440p`, `1080p`, `720p`, `480p`, `audio`); NULL follows global quality |
 | `want_subtitles` / `want_thumbnail` / `want_description` | 0/1 sidecar flags |
-| `duration` | seconds from the listing (drives the watchdog) |
+| `duration` | seconds from the listing (drives the watchdog); NULL when the listing had none, completed by the pre-download probe (gotcha 46) |
 | `download_status` | `pending` \| `downloading` \| `downloaded` \| `paused` \| `failed` \| `waiting_live` |
 | `conversion_status` | `pending` \| `in_progress` \| `done` \| `failed` \| `not_needed` |
 | `metadata_status` | `pending` \| `in_progress` \| `done` \| `failed` \| `not_needed` |
@@ -768,13 +775,16 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/engine-lease.test.ts` | the database-level engine lease: acquisition/refusal, takeover of an expired lease and of one whose owning process is gone, renewal failure after a takeover, the heartbeat's lost-lease signal, release + clean restart (fencing survives), and that the startup/reaper sweeps refuse to run without the lease. Uses file-backed databases and a real second process (`tests/fixtures/claim-worker.ts`) |
 | `tests/claim-races.test.ts` | claim ownership across SEPARATE connections and PROCESSES: two handles cannot claim the same job twice, three processes draining 40 jobs never double-claim (unique token per row), a crashed owner reclaimed only after its lease lapses, a stale worker's progress/release refused after its claim was taken, a long-running heartbeating conversion never reaped (and reaped once the heartbeat stops), metadata reaped on its heartbeat rather than `updated_at`, and two reapers racing one expired claim where exactly one CAS wins |
 | `tests/cookies.test.ts` | `cookiesArgs`/`cookiesState` on a missing/empty/present file, the appeared/updated/disappeared transitions, and `cookiesWatch`'s credential-blocked count |
-| `tests/rss.test.ts` | `parseRssFeed` against a realistic feed (CDATA, missing duration); timer picks up live-added channels after an empty startup |
+| `tests/cookie-sources.test.ts` | where the cookies come from (file → browsers → anonymous), the private working copy, and which sites the validity probe asks: the historical YouTube-only default, first answer wins, a YouTube-unreachable network still keeps good cookies, and cookies every configured site rejects are still rejected |
+| `tests/rss.test.ts` | `parseRssFeed` against a realistic feed (CDATA, missing duration); timer picks up live-added channels after an empty startup; RSS is a YouTube-only feature, so a Bilibili space is skipped without an id resolution or a feed fetch |
 | `tests/webauth.test.ts` | token extraction, timing-safe compare, authorization |
 | `tests/report.test.ts` | run report contents |
 | `tests/download-args.test.ts` | downloader-engine selection, aria2c args, bandwidth split, fragment/chunk/buffer flags, watchdog scaling, multi-audio selector/multistream flags |
 | `tests/download-output.test.ts` | bounded CR/LF pipe parsing, split UTF-8, oversized-record discard, validated final-path markers |
 | `tests/download-process.test.ts` | a progress-callback failure kills/reaps the downloader and clears active process tracking; the orphan check that needs `pgrep` is POSIX-only (9.5) |
-| `tests/scanner.test.ts` | `getPlaylistItems` against a fake yt-dlp: parsed flat-playlist output, a genuine empty answer, a non-zero exit reported instead of swallowed, and the hung-scan kill |
+| `tests/providers.test.ts` | every per-site URL fact (gotcha 45): host matching (including a host that merely *contains* a supported domain), each Bilibili video/list/channel shape and its canonical form, which query parameters survive, listing-entry ids that are lists rather than videos, `resolveListingVideoUrl`'s precedence, the YouTube regressions, and the cookie/network probe ordering |
+| `tests/video-summary.test.ts` | the pre-download title/duration probe (gotcha 46): what one `--print` line parses to (incl. `NA`, a fractional duration, a title containing the separator), which jobs may be probed at all, the probe's argv, and the process lifecycle against real child processes — a chatty stderr that must not deadlock the reader, a failure's wording, and the watchdog kill |
+| `tests/scanner.test.ts` | `getPlaylistItems` against a fake yt-dlp: parsed flat-playlist output, a genuine empty answer, a non-zero exit reported instead of swallowed, the hung-scan kill, Bilibili listings (no title/duration, a page URL in `%(url)s`, a nested collection dropped) and the folder a Bilibili space gets |
 | `tests/yt-dlp-update.test.ts` | the bounded `yt-dlp -U`: output drained and reported, a failed update's diagnostic, and the hard kill of an updater that hangs |
 | `tests/download-pause.test.ts` | user pause state survives download failure and successful file recording |
 | `tests/download-resume-416.test.ts` | the unrecoverable-resume branch: an HTTP 416 (or aria2c's control-file refusal) discards the `.part` WITH its `.aria2`, zeroes progress/best_progress and re-queues for a fresh transfer; the budget still bounds it; a lost claim writes nothing over the new owner's row; a plain corrupt error still KEEPS the partial |
@@ -800,7 +810,13 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 
 `tests/mocks/yt-dlp`, `tests/mocks/ffmpeg`, and `tests/mocks/aria2c` are Bun
 scripts that implement just enough of each CLI for the engine to run its full
-pipeline. The mock yt-dlp honours `--downloader aria2c` by spawning the mock
+pipeline. The mock yt-dlp answers a listing in the engine's own
+`LISTING_PRINT_TEMPLATE` field order and knows both sites: a YouTube list prints
+titles and durations, a Bilibili list prints `NA` for both plus the entry's page
+URL in `%(url)s`, and a `--skip-download --print "%(title)s|||%(duration)s"`
+call is the summary probe (`FAKE_SUMMARY_TITLE`/`_DURATION`/`_NA`/`_FAIL`/
+`_HANG`/`_LOG` steer it). Its archive lines carry the extractor prefix the real
+yt-dlp writes (`youtube <id>`, `bilibili <BV…>`). The mock yt-dlp honours `--downloader aria2c` by spawning the mock
 aria2c and recording the argv it received to `<out>.aria2-args`, which is how
 the aria2c integration test proves the connection tuning and the bandwidth cap
 actually reach the downloader. The integration
@@ -1268,7 +1284,7 @@ Windows — an environment assumption is still a broken test:
     source removal or queue purge. `tests/db.test.ts` verifies the ignore survives
     closing/reopening the SQLite archive and blocks a subsequent scan.
 44. **Video identity is global; source URLs are only ownership links.**
-    `jobs.id` is the YouTube video ID, so a second playlist that lists the same
+    `jobs.id` is the site's video ID, so a second playlist that lists the same
     video must link to the existing job instead of creating a second row.
     Source cleanup may delete that row while leaving the finished media and
     `--download-archive` entry behind; when `archiveFile` is enabled,
@@ -1278,6 +1294,45 @@ Windows — an environment assumption is still a broken test:
     allow-again route must clear both the ignore tombstone and archive entry,
     or the scanner will continue suppressing the user's opt-in. Pin both paths
     with distinct-source and source-cleanup regressions.
+
+45. **Every per-site URL fact lives in `src/providers.ts`, and it stays a leaf.**
+    Which hosts belong to which site, what a URL shape means (`video` /
+    `playlist` / `channel`), how a video or list URL canonicalizes, which listing
+    entry ids are videos, and which hosts the cookie/network probes should try —
+    all of it is there, pure and unit-tested (`tests/providers.test.ts`). Nothing
+    else may grow its own copy: `sources.ts` dispatches through
+    `classifySourceUrl()`, `scanner.ts` through `listingProvider()` /
+    `resolveListingVideoUrl()`, `retry.ts` and the dashboard only classify
+    messages. `tools.ts` is a zero-dependency leaf, so it must NOT import
+    `providers.ts` or `state.ts`: `engine.ts` computes
+    `cookieProbeUrls([...sources])` and injects it as `config.probeUrls`.
+    Adding a site means adding it there once, then the tests.
+
+46. **A listing that names nothing is completed before the first download, never after.**
+    Bilibili's flat entries carry ids and URLs but no title and no duration, so
+    `workers/download.ts runDownload()` calls `video-summary.ts`
+    `probeVideoSummary()` before `buildDownloadPlan()`: the title names the file
+    and the duration sizes the watchdog (`computeDownloadTimeoutMs` falls back to
+    the configured MINIMUM without one, which kills a long upload). The gate
+    (`needsSummaryBackfill`) refuses to run once `file_path`,
+    `partial_file_path` or `best_progress > 0` exists — renaming then would
+    orphan the `.part` and its aria2c control file the resume depends on. The
+    write is a claim-token CAS like every other write from that worker, and a
+    failed probe is logged once and the download proceeds with the placeholder
+    title. `parseListingLine` treats a literal `NA` as *missing*, never as a
+    title, or the gate never fires and files are named `001 - NA.mp4`.
+
+47. **`%(url)s` means two different things; only one of them is a page URL.**
+    On a FLAT listing entry it is the entry's page URL. On a full extraction
+    (a single-video source, which `--flat-playlist` does not flatten) it is the
+    *selected format's* expiring CDN URL (`googlevideo.com`, `bilivideo.com`).
+    The listing template therefore prints `%(webpage_url)s` and `%(url)s` LAST —
+    a yt-dlp that answers fewer fields still parses, because missing trailing
+    fields are absent, never `""` (`tests/scanner.test.ts` compares whole
+    objects) — and `resolveListingVideoUrl()` accepts a printed URL only when it
+    canonicalizes for a known provider, falling back to the source URL and the
+    id. Storing a stream URL as `jobs.url` would leave a job whose URL is dead
+    within minutes.
 
 ---
 
@@ -1296,7 +1351,8 @@ Windows — an environment assumption is still a broken test:
 | Add a run-level CLI override | Pure parser in `src/config.ts` → apply to the in-memory config in `src/engine.ts` before `setConfig()` → focused `tests/config.test.ts`; document in README |
 | Change relocation | `src/relocate.ts` (+ the `RELOCATION_WHERE` predicate and `relocated_to` in `src/db.ts`, written by `workers/convert.ts finalizeConversion` and `workers/download.ts recordSuccess`) → `tests/offline-mode.test.ts` |
 | Add a worker | `src/workers/<name>.ts` → claim fn in `db.ts` → `supervise()` in `engine.ts` → TUI line in `dashboard.ts` |
-| Support a new site/URL shape | `src/sources.ts parseSourceUrl()` (Web UI validation/source identity) + `src/scanner.ts normalizeVideoUrl()` (job URL canonicalization) |
+| Support a new site/URL shape | `src/providers.ts` (hosts, shapes, canonical URLs, entry-id rules, probe hosts — gotcha 45) → `src/sources.ts` (source identity/list choice) → `src/scanner.ts` (listing + ingest) → `src/retry.ts` (that site's wordings) → `tests/providers.test.ts` + the mock in `tests/mocks/yt-dlp` |
+| Change how a job's title/duration is obtained | `src/video-summary.ts` (probe + gate) → `workers/download.ts backfillJobSummary()` (gotcha 46) → `tests/video-summary.test.ts` + the Bilibili scenarios in `tests/integration.test.ts` |
 | Probe the OS (disk space, …) | `src/resilience.ts diskUsage()` — statfs + PowerShell fallback + degraded mode in one place; never call `statfs` directly (gotcha 22) |
 
 ## 12. Definition of done

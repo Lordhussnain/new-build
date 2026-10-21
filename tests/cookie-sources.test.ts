@@ -5,11 +5,19 @@
 // when validation is off, and an empty cookieBrowsers list means anonymous.
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG, parseConfig } from "../src/config";
-import { activeBrowserCookieSource, cookiesArgs, resolveCookieSource } from "../src/tools";
+import {
+  activeBrowserCookieSource,
+  cookiesArgs,
+  DEFAULT_COOKIE_PROBE_URL,
+  resolveCookieSource,
+  validateCookieArgs,
+  validateCookies,
+} from "../src/tools";
+import { resolvedTools } from "../src/tools";
 
 const dir = await mkdtemp(join(tmpdir(), "cookie-sources-"));
 afterAll(() => rm(dir, { recursive: true, force: true }));
@@ -92,5 +100,110 @@ describe("cookie working copy", () => {
     await writeFile(file, "# second export, different size\n");
     cookieWorkingCopy(file);
     expect(await Bun.file(working).text()).toBe("# second export, different size\n");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Which site the cookie probe asks. A Bilibili archive is exactly the case where
+// this matters: its cookies unlock 1080P+ and every login-gated video, and its
+// operator may be on a network that cannot reach YouTube at all — probing only
+// YouTube would throw a perfectly good cookies.txt away.
+describe.skipIf(process.platform === "win32")("cookie probe targets follow the sites in use", () => {
+  const original = resolvedTools.ytDlp;
+  const stubDirs: string[] = [];
+  const YOUTUBE_PROBE = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+  const BILIBILI_PROBE = "https://www.bilibili.com/video/BV1GJ411x7h7";
+
+  async function probeStub(name: string, body: string): Promise<string> {
+    const stubDir = await mkdtemp(join(tmpdir(), `yta-cookie-probe-${name}-`));
+    stubDirs.push(stubDir);
+    const file = join(stubDir, "yt-dlp");
+    // Absolute interpreter: the stub must not need a working PATH.
+    await writeFile(file, `#!${process.execPath}\n${body}\n`);
+    await chmod(file, 0o755);
+    return file;
+  }
+
+  /** A stub that appends every probe URL it is asked for, then answers per rule. */
+  function stubBody(logFile: string, failYoutube: boolean, loginRequired: boolean): string {
+    return [
+      'import { appendFileSync } from "node:fs";',
+      `const logFile = ${JSON.stringify(logFile)};`,
+      "const url = process.argv[process.argv.length - 1];",
+      'appendFileSync(logFile, url + "\\n");',
+      `if (loginRequiredFlag(${JSON.stringify(loginRequired)})) {`,
+      '  console.error("ERROR: [youtube] dQw4w9WgXcQ: Login required");',
+      "  process.exit(0);",
+      "}",
+      `if (${JSON.stringify(failYoutube)} && /youtube\\.com|youtu\\.be/.test(url)) process.exit(1);`,
+      "process.exit(0);",
+      "function loginRequiredFlag(v) { return v === true; }",
+    ].join("\n");
+  }
+
+  const readLog = async (logFile: string): Promise<string[]> =>
+    (await Bun.file(logFile).text().catch(() => "")).split("\n").filter(Boolean);
+
+  afterAll(async () => {
+    resolvedTools.ytDlp = original;
+    for (const stubDir of stubDirs.splice(0)) await rm(stubDir, { recursive: true, force: true });
+  });
+
+  test("with no probe list the historical YouTube probe is the only one", async () => {
+    const logFile = join(dir, "probe-default.log");
+    resolvedTools.ytDlp = await probeStub("default", stubBody(logFile, false, false));
+    await expect(validateCookieArgs(["--cookies", join(dir, "cookies.txt")])).resolves.toBe(true);
+    expect(await readLog(logFile)).toEqual([YOUTUBE_PROBE]);
+    expect(DEFAULT_COOKIE_PROBE_URL).toBe(YOUTUBE_PROBE);
+  });
+
+  test("the first site that answers settles it — no second probe is spent", async () => {
+    const logFile = join(dir, "probe-first.log");
+    resolvedTools.ytDlp = await probeStub("first", stubBody(logFile, false, false));
+    await expect(
+      validateCookieArgs(["--cookies", join(dir, "cookies.txt")], [BILIBILI_PROBE, YOUTUBE_PROBE]),
+    ).resolves.toBe(true);
+    expect(await readLog(logFile)).toEqual([BILIBILI_PROBE]);
+  });
+
+  test("a network that cannot reach YouTube still keeps the cookies", async () => {
+    const logFile = join(dir, "probe-youtube-down.log");
+    resolvedTools.ytDlp = await probeStub("youtube-down", stubBody(logFile, true, false));
+    // The order a mixed YouTube+Bilibili config produces: YouTube first.
+    await expect(
+      validateCookieArgs(["--cookies", join(dir, "cookies.txt")], [YOUTUBE_PROBE, BILIBILI_PROBE]),
+    ).resolves.toBe(true);
+    expect(await readLog(logFile)).toEqual([YOUTUBE_PROBE, BILIBILI_PROBE]);
+  });
+
+  test("cookies every configured site rejects are still rejected", async () => {
+    const logFile = join(dir, "probe-login.log");
+    resolvedTools.ytDlp = await probeStub("login", stubBody(logFile, false, true));
+    const cookies = join(dir, "probe-cookies.txt");
+    await writeFile(cookies, "# Netscape HTTP Cookie File\n");
+    await expect(validateCookies(cookies, [BILIBILI_PROBE, YOUTUBE_PROBE])).resolves.toBe(false);
+    expect(await readLog(logFile)).toEqual([BILIBILI_PROBE, YOUTUBE_PROBE]);
+  });
+
+  test("resolveCookieSource hands its probe list to the validator", async () => {
+    const logFile = join(dir, "probe-resolve.log");
+    resolvedTools.ytDlp = await probeStub("resolve", stubBody(logFile, true, false));
+    const cookies = join(dir, "resolve-cookies.txt");
+    await writeFile(cookies, "# Netscape HTTP Cookie File\n");
+    const lines: string[] = [];
+    await resolveCookieSource(
+      {
+        cookiesFile: cookies,
+        validateCookiesOnStart: true,
+        cookieBrowsers: [],
+        offlineMode: false,
+        // What engine.ts passes for a Bilibili-only config.
+        probeUrls: [BILIBILI_PROBE, YOUTUBE_PROBE],
+      },
+      { force: true, log: (m) => lines.push(m) },
+    );
+    expect(lines.join("\n")).toContain("Cookies validated (cookies.txt)");
+    expect(await readLog(logFile)).toEqual([BILIBILI_PROBE]);
+    expect(cookiesArgs({ cookiesFile: cookies })).toEqual(["--cookies", `${cookies}.working`]);
   });
 });

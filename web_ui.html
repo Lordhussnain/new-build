@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>🎬 YouTube Archive Engine V5</title>
+  <title>🎬 YouTube &amp; Bilibili Archive Engine V5</title>
   <style>
     :root {
       --bg-primary: #0b0f19;
@@ -1282,7 +1282,7 @@
     <div class="brand-wrap">
       <span class="brand-icon">🎬</span>
       <div class="brand-text">
-        <h1>YouTube Archive Engine</h1>
+        <h1>YouTube &amp; Bilibili Archive Engine</h1>
         <div class="brand-tag">V5 Autonomous Pipeline</div>
       </div>
     </div>
@@ -1353,12 +1353,12 @@
       <span style="font-size: 0.74rem; color: var(--text-secondary);">Saved automatically to config.json</span>
     </div>
     <div class="add-url-inputs">
-      <input type="text" id="newUrlInput" placeholder="Paste a full YouTube playlist, channel or video URL..." />
+      <input type="text" id="newUrlInput" placeholder="Paste a full YouTube or Bilibili playlist, channel or video URL..." />
       <input type="text" id="folderOverride" placeholder="Optional: Custom subfolder" />
       <button class="btn btn-primary" id="scanUrlButton" onclick="scanUrl()">📡 Save &amp; Scan</button>
     </div>
     <div class="add-url-options">
-      <label title="For links like watch?v=…&list=…&index=…: save only that video instead of the whole playlist">
+      <label title="For links that carry both a video and a list (watch?v=…&list=…, or a shared Bilibili collection): save only that video instead of the whole list">
         <input type="checkbox" id="singleVideoCheckbox" />
         <span>Single video only (for <code>watch?v=…&amp;list=…</code> links)</span>
       </label>
@@ -1592,10 +1592,10 @@
       </div>
       <div class="modal-body">
         <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 12px;">
-          One YouTube link per line. Blank lines and lines starting with <code>#</code> are ignored.
+          One YouTube or Bilibili link per line. Blank lines and lines starting with <code>#</code> are ignored.
           Valid links are saved to config.json, then scanned in the background.
         </p>
-        <textarea id="batchUrlsInput" class="batch-textarea" spellcheck="false" oninput="updateBatchCount()" placeholder="https://www.youtube.com/playlist?list=PLG6V3xWznon-iJRo_B4XyCiMNaGJmOV-5&#10;https://www.youtube.com/watch?v=juY5TV5vNYw&amp;list=PLG6V3xWznon-iJRo_B4XyCiMNaGJmOV-5&amp;index=8&#10;# comments are skipped"></textarea>
+        <textarea id="batchUrlsInput" class="batch-textarea" spellcheck="false" oninput="updateBatchCount()" placeholder="https://www.youtube.com/playlist?list=PLG6V3xWznon-iJRo_B4XyCiMNaGJmOV-5&#10;https://www.youtube.com/watch?v=juY5TV5vNYw&amp;list=PLG6V3xWznon-iJRo_B4XyCiMNaGJmOV-5&amp;index=8&#10;https://space.bilibili.com/3546702659488348/favlist?fid=3707880948&#10;https://www.bilibili.com/video/BV1GJ411x7h7&#10;https://space.bilibili.com/55/upload/video&#10;# comments are skipped"></textarea>
         <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 8px;">
           <label class="btn btn-secondary btn-sm" style="cursor: pointer; margin: 0;">
             📁 Upload .txt
@@ -1637,7 +1637,7 @@
           Paste a video or playlist link to save its sidecar files only. They are written into the folder
           the videos would use, so a later download lands next to them. Nothing is queued for download.
         </p>
-        <input type="text" id="metadataUrlInput" class="batch-input" spellcheck="false" placeholder="https://www.youtube.com/playlist?list=… or https://www.youtube.com/watch?v=…" />
+        <input type="text" id="metadataUrlInput" class="batch-input" spellcheck="false" placeholder="YouTube: https://www.youtube.com/playlist?list=… or /watch?v=…  ·  Bilibili: https://space.bilibili.com/…/favlist?fid=… or /video/BV…" />
         <div class="batch-grid" style="margin-top: 10px;">
           <label class="batch-check">
             <input type="checkbox" id="metadataSingleVideo" />
@@ -1890,7 +1890,7 @@
         const latency = Date.now() - start;
         if (res.ok) {
           if (offlineModeActive) {
-            // Reachable, but deliberately not talking to YouTube.
+            // Reachable, but deliberately not talking to any source site.
             dot.className = 'status-dot degraded';
             text.textContent = 'Offline mode';
             latencyEl.textContent = '';
@@ -1936,7 +1936,8 @@
       else if (tabName === 'logs') loadLogs();
     }
 
-    // Job ids are YouTube video ids (strings), not numbers — `Number(id)` used
+    // Job ids are video ids from the source site (strings — a YouTube id or a
+    // Bilibili BV…/av…), not numbers. `Number(id)` used
     // to turn every selection into NaN, so the bulk bar collected nothing.
     function toggleSelectAll() {
       const selectAll = document.getElementById('selectAll');
@@ -2610,7 +2611,7 @@
       if (!tracks.length) {
         return `
           <h4>🎵 Multi-Language Audio Tracks</h4>
-          <div class="popover-hint">No audio tracks probed for this video yet. Probing queries YouTube for the available language streams.</div>
+          <div class="popover-hint">No audio tracks probed for this video yet. Probing asks the source site which language streams exist (YouTube multi-audio).</div>
           <div class="popover-actions">
             <button class="btn btn-primary btn-sm" data-job-id="${escapeHtml(job.id)}" onclick="probePopoverAudioTracks(this.dataset.jobId)">🔍 Probe Tracks</button>
           </div>
@@ -2768,13 +2769,15 @@
           container.innerHTML = '<div class="source-empty">No saved sources yet. Paste a playlist or channel URL above.</div>';
           return;
         }
-        // GET /api/sources → { ok, sources: [{ key, url, trackedJobs }] }. `key`
-        // is which config.json list the URL lives in, and trackedJobs is the
-        // number of queue rows that source owns.
+        // GET /api/sources → { ok, sources: [{ key, url, trackedJobs, provider,
+        // providerLabel, shape }] }. `key` is which config.json list the URL
+        // lives in, trackedJobs is the number of queue rows that source owns, and
+        // providerLabel is which site it points at (null for an entry this UI
+        // would not accept — one added by hand, or by an older build).
         const KIND_LABELS = { playlists: 'Playlist', channels: 'Channel', channelPlaylists: 'Channel playlist' };
         container.innerHTML = data.sources.map(src => {
           const kind = KIND_LABELS[src.key] || src.key || 'Source';
-          const sub = [kind, `${src.trackedJobs ?? 0} job(s)`].filter(Boolean).join(' · ');
+          const sub = [src.providerLabel || '', kind, `${src.trackedJobs ?? 0} job(s)`].filter(Boolean).join(' · ');
           return `
             <div class="source-row">
               <div class="source-info">
@@ -2821,7 +2824,7 @@
       const url = (input.value || '').trim();
       const folder = (folderInput.value || '').trim();
       if (!url) {
-        showNotification('Please enter a YouTube playlist, channel or video URL', 'warning');
+        showNotification('Please enter a YouTube or Bilibili playlist, channel or video URL', 'warning');
         return;
       }
       button.disabled = true;
@@ -2890,7 +2893,7 @@
 
     async function startMetadataOnlyFromUi() {
       const url = document.getElementById('metadataUrlInput').value.trim();
-      if (!url) { showNotification('Paste a YouTube link first', 'error'); return; }
+      if (!url) { showNotification('Paste a YouTube or Bilibili link first', 'error'); return; }
       const kinds = METADATA_KIND_BOXES.filter(([, box]) => document.getElementById(box).checked).map(([kind]) => kind);
       if (kinds.length === 0) { showNotification('Choose at least one kind of metadata', 'error'); return; }
       const btn = document.getElementById('metadataStartBtn');
@@ -2982,6 +2985,12 @@
       const stat = (label, value) => `<div><strong>${Number(value) || 0}</strong>${escapeHtml(label)}</div>`;
       const errors = Array.isArray(data.errors) ? data.errors : [];
       const shown = errors.slice(0, 200);
+      // `byProvider` is additive: only the sites this batch actually contained,
+      // so a YouTube-only import renders exactly the stats it always did.
+      const SITE_LABELS = { youtube: 'YouTube', bilibili: 'Bilibili' };
+      const providerStats = Object.entries(s.byProvider || {})
+        .map(([site, count]) => stat(SITE_LABELS[site] || site, count))
+        .join('');
       box.innerHTML = `
         <div class="batch-stats">
           ${stat('lines read', data.total)}
@@ -2991,6 +3000,7 @@
           ${stat('playlists', s.playlists)}
           ${stat('single videos', s.videos)}
           ${stat('channels', s.channels)}
+          ${providerStats}
           ${stat('duplicates', data.duplicates)}
         </div>
         ${errors.length ? `
@@ -3185,6 +3195,12 @@
       const m = String(message);
       if (/HTTP Error 429/i.test(m)) return '⛔ Rate limited by YouTube (429) — backing off';
       if (/Sign in to confirm you’re not a bot/i.test(m)) return '⛔ YouTube bot detection (sign-in required)';
+      // Bilibili's risk control is a throttle, not a dead video: it clears on
+      // its own, and the engine keeps the job queued for a later retry.
+      if (/blocked by server \(412\)|rejected by server \(352\)|please wait and try later/i.test(m)) return '⏳ Bilibili rate control — retrying later';
+      if (/supporter-only video/i.test(m)) return '⛔ Supporter-only video (uploader exclusive)';
+      if (/need to purchase|purchase the course/i.test(m)) return '⛔ Paid course episode';
+      if (/may be deleted or geo-restricted/i.test(m)) return '⛔ Deleted or region-locked';
       if (/Private video/i.test(m)) return '⛔ Private video';
       if (/Video unavailable/i.test(m)) return '⛔ Video unavailable';
       return m;
@@ -3689,7 +3705,7 @@
           </div>
           ${tracks.length === 0 ? `
             <div style="font-size: 0.75rem; color: var(--text-muted);">
-              Track list has not been probed yet. Click "Probe Tracks" to query YouTube for available audio streams.
+              Track list has not been probed yet. Click "Probe Tracks" to ask the source site which audio streams exist.
             </div>
           ` : `
             <div style="max-height: 180px; overflow-y: auto; margin-bottom: 8px;">${rows}</div>

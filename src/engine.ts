@@ -23,6 +23,7 @@ import {
   releaseEngineLease,
   startEngineLeaseHeartbeat,
 } from "./lease";
+import { cookieProbeUrls } from "./providers";
 import { SOURCE_KEYS, sourceIdentity } from "./sources";
 import {
   cleanOrphanedFiles,
@@ -75,6 +76,21 @@ export function ensureDownloadWorkers(): void {
   autoscaler.poolSize = wanted;
   // Reserve dashboard rows for the new workers. Redraws the block if it is on screen.
   setDownloadRows(wanted);
+}
+
+/** Every source URL configured, across all three lists. */
+type SourceLists = { playlists: string[]; channels: string[]; channelPlaylists: string[] };
+function configuredSources(config: SourceLists): string[] {
+  return SOURCE_KEYS.flatMap((key) => config[key]);
+}
+
+/**
+ * The same config plus the cookie-probe targets for the sites actually in use
+ * (see `providers.cookieProbeUrls`), so a cookie source is judged against a
+ * site the operator can reach.
+ */
+function withCookieProbes<T extends SourceLists>(config: T): T & { probeUrls: string[] } {
+  return { ...config, probeUrls: cookieProbeUrls(configuredSources(config)) };
 }
 
 export async function main(): Promise<void> {
@@ -263,14 +279,16 @@ export async function main(): Promise<void> {
     console.log("🍪 Cookies: not used (offline mode).");
   } else {
     // cookies.txt first (if present and valid), then the browsers in
-    // cookieBrowsers, then anonymous. See resolveCookieSource().
-    await resolveCookieSource(config);
+    // cookieBrowsers, then anonymous. See resolveCookieSource(). The probe
+    // targets follow the sites in use, so a cookies.txt full of Bilibili
+    // credentials is not thrown away on a network that cannot reach YouTube.
+    await resolveCookieSource(withCookieProbes(config));
   }
 
   // 3) Load every link from config.json, fetch video details, store in DB.
   //    Scanning is a network round-trip per source, so offline mode skips it
   //    entirely: nothing can be discovered, and the queued jobs are untouched.
-  const allLinks = [...config.playlists, ...config.channels, ...config.channelPlaylists];
+  const allLinks = configuredSources(config);
   if (config.offlineMode) {
     console.log(`📡 Source scan skipped (offline mode) — ${allLinks.length} configured source(s) unchanged.`);
   } else if (allLinks.length > 0) {
@@ -337,11 +355,11 @@ export async function main(): Promise<void> {
   // Cookies sweep is local filesystem observation (not a network fetch), so it
   // stays registered through offline mode and is ready if the mode ends live.
   setInterval(() => {
-    if (cookiesWatch(getConfig())) void resolveCookieSource(getConfig(), { force: true });
+    if (cookiesWatch(getConfig())) void resolveCookieSource(withCookieProbes(getConfig()), { force: true });
   }, 60_000);
   // Browser cookies can expire or the browser can be closed/unlocked later on,
   // so the chosen source is re-checked periodically.
-  setInterval(() => void resolveCookieSource(getConfig()), COOKIE_SOURCE_RECHECK_MS);
+  setInterval(() => void resolveCookieSource(withCookieProbes(getConfig())), COOKIE_SOURCE_RECHECK_MS);
   // Secondary-storage relocation: files that need no conversion still have to
   // reach secondary storage (src/relocate.ts).
   startRelocation();

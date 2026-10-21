@@ -29,6 +29,13 @@
 //                              announcement instead of burning the retry
 //                              budget; a video that matches no selector at all
 //                              ends as a terminal "No format available" skip
+//  10. Bilibili sources       — a list whose entries carry no title or duration
+//                              is ingested with page URLs, each video's real
+//                              title/duration is probed before its first
+//                              download (so files are named and the watchdog is
+//                              sized), the archive records Bilibili's extractor
+//                              prefix, and a probe that fails costs only the
+//                              placeholder name — never the video
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { copyFile, mkdir, mkdtemp, readdir, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
@@ -303,9 +310,10 @@ const BASE_CONFIG = (port: number, overrides: Record<string, unknown> = {}) => (
   rssEnabled: false,
   rescanIntervalHours: 0,
   autoscaleEnabled: false,
-  // The network monitor probes real YouTube endpoints; disable it so the
-  // subprocess never makes egress requests. A dedicated unit-test block
-  // covers the monitor's pause/resume logic with a fake probe.
+  // The network monitor probes real endpoints (the configured sites first, then
+  // the generic ones); disable it so the subprocess never makes egress requests.
+  // A dedicated unit-test block covers the monitor's pause/resume logic with a
+  // fake probe.
   networkMonitorEnabled: false,
   ...overrides,
 });
@@ -3349,6 +3357,124 @@ describe("integration: offline mode", () => {
     // the next ordinary start downloads again.
     const saved = JSON.parse(await Bun.file(join(dir, "config.json")).text());
     expect("offlineMode" in saved).toBe(false);
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
+// Bilibili sources. A Bilibili list is scanned exactly like a YouTube playlist,
+// but its flat entries carry NO title and NO duration — so the pipeline has to
+// complete both before the first download attempt names the file and arms the
+// duration-aware watchdog.
+describe("integration: Bilibili sources", () => {
+  const FAVLIST = "https://space.bilibili.com/3546702659488348/favlist?fid=3707880948";
+  const IDS = ["BV1GJ411x7h7", "BV1uv411q7Mv", "BV1x411c7mD"];
+
+  test("a Bilibili list ingests, names each file from the pre-download probe, and records the extractor in the archive", async () => {
+    const dir = await makeRunDir();
+    const probeLog = join(dir, "summary-probes.log");
+    const engine = await startEngine(
+      dir,
+      4028,
+      BASE_CONFIG(4028, { playlists: [FAVLIST], maxDownloadWorkers: 1, maxConcurrentDownloads: 1 }),
+      { FAKE_SUMMARY_LOG: probeLog },
+    );
+    const folder = join(dir, "downloads", "Mock Bilibili List");
+
+    try {
+      const jobs = await waitForAllJobs(engine, (j) => j.download_status === "downloaded");
+      expect(jobs.map((j) => j.id).sort()).toEqual(IDS);
+      // The listing gave no titles, so the probe did: every file is named after
+      // the video's real title instead of three identical "001 - video.mp4"s.
+      for (const job of jobs) {
+        expect(job.title).toBe(`Mock Summary ${job.id}`);
+        expect(job.file_path).toContain(`Mock Summary ${job.id}`);
+      }
+      const files = await readdir(folder);
+      expect(files.filter((f) => f.endsWith(".mp4"))).toHaveLength(3);
+      expect(files.filter((f) => f.includes(" - video.mp4"))).toHaveLength(0);
+
+      // Exactly one probe per job — not one per attempt, and not one per rescan.
+      const probes = (await Bun.file(probeLog).text()).split("\n").filter(Boolean);
+      expect(probes.sort()).toEqual(IDS.map((id) => `https://www.bilibili.com/video/${id}`).sort());
+
+      // The saved source is reported with the site it points at, and the archive
+      // carries Bilibili's own extractor prefix (only the last field is read).
+      const sources = await engine.api("/api/sources");
+      expect(sources.sources).toEqual([
+        {
+          key: "playlists",
+          url: FAVLIST,
+          trackedJobs: 3,
+          provider: "bilibili",
+          providerLabel: "Bilibili",
+          shape: "playlist",
+        },
+      ]);
+    } finally {
+      await engine.stop();
+    }
+
+    const db = readDb(dir);
+    try {
+      const rows = db
+        .query("SELECT id, url, title, duration, file_path FROM jobs ORDER BY id")
+        .all() as { id: string; url: string; title: string; duration: number | null; file_path: string | null }[];
+      expect(rows.map((r) => r.id)).toEqual(IDS);
+      for (const row of rows) {
+        // The job URL is the video's own page, rebuilt from the entry id because
+        // a flat entry prints no webpage_url.
+        expect(row.url).toBe(`https://www.bilibili.com/video/${row.id}`);
+        expect(row.title).toBe(`Mock Summary ${row.id}`);
+        // The probed duration is what scales the download watchdog past its
+        // minimum for a long upload.
+        expect(row.duration).toBe(900);
+        expect(row.file_path).toBeTruthy();
+        expect(existsSync(resolve(dir, row.file_path!))).toBe(true);
+      }
+      const archive = (await Bun.file(join(dir, "downloaded_videos.txt")).text()).split("\n").filter(Boolean);
+      expect(archive.sort()).toEqual(IDS.map((id) => `bilibili ${id}`).sort());
+    } finally {
+      db.close();
+    }
+  }, TEST_TIMEOUT);
+
+  test("a failed title probe costs the placeholder name, never the video", async () => {
+    const dir = await makeRunDir();
+    const probeLog = join(dir, "summary-probes.log");
+    // The engine writes error.log wherever NODE_ENV puts it, and the suite shares
+    // that temp-dir file — so the baseline is taken BEFORE the engine starts (it
+    // scans and downloads straight away) and only the delta is asserted on.
+    const logBefore = await engineErrorLog(dir);
+    const engine = await startEngine(
+      dir,
+      4029,
+      BASE_CONFIG(4029, { playlists: [FAVLIST], maxDownloadWorkers: 1, maxConcurrentDownloads: 1 }),
+      { FAKE_SUMMARY_FAIL: "1", FAKE_SUMMARY_LOG: probeLog },
+    );
+    const folder = join(dir, "downloads", "Mock Bilibili List");
+
+    try {
+      // Bilibili's risk-control answer is a throttle: the probe reports it, the
+      // download runs anyway, and the job still finishes.
+      const jobs = await waitForAllJobs(engine, (j) => j.download_status === "downloaded");
+      expect(jobs.map((j) => j.id).sort()).toEqual(IDS);
+      for (const job of jobs) {
+        expect(job.title).toBe("video");
+        expect(job.last_error).toBeFalsy();
+      }
+      const files = (await readdir(folder)).filter((f) => f.endsWith(".mp4")).sort();
+      expect(files).toEqual(["001 - video.mp4", "002 - video.mp4", "003 - video.mp4"]);
+
+      // The failure is written once per job to error.log, and the probes were not
+      // retried into a storm.
+      const probes = (await Bun.file(probeLog).text()).split("\n").filter(Boolean);
+      expect(probes).toHaveLength(3);
+      const logDelta = (await engineErrorLog(dir)).slice(logBefore.length);
+      expect(logDelta.split("\n").filter((l) => l.includes("title/duration probe failed"))).toHaveLength(3);
+      expect(logDelta).toContain("blocked by server (412)");
+    } finally {
+      await engine.stop();
+    }
   }, TEST_TIMEOUT);
 });
 

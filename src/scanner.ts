@@ -2,25 +2,50 @@
 //
 // Two sources feed the same ingest path: the full yt-dlp flat-playlist scan
 // (slow, authoritative) and the cheap per-channel RSS poller (fast, recent
-// uploads only). Both dedupe on the YouTube video id, so the same video found
-// by a playlist, a channel, and a watch URL is only ever queued once.
+// uploads only). Both dedupe on the video id, so the same video found by a
+// playlist, a channel, and a watch URL is only ever queued once.
+//
+// Nothing here knows what a YouTube or a Bilibili URL looks like: src/providers.ts
+// answers which site a source belongs to, which listing ids are videos, and the
+// canonical page URL an entry becomes a job with.
 
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { readArchiveIds } from "./archive";
 import { db, getNextIndex, isVideoIgnored, isVideoInDb, takeReservedFileIndex } from "./db";
+import {
+  channelFolderFallback,
+  isListingVideoId,
+  listingProvider,
+  normalizeVideoUrl,
+  resolveListingVideoUrl,
+  type ProviderId,
+} from "./providers";
 import { isSourceBlocked, parseSourceUrl, sourceIdentity } from "./sources";
 import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
+import { UNKNOWN_LISTING_TITLE } from "./video-summary";
 import { sanitizeFolderName } from "./util";
 import { getConfig, stats } from "./state";
 import { logError } from "./logger";
 import type { Config } from "./config";
+
+export { normalizeVideoUrl };
 
 export interface ListingItem {
   id: string;
   title: string;
   playlist: string;
   duration: number;
+  /**
+   * The entry's own page URL, when yt-dlp printed one (`%(webpage_url)s` on a
+   * fully extracted video, `%(url)s` on a flat entry). Optional and untrusted:
+   * a flat YouTube entry prints its bare id there and a full extraction prints
+   * the selected format's expiring CDN URL, so `resolveListingVideoUrl` only
+   * accepts it when it validates as a page URL of a supported site.
+   */
+  webpageUrl?: string;
+  /** The raw `%(url)s` field, kept separate for the same validation. */
+  printedUrl?: string;
   /**
    * The uploading channel's display name (yt-dlp `playlist_channel`). Set for
    * channel listings, where `playlist` is the tab title ("Name - Shorts").
@@ -60,31 +85,31 @@ export function isShortsTabItem(item: ListingItem): boolean {
 
 /**
  * yt-dlp lists a channel's /playlists tab, or a playlist that appears inside a
- * tab, as an entry whose id is a playlist/channel id (PL…, UU…, UC…), not an
- * 11-character video id. Those are not videos and must never become jobs.
+ * tab, as an entry whose id is a playlist/channel id (PL…, UU…, UC…), not a
+ * video id. Those are not videos and must never become jobs. Bilibili's
+ * equivalent (a nested collection inside a space's uploads) is handled by the
+ * same provider-aware check in `parseListingLine`.
  */
-export function isPlaylistLikeId(id: string): boolean {
-  return id.length > 11 && /^(?:PL|UU|OL|FL|LL|RD|UC|VL|EL)/.test(id);
-}
+export { isPlaylistLikeId } from "./providers";
+
+/** Field separator of the listing `--print` template: never valid in a URL. */
+const FIELD_SEPARATOR = "|||";
 
 /**
- * Canonical form of a video URL: strip tracking/timestamp junk and fold
- * youtu.be short links into watch URLs, so the same video always produces the
- * same stored job URL regardless of how it was discovered.
+ * What one listing line asks yt-dlp for, in the order `parseListingLine` reads
+ * it. `webpage_url`/`url` come last so a yt-dlp that answers fewer fields (an
+ * older build, or the test mock) still parses: missing trailing fields are
+ * simply absent, and the job URL falls back to the source and the id.
  */
-export function normalizeVideoUrl(url: string): string {
-  const trimmed = (url || "").trim();
-  if (!trimmed) return trimmed;
-  try {
-    const u = new URL(trimmed);
-    const shortMatch = u.hostname === "youtu.be" ? u.pathname.slice(1).split("/")[0] : null;
-    const v = shortMatch || u.searchParams.get("v");
-    if (v && /^[\w-]{6,}$/.test(v)) return `https://www.youtube.com/watch?v=${v}`;
-    return trimmed;
-  } catch {
-    return trimmed;
-  }
-}
+export const LISTING_PRINT_TEMPLATE = [
+  "%(playlist_title)s",
+  "%(id)s",
+  "%(title)s",
+  "%(duration)s",
+  "%(playlist_channel)s",
+  "%(webpage_url)s",
+  "%(url)s",
+].join(FIELD_SEPARATOR);
 
 /** Maximum time a flat-playlist listing may keep its pipes and worker occupied. */
 export const PLAYLIST_SCAN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -112,6 +137,13 @@ export function isScanErrorTransient(message: string): boolean {
     m.includes("http error 5") ||
     m.includes("too many requests") ||
     m.includes("rate limit") ||
+    // Bilibili risk control: a listing that answers 412 / -352 / "please wait
+    // and try later" is throttled, not gone, so the retry budget applies.
+    m.includes("blocked by server") ||
+    m.includes("rejected by server") ||
+    m.includes("please wait and try later") ||
+    m.includes("risk control") ||
+    m.includes("http error 412") ||
     m.includes("service unavailable") ||
     m.includes("read error") ||
     m.includes("ssl") ||
@@ -136,22 +168,42 @@ export interface PlaylistListingOptions {
   onItems?: (items: ListingItem[]) => Promise<void> | void;
 }
 
-/** Parse one `--print` line; null for blank lines and entries without an id. */
-export function parseListingLine(line: string): ListingItem | null {
+/** A yt-dlp `--print` field that the entry does not have. */
+function field(value: string | undefined): string {
+  const trimmed = (value || "").trim();
+  return trimmed === "NA" ? "" : trimmed;
+}
+
+/**
+ * Parse one `--print` line; null for blank lines, entries without an id, and
+ * entries that are lists rather than videos.
+ *
+ * `provider` decides which ids count as videos — YouTube's playlist-id prefixes
+ * versus Bilibili's `<mid>_<sid>` collection rows. It defaults to YouTube so a
+ * caller that has no source URL keeps the historical behaviour.
+ */
+export function parseListingLine(line: string, provider: ProviderId = "youtube"): ListingItem | null {
   if (!line.trim()) return null;
-  const [playlist, id, title, duration, channel] = line.split("|||");
+  const [playlist, id, title, duration, channel, webpageUrl, printedUrl] = line.split(FIELD_SEPARATOR);
   const item: ListingItem = {
-    title: (title || "video").trim(),
+    // yt-dlp prints NA for a field the entry does not have, and a Bilibili flat
+    // listing has no titles at all. The placeholder is what
+    // `needsSummaryBackfill` looks for before the first download.
+    title: field(title) || UNKNOWN_LISTING_TITLE,
     id: (id || "").trim(),
-    // yt-dlp prints NA for a field the video does not have. A single video has
-    // no playlist title, so it stays empty and the folder falls back to
-    // "Single Videos" (the same fallback ingest and Metadata Only use).
-    playlist: (playlist || "").trim() === "NA" ? "" : (playlist || "").trim(),
+    // A single video has no playlist title, so it stays empty and the folder
+    // falls back to "Single Videos" (the same fallback ingest and Metadata Only
+    // use).
+    playlist: field(playlist),
     duration: parseFloat(duration ?? "NaN"),
   };
-  const uploader = (channel || "").trim();
-  if (uploader && uploader !== "NA") item.channel = uploader;
-  if (isPlaylistLikeId(item.id)) return null;
+  const uploader = field(channel);
+  if (uploader) item.channel = uploader;
+  const page = field(webpageUrl);
+  if (page) item.webpageUrl = page;
+  const printed = field(printedUrl);
+  if (printed) item.printedUrl = printed;
+  if (!isListingVideoId(provider, item.id)) return null;
   return item.id ? item : null;
 }
 
@@ -162,13 +214,14 @@ async function streamListing(
   onItems: PlaylistListingOptions["onItems"],
   onSinkError: (error: unknown) => void,
   onActivity: () => void = () => {},
+  provider: ProviderId = "youtube",
 ): Promise<void> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let carry = "";
   let batch: ListingItem[] = [];
   const take = (line: string) => {
-    const item = parseListingLine(line);
+    const item = parseListingLine(line, provider);
     if (item) {
       items.push(item);
       batch.push(item);
@@ -228,9 +281,12 @@ export async function getPlaylistItems(
     // private uploads. The failure is still visible on individual job rows.
     "--ignore-errors",
     "--print",
-    "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s|||%(playlist_channel)s",
+    LISTING_PRINT_TEMPLATE,
     url,
   ];
+  // Which site is being listed decides which entry ids are videos, and how a
+  // missing one is turned back into a page URL at ingest.
+  const provider = listingProvider(url);
   const ctl = new AbortController();
   const limitMs = opts.timeoutMs ?? (opts.idle ? CHANNEL_SCAN_IDLE_TIMEOUT_MS : PLAYLIST_SCAN_TIMEOUT_MS);
   let proc: Bun.Subprocess | null = null;
@@ -276,7 +332,7 @@ export async function getPlaylistItems(
       streamListing(child.stdout, items, opts.onItems, (error) => {
         sinkFailed = true;
         sinkError = error;
-      }, onActivity),
+      }, onActivity, provider),
       new Response(child.stderr).text(),
       child.exited,
     ]);
@@ -323,6 +379,10 @@ export async function ingestItems(
   if (config.offlineMode || getConfig().offlineMode) return { found: 0, added: 0, skipped: 0 };
   if (items.length === 0) return { found: 0, added: 0, skipped: 0 };
   const sourceKey = sourceUrl ? sourceIdentity(sourceUrl) : null;
+  // Which site this listing came from decides how an entry id becomes a job
+  // URL. A listing ingested without a source (a caller that already knows what
+  // it queued) keeps the historical YouTube-shaped answer.
+  const provider = listingProvider(sourceKey || sourceUrl);
   const folder = sanitizeFolderName(overrideFolderName || items[0].playlist || "Single Videos");
   const outputDir = join(config.outputRoot, folder);
   await mkdir(outputDir, { recursive: true });
@@ -403,7 +463,16 @@ export async function ingestItems(
       const index = takeReservedFileIndex(folder, item.id) ?? getNextIndex(folder);
       stmt.run(
         item.id,
-        normalizeVideoUrl(`https://www.youtube.com/watch?v=${item.id}`),
+        // The page URL this video is downloaded from: what yt-dlp printed for
+        // the entry when that validates as a page URL, else the source (a
+        // single-video scan) or the id read through the source's shape.
+        resolveListingVideoUrl({
+          id: item.id,
+          provider,
+          sourceUrl: sourceKey || sourceUrl,
+          webpageUrl: item.webpageUrl,
+          printedUrl: item.printedUrl,
+        }),
         item.title,
         outputDir,
         targetFormat,
@@ -460,7 +529,10 @@ export async function scanAndIngest(
     if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) return;
     let folder = overrideFolderName;
     if (!folder && channel && items.length > 0) {
-      channelFolder ??= channelFolderName(items[0]) || undefined;
+      // A listing that names neither a channel nor a playlist (a Bilibili space
+      // is built by yt-dlp with only the uploader's numeric id) still gets one
+      // folder of its own instead of sharing "Single Videos" with everything.
+      channelFolder ??= channelFolderName(items[0]) || channelFolderFallback(url) || undefined;
       folder = channelFolder;
     }
     const result = await ingestItems(items, config, folder, url);

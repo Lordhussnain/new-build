@@ -59,6 +59,11 @@ import {
   selectAudioTracks,
   type AudioTrack,
 } from "../audio-tracks";
+import {
+  isUnknownListingTitle,
+  needsSummaryBackfill,
+  probeVideoSummary,
+} from "../video-summary";
 import { findDownloadedFile, formatBytesPerSec, parseSpeedToBytesPerSec } from "../util";
 import { updateWorkerLine } from "../dashboard";
 import {
@@ -212,6 +217,11 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
 
 /** One download attempt for `job`. Throws on any failure. */
 async function runDownload(id: number, job: Job, config: Config): Promise<void> {
+  // A listing that carried no title (Bilibili's flat entries) is completed here,
+  // before the plan is built: the file name comes from the title and the
+  // duration-aware watchdog from the duration, so both have to be right on the
+  // first attempt and are never renamed afterwards.
+  await backfillJobSummary(id, job, config);
   // Multi-audio support: know what the video offers (original + auto-dubbed
   // tracks) and which tracks this job wants, then hand the selection to the
   // plan so every wanted language is downloaded into one switchable file.
@@ -239,8 +249,8 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
   const engineTag = plan.engine === "aria2c" ? `aria2c×${plan.connectionsPerDownload}` : "native";
   const audioTag = audioTracks.length > 0 ? `, ${audioTracks.length} audio track(s)` : "";
 
-  // The audio probe above is a network round-trip; the job can be paused,
-  // deleted, or purged while it runs. Spawning yt-dlp for a claim we no longer
+  // The title and audio probes above are network round-trips; the job can be
+  // paused, deleted, or purged while they run. Spawning yt-dlp for a claim we no longer
   // own is exactly how a cancelled job used to keep downloading in the
   // terminal, so ownership is re-checked immediately before the spawn.
   if (isJobCancelled(job.id) || !ownsClaim("download", job.id, downloadClaim(job))) {
@@ -1205,6 +1215,53 @@ function parkTerminal(
 }
 
 // --- small DB helpers --------------------------------------------------------
+
+/**
+ * Complete a job's title and duration when the listing had neither.
+ *
+ * One bounded `--skip-download` probe, inside the claimed slot and before any
+ * yt-dlp download is spawned. The write is a claim-token CAS like every other
+ * write from this worker, so a job whose claim was reaped while the probe ran
+ * keeps the state its new owner gave it. A probe that fails costs nothing but
+ * the placeholder title: the download still runs, and the next attempt (with no
+ * files on disk yet) may succeed.
+ */
+async function backfillJobSummary(id: number, job: Job, config: Config): Promise<void> {
+  if (!needsSummaryBackfill(job)) return;
+  // A probe is a network round-trip of its own: say what the slot is doing
+  // instead of leaving the previous line on screen while it runs.
+  updateWorkerLine(id, `📝 Reading the video's title… | ${job.url}`, config);
+  let title: string | null = null;
+  let duration: number | null = null;
+  try {
+    const summary = await probeVideoSummary(job.url, config);
+    title = summary.title && !isUnknownListingTitle(summary.title) ? summary.title : null;
+    duration = summary.duration;
+  } catch (err: any) {
+    logError(
+      "download",
+      `${job.id} title/duration probe failed (keeping the listing's values): ${String(err?.message || err).slice(0, 200)}`,
+    );
+    return;
+  }
+  if (!title && duration === null) return;
+  // The job can be deleted or re-claimed while the probe is in flight; a lost
+  // claim writes nothing, exactly as the audio-track probe does.
+  const changed = updateClaimedJob(
+    "download",
+    job.id,
+    downloadClaim(job),
+    `title = COALESCE(?, title), duration = COALESCE(?, duration), updated_at = CURRENT_TIMESTAMP`,
+    [title, duration],
+  );
+  if (!changed) {
+    logError("download", `${job.id} ${job.title}: lost the download claim during the title probe — job state left untouched`);
+    return;
+  }
+  // The plan below and every log line this attempt writes must see the new name.
+  if (title) job.title = title;
+  if (duration !== null) job.duration = duration;
+}
 
 /**
  * Discover the video's audio tracks once per job (persisted in

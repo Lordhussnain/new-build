@@ -11,6 +11,7 @@ import { statfs } from "node:fs/promises";
 import { resolve } from "node:path";
 import { db } from "./db";
 import { logError } from "./logger";
+import { networkProbeUrls } from "./providers";
 import {
   activeConvertJobs,
   activeConvertProcs,
@@ -260,20 +261,20 @@ export function notePipelineFailure(stage: "dl" | "post", config: Config): void 
 
 // --- Network monitor ---------------------------------------------------------
 // Tried in order: the first reachable host means "online". Multiple endpoints
-// keep the monitor honest on networks that block one host but not another.
-const NETWORK_PROBES = [
-  "https://www.youtube.com/favicon.ico",
-  "https://youtu.be/favicon.ico",
-  "https://manifest.googlevideo.com/favicon.ico",
-  "https://1.1.1.1",
-  "https://www.google.com/favicon.ico",
-  "https://cloudflare.com/cdn-cgi/trace",
-];
-
+// keep the monitor honest on networks that block one host but not another, and
+// the sites actually configured come first — an operator archiving Bilibili from
+// a network that cannot reach YouTube must not have the engine paused because a
+// YouTube favicon never answered (see providers.networkProbeUrls).
 export type NetworkProbe = () => Promise<boolean>;
 
+/** The probe list for the sources configured right now. */
+export function networkProbeList(): string[] {
+  const config = getConfig();
+  return networkProbeUrls([...config.playlists, ...config.channels, ...config.channelPlaylists]);
+}
+
 export async function defaultNetworkProbe(): Promise<boolean> {
-  for (const url of NETWORK_PROBES) {
+  for (const url of networkProbeList()) {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
@@ -341,7 +342,7 @@ export function networkMonitorTick(
 }
 
 export interface NetworkMonitorOptions {
-  /** Injectable probe (default: real fetch against YouTube endpoints). */
+  /** Injectable probe (default: real fetch against the configured sites). */
   probe?: NetworkProbe;
   /** Milliseconds between probes (default: 15 000). */
   intervalMs?: number;

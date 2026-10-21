@@ -275,7 +275,35 @@ export function resetCookiesBaseline(): void {
  */
 export const COOKIE_PROBE_TIMEOUT_MS = 30_000;
 
-export async function validateCookieArgs(source: string[]): Promise<boolean> {
+/**
+ * The historical probe target. Callers pass `providers.cookieProbeUrls()` for
+ * the sites actually configured; the default keeps a bare call behaving exactly
+ * as it always has.
+ */
+export const DEFAULT_COOKIE_PROBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+
+/**
+ * Is a cookie source usable? One probe per site in `probeUrls`, first success
+ * wins.
+ *
+ * Probing only YouTube would discard a perfectly good `cookies.txt` for an
+ * operator whose network cannot reach YouTube at all — which is exactly the
+ * operator a Bilibili archive belongs to — and Bilibili needs its cookies far
+ * more than YouTube does (they are what unlocks 1080P+ and any login-gated
+ * video).
+ */
+export async function validateCookieArgs(
+  source: string[],
+  probeUrls: string[] = [DEFAULT_COOKIE_PROBE_URL],
+): Promise<boolean> {
+  const urls = probeUrls.filter((url) => typeof url === "string" && url.trim());
+  for (const url of urls.length > 0 ? urls : [DEFAULT_COOKIE_PROBE_URL]) {
+    if (await probeCookieArgsOnce(source, url)) return true;
+  }
+  return false;
+}
+
+async function probeCookieArgsOnce(source: string[], probeUrl: string): Promise<boolean> {
   try {
     const child = Bun.spawn(
       [
@@ -284,7 +312,7 @@ export async function validateCookieArgs(source: string[]): Promise<boolean> {
         ...jsRuntimeArgs(),
         "--no-warnings",
         "--dump-single-json",
-        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        probeUrl,
       ],
       { stdout: "pipe", stderr: "pipe" },
     );
@@ -316,10 +344,13 @@ export async function validateCookieArgs(source: string[]): Promise<boolean> {
   }
 }
 
-/** Cheap validity probe for a cookies file (one yt-dlp metadata call). */
-export async function validateCookies(cookiesFile: string): Promise<boolean> {
+/** Cheap validity probe for a cookies file (one yt-dlp metadata call per site). */
+export async function validateCookies(
+  cookiesFile: string,
+  probeUrls: string[] = [DEFAULT_COOKIE_PROBE_URL],
+): Promise<boolean> {
   if (!existsSync(cookiesFile)) return false;
-  return validateCookieArgs(["--cookies", cookieWorkingCopy(cookiesFile)]);
+  return validateCookieArgs(["--cookies", cookieWorkingCopy(cookiesFile)], probeUrls);
 }
 
 /**
@@ -339,6 +370,11 @@ export function resolveCookieSource(
     validateCookiesOnStart: boolean;
     cookieBrowsers: string[];
     offlineMode: boolean;
+    /**
+     * Probe targets for the sites in use — `providers.cookieProbeUrls(...)` over
+     * the configured sources. Omitted means the historical YouTube-only probe.
+     */
+    probeUrls?: string[];
   },
   opts: { force?: boolean; log?: (msg: string) => void } = {},
 ): Promise<void> {
@@ -351,14 +387,15 @@ export function resolveCookieSource(
 }
 
 async function doResolve(
-  config: { cookiesFile: string; validateCookiesOnStart: boolean; cookieBrowsers: string[] },
+  config: { cookiesFile: string; validateCookiesOnStart: boolean; cookieBrowsers: string[]; probeUrls?: string[] },
   opts: { force?: boolean; log?: (msg: string) => void },
 ): Promise<void> {
   const log = opts.log ?? ((msg: string) => console.log(msg));
   const s = cookiesState(config);
+  const probeUrls = config.probeUrls;
 
   if (s.present && config.validateCookiesOnStart) {
-    fileCookieValid = await validateCookies(s.file);
+    fileCookieValid = await validateCookies(s.file, probeUrls);
     if (fileCookieValid) {
       browserCookieSource = null;
       log("✅ Cookies validated (cookies.txt).");
@@ -380,7 +417,7 @@ async function doResolve(
   const tried: string[] = [];
   for (const browser of config.cookieBrowsers) {
     tried.push(browser);
-    if (await validateCookieArgs(["--cookies-from-browser", browser])) {
+    if (await validateCookieArgs(["--cookies-from-browser", browser], probeUrls)) {
       browserCookieSource = browser;
       log(`🍪 Using cookies from ${browser} (${s.present ? "cookies.txt invalid" : "no cookies.txt"}).`);
       return;

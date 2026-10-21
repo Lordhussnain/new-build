@@ -174,7 +174,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     min: 0,
     max: 60,
     group: "downloader",
-    help: "Seconds yt-dlp waits before starting each download (--sleep-interval). A gentler pace on long playlists can reduce YouTube rate limiting. 0 = off. Capped at 60.",
+    help: "Seconds yt-dlp waits before starting each download (--sleep-interval). A gentler pace on long playlists can reduce rate limiting (YouTube 429s, Bilibili 412 risk control). 0 = off. Capped at 60.",
   },
   {
     key: "maxSleepInterval",
@@ -509,7 +509,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     type: "boolean",
     group: "reliability",
     restartRequired: true,
-    help: "Probe YouTube periodically and pause the engine after consecutive failures. Takes effect after a restart.",
+    help: "Probe the network periodically — the sites you configured first, then the generic endpoints — and pause the engine after consecutive failures. Takes effect after a restart.",
   },
   // --- storage --------------------------------------------------------------
   {
