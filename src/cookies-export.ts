@@ -1,8 +1,8 @@
 // src/cookies-export.ts — save a browser's YouTube cookies as cookies.txt.
 //
 // yt-dlp reads a browser's cookie store (`--cookies-from-browser`) and writes its
-// cookie jar to a file (`--cookies`) when it exits, so one quick yt-dlp run is an
-// export (see readBrowserCookieJar in tools.ts: no video is fetched). The export
+// cookie jar to a file (`--cookies`) when it exits, so one yt-dlp run with a
+// known video (see readBrowserCookieJar in tools.ts) is an export. The export
 // only replaces cookies.txt when the jar verifiably contains a signed-in YouTube
 // session, so a failed export never overwrites a working file. The previous file
 // is kept as `<cookiesFile>.bak`.

@@ -275,15 +275,15 @@ export function resetCookiesBaseline(): void {
  * that hangs (a stalled network, a browser database that never unlocks) must
  * not stall the engine: the probe is killed and counts as "not usable".
  */
-export const COOKIE_PROBE_TIMEOUT_MS = 60_000;
+export const COOKIE_PROBE_TIMEOUT_MS = 120_000;
 
 /**
- * URL used only to make yt-dlp load a browser's cookies and exit. It refuses
- * the connection at once, so yt-dlp never runs the slow video extraction (player
- * JavaScript, challenge solver) that a real video URL costs. yt-dlp reads the
- * cookie store before it looks at the URL, and writes the cookie jar on exit.
+ * A real video used only to make yt-dlp load a browser's cookies and write the
+ * jar on exit. `--skip-download --playlist-items 0` means nothing is downloaded.
+ * The video is fetched (about 30 seconds), which is the proven command for this
+ * export. If the video is ever removed, change this constant.
  */
-export const COOKIE_JAR_URL = "https://127.0.0.1:9/cookie-check";
+export const COOKIE_JAR_URL = "https://www.youtube.com/watch?v=Are3UkcYytw";
 
 /** Result of reading one browser's cookie store into a Netscape jar. */
 export interface BrowserCookieJar {
@@ -311,11 +311,7 @@ export async function readBrowserCookieJar(
           "--cookies",
           jarPath,
           "--skip-download",
-          "--socket-timeout",
-          "5",
-          "--retries",
-          "0",
-          "--extractor-retries",
+          "--playlist-items",
           "0",
           COOKIE_JAR_URL,
         ],
@@ -347,8 +343,8 @@ export async function readBrowserCookieJar(
 }
 
 /**
- * Is `browser` signed in to YouTube? Reads its cookie store (about a second)
- * and checks for a live session cookie. No video is fetched.
+ * Is `browser` signed in to YouTube? Reads its cookie store with yt-dlp (about
+ * 30 seconds, mostly the video fetch) and checks for a live session cookie.
  */
 export async function probeBrowserCookies(browser: string): Promise<CookieProbe> {
   const read = await readBrowserCookieJar(browser);

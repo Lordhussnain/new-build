@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { diagnoseCookiesText, ytDlpFailureReason } from "../src/cookie-file";
 import { exportBrowserCookies } from "../src/cookies-export";
-import { probeBrowserCookies, probeCookieFile, resolvedTools } from "../src/tools";
+import { COOKIE_JAR_URL, probeBrowserCookies, probeCookieFile, resolvedTools } from "../src/tools";
 
 const WIN = process.platform === "win32";
 const dir = await mkdtemp(join(tmpdir(), "cookie-export-"));
@@ -112,6 +112,28 @@ describe("probeBrowserCookies", () => {
     } finally {
       resolvedTools.ytDlp = original;
     }
+  });
+});
+
+describe("the export command", () => {
+  test.skipIf(WIN)("runs the verified command: browser cookies to a jar, nothing downloaded, one playlist item", async () => {
+    const argsFile = join(dir, "export-args.json");
+    const fake = await fakeYtDlp(
+      "export-args",
+      `await Bun.write(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2))); await Bun.write(argValue("--cookies"), ${JSON.stringify(SIGNED_IN)});`,
+    );
+    const original = resolvedTools.ytDlp;
+    try {
+      resolvedTools.ytDlp = fake;
+      const result = await exportBrowserCookies("firefox", join(dir, "export-cookies.txt"));
+      expect(result.ok).toBe(true);
+    } finally {
+      resolvedTools.ytDlp = original;
+    }
+    const args: string[] = JSON.parse(await readFile(argsFile, "utf8"));
+    expect(args.slice(0, 4)).toEqual(["--cookies-from-browser", "firefox", "--cookies", args[3]]);
+    expect(args.slice(4)).toEqual(["--skip-download", "--playlist-items", "0", COOKIE_JAR_URL]);
+    expect(COOKIE_JAR_URL).toBe("https://www.youtube.com/watch?v=Are3UkcYytw");
   });
 });
 
