@@ -392,6 +392,91 @@ describe("job mutations reject active pipeline claims", () => {
   });
 });
 
+// --- Request deadlines --------------------------------------------------------
+// Bun closes a request whose handler has not answered within `idleTimeout`
+// (default 10s) and prints "Bun.serve() timed out a request after 10 seconds".
+// Handlers that do real work (a playlist scan, a cookie export, a live audio
+// probe) must therefore declare a longer deadline of their own, while ordinary
+// endpoints keep the server default.
+
+/** Stands in for Bun's server object: records every deadline the router sets. */
+function deadlineStub() {
+  const calls: { path: string; seconds: number }[] = [];
+  return {
+    calls,
+    server: {
+      timeout(request: Request, seconds: number) {
+        calls.push({ path: new URL(request.url).pathname, seconds });
+      },
+    },
+  };
+}
+
+/** Same as `api`, but through a live-server handle. */
+const apiOn = (path: string, config: Config, server: unknown, init?: RequestInit) =>
+  handleRequest(req(path, init), config, server as any);
+
+describe("request deadlines", () => {
+  test("a scan gets a minutes-long deadline instead of the 10-second default", async () => {
+    const { calls, server } = deadlineStub();
+    // An invalid URL is rejected before any network work, which keeps the test
+    // fast while still proving the deadline is set before the handler runs.
+    const res = await apiOn("/api/scan", baseConfig(), server, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "not a url" }),
+    });
+    expect(res.status).toBe(400);
+    expect(calls).toEqual([{ path: "/api/scan", seconds: 15 * 60 }]);
+  });
+
+  test("the metadata scan, the local sweep, a cookie export and an audio probe each extend their own request", async () => {
+    const { calls, server } = deadlineStub();
+    const offline = baseConfig({ offlineMode: true });
+
+    // Metadata scan refuses while offline, but only after claiming its deadline.
+    await apiOn("/api/metadata/scan", offline, server, { method: "POST" });
+    await apiOn("/api/scan/unconverted", baseConfig(), server, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetFormat: "avi" }),
+    });
+    await apiOn("/api/cookies/export", baseConfig(), server, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    await apiOn("/api/jobs/nope/audio-probe", baseConfig(), server, { method: "POST" });
+
+    expect(calls).toEqual([
+      { path: "/api/metadata/scan", seconds: 15 * 60 },
+      { path: "/api/scan/unconverted", seconds: 15 * 60 },
+      { path: "/api/cookies/export", seconds: 5 * 60 },
+      { path: "/api/jobs/nope/audio-probe", seconds: 120 },
+    ]);
+  });
+
+  test("fast endpoints keep the server's own idle timeout", async () => {
+    const { calls, server } = deadlineStub();
+    await apiOn("/api/ping", baseConfig(), server);
+    await apiOn("/api/version", baseConfig(), server);
+    expect(calls).toEqual([]);
+  });
+
+  test("a server that cannot extend the deadline never turns into a 500", async () => {
+    const res = await apiOn("/api/scan", baseConfig(), {
+      timeout() {
+        throw new Error("request already answered");
+      },
+    }, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "not a url" }),
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
 // --- Deliberate re-downloads and per-job sidecars -----------------------------
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";

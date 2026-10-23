@@ -17,6 +17,36 @@ import { recordPartialPaths } from "./reconcile";
 let isShuttingDown = false;
 let shutdownExitCode = 0;
 
+/**
+ * Stop accepting HTTP requests, keeping in-flight responses alive.
+ *
+ * Called first in the shutdown sequence: the dashboard polls /api/status every
+ * few seconds, and a poll that arrives while the database is being checkpointed
+ * would otherwise sit unanswered until process.exit() killed the socket
+ * mid-response — the half-served request Bun reports as an idle timeout with
+ * "Bun.serve() timed out a request after 10 seconds. Pass `idleTimeout` to
+ * configure." `stop(false)` closes the listener and lets outstanding responses
+ * finish; the final `stop(true)` in the shutdown path still force-closes
+ * whatever is left, and Bun treats a second `stop()` on a closed listener as a
+ * no-op.
+ *
+ * Failures are logged, never raised: the shutdown must not turn a clean Ctrl+C
+ * into a non-zero exit because the port was already released.
+ */
+export function stopAcceptingRequests(
+  webServer: { stop: (closeActive?: boolean) => void } | null,
+): void {
+  if (!webServer) return;
+  try {
+    webServer.stop(false);
+  } catch (error) {
+    logError(
+      "lifecycle",
+      `could not close the web listener: ${error instanceof Error ? error.message : error}`,
+    );
+  }
+}
+
 export async function handleShutdown(
   sig: string,
   webServer: { stop: (closeActive?: boolean) => void } | null,
@@ -31,6 +61,8 @@ export async function handleShutdown(
   isShuttingDown = true;
   shutdownExitCode = exitCode;
   console.log(`\n🛑 ${sig} received. Gracefully stopping active downloads...`);
+  // Close the listener before anything long-running starts (see the helper).
+  stopAcceptingRequests(webServer);
   try {
     triggerPause("SHUTDOWN_REQUESTED");
     // Give in-flight yt-dlp processes a moment to flush their .part files and

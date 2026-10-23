@@ -712,6 +712,25 @@ slashes collapse (`/api/jobs/` is `/api/jobs`). Static action paths are listed
 *before* `:param` routes so a wrong method answers 405 instead of binding the
 segment as an id (gotcha 21).
 
+
+Request deadlines: `Bun.serve()` is started with an explicit `idleTimeout`
+(`WEB_IDLE_TIMEOUT_SECONDS`, 60s). Bun's default is 10s, and any response that
+has not started by then is dropped, with `warn: Bun.serve() timed out a
+request after 10 seconds. Pass `idleTimeout` to configure.` printed at most
+once per process — and in some Bun 1.4 builds only when stderr is flushed at
+exit, which is why operators report it at Ctrl+C for a request that died
+minutes earlier. Passing the option also stops Bun from installing that
+warning handler (`has_idle_timeout`), so the message cannot come back.
+
+Routes that legitimately outlive that default declare `deadlineSeconds` in
+their `ROUTES` entry: `/api/scan`, `/api/scan/unconverted` and
+`/api/metadata/scan` 15m, `/api/cookies/export` 5m,
+`/api/jobs/:id/audio-probe` 120s. `handleApi` applies it with
+`server.timeout(req, n)`; `handleRequest` takes the server as an optional
+third argument, so unit tests can drive the routes without a socket. Shutdown
+closes the listener first (`stopAcceptingRequests` -> `stop(false)`, in-flight
+responses drain) instead of only at the very end.
+
 Job retry and per-job override must check all pipeline stages and claims inside
 an immediate SQLite transaction (`withIdleJobs()`
 for id-based operations). If any targeted row is downloading, converting, fetching

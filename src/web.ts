@@ -216,20 +216,53 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 </script>
 </body></html>`;
 
+/**
+ * How long one HTTP request may take before Bun closes its socket (seconds).
+ *
+ * Bun's default is 10 s, and any handler that has not answered by then gets its
+ * connection reset AND a warning on stderr:
+ *
+ *   warn: Bun.serve() timed out a request after 10 seconds. Pass `idleTimeout`
+ *   to configure.
+ *
+ * That message is printed at most once per process and (in some Bun 1.4 builds)
+ * only when stderr is flushed at exit, which is why operators report it while
+ * pressing Ctrl+C rather than when the request actually died. Ten seconds is
+ * far too short here: a playlist scan or a cookie export takes minutes, and the
+ * dashboard then reported a network error for work that was still running
+ * server-side.
+ *
+ * Passing `idleTimeout` explicitly also stops Bun from installing the warning
+ * handler at all (its `should_add_timeout_handler_for_warning` is false once
+ * the option is present), so the message cannot come back. Handlers that
+ * legitimately outlive this value declare `deadlineSeconds` in the route table.
+ */
+export const WEB_IDLE_TIMEOUT_SECONDS = 60;
+
+/**
+ * The slice of Bun's server object the router needs, structurally typed so
+ * tests (which call handleRequest with no server) and stubs stay simple.
+ */
+export interface RequestDeadlineServer {
+  /** Reset this request's idle timer; 0 means "no limit". */
+  timeout(request: Request, seconds: number): void;
+}
+
 export function startWebServer(port: number, config: Config, hostname: string = config.webBind || "127.0.0.1") {
   return Bun.serve({
     // LAN-safe default: listen on loopback unless webBind is explicitly set
     // (e.g. 0.0.0.0 to reach the UI from other devices on the LAN).
     port,
     hostname,
-    async fetch(req) {
+    idleTimeout: WEB_IDLE_TIMEOUT_SECONDS,
+    async fetch(req, server) {
       // Every request is wrapped: a handler crash returns JSON 500 instead of
       // hanging the socket, and the error lands in error.log.
       try {
         // Read the live config, not the one captured at startup: settings
         // changed from the dashboard (POST /api/settings) must be reflected by
         // every endpoint immediately, and setConfig() replaces the object.
-        return await handleRequest(req, getConfig());
+        return await handleRequest(req, getConfig(), server);
       } catch (e: any) {
         logError("http", `${req.method} ${new URL(req.url).pathname}: ${e?.stack || e}`);
         return Response.json({ ok: false, error: "Internal server error" }, { status: 500 });
@@ -238,7 +271,11 @@ export function startWebServer(port: number, config: Config, hostname: string = 
   });
 }
 
-export async function handleRequest(req: Request, config: Config): Promise<Response> {
+export async function handleRequest(
+  req: Request,
+  config: Config,
+  server?: RequestDeadlineServer | null,
+): Promise<Response> {
   const url = new URL(req.url);
 
   if (!isSameOriginMutation(req, url)) {
@@ -294,7 +331,7 @@ export async function handleRequest(req: Request, config: Config): Promise<Respo
   // Collapse trailing slashes so /api/jobs/ and /api/jobs are the same route
   // (the root "/" is handled above).
   const pathname = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
-  return handleApi(req, config, url, pathname);
+  return handleApi(req, config, url, pathname, server);
 }
 
 // --- API routing --------------------------------------------------------------
@@ -320,7 +357,23 @@ interface Route {
   methods: string[];
   pattern: string;
   handler: RouteHandler;
+  /**
+   * Seconds this handler may take before Bun closes its socket.
+   *
+   * Only for handlers that do real work inside the request (a playlist scan, a
+   * cookie export, a live audio probe). Without it they are cut at
+   * WEB_IDLE_TIMEOUT_SECONDS while the work carries on server-side, so the
+   * dashboard reports a failure for a scan that actually succeeded.
+   */
+  deadlineSeconds?: number;
 }
+
+/** Minutes-scale work: a playlist/channel scan over a large source. */
+const SCAN_DEADLINE_SECONDS = 15 * 60;
+/** A browser cookie read plus the live YouTube check it performs. */
+const COOKIE_EXPORT_DEADLINE_SECONDS = 5 * 60;
+/** A `yt-dlp -J` audio-track probe; the probe itself gives up at 90s. */
+const AUDIO_PROBE_DEADLINE_SECONDS = 120;
 
 /** Match a `/api/…/:param` pattern against path segments; null = no match. */
 function matchRoute(pattern: string, segments: string[]): RouteParams | null {
@@ -1171,6 +1224,8 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/jobs/:id/audio-probe",
+    // The probe gives up after 90s; the socket must outlive it.
+    deadlineSeconds: AUDIO_PROBE_DEADLINE_SECONDS,
     handler: async ({ req, config, params }) => {
       // Discover (or refresh) the audio tracks YouTube offers for one job —
       // the dashboard's track picker needs the list before a download has run.
@@ -1599,6 +1654,8 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/scan",
+    // A scan runs a full yt-dlp playlist/channel listing before it answers.
+    deadlineSeconds: SCAN_DEADLINE_SECONDS,
     handler: async ({ req }) => {
       const body = await req.json().catch(() => null);
       let source: SourceUrl;
@@ -1767,6 +1824,8 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/scan/unconverted",
+    // Walks the whole output tree; a large archive takes minutes.
+    deadlineSeconds: SCAN_DEADLINE_SECONDS,
     handler: async ({ req, config }) => {
       // "Scan Unconverted Videos": sweep the local output folders for video
       // files the archive does not track yet and batch-import them into the
@@ -1808,6 +1867,8 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/cookies/export",
+    // Reads a browser cookie store and validates it against YouTube.
+    deadlineSeconds: COOKIE_EXPORT_DEADLINE_SECONDS,
     handler: async ({ req }) => {
       // Save a browser's YouTube cookies as cookies.txt (see cookies-export.ts).
       // Only one export at a time: each one starts a browser-store read.
@@ -1917,6 +1978,8 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/metadata/scan",
+    // Walks every downloaded job and its folder before answering.
+    deadlineSeconds: SCAN_DEADLINE_SECONDS,
     handler: async ({ config }) => {
       if (config.offlineMode || getConfig().offlineMode) {
         return Response.json({ ok: false, error: "Metadata scanning is unavailable while offline" }, { status: 409 });
@@ -2042,7 +2105,13 @@ const ROUTES: Route[] = [
 ];
 
 /** Dispatch an API request through the route table. */
-async function handleApi(req: Request, config: Config, url: URL, pathname: string): Promise<Response> {
+async function handleApi(
+  req: Request,
+  config: Config,
+  url: URL,
+  pathname: string,
+  server?: RequestDeadlineServer | null,
+): Promise<Response> {
   const segments = pathname.split("/").filter(Boolean);
   // A static path (/api/jobs/pause) that exists with a different method is a
   // 405 — it must never fall through to a :param route and be read as an id.
@@ -2070,6 +2139,17 @@ async function handleApi(req: Request, config: Config, url: URL, pathname: strin
     if (!route.methods.includes(req.method)) {
       for (const m of route.methods) allow.add(m);
       continue;
+    }
+    // Give this one request its own deadline before the handler blocks for
+    // minutes. No server means no live socket (unit tests call handleRequest
+    // directly), and a handler that fails here must still run: the deadline is
+    // a convenience, never a reason to answer 500.
+    if (route.deadlineSeconds && server) {
+      try {
+        server.timeout(req, route.deadlineSeconds);
+      } catch {
+        // The request is not attached to a live connection any more.
+      }
     }
     return await route.handler({ req, config, url, params });
   }

@@ -472,6 +472,15 @@ CLI/API clients.
 | `GET /api/reliability` | Resume + self-healing snapshot (see above). |
 | `GET /api/history?limit=` · `GET /api/logs?type=error\|report&limit=` | Run history; logs. |
 
+Every request gets 60 seconds, and the endpoints that legitimately need longer
+extend their own deadline: a source scan or a Scan Unconverted sweep gets 15
+minutes, a browser cookie export 5 minutes, and an audio-track probe 2
+minutes. Bun's own 10-second default used to cut those requests mid-flight —
+the dashboard showed a network error while the scan kept running — and emitted
+`warn: Bun.serve() timed out a request after 10 seconds`, the line that
+appeared when pressing Ctrl+C. It is gone: the server always passes that
+`idleTimeout` setting now.
+
 The terminal UI carries the same signal: the header line gains a `Res:n` field
 whenever jobs are holding a partial they will resume from, so a paused engine
 reports its resume state without needing the browser open.
