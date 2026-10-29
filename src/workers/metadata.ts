@@ -174,7 +174,11 @@ export async function metadataWorker(id: number, config: Config): Promise<void> 
     try {
       await runMetadataJob(job, config, id);
     } catch (err: any) {
-      await handleMetadataFailure(job, config, err, id);
+      // The failure handler must never break the loop — supervise() would
+      // restart it at the cost of a claim-leak and a stall.
+      await handleMetadataFailure(job, config, err, id).catch((handlerErr: any) => {
+        logError("metadata", `${job.id} ${job.title}: failure handler crashed: ${handlerErr?.message || handlerErr}`);
+      });
     } finally {
       activeMetadataJobs.delete(id);
       activeMetadataProcs.delete(id);

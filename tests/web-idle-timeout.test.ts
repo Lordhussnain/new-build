@@ -17,8 +17,9 @@
 // which is also when Bun prints the warning an operator sees at Ctrl+C.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 import { db, initDatabase } from "../src/db";
@@ -28,6 +29,28 @@ import { startWebServer } from "../src/web";
 
 /** Longer than Bun's 10s default, short enough to keep the suite quick. */
 const PROBE_DELAY_MS = 15_000;
+const WIN = process.platform === "win32";
+
+/**
+ * Windows can neither read shebangs nor launch an extensionless file, so the
+ * stub is compiled into a real executable there (the same rule the integration
+ * harness applies to its mocks — AGENTS.md §9.5). Staged under a .ts name
+ * first: `bun build --compile` on an extensionless entry silently emits a
+ * no-op program.
+ */
+async function usableStub(dir: string, source: string): Promise<string> {
+  if (!WIN) return source;
+  const exe = join(dir, "yt-dlp.exe");
+  const staged = join(dir, "yt-dlp.ts");
+  await copyFile(source, staged);
+  const proc = Bun.spawn(
+    [process.execPath, "build", "--compile", staged, "--outfile", exe],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+  const [, errText, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  if (code !== 0 || !existsSync(exe)) throw new Error(`stub compile failed: ${errText}`);
+  return exe;
+}
 
 function baseConfig(overrides: Partial<Config> = {}): Config {
   return { ...DEFAULT_CONFIG, ...overrides };
@@ -62,7 +85,7 @@ describe("a request that outlives Bun's 10-second idle timeout", () => {
         `    audio_track: { id: "en.0", display_name: "English (original)" } } ] }));\n`,
     );
     await chmod(stub, 0o755);
-    resolvedTools.ytDlp = stub;
+    resolvedTools.ytDlp = await usableStub(stubDir, stub);
     server = startWebServer(0, baseConfig());
   });
 

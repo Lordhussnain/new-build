@@ -11,6 +11,7 @@ import { statfs } from "node:fs/promises";
 import { resolve } from "node:path";
 import { db } from "./db";
 import { logError } from "./logger";
+import { holdsEngineLease } from "./lease";
 import {
   activeConvertJobs,
   activeConvertProcs,
@@ -135,6 +136,7 @@ export function interruptChild(proc: Bun.Subprocess | undefined): boolean {
 
 export function triggerPause(reason: string): void {
   if (isPaused() && getPauseReason() === reason) return;
+  if (reason.startsWith("BAD_DOWNLOADER_ARGS")) badArgsSettings = downloaderSettings(getConfig());
   setPaused(true, reason);
   console.log(`⏸️ Triggering pause: ${reason}`);
   for (const [, proc] of activeProcs.entries()) {
@@ -238,14 +240,28 @@ export function triggerResume(): void {
 // hard failures with no successes in between (expired cookies overnight, a
 // YouTube outage, a broken ffmpeg) pauses the whole engine instead of letting
 // it burn through the queue one video at a time.
-const failureCircuit = { dl: 0, post: 0 };
+const failureCircuit = { dl: 0, post: 0, trips: 0, retryAt: null as number | null };
+let badArgsSettings: string | null = null;
+let recoveryRunning = false;
 
-export function notePipelineSuccess(stage: "dl" | "post"): void {
-  if (stage === "dl") failureCircuit.dl = 0;
-  else failureCircuit.post = 0;
+function downloaderSettings(config: Config): string {
+  return JSON.stringify([
+    config.useAria2c, config.connectionsPerDownload, config.minSplitSize,
+    config.concurrentFragments, config.httpChunkSize, config.bufferSize,
+    config.sleepInterval, config.maxSleepInterval, config.fragmentRetries,
+    config.maxBandwidthKBps, config.userAgent,
+  ]);
 }
 
-export function notePipelineFailure(stage: "dl" | "post", config: Config): void {
+export function notePipelineSuccess(stage: "dl" | "post"): void {
+  if (stage === "dl") {
+    failureCircuit.dl = 0;
+    failureCircuit.trips = 0;
+  } else failureCircuit.post = 0;
+}
+
+export function notePipelineFailure(stage: "dl" | "post", config: Config, now = Date.now()): void {
+  if (isPaused()) return;
   if (stage === "dl") failureCircuit.dl++;
   else failureCircuit.post++;
   const worst = Math.max(failureCircuit.dl, failureCircuit.post);
@@ -253,8 +269,60 @@ export function notePipelineFailure(stage: "dl" | "post", config: Config): void 
     const detail = `TOO_MANY_FAILURES (${failureCircuit.dl} consecutive download / ${failureCircuit.post} consecutive post-processing failures, limit ${config.maxFailures})`;
     failureCircuit.dl = 0;
     failureCircuit.post = 0;
+    failureCircuit.trips++;
+    failureCircuit.retryAt = now + Math.min(6 * 60 * 60_000, 10 * 60_000 * 2 ** Math.min(6, failureCircuit.trips - 1));
     logError("circuit", `pausing engine: ${detail}`);
     triggerPause(detail);
+  }
+}
+
+export function recoveryStatus(): { retryAt: string | null; circuitTrips: number } {
+  return {
+    retryAt: isPaused() && getPauseReason()?.startsWith("TOO_MANY_FAILURES") && failureCircuit.retryAt !== null
+      ? new Date(failureCircuit.retryAt).toISOString() : null,
+    circuitTrips: failureCircuit.trips,
+  };
+}
+
+export function resumeAutomatically(reason: string): boolean {
+  if (!/^(NETWORK_DISCONNECTED$|LOW_DISK_SPACE(?: |$)|TOO_MANY_FAILURES(?: |$)|BAD_DOWNLOADER_ARGS(?: |$))/.test(reason)) return false;
+  if (abortController.signal.aborted || !holdsEngineLease() || !isPaused() || getPauseReason() !== reason) return false;
+  db.run(`UPDATE jobs SET download_status = 'pending', pause_reason = NULL, updated_at = CURRENT_TIMESTAMP
+    WHERE download_status = 'paused' AND pause_reason = 'interrupted'
+      AND download_claimed_by IS NULL AND download_claim_token IS NULL
+      AND conversion_claimed_by IS NULL AND conversion_claim_token IS NULL
+      AND metadata_claimed_by IS NULL AND metadata_claim_token IS NULL
+      AND conversion_status != 'in_progress' AND metadata_status != 'in_progress'`);
+  setPaused(false, null);
+  failureCircuit.dl = 0;
+  failureCircuit.post = 0;
+  failureCircuit.retryAt = null;
+  return true;
+}
+
+export async function automaticRecoveryTick(opts: {
+  now?: number;
+  diskProbe?: typeof checkDiskSpace;
+} = {}): Promise<void> {
+  if (recoveryRunning || abortController.signal.aborted || !holdsEngineLease() || !isPaused()) return;
+  const reason = getPauseReason();
+  if (!reason) return;
+  const config = getConfig();
+  recoveryRunning = true;
+  try {
+    if (reason.startsWith("TOO_MANY_FAILURES") && failureCircuit.retryAt !== null && (opts.now ?? Date.now()) >= failureCircuit.retryAt) {
+      resumeAutomatically(reason);
+    } else if (reason.startsWith("BAD_DOWNLOADER_ARGS") && badArgsSettings !== null && badArgsSettings !== downloaderSettings(config)) {
+      resumeAutomatically(reason);
+    } else if (reason.startsWith("LOW_DISK_SPACE")) {
+      const disk = await (opts.diskProbe ?? checkDiskSpace)(config.outputRoot, config.minFreeSpaceGB);
+      const live = getConfig();
+      if (live.outputRoot === config.outputRoot && live.minFreeSpaceGB === config.minFreeSpaceGB && disk.free >= 0 && disk.ok) {
+        resumeAutomatically(reason);
+      }
+    }
+  } finally {
+    recoveryRunning = false;
   }
 }
 
@@ -384,7 +452,7 @@ export async function networkMonitor(opts: NetworkMonitorOptions = {}): Promise<
     }
     if (decision.shouldResume) {
       console.log(offlineNow ? "🌐 Offline mode: clearing the network-caused pause for local work." : "🌐 Network restored!");
-      triggerResume();
+      if (!signal.aborted) resumeAutomatically("NETWORK_DISCONNECTED");
     }
     await Bun.sleep(intervalMs);
   }

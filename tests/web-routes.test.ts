@@ -478,7 +478,7 @@ describe("request deadlines", () => {
 });
 
 // --- Deliberate re-downloads and per-job sidecars -----------------------------
-import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, rm, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
@@ -802,6 +802,53 @@ describe("retry as a deliberate re-download", () => {
     const res = await apiWith("/api/retry/redl02", config, { method: "POST" });
     expect((await res.json()).ok).toBe(true);
     expect((await readFile(archive, "utf-8")).trim()).toBe("");
+  });
+
+  test("a failed stash restores the archive entry (plain text cannot roll back)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-webretry-"));
+    const archive = join(dir, "downloaded_videos.txt");
+    await writeFile(archive, "youtube other02\nyoutube redl03\n");
+    const media = join(dir, "002 - Video.mp4");
+    await writeFile(media, "old-bytes");
+    // The rename inside the stash fails: the backup path is taken by a
+    // directory, so `renameSync(file, file.superseded)` cannot succeed on
+    // any platform.
+    await mkdir(`${media}.superseded`);
+    insertJob("redl03", { download_status: "downloaded", file_path: media, file_size: 9 });
+    const config = cfgWith({ archiveFile: archive });
+
+    const res = await apiWith("/api/jobs/redl03/retry", config, { method: "POST" });
+    expect(res.status).toBe(500);
+
+    // The job row is back to downloaded (the transaction rolled back) and the
+    // archive still names the id — the archive-fallback dedupe keeps
+    // suppressing this video after a later source cleanup.
+    const job = getJob("redl03");
+    expect(job.download_status).toBe("downloaded");
+    expect(job.file_path).toBe(media);
+    const ids = (await readFile(archive, "utf-8")).split("\n").filter(Boolean).map((l) => l.trim().split(/\s+/).pop());
+    expect(ids).toContain("redl03");
+    expect(ids).toContain("other02");
+  });
+});
+
+describe("GET /api/history", () => {
+  test("an unparsable or non-positive limit falls back instead of unbounding the query", async () => {
+    db.run(
+      `INSERT INTO run_history (started_at, ended_at, duration_seconds, downloaded, skipped, failed, total_queued)
+       VALUES (datetime('now'), datetime('now'), 1, 0, 0, 0, 1)`,
+    );
+    for (const bad of ["banana", "-5", "0", ""]) {
+      const res = await api(`/api/history?limit=${encodeURIComponent(bad)}`);
+      expect(res.status).toBe(200);
+      const data = (await res.json()) as { ok: boolean; history: unknown[] };
+      expect(data.ok).toBe(true);
+      expect(data.history.length).toBe(1);
+    }
+    // An absurd limit is clamped, not passed through raw.
+    const huge = await api("/api/history?limit=999999999");
+    expect(huge.status).toBe(200);
+    expect(((await huge.json()) as { history: unknown[] }).history.length).toBe(1);
   });
 });
 

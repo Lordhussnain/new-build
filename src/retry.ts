@@ -55,6 +55,11 @@ const PERMANENT_ERROR_PATTERNS: RegExp[] = [
   /premium members/i,
   /requires payment/i,
   /members[- ]only/i,
+  // YouTube's members-only wording: "Join this channel to get access to
+  // members-only content…" and the shorter "Join this channel to get access"
+  // (which the "members-only" rules above do not match).
+  /join this channel to get access/i,
+  /available to .*\bmembers\b/i,
   /sign in to confirm your age/i,
   /age[- ]restricted/i,
   /age verification required/i,
@@ -203,6 +208,7 @@ export type TerminalErrorCode =
   | "private"
   | "members_only"
   | "age_restricted"
+  | "sign_in_required"
   | "payment_required"
   | "copyright"
   | "terminated"
@@ -239,12 +245,22 @@ const TERMINAL_ERROR_RULES: ReadonlyArray<{ code: TerminalErrorCode; label: stri
   {
     code: "members_only",
     label: "Members-only video",
-    pattern: /members[- ]only|member[- ]only|premium members|only available to .*\bmembers?\b/i,
+    pattern:
+      /members[- ]only|member[- ]only|premium members|only available to .*\bmembers?\b|join this channel to get access|available to .*\bmembers\b/i,
   },
   {
     code: "age_restricted",
     label: "Age-restricted video",
     pattern: /sign in to confirm your age|age[- ]restricted|age verification required|inappropriate for some users/i,
+  },
+  {
+    // YouTube's anti-bot gate. Like age-gating it is credential-shaped — valid
+    // cookies unblock it — but without them no retry will ever succeed, so it
+    // parks as a terminal skip and the cookie watcher counts it as rescuable
+    // (its "sign in" LIKE already matches this wording).
+    code: "sign_in_required",
+    label: "Sign-in required (bot check)",
+    pattern: /sign in to confirm (?:you'?re not a bot|your age)|confirm you'?re not a bot/i,
   },
   {
     code: "payment_required",
@@ -300,6 +316,25 @@ export function classifyTerminalDownloadError(message: string | null | undefined
 export function isTerminalErrorMessage(message: string | null | undefined): boolean {
   if (typeof message !== "string") return false;
   return message.trimStart().toLowerCase().startsWith(TERMINAL_ERROR_MARKER);
+}
+
+const CREDENTIAL_RESCUABLE_CODES: ReadonlySet<TerminalErrorCode> = new Set([
+  "age_restricted",
+  "sign_in_required",
+  "members_only",
+]);
+
+export function isCredentialBlockedError(message: string | null | undefined): boolean {
+  if (!message) return false;
+  const stored = parseStoredTerminalError(message);
+  if (stored) {
+    const rule = TERMINAL_ERROR_RULES.find((rule) => rule.label === stored.label);
+    return !!rule && CREDENTIAL_RESCUABLE_CODES.has(rule.code);
+  }
+  const info = classifyTerminalDownloadError(message);
+  if (info && info.code !== "unavailable") return CREDENTIAL_RESCUABLE_CODES.has(info.code);
+  return /sign in to confirm|not a bot|login required|login to confirm/i.test(message)
+    || (/cookies?/i.test(message) && /invalid|expired|required/i.test(message));
 }
 
 /**

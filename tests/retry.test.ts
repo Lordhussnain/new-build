@@ -9,6 +9,7 @@ import {
   formatSwitchMessage,
   formatTerminalErrorMessage,
   isDiskFullError,
+  isCredentialBlockedError,
   isDownloaderArgsError,
   isFormatAvailabilityError,
   isNChallengeError,
@@ -22,6 +23,15 @@ import {
   progressAwareRetryState,
   TERMINAL_ERROR_MARKER,
 } from "../src/retry";
+
+describe("credential error classification", () => {
+  test("recognizes a login blocker within generic unavailable wording", () => {
+    expect(isCredentialBlockedError("Video unavailable. Login required")).toBe(true);
+    expect(isCredentialBlockedError("Private video. Login required")).toBe(false);
+    expect(isCredentialBlockedError("Video has been removed. Login required")).toBe(false);
+    expect(isCredentialBlockedError("[terminal] Video not found — cookies expired")).toBe(false);
+  });
+});
 
 describe("computeBackoffMs", () => {
   test("grows exponentially from the base", () => {
@@ -376,6 +386,9 @@ describe("permanent-classification gaps that used to loop forever", () => {
     "ERROR: [youtube] abc: This video has been deleted",
     "ERROR: [youtube] abc: This video requires payment to watch",
     "ERROR: [youtube] abc: This video is only available to Music Premium members",
+    "ERROR: [youtube] abc: Join this channel to get access",
+    "ERROR: [youtube] abc: Join this channel to get access to members-only content like this video",
+    "ERROR: [youtube] abc: Sign in to confirm you're not a bot. This helps protect our community.",
   ];
 
   test("every wording is both permanent and labelled", () => {
@@ -394,6 +407,13 @@ describe("permanent-classification gaps that used to loop forever", () => {
       classifyTerminalDownloadError("ERROR: [youtube] abc: Sign in to confirm your age")!.code,
     ).toBe("age_restricted");
     expect(classifyTerminalDownloadError("ERROR: members-only content")!.code).toBe("members_only");
+    // The channel-join wordings YouTube uses for members-only videos.
+    expect(classifyTerminalDownloadError("ERROR: Join this channel to get access")!.code).toBe("members_only");
+    // YouTube's anti-bot gate: credential-shaped, so it parks (no retry loop)
+    // while the cookie watcher still counts it as rescuable ("sign in" LIKE).
+    expect(
+      classifyTerminalDownloadError("Sign in to confirm you're not a bot")!.code,
+    ).toBe("sign_in_required");
     expect(classifyTerminalDownloadError("ERROR: [youtube] abc: This video has been removed")!.code).toBe("removed");
     expect(classifyTerminalDownloadError("HTTP Error 404: Not Found")!.code).toBe("not_found");
     expect(classifyTerminalDownloadError("ERROR: [youtube] abc: No video formats found")!.code).toBe("no_formats");

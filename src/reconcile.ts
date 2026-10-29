@@ -25,10 +25,10 @@ import {
 } from "./db";
 import { removeFromArchive } from "./archive";
 import { logError } from "./logger";
-import { detectCookiesChange, type CookiesChange } from "./tools";
-import { isPermanentDownloadError } from "./retry";
+import { detectCookiesChange, resolveCookieSource, usableCookieFingerprint, type CookiesChange } from "./tools";
+import { isCredentialBlockedError, isPermanentDownloadError } from "./retry";
 import { jobFittedBaseFilename } from "./download-args";
-import { activeDownloadJobs } from "./state";
+import { activeDownloadJobs, abortController, getConfig, isJobCancelled, isPaused } from "./state";
 import { holdsEngineLease, readEngineLease, describeEngineLease } from "./lease";
 import type { Config } from "./config";
 
@@ -411,28 +411,30 @@ export function cookiesWatch(config: Config): CookiesChange {
   });
   if (!change) return null;
   if (change === "appeared" || change === "updated") {
-    // Jobs parked by a credential-shaped permanent error are the ones this
-    // unblocks. They are NOT auto-requeued — permanent failures never are —
-    // but the operator is told exactly how many the new cookies may rescue.
     const blocked =
       (
         db
           .query(
             `SELECT COUNT(*) AS n FROM jobs
               WHERE download_status = 'failed'
-                AND (lower(COALESCE(last_error, '')) LIKE '%login%'
-                  OR lower(COALESCE(last_error, '')) LIKE '%sign in%'
-                  OR lower(COALESCE(last_error, '')) LIKE '%age%'
-                  OR lower(COALESCE(last_error, '')) LIKE '%cookie%')`,
+                AND (lower(COALESCE(last_error, '')) LIKE '%sign in%'
+                  OR lower(COALESCE(last_error, '')) LIKE '%login%'
+                  OR lower(COALESCE(last_error, '')) LIKE '%cookie%'
+                  OR lower(COALESCE(last_error, '')) LIKE '%not a bot%'
+                  OR lower(COALESCE(last_error, '')) LIKE '%members%'
+                  OR lower(COALESCE(last_error, '')) LIKE '%private%'
+                  OR lower(COALESCE(last_error, '')) LIKE '%confirm your age%'
+                  OR lower(COALESCE(last_error, '')) LIKE '%age-restricted%'
+                  OR lower(COALESCE(last_error, '')) LIKE '%age restricted%')`,
           )
           .get() as any
       )?.n || 0;
     console.log(
-      `🍪 cookies.txt ${change === "appeared" ? "found" : "changed"} (${state.size} bytes) — the next download attempt will use it.`,
+      `cookies.txt ${change === "appeared" ? "found" : "changed"} (${state.size} bytes) — checking the updated file.`, 
     );
     if (blocked > 0) {
       console.log(
-        `   ${blocked} failed job(s) look credential-related — use each job's manual Retry action to spend the new cookies on it.`,
+        `   ${blocked} failed job(s) look credential-related — eligible jobs are retried once fresh usable cookies are available and the engine is running.`,
       );
     }
     logError(
@@ -452,6 +454,46 @@ export interface RequeueResult {
   downloads: number;
   conversions: number;
   metadata: number;
+}
+
+const rescuedCookieFingerprints = new WeakMap<object, string>();
+
+export async function refreshCookies(opts: { force?: boolean } = {}): Promise<number> {
+  const config = getConfig();
+  if (abortController.signal.aborted || config.offlineMode || !holdsEngineLease()) return 0;
+  await resolveCookieSource(config, opts);
+  if (abortController.signal.aborted || getConfig() !== config || config.offlineMode || isPaused() || !holdsEngineLease()) return 0;
+  const fingerprint = usableCookieFingerprint(config);
+  if (!fingerprint || rescuedCookieFingerprints.get(db) === fingerprint) return 0;
+  const rescued = requeueCredentialBlockedJobs(config);
+  rescuedCookieFingerprints.set(db, fingerprint);
+  return rescued;
+}
+
+export function requeueCredentialBlockedJobs(config: Config): number {
+  if (config.offlineMode || isPaused() || abortController.signal.aborted || !holdsEngineLease()) return 0;
+  const rescued = db.transaction(() => {
+    let count = 0;
+    const rows = db.query(`SELECT id, last_error FROM jobs WHERE download_status = 'failed'`)
+      .all() as { id: string; last_error: string | null }[];
+    for (const row of rows) {
+      if (!isCredentialBlockedError(row.last_error) || isJobCancelled(row.id)) continue;
+      count += db.run(
+        `UPDATE jobs SET download_status = 'pending', pause_reason = NULL,
+           retry_count = 0, resume_count = 0, last_error = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND download_status = 'failed' AND last_error IS ?
+           AND (pause_reason IS NULL OR pause_reason != 'user')
+           AND download_claimed_by IS NULL AND download_claim_token IS NULL
+           AND metadata_claimed_by IS NULL AND metadata_claim_token IS NULL
+           AND conversion_claimed_by IS NULL AND conversion_claim_token IS NULL
+           AND metadata_status != 'in_progress' AND conversion_status != 'in_progress'`,
+        [row.id, row.last_error],
+      ).changes;
+    }
+    return count;
+  })();
+  if (rescued > 0) console.log(`Fresh cookies: re-queued ${rescued} credential-blocked job(s).`);
+  return rescued;
 }
 
 /**

@@ -6,7 +6,9 @@
 // path) all work without touching PATH.
 
 import { copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
-import { diagnoseCookiesText, ytDlpFailureReason } from "./cookie-file";
+import { cookieExportMetadata, cookiePathKey, diagnoseCookiesText, filterCookiesText, persistCookieJar, ytDlpFailureReason } from "./cookie-file";
+import { COOKIE_BROWSER_NAMES } from "./config";
+import { getConfig } from "./state";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join, dirname, basename } from "node:path";
@@ -88,26 +90,61 @@ export function cookiesState(config: { cookiesFile: string }): CookiesState {
   const file = config.cookiesFile || "";
   try {
     const s = statSync(file);
-    return { file, present: s.size > 0, size: s.size, mtimeMs: s.mtimeMs };
+    return { file, present: s.isFile() && s.size > 0, size: s.size, mtimeMs: s.mtimeMs };
   } catch {
     return { file, present: false, size: 0, mtimeMs: 0 };
   }
 }
 
+export interface CookieStatus {
+  present: boolean;
+  valid: boolean | null;
+  source: string | null;
+  modifiedAt: string | null;
+  exportedAt: string | null;
+  cookies: number;
+}
+
+/** Local-only metadata. Never returns cookie values or invents an export time. */
+export function getCookieStatus(config: { cookiesFile: string }): CookieStatus {
+  const state = cookiesState(config);
+  const status: CookieStatus = {
+    present: state.present, valid: null, source: null,
+    modifiedAt: state.present || state.mtimeMs !== 0 ? new Date(state.mtimeMs).toISOString() : null,
+    exportedAt: null, cookies: 0,
+  };
+  if (!state.present) return status;
+  try {
+    const bytes = readFileSync(state.file);
+    const text = bytes.toString("utf8");
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const metadata = cookieExportMetadata(state.file, hash);
+    return {
+      ...status, valid: diagnoseCookiesText(text).problem === null,
+      source: metadata?.source ?? "file", exportedAt: metadata?.exportedAt ?? null,
+      cookies: diagnoseCookiesText(filterCookiesText(text)).siteEntries,
+    };
+  } catch { return status; }
+}
+
+/** A usable file's identity and BYTES hash; mtime-only changes are not credentials. */
+export function usableCookieFingerprint(config: { cookiesFile: string }): string | null {
+  if (!config.cookiesFile) return null;
+  try {
+    const bytes = readFileSync(config.cookiesFile);
+    if (diagnoseCookiesText(bytes.toString("utf8")).problem !== null) return null;
+    return `${cookiePathKey(config.cookiesFile)}:${createHash("sha256").update(bytes).digest("hex")}`;
+  } catch { return null; }
+}
+
 /** How often browser cookies are re-probe (and the file re-validated) while running. */
 export const COOKIE_SOURCE_RECHECK_MS = 30 * 60_000;
 
-/**
- * Cookie source resolved by `resolveCookieSource()`.
- *
- *   • `fileCookieValid`: result of the last cookies.txt probe (null = not probed).
- *   • `browserCookieSource`: the first browser in `cookieBrowsers` whose cookies
- *     passed the probe, or null when none did.
- */
-let fileCookieValid: boolean | null = null;
+// Negative validation belongs to a particular source's bytes, not every path.
+const invalidCookieFiles = new Map<string, string>();
 let browserCookieSource: string | null = null;
-let browserCheckedAt = 0;
-let resolving: Promise<void> | null = null;
+const browserCheckedAt = new Map<string, number>();
+const resolving = new Map<string, Promise<void>>();
 
 /**
  * yt-dlp does not only READ `--cookies FILE`: on exit it dumps its cookie jar
@@ -124,7 +161,7 @@ export function cookieWorkingCopyPath(cookiesFile: string): string {
   return `${cookiesFile}.working`;
 }
 
-let workingCopySource: { mtimeMs: number; size: number } | null = null;
+let workingCopySource: { path: string; mtimeMs: number; size: number; ctimeMs: number } | null = null;
 
 /**
  * Path to hand yt-dlp for the cookies file. Re-copies the export when it is
@@ -138,11 +175,13 @@ export function cookieWorkingCopy(cookiesFile: string): string {
     const same =
       existsSync(working) &&
       workingCopySource !== null &&
+      workingCopySource.path === cookiePathKey(cookiesFile) &&
       workingCopySource.mtimeMs === src.mtimeMs &&
+      workingCopySource.ctimeMs === src.ctimeMs &&
       workingCopySource.size === src.size;
     if (!same) {
       copyFileSync(cookiesFile, working);
-      workingCopySource = { mtimeMs: src.mtimeMs, size: src.size };
+      workingCopySource = { path: cookiePathKey(cookiesFile), mtimeMs: src.mtimeMs, size: src.size, ctimeMs: src.ctimeMs };
     }
     return working;
   } catch {
@@ -150,19 +189,26 @@ export function cookieWorkingCopy(cookiesFile: string): string {
   }
 }
 
-/**
- * The cookie arguments for a yt-dlp call. Order of preference:
- *   1. cookies.txt, when it exists and has not failed validation;
- *   2. the browser that was resolved from `cookieBrowsers`;
- *   3. cookies.txt even though it failed validation (the old behaviour);
- *   4. nothing (anonymous).
- * Stays synchronous and cheap: it only reads cached state and stats the file.
+/** Use the persisted jar, never repeat browser extraction on every download.
+ * Unvalidated files retain compatibility; known-invalid bytes are never sent.
  */
 export function cookiesArgs(config: { cookiesFile: string }): string[] {
   const s = cookiesState(config);
-  if (s.present && fileCookieValid !== false) return ["--cookies", cookieWorkingCopy(s.file)];
-  if (browserCookieSource) return ["--cookies-from-browser", browserCookieSource];
-  return s.present ? ["--cookies", cookieWorkingCopy(s.file)] : [];
+  if (!s.present) return [];
+  const key = cookiePathKey(s.file);
+  const invalidHash = invalidCookieFiles.get(key);
+  if (invalidHash) {
+    try {
+      const bytes = readFileSync(s.file);
+      const hash = createHash("sha256").update(bytes).digest("hex");
+      if (hash === invalidHash || diagnoseCookiesText(bytes.toString("utf8")).problem !== null) {
+        invalidCookieFiles.set(key, hash);
+        return [];
+      }
+      invalidCookieFiles.delete(key);
+    } catch { return []; }
+  }
+  return ["--cookies", cookieWorkingCopy(s.file)];
 }
 
 /** The browser currently supplying cookies, or null. For logs and the dashboard. */
@@ -293,52 +339,66 @@ export interface BrowserCookieJar {
   timedOut: boolean;
 }
 
-/** Read `browser`'s cookies with yt-dlp into a temp jar. Never throws. */
+const COOKIE_DIAGNOSTIC_LIMIT = 16_384;
+
+/** Drain without accumulating stdout or unbounded stderr in memory. */
+async function drainCookiePipe(stream: ReadableStream<Uint8Array>, keep: number): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let tail = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (keep) tail = (tail + decoder.decode(value, { stream: true })).slice(-keep);
+    }
+    return keep ? (tail + decoder.decode()).slice(-keep) : "";
+  } finally { reader.releaseLock(); }
+}
+
+/** Read only an allowlisted browser's default profile into a temporary jar. */
 export async function readBrowserCookieJar(
   browser: string,
-  opts: { ytDlp?: string; timeoutMs?: number } = {},
+  opts: { ytDlp?: string; timeoutMs?: number; shouldContinue?: () => boolean } = {},
 ): Promise<BrowserCookieJar> {
-  const dir = await mkdtemp(join(os.tmpdir(), "yta-cookies-"));
-  const jarPath = join(dir, "jar.txt");
+  if (!(COOKIE_BROWSER_NAMES as readonly string[]).includes(browser)) {
+    return { jar: null, stderr: `Unknown browser "${browser}".`, timedOut: false };
+  }
+  let dir: string | undefined;
+  let child: Bun.PipedSubprocess | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let pipes: Promise<unknown>[] = [];
+  let timedOut = false;
+  const kill = () => { try { child?.kill("SIGKILL"); } catch { /* already exited */ } };
   try {
-    let child: Bun.PipedSubprocess;
-    try {
-      child = Bun.spawn(
-        [
-          opts.ytDlp ?? ytDlp(),
-          "--cookies-from-browser",
-          browser,
-          "--cookies",
-          jarPath,
-          "--skip-download",
-          "--playlist-items",
-          "0",
-          COOKIE_JAR_URL,
-        ],
-        { stdout: "pipe", stderr: "pipe" },
-      );
-    } catch (error: any) {
-      return { jar: null, stderr: `could not start yt-dlp: ${error?.message || error}`, timedOut: false };
+    dir = await mkdtemp(join(os.tmpdir(), "yta-cookies-"));
+    if (opts.shouldContinue && !opts.shouldContinue()) {
+      return { jar: null, stderr: "Cookie configuration changed before extraction.", timedOut: false };
     }
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // already exited
-      }
-    }, opts.timeoutMs ?? COOKIE_PROBE_TIMEOUT_MS);
-    let stderr = "";
-    try {
-      [stderr] = await Promise.all([new Response(child.stderr).text(), child.exited]);
-    } finally {
-      clearTimeout(timer);
-    }
-    const jar = await readFile(jarPath, "utf8").catch(() => null);
+    const jarPath = join(dir, "jar.txt");
+    child = Bun.spawn([
+      opts.ytDlp ?? ytDlp(), "--cookies-from-browser", browser, "--cookies", jarPath,
+      "--skip-download", "--playlist-items", "0", COOKIE_JAR_URL,
+    ], { stdout: "pipe", stderr: "pipe" });
+    timer = setTimeout(() => { timedOut = true; kill(); }, opts.timeoutMs ?? COOKIE_PROBE_TIMEOUT_MS);
+    const stderrRead = drainCookiePipe(child.stderr, COOKIE_DIAGNOSTIC_LIMIT);
+    pipes = [drainCookiePipe(child.stdout, 0), stderrRead];
+    const [, stderr] = await Promise.all([pipes[0], stderrRead, child.exited]);
+    // A failed video lookup may still leave a valid exported jar. Trust the
+    // local diagnosis, not the video exit status; a timeout is always a failure.
+    const jar = timedOut ? null : await readFile(jarPath, "utf8").catch(() => null);
     return { jar, stderr, timedOut };
+  } catch (error: any) {
+    kill();
+    return { jar: null, stderr: `could not read browser cookies: ${error?.message || error}`.slice(0, COOKIE_DIAGNOSTIC_LIMIT), timedOut };
   } finally {
-    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    clearTimeout(timer);
+    if (child) {
+      kill();
+      await child.exited.catch(() => {});
+      await Promise.allSettled(pipes);
+    }
+    if (dir) await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }).catch(() => {});
   }
 }
 
@@ -444,85 +504,109 @@ export async function validateCookies(cookiesFile: string): Promise<boolean> {
   return validateCookieArgs(["--cookies", cookieWorkingCopy(cookiesFile)]);
 }
 
-/**
- * Decide where cookies come from for this run, and remember the answer:
- *
- *   1. cookies.txt, if present and (when validateCookiesOnStart) it passes the probe;
- *   2. otherwise the first browser in `cookieBrowsers` whose cookies pass the probe;
- *   3. otherwise anonymous downloads.
- *
- * Browser probes are re-run at most every COOKIE_SOURCE_RECHECK_MS unless `force`
- * is set (the engine forces a re-run when cookies.txt appears, changes or goes).
- * Offline mode does no network work, so nothing is probed then.
+interface CookieSourceConfig {
+  cookiesFile: string;
+  validateCookiesOnStart: boolean;
+  cookieBrowsers: readonly string[];
+  offlineMode: boolean;
+}
+interface CookieResolveOptions {
+  force?: boolean;
+  log?: (msg: string) => void;
+  ytDlp?: string;
+  timeoutMs?: number;
+}
+
+function cookieConfigKey(config: CookieSourceConfig): string {
+  return JSON.stringify([cookiePathKey(config.cookiesFile), config.validateCookiesOnStart, [...new Set(config.cookieBrowsers)]]);
+}
+
+/** Locally validate the file, otherwise extract and persist each browser at most
+ * once. Rechecks are throttled per configuration, not globally across paths.
  */
 export function resolveCookieSource(
-  config: {
-    cookiesFile: string;
-    validateCookiesOnStart: boolean;
-    cookieBrowsers: string[];
-    offlineMode: boolean;
-  },
-  opts: { force?: boolean; log?: (msg: string) => void } = {},
+  config: CookieSourceConfig,
+  opts: CookieResolveOptions = {},
 ): Promise<void> {
   if (config.offlineMode) return Promise.resolve();
-  if (resolving) return resolving;
-  resolving = doResolve(config, opts).finally(() => {
-    resolving = null;
+  const key = cookieConfigKey(config);
+  const pending = resolving.get(key);
+  if (pending) return pending;
+  const initialLive = getConfig();
+  const stillCurrent = () => {
+    if (config.offlineMode || cookieConfigKey(config) !== key) return false;
+    const live = getConfig();
+    // Standalone callers may intentionally pass a config without installing it
+    // in state. Once live config changes, however, never publish stale results.
+    return live === initialLive && config !== initialLive ||
+      (!live.offlineMode && cookieConfigKey(live) === key);
+  };
+  const work = doResolve(config, opts, key, stillCurrent).finally(() => {
+    if (resolving.get(key) === work) resolving.delete(key);
   });
-  return resolving;
+  resolving.set(key, work);
+  return work;
 }
 
 async function doResolve(
-  config: { cookiesFile: string; validateCookiesOnStart: boolean; cookieBrowsers: string[] },
-  opts: { force?: boolean; log?: (msg: string) => void },
+  config: CookieSourceConfig,
+  opts: CookieResolveOptions,
+  key: string,
+  stillCurrent: () => boolean,
 ): Promise<void> {
   const log = opts.log ?? ((msg: string) => console.log(msg));
   const s = cookiesState(config);
-
-  if (s.present && config.validateCookiesOnStart) {
-    const probe = probeCookieFile(s.file);
-    fileCookieValid = probe.ok;
-    if (fileCookieValid) {
-      browserCookieSource = null;
-      log("✅ cookies.txt has a signed-in YouTube session (checked locally).");
+  const path = cookiePathKey(s.file);
+  browserCookieSource = null;
+  if (s.present) {
+    if (!config.validateCookiesOnStart) {
+      invalidCookieFiles.delete(path);
       return;
     }
-    // Say WHY, so a bad export is fixable: a format problem, a signed-out
-    // browser, or an expired session look different in the log.
-    log("⚠️ cookies.txt is invalid or expired — trying browser cookies.");
-    log(`   cookies.txt: ${probe.reason}`);
-  } else if (s.present) {
-    // Validation switched off: trust the file as before, never probe browsers.
-    fileCookieValid = null;
-    browserCookieSource = null;
-    return;
-  } else {
-    fileCookieValid = null;
+    const text = readCookiesTextSafely(s.file);
+    const diagnosis = diagnoseCookiesText(text);
+    if (diagnosis.problem === null) {
+      invalidCookieFiles.delete(path);
+      log("cookies.txt has a signed-in YouTube session (checked locally).");
+      return;
+    }
+    invalidCookieFiles.set(path, createHash("sha256").update(text).digest("hex"));
+    log(`cookies.txt is invalid or expired: ${diagnosis.problem}`);
   }
-
-  if (!opts.force && Date.now() - browserCheckedAt < COOKIE_SOURCE_RECHECK_MS) return;
-  browserCheckedAt = Date.now();
+  if (!opts.force && Date.now() - (browserCheckedAt.get(key) ?? 0) < COOKIE_SOURCE_RECHECK_MS) return;
+  if (!stillCurrent()) return;
+  browserCheckedAt.set(key, Date.now());
 
   const tried: string[] = [];
-  for (const browser of config.cookieBrowsers) {
-    const probe = await probeBrowserCookies(browser);
-    if (probe.ok) {
+  for (const browser of new Set(config.cookieBrowsers)) {
+    if (!stillCurrent()) return;
+    if (!config.cookiesFile.trim()) {
+      tried.push("No cookies.txt path is configured (cookiesFile).");
+      break;
+    }
+    const read = await readBrowserCookieJar(browser, { ...opts, shouldContinue: stillCurrent });
+    if (!stillCurrent()) { browserCheckedAt.delete(key); return; }
+    const problem = read.timedOut ? `reading ${browser} cookies timed out` :
+      read.jar === null ? ytDlpFailureReason(read.stderr) : diagnoseCookiesText(read.jar).problem;
+    if (problem !== null) {
+      tried.push(`${browser} — ${problem}`);
+      continue;
+    }
+    const saved = await persistCookieJar(browser, config.cookiesFile, read.jar!, stillCurrent);
+    if (!stillCurrent()) { browserCheckedAt.delete(key); return; }
+    if (saved.ok) {
+      invalidCookieFiles.delete(path);
       browserCookieSource = browser;
-      log(`🍪 Using cookies from ${browser} (${s.present ? "cookies.txt invalid" : "no cookies.txt"}).`);
+      log(`Saved ${saved.cookies} YouTube/Google cookies from ${browser} to cookies.txt.`);
       return;
     }
-    tried.push(`${browser} — ${probe.reason}`);
+    tried.push(`${browser} — ${saved.error}`);
   }
-  browserCookieSource = null;
   if (tried.length === 0) {
-    log(
-      `ℹ️ No ${config.cookiesFile} and no cookieBrowsers configured — downloads run anonymously. Drop the file in while the engine runs and it is picked up within a minute.`,
-    );
+    log(`No ${config.cookiesFile} and no cookieBrowsers configured — downloads run anonymously.`);
   } else {
     for (const line of tried) log(`   browser ${line}`);
-    log(
-      `ℹ️ No usable cookies (cookies.txt missing or rejected; browsers tried: ${config.cookieBrowsers.join(", ")}) — downloads run anonymously. Drop cookies.txt in while the engine runs and it is picked up within a minute.`,
-    );
+    log("No usable cookies — downloads run anonymously. Drop a valid cookies.txt in while the engine runs.");
   }
 }
 

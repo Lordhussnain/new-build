@@ -182,6 +182,30 @@ beforeEach(() => {
 });
 
 describe("the dashboard's API calls", () => {
+  test("cookie status shows source, count and truthful file/export ages without HTML injection", async () => {
+    const ui = await loadDashboard({ ...DEFAULT_CONFIG, cookiesFile: "nonexistent-cookie-status-fixture" });
+    ui.run("renderCookieStatus", {
+      present: true, valid: true, source: "<img src=x onerror=alert(1)>", cookies: 4,
+      modifiedAt: new Date(Date.now() - 120_000).toISOString(), exportedAt: null,
+    }, false);
+    expect(String(ui.el("cookieStatus").textContent)).toContain("4 cookies");
+    expect(String(ui.el("cookieStatus").textContent)).toContain("File updated 2m ago");
+    expect(String(ui.el("cookieStatus").textContent)).toContain("<img src=x onerror=alert(1)>");
+    expect(ui.el("cookieStatus").innerHTML).toBe("");
+    expect(String(ui.el("cookieStatus").textContent)).not.toContain("Exported");
+    ui.run("renderCookieStatus", {
+      present: true, valid: true, source: "firefox", cookies: 6,
+      modifiedAt: new Date().toISOString(), exportedAt: new Date().toISOString(),
+    }, false);
+    expect(String(ui.el("cookieStatus").textContent)).toContain("Exported just now");
+    ui.run("renderCookieStatus", { present: false, valid: null, source: null, cookies: 0, modifiedAt: null, exportedAt: null }, true);
+    expect(String(ui.el("cookieStatus").textContent)).toContain("Offline");
+    expect(ui.el("cookieExportRunBtn").disabled).toBe(true);
+    ui.run("renderCookieStatus", { present: true, valid: false, source: null, cookies: 0, modifiedAt: null, exportedAt: null }, false);
+    expect(String(ui.el("cookieStatus").textContent)).toContain("Invalid or expired");
+    expect(ui.el("cookieExportRunBtn").disabled).toBe(false);
+  });
+
   test("the HTML document ends at its closing tag with no rendered source after it", () => {
     const html = readFileSync(UI_PATH, "utf8");
     const lower = html.toLowerCase();

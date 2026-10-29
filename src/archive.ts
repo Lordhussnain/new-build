@@ -43,3 +43,23 @@ export function readArchiveIds(archiveFile: string): Set<string> {
   }
   return ids;
 }
+
+/**
+ * Re-append a video id to the archive file, undoing a `removeFromArchive` that
+ * ran before a step outside SQLite failed (a rename, say) — the archive is a
+ * plain-text file no transaction can roll back, and a scrubbed id would stop
+ * the archive-fallback dedupe from suppressing the video after a source
+ * cleanup deletes its job row. A duplicate line is harmless (readers use a
+ * Set). Returns false when the file cannot be written.
+ */
+export function appendToArchive(archiveFile: string, videoId: string): boolean {
+  try {
+    if (!archiveFile) return false;
+    const existing = existsSync(archiveFile) ? readFileSync(archiveFile, "utf-8") : "";
+    const needsNewline = existing.length > 0 && !existing.endsWith("\n");
+    writeFileSync(archiveFile, `${existing}${needsNewline ? "\n" : ""}youtube ${videoId}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}

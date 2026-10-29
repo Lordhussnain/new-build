@@ -47,7 +47,7 @@ import {
 } from "./sources";
 import { cancelActiveStages, diskUsage, interruptActiveDownloads, triggerPause, triggerResume, type CancelledStages } from "./resilience";
 import { METADATA_KINDS, listMetadataOnlyTasks, startMetadataOnly } from "./metadata-only";
-import { removeFromArchive } from "./archive";
+import { appendToArchive, readArchiveIds, removeFromArchive } from "./archive";
 import {
   findPartialFile,
   requeueFailedJobs,
@@ -441,10 +441,23 @@ const ACTIVE_JOB_PREDICATE = `
   OR conversion_claimed_by IS NOT NULL
   OR conversion_claim_token IS NOT NULL
   OR COALESCE(metadata_status, '') = 'in_progress'
+  OR metadata_claimed_by IS NOT NULL
   OR metadata_claim_token IS NOT NULL
 `;
 
 const PURGE_QUEUE_PREDICATE = "download_status IN ('pending', 'paused', 'waiting_live', 'failed', 'downloading')";
+
+/**
+ * Parse a ?limit= value into a bounded row/line count. NaN/negative/absurd
+ * values fall back to `fallback` — an unvalidated parseInt used to hand SQL
+ * `LIMIT NaN` (SQLite treats it as 0) or a bare `-1` (SQLite reads it as
+ * unbounded), neither of which is what a dashboard query meant.
+ */
+function boundedQueryLimit(raw: string | null, fallback: number, max: number): number {
+  const n = parseInt(raw ?? "", 10);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(n, max);
+}
 
 type IdleJobResult<T> = { ok: true; value: T } | { ok: false };
 
@@ -730,13 +743,24 @@ async function retryJobById(id: string, config: Config, override?: JobOverride):
       index: number | null;
     } | null;
     if (!row) return 0;
-    removeFromArchive(config.archiveFile, id);
-    // Move the previous file aside BEFORE the job becomes claimable: a worker
-    // that grabs it while the old file still exists would get a yt-dlp skip
-    // (`--no-overwrites`) instead of a real download. Throws when the file
-    // cannot be renamed — the route then answers 500 instead of starting a
-    // download that would silently no-op.
-    stashDownloadedFile(id, row.file_path);
+    // The archive file is plain text outside SQLite: a scrub before a stash
+    // that then throws cannot be rolled back by the transaction. Remember the
+    // id's presence so the catch below can undo the scrub — otherwise the
+    // archive-fallback dedupe would stop suppressing this video once a source
+    // cleanup deletes its row.
+    const archiveHadId = readArchiveIds(config.archiveFile).has(id);
+    try {
+      removeFromArchive(config.archiveFile, id);
+      // Move the previous file aside BEFORE the job becomes claimable: a worker
+      // that grabs it while the old file still exists would get a yt-dlp skip
+      // (`--no-overwrites`) instead of a real download. Throws when the file
+      // cannot be renamed — the route then answers 500 instead of starting a
+      // download that would silently no-op.
+      stashDownloadedFile(id, row.file_path);
+    } catch (err) {
+      if (archiveHadId) appendToArchive(config.archiveFile, id);
+      throw err;
+    }
 
     // Remember the partial for the post-transaction wipe: the row must stop
     // referencing it first, so a crash between the two steps leaves at worst an
@@ -2073,8 +2097,9 @@ const ROUTES: Route[] = [
     methods: ["GET"],
     pattern: "/api/history",
     handler: ({ url }) => {
-      const limit = parseInt(url.searchParams.get("limit") || "20", 10);
-      const rows = db.query("SELECT * FROM run_history ORDER BY ended_at DESC LIMIT ?").all(limit);
+      const rows = db
+        .query("SELECT * FROM run_history ORDER BY ended_at DESC LIMIT ?")
+        .all(boundedQueryLimit(url.searchParams.get("limit"), 20, 500));
       return Response.json({ ok: true, history: rows });
     },
   },
@@ -2083,7 +2108,7 @@ const ROUTES: Route[] = [
     pattern: "/api/logs",
     handler: ({ url }) => {
       const logType = url.searchParams.get("type") || "error";
-      const limit = parseInt(url.searchParams.get("limit") || "100", 10);
+      const limit = boundedQueryLimit(url.searchParams.get("limit"), 100, 5000);
       let logs: string[] = [];
       try {
         if (logType === "report") {

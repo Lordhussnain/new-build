@@ -7,10 +7,8 @@
 // session, so a failed export never overwrites a working file. The previous file
 // is kept as `<cookiesFile>.bak`.
 
-import { existsSync } from "node:fs";
-import { copyFile, rm, writeFile, rename } from "node:fs/promises";
 import { COOKIE_BROWSER_NAMES } from "./config";
-import { diagnoseCookiesText, ytDlpFailureReason } from "./cookie-file";
+import { diagnoseCookiesText, persistCookieJar, ytDlpFailureReason } from "./cookie-file";
 import { readBrowserCookieJar } from "./tools";
 
 export interface CookieExportResult {
@@ -71,19 +69,28 @@ export async function exportBrowserCookies(
     };
   }
 
-  // Verified: replace cookies.txt atomically, keeping the old file as a backup.
-  const incoming = `${cookiesFile}.incoming`;
-  let backup: string | undefined;
-  try {
-    await writeFile(incoming, text, "utf8");
-    if (existsSync(cookiesFile)) {
-      backup = `${cookiesFile}.bak`;
-      await copyFile(cookiesFile, backup);
-    }
-    await rename(incoming, cookiesFile);
-  } catch (error: any) {
-    await rm(incoming, { force: true }).catch(() => {});
-    return { ok: false, browser, error: `Could not write ${cookiesFile}: ${error?.message || error}` };
+  const result = await persistCookieJar(browser, cookiesFile, text);
+  return { ...result, browser, ...(result.ok ? { file: cookiesFile } : {}) };
+}
+
+export interface CookieFallbackExportResult extends CookieExportResult {
+  /** Failed candidates, including failures before a successful fallback. */
+  errors: { browser: string; error: string }[];
+}
+
+/** Selected default profile first, then each configured default profile once. */
+export async function exportBrowserCookiesWithFallback(
+  browser: string,
+  cookiesFile: string,
+  browsers: readonly string[],
+  opts: CookieExportOptions = {},
+): Promise<CookieFallbackExportResult> {
+  const errors: CookieFallbackExportResult["errors"] = [];
+  for (const candidate of new Set([browser, ...browsers])) {
+    const result = await exportBrowserCookies(candidate, cookiesFile, opts);
+    if (result.ok) return { ...result, errors };
+    errors.push({ browser: candidate, error: result.error ?? "Cookie export failed." });
+    if (!cookiesFile.trim()) break;
   }
-  return { ok: true, browser, file: cookiesFile, cookies: diagnosis.siteEntries, backup };
+  return { ok: false, browser, errors, error: errors.map(item => `${item.browser}: ${item.error}`).join("; ") };
 }

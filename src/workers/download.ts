@@ -198,7 +198,12 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
       stopHeartbeat();
     } catch (err: any) {
       stopHeartbeat();
-      await handleDownloadFailure(id, job, config, err);
+      // The failure handler itself must never break the loop ("a crashed loop
+      // is restarted by supervise()" costs a claim-leak and a 5s stall): its
+      // own DB writes can throw mid-shutdown just like the stage did.
+      await handleDownloadFailure(id, job, config, err).catch((handlerErr: any) => {
+        logError("download", `${job.id} ${job.title}: failure handler crashed: ${handlerErr?.message || handlerErr}`);
+      });
     } finally {
       stopHeartbeat();
       activeDownloadJobs.delete(id);

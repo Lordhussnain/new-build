@@ -147,10 +147,14 @@ function requeueWrongContainerJobs(
        WHERE download_status = 'downloaded' AND conversion_status IN ('done', 'not_needed')`,
     )
     .all() as { id: string; file_path: string | null; audio_tracks: string | null; audio_selection: string | null }[];
+  // The comparison key is case-folded on Windows; the root must be folded the
+  // same way or a mixed-case temp path never matches and every candidate is
+  // skipped (pathKey is not idempotent-safe to call per row only).
+  const rootKey = pathKey(root);
   for (const row of rows) {
     if (!row.file_path) continue;
     const key = pathKey(row.file_path);
-    if (key !== root && !key.startsWith(root + sep)) continue;
+    if (key !== rootKey && !key.startsWith(rootKey + sep)) continue;
     const ext = extname(key).toLowerCase();
     if (!REQUEUEABLE_EXTENSIONS.has(ext)) continue;
     if (ext.replace(/^\./, "") === targetFormat) continue;

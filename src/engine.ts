@@ -15,11 +15,12 @@ import {
   webPortOverrideFromRuntime,
   webTokenOverrideFromRuntime,
 } from "./config";
-import { COOKIE_SOURCE_RECHECK_MS, aria2cPath, checkDependencies, resolveCookieSource } from "./tools";
+import { aria2cPath, checkDependencies } from "./tools";
 import { initDatabase, pruneJobsForUnconfiguredSources } from "./db";
 import {
   acquireEngineLease,
   describeEngineLease,
+  holdsEngineLease,
   releaseEngineLease,
   startEngineLeaseHeartbeat,
 } from "./lease";
@@ -32,9 +33,11 @@ import {
   reconcileSupersededFiles,
   reapStaleClaims,
   requeueFailedJobs,
+  refreshCookies,
 } from "./reconcile";
 import { autoscaleTick, autoscaler } from "./autoscale";
-import { networkMonitor, triggerPause } from "./resilience";
+import { automaticRecoveryTick, networkMonitor, triggerPause } from "./resilience";
+import { abortController, isPaused } from "./state";
 import { scanAndIngest } from "./scanner";
 import { startWebServer } from "./web";
 import { initDashboard, renderDashboard, setDownloadRows } from "./dashboard";
@@ -264,7 +267,7 @@ export async function main(): Promise<void> {
   } else {
     // cookies.txt first (if present and valid), then the browsers in
     // cookieBrowsers, then anonymous. See resolveCookieSource().
-    await resolveCookieSource(config);
+    await refreshCookies();
   }
 
   // 3) Load every link from config.json, fetch video details, store in DB.
@@ -333,15 +336,22 @@ export async function main(): Promise<void> {
   // Failed-job sweep: re-queue transient failures after their cooldown. It also
   // re-queues failed CONVERSIONS, which is exactly what offline mode wants, so
   // the sweep keeps running; download re-queues simply wait for the mode to end.
-  setInterval(() => requeueFailedJobs(getConfig()), 60_000);
-  // Cookies sweep is local filesystem observation (not a network fetch), so it
-  // stays registered through offline mode and is ready if the mode ends live.
+  // Lease-gated like the reaper: without the lease this process must not flip
+  // job rows another engine owns, and a paused engine (BAD_DOWNLOADER_ARGS,
+  // disk full, ENGINE_LEASE_LOST) must not re-arm rows the operator parked.
   setInterval(() => {
-    if (cookiesWatch(getConfig())) void resolveCookieSource(getConfig(), { force: true });
+    if (isPaused() || !holdsEngineLease()) return;
+    requeueFailedJobs(getConfig());
   }, 60_000);
-  // Browser cookies can expire or the browser can be closed/unlocked later on,
-  // so the chosen source is re-checked periodically.
-  setInterval(() => void resolveCookieSource(getConfig()), COOKIE_SOURCE_RECHECK_MS);
+  const recoveryTimer = setInterval(() => {
+    void automaticRecoveryTick().catch((error) => logError("recovery", String(error)));
+  }, 60_000);
+  abortController.signal.addEventListener("abort", () => clearInterval(recoveryTimer), { once: true });
+  const cookiesTimer = setInterval(() => {
+    const change = cookiesWatch(getConfig());
+    void refreshCookies({ force: !!change }).catch((error) => logError("cookies", String(error)));
+  }, 60_000);
+  abortController.signal.addEventListener("abort", () => clearInterval(cookiesTimer), { once: true });
   // Secondary-storage relocation: files that need no conversion still have to
   // reach secondary storage (src/relocate.ts).
   startRelocation();

@@ -64,11 +64,23 @@ export async function runFfmpeg(
   workerId?: number,
 ): Promise<{ code: number; stderr: string; timedOut: boolean }> {
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  let proc: Bun.Subprocess | undefined;
+  const timer = setTimeout(() => {
+    ctl.abort();
+    // Abort normally terminates the child. Force-kill as a bounded fallback so
+    // an ffmpeg that ignores the signal cannot pin this worker forever (the
+    // claim heartbeat would keep the lease alive, so the reaper never fires).
+    if (proc && proc.exitCode === null) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+  }, timeoutMs);
   try {
-    const proc = Bun.spawn([ffmpeg(), ...args], { stdout: "ignore", stderr: "pipe", signal: ctl.signal });
-    if (workerId !== undefined) activeConvertProcs.set(workerId, proc);
-    const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    const child = Bun.spawn([ffmpeg(), ...args], { stdout: "ignore", stderr: "pipe", signal: ctl.signal });
+    proc = child;
+    if (workerId !== undefined) activeConvertProcs.set(workerId, child);
+    const [stderr, code] = await Promise.all([new Response(child.stderr).text(), child.exited]);
     return { code, stderr, timedOut: ctl.signal.aborted };
   } finally {
     clearTimeout(timer);
@@ -85,33 +97,55 @@ export async function runFfmpeg(
  * embedded. A probe failure yields an empty probe — the remux then falls back
  * to mapping everything ffmpeg can see.
  */
+/** A wedged probe must not pin a converter worker; this bounds it. */
+const MEDIA_PROBE_TIMEOUT_MS = 30_000;
+
 export async function probeMediaStreams(path: string, workerId?: number): Promise<MediaStreamProbe> {
+  const ctl = new AbortController();
+  let proc: Bun.Subprocess | undefined;
+  const timer = setTimeout(() => {
+    ctl.abort();
+    if (proc && proc.exitCode === null) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+  }, MEDIA_PROBE_TIMEOUT_MS);
   try {
-    const proc = Bun.spawn([ffmpeg(), "-hide_banner", "-i", path], {
+    const child = Bun.spawn([ffmpeg(), "-hide_banner", "-i", path], {
       stdout: "pipe",
       stderr: "pipe",
+      signal: ctl.signal,
     });
-    if (workerId !== undefined) activeConvertProcs.set(workerId, proc);
+    proc = child;
+    if (workerId !== undefined) activeConvertProcs.set(workerId, child);
     const [out, err] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
     ]);
+    if (ctl.signal.aborted) {
+      logError("convert", `media probe timed out after ${MEDIA_PROBE_TIMEOUT_MS / 1000}s: ${path}`);
+      return EMPTY_PROBE;
+    }
     const banner = `${out}\n${err}`;
     return parseMediaStreamProbe(banner);
   } catch {
-    return {
-      videoStreams: 0,
-      audioStreams: 0,
-      subtitleStreams: 0,
-      attachmentStreams: 0,
-      hasAttachedPicture: false,
-      hasCoverAttachment: false,
-    };
+    return EMPTY_PROBE;
   } finally {
+    clearTimeout(timer);
     if (workerId !== undefined) activeConvertProcs.delete(workerId);
   }
 }
+
+const EMPTY_PROBE: MediaStreamProbe = {
+  videoStreams: 0,
+  audioStreams: 0,
+  subtitleStreams: 0,
+  attachmentStreams: 0,
+  hasAttachedPicture: false,
+  hasCoverAttachment: false,
+};
 
 /**
  * How many audio streams a media file carries. Used to identify multi-audio
@@ -221,7 +255,11 @@ export async function converterWorker(id: number, config: Config): Promise<void>
     try {
       await convertJob(job, config, id);
     } catch (err: any) {
-      await handleConvertFailure(job, config, err, id);
+      // The failure handler must never break the loop — supervise() would
+      // restart it at the cost of a claim-leak and a stall.
+      await handleConvertFailure(job, config, err, id).catch((handlerErr: any) => {
+        logError("convert", `${job.id} ${job.title}: failure handler crashed: ${handlerErr?.message || handlerErr}`);
+      });
     } finally {
       activeConvertJobs.delete(id);
       activeConvertProcs.delete(id);
