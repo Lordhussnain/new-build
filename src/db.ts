@@ -20,6 +20,7 @@
 import { Database } from "bun:sqlite";
 import type { Config } from "./config";
 import { clearJobCancelled } from "./state";
+import { nativeCore, nativeValue } from "./native-core";
 
 export interface Job {
   id: string;
@@ -454,6 +455,9 @@ const CLAIM_COLUMNS: Record<ClaimStage, ClaimColumns> = {
 
 /** Column names for one stage's claim — the single source of truth. */
 export function claimColumns(stage: ClaimStage): ClaimColumns {
+  if (nativeCore && Object.hasOwn(CLAIM_COLUMNS, stage)) {
+    return nativeValue<ClaimColumns>(nativeCore.claimColumns(stage));
+  }
   return CLAIM_COLUMNS[stage];
 }
 
@@ -471,6 +475,9 @@ export interface ClaimRef {
  * it over once its `*_claimed_at` ages out — exactly like before.
  */
 export function claimRef(stage: ClaimStage, row: Record<string, unknown> | Job): ClaimRef {
+  if (nativeCore && Object.hasOwn(CLAIM_COLUMNS, stage)) {
+    return nativeValue<ClaimRef>(nativeCore.claimRef(stage, JSON.stringify(row)));
+  }
   const c = CLAIM_COLUMNS[stage];
   const r = row as Record<string, unknown>;
   return {
@@ -519,8 +526,11 @@ export function updateClaimedJob(
 ): number {
   const c = CLAIM_COLUMNS[stage];
   const extra = extraCondition ? ` AND (${extraCondition})` : "";
+  const sql = nativeCore && Object.hasOwn(CLAIM_COLUMNS, stage)
+    ? nativeValue<string>(nativeCore.claimUpdateSql(stage, setClause, extraCondition))
+    : `UPDATE jobs SET ${setClause} WHERE id = ? AND ${c.token} IS ? AND ${c.by} IS ?${extra}`;
   return db.run(
-    `UPDATE jobs SET ${setClause} WHERE id = ? AND ${c.token} IS ? AND ${c.by} IS ?${extra}`,
+    sql,
     [...params, jobId, claim.token, claim.by] as any,
   ).changes;
 }
@@ -547,7 +557,9 @@ export function releaseClaimedJob(
     `${c.heartbeat} = NULL`,
     "updated_at = CURRENT_TIMESTAMP",
   ].join(", ");
-  const set = [setClause, release].filter((s) => s && s.trim().length > 0).join(", ");
+  const set = nativeCore && Object.hasOwn(CLAIM_COLUMNS, stage)
+    ? nativeValue<string>(nativeCore.claimReleaseSet(stage, setClause))
+    : [setClause, release].filter((s) => s && s.trim().length > 0).join(", ");
   return updateClaimedJob(stage, jobId, claim, set, params, extraCondition);
 }
 
@@ -623,6 +635,7 @@ export function startClaimHeartbeat(
 
 /** Per-video failure cap: the smaller of the two knobs, so both stay honest. */
 export function perVideoCap(config: Config): number {
+  if (nativeCore) return nativeValue<number>(nativeCore.perVideoCap(JSON.stringify(config)));
   return Math.min(config.maxRetryAttempts, config.maxFailuresPerVideo);
 }
 

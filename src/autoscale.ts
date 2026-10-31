@@ -10,6 +10,7 @@
 
 import { db } from "./db";
 import { getConfig } from "./state";
+import { nativeCore, nativeValue } from "./native-core";
 
 /** Largest slot id the engine will ever use (the schema's maxDownloadWorkers). */
 export const MAX_SLOT_ID = 20;
@@ -117,7 +118,7 @@ export interface SlotTargetResult {
  *
  * A changed floor or ceiling is enforced immediately in every branch.
  */
-export function nextSlotTarget(input: SlotTargetInput): SlotTargetResult {
+function nextSlotTargetTypeScript(input: SlotTargetInput): SlotTargetResult {
   const floor = Math.max(1, input.minWorkers);
   const ceiling = Math.max(floor, input.maxWorkers);
   const demand = Math.max(0, input.inFlight) + Math.max(0, input.backlog);
@@ -139,6 +140,25 @@ export function nextSlotTarget(input: SlotTargetInput): SlotTargetResult {
     target = Math.min(target + Math.max(1, input.rampStep), demand, ceiling);
   }
   return { target, bandwidthShed: false };
+}
+
+export function nextSlotTarget(input: SlotTargetInput): SlotTargetResult {
+  const finite = [
+    input.current,
+    input.backlog,
+    input.inFlight,
+    input.minWorkers,
+    input.maxWorkers,
+    input.rampStep,
+    input.aggBps,
+    input.capBps,
+    input.now,
+    input.lastScaleDownAt,
+  ].every(Number.isFinite);
+  if (nativeCore && finite && (input.cooldownMs === undefined || Number.isFinite(input.cooldownMs))) {
+    return nativeValue<SlotTargetResult>(nativeCore.nextSlotTarget(JSON.stringify(input)));
+  }
+  return nextSlotTargetTypeScript(input);
 }
 
 /**

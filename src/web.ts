@@ -67,6 +67,7 @@ import { aria2cPath, getCookieStatus, jsRuntime } from "./tools";
 import { cookiePathKey } from "./cookie-file";
 import { exportBrowserCookiesWithFallback } from "./cookies-export";
 import { applySettings, readSettings } from "./settings";
+import { NativeCoreError } from "./native-core";
 import { effectiveTargetFormat, effectiveVideoQuality, jobFittedBaseFilename, resolveDownloaderEngine } from "./download-args";
 import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-tracks";
 import { formatBytesPerSec, formatDuration } from "./util";
@@ -2094,7 +2095,19 @@ const ROUTES: Route[] = [
         return Response.json({ ok: false, error: "Expected a JSON body" }, { status: 400 });
       }
       const writeInfoJsonWasEnabled = getConfig().writeInfoJson;
-      const result = await withConfigWriteLock(() => applySettings(getConfig(), patch as Record<string, unknown>));
+      let result: Awaited<ReturnType<typeof applySettings>>;
+      try {
+        result = await withConfigWriteLock(() => applySettings(getConfig(), patch as Record<string, unknown>));
+      } catch (error) {
+        if (error instanceof NativeCoreError) {
+          logError("settings", `Native settings validation failed: ${error.message}`);
+          return Response.json(
+            { ok: false, error: "Settings were not changed because the native validator failed" },
+            { status: 503 },
+          );
+        }
+        throw error;
+      }
       if (!result.ok) {
         return Response.json({ ok: false, error: result.error }, { status: 400 });
       }

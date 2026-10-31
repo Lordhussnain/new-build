@@ -1,6 +1,8 @@
 # Dependencies and compiled artifacts
 /node_modules/
 /dist/
+/native/target/
+/native/*.node
 
 # Runtime configuration and credentials
 /config.json

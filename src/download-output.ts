@@ -6,6 +6,7 @@
 // converter (1.3.14, toWPathMaybeDir) instead of throwing a catchable JS error.
 
 import { parseSpeedToBytesPerSec } from "./util";
+import { NativeCoreError, nativeCore, nativeValue } from "./native-core";
 
 export const DOWNLOAD_PATH_PREFIX = "FILEPATH:";
 // Deliberately conservative capture limits, not the OS's maximum path length.
@@ -15,11 +16,16 @@ export const MAX_OUTPUT_LINE_LENGTH = 8 * 1024;
 export const MAX_OUTPUT_TAIL_LENGTH = 8 * 1024;
 
 /** Only accept our explicit after_move record, validated BEFORE any fs call. */
-export function parseDownloadPath(line: string): string | null {
+function parseDownloadPathTypeScript(line: string): string | null {
   if (!line.startsWith(DOWNLOAD_PATH_PREFIX)) return null;
   const path = line.slice(DOWNLOAD_PATH_PREFIX.length);
   if (!path.trim() || path.length > MAX_DOWNLOAD_PATH_LENGTH || /[\x00-\x1f\x7f]/.test(path)) return null;
   return path; // Preserve spaces and Unicode in the actual path.
+}
+
+export function parseDownloadPath(line: string): string | null {
+  if (nativeCore) return nativeValue<string | null>(nativeCore.parseDownloadPath(line));
+  return parseDownloadPathTypeScript(line);
 }
 
 /**
@@ -138,7 +144,7 @@ function parseAria2cEta(eta: string): number {
   return parseInt(m[1] || "0", 10) * 3600 + parseInt(m[2] || "0", 10) * 60 + parseInt(m[3] || "0", 10);
 }
 
-export function parseAria2cReadout(line: string): Aria2cReadout | null {
+function parseAria2cReadoutTypeScript(line: string): Aria2cReadout | null {
   // A Windows console pads the record to the terminal width and may terminate
   // it with CR instead of LF, so tolerate whitespace on both sides.
   const text = line.trim();
@@ -167,4 +173,20 @@ export function parseAria2cReadout(line: string): Aria2cReadout | null {
     totalBytes,
     downloadedBytes,
   };
+}
+
+export function parseAria2cReadout(line: string): Aria2cReadout | null {
+  if (nativeCore && /^[\x00-\x7F]*$/.test(line)) {
+    try {
+      return nativeValue<Aria2cReadout | null>(nativeCore.parseAria2cReadout(line));
+    } catch (error) {
+      // JSON cannot carry Infinity/NaN. Keep the historical result for those
+      // exotic numeric tokens without hiding real bridge/operational failures.
+      if (error instanceof NativeCoreError && error.code === "NATIVE_UNSUPPORTED") {
+        return parseAria2cReadoutTypeScript(line);
+      }
+      throw error;
+    }
+  }
+  return parseAria2cReadoutTypeScript(line);
 }

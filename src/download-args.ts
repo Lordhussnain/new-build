@@ -25,16 +25,34 @@ import { computeDownloadTimeoutMs } from "./retry";
 import { QUALITY_FORMATS, type Config } from "./config";
 import { multiAudioFormatSelector, type AudioTrack } from "./audio-tracks";
 import type { Job } from "./db";
+import { NativeCoreError, nativeCore, nativeValue } from "./native-core";
 
 export type DownloaderEngine = "aria2c" | "native";
 
+function nativeEffectiveDownloadFormat(
+  job: { target_format?: string | null; video_quality?: string | null },
+  config: Config,
+): { quality: string; targetFormat: string } | null {
+  if (!nativeCore) return null;
+  return nativeValue<{ quality: string; targetFormat: string }>(nativeCore.effectiveDownloadFormat(
+    job.video_quality ?? null,
+    job.target_format ?? null,
+    config.videoQuality,
+    config.targetFormat,
+    JSON.stringify(Object.keys(QUALITY_FORMATS)),
+  ));
+}
+
 /** Which engine a download should use, given availability and config. */
 export function resolveDownloaderEngine(config: Config, aria2cAvailable: boolean): DownloaderEngine {
+  if (nativeCore) return nativeValue<DownloaderEngine>(nativeCore.resolveDownloaderEngine(config.useAria2c, aria2cAvailable));
   return config.useAria2c && aria2cAvailable ? "aria2c" : "native";
 }
 
 /** Resolve a job's nullable quality override against the live global setting. */
 export function effectiveVideoQuality(job: { video_quality?: string | null }, config: Config): string {
+  const native = nativeEffectiveDownloadFormat(job, config);
+  if (native) return native.quality;
   const override = job.video_quality;
   return override && Object.hasOwn(QUALITY_FORMATS, override) ? override : config.videoQuality;
 }
@@ -44,6 +62,8 @@ export function effectiveTargetFormat(
   job: { target_format?: string | null; video_quality?: string | null },
   config: Config,
 ): string {
+  const native = nativeEffectiveDownloadFormat(job, config);
+  if (native) return native.targetFormat;
   const quality = effectiveVideoQuality(job, config);
   const stored = typeof job.target_format === "string" ? job.target_format.trim().toLowerCase() : "";
   return stored || (quality === "audio" ? "mp3" : (config.targetFormat || "mp4").toLowerCase());
@@ -68,7 +88,7 @@ export function effectiveTargetFormat(
 export const ARIA2C_MAX_CONNECTIONS_PER_SERVER = 16;
 export const ARIA2C_MIN_SPLIT_SIZE_BYTES = 1048576; // 1M (aria2c rejects anything lower with exit 28)
 
-export function parseAria2cSplitSizeBytes(sizeStr: string): number | null {
+function parseAria2cSplitSizeBytesTypeScript(sizeStr: string): number | null {
   const match = sizeStr.trim().match(/^(\d+(?:\.\d+)?)\s*([KkMmGg]?)[Bb]?$/);
   if (!match) return null;
   const num = parseFloat(match[1]);
@@ -78,6 +98,20 @@ export function parseAria2cSplitSizeBytes(sizeStr: string): number | null {
   if (unit === "M") return Math.floor(num * 1024 * 1024);
   if (unit === "G") return Math.floor(num * 1024 * 1024 * 1024);
   return Math.floor(num);
+}
+
+export function parseAria2cSplitSizeBytes(sizeStr: string): number | null {
+  if (nativeCore) {
+    try {
+      return nativeValue<number | null>(nativeCore.parseAria2cSplitSizeBytes(sizeStr));
+    } catch (error) {
+      if (error instanceof NativeCoreError && error.code === "NATIVE_UNSUPPORTED") {
+        return parseAria2cSplitSizeBytesTypeScript(sizeStr);
+      }
+      throw error;
+    }
+  }
+  return parseAria2cSplitSizeBytesTypeScript(sizeStr);
 }
 
 /**
@@ -100,21 +134,31 @@ export const MIN_TRANSFERS_PER_DOWNLOAD = 4;
  * configured value, reduced to its share of `budget` but never below the floor
  * and never above the configured value.
  */
-export function perDownloadTransfers(configured: number, activeSlots: number, budget: number): number {
+function perDownloadTransfersTypeScript(configured: number, activeSlots: number, budget: number): number {
   const wanted = Math.max(1, Math.floor(configured));
   const slots = Math.max(1, Math.floor(activeSlots));
   const share = Math.floor(budget / slots);
   return Math.max(1, Math.min(wanted, Math.max(MIN_TRANSFERS_PER_DOWNLOAD, share)));
 }
 
+export function perDownloadTransfers(configured: number, activeSlots: number, budget: number): number {
+  if (nativeCore && [configured, activeSlots, budget].every(Number.isFinite)) {
+    return nativeValue<number>(nativeCore.perDownloadTransfers(configured, activeSlots, budget));
+  }
+  return perDownloadTransfersTypeScript(configured, activeSlots, budget);
+}
+
 export function buildAria2cArgs(config: Config, activeSlots = 1): string {
+  const split = (config.minSplitSize || "").trim();
+  if (nativeCore && [config.connectionsPerDownload, activeSlots, CONNECTION_BUDGET].every(Number.isFinite)) {
+    return nativeValue<string>(nativeCore.buildAria2cArgs(config.connectionsPerDownload, activeSlots, CONNECTION_BUDGET, split));
+  }
   const n = perDownloadTransfers(config.connectionsPerDownload, activeSlots, CONNECTION_BUDGET);
   const x = Math.min(n, ARIA2C_MAX_CONNECTIONS_PER_SERVER);
   const parts = [`-x ${x}`, `-s ${n}`, `-j ${n}`];
-  const split = (config.minSplitSize || "").trim();
   const bytes = split ? parseAria2cSplitSizeBytes(split) : null;
   if (split && bytes === null) {
-    // Not a size at all ("banana", "5X", "1 MB"): hand the value to aria2c
+    // Not a size at all ("banana", "5X"): hand the value to aria2c
     // verbatim instead of dropping it. aria2c validates every option before it
     // transfers a byte and answers an unusable `--min-split-size` with exit 28
     // plus the option's help block, which the worker turns into the actionable
@@ -146,6 +190,9 @@ export function buildAria2cArgs(config: Config, activeSlots = 1): string {
  * 64 KB/s per worker). Returns null when no cap is configured.
  */
 export function computePerWorkerLimitBytesPerSec(config: Config, activeSlots: number): number | null {
+  if (nativeCore && Number.isFinite(config.maxBandwidthKBps) && Number.isFinite(activeSlots)) {
+    return nativeValue<number | null>(nativeCore.computePerWorkerLimitBytesPerSec(config.maxBandwidthKBps, activeSlots));
+  }
   if (config.maxBandwidthKBps <= 0) return null;
   const slots = Math.max(1, Math.floor(activeSlots));
   return Math.max(1, Math.floor((config.maxBandwidthKBps * 1024) / slots));

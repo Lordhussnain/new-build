@@ -13,6 +13,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join, dirname, basename } from "node:path";
 import os from "node:os";
+import { nativeCore, nativeValue } from "./native-core";
 
 // aria2c is optional: when present it becomes the multi-connection downloader
 // (yt-dlp --downloader aria2c), and when absent the engine transparently uses
@@ -72,6 +73,7 @@ export function jsRuntimeArgs(runtime: JsRuntime | null = resolvedTools.jsRuntim
  * `process.versions.bun` but `execPath` is not a JS runtime.
  */
 export function bunInterpreterPath(execPath: string = process.execPath): string | null {
+  if (nativeCore) return nativeValue<string | null>(nativeCore.bunInterpreterPath(execPath));
   const base = basename(execPath).replace(/\.exe$/i, "").toLowerCase();
   return base === "bun" ? execPath : null;
 }
@@ -754,7 +756,7 @@ function pathLookupAvailable(search: ToolSearchEnv): boolean {
 
 // Candidate search order: explicit config path → PATH → app folder → folder of
 // the compiled exe → common Windows package-manager shims.
-function toolCandidates(
+function toolCandidatesFallback(
   cfgPath: string,
   posixNames: string[],
   winNames: string[],
@@ -791,6 +793,28 @@ function toolCandidates(
     seen.add(c);
     return true;
   });
+}
+
+function toolCandidates(
+  cfgPath: string,
+  posixNames: string[],
+  winNames: string[],
+  search: ToolSearchEnv = {},
+): string[] {
+  if (nativeCore) {
+    return nativeValue<string[]>(nativeCore.toolCandidates(JSON.stringify({
+      cfgPath,
+      posixNames,
+      winNames,
+      cwd: search.cwd ?? process.cwd(),
+      exeDir: search.exeDir ?? dirname(process.execPath),
+      platform: search.platform ?? process.platform,
+      home: os.homedir(),
+      env: search.env ?? process.env,
+      envIsInjected: search.env !== undefined,
+    })));
+  }
+  return toolCandidatesFallback(cfgPath, posixNames, winNames, search);
 }
 
 /**

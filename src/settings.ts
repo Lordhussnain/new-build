@@ -16,8 +16,9 @@
 // (worker pool sizes, tool discovery, the HTTP listener, watcher intervals), so
 // a saved value applies on the next start; everything else is live.
 
-import { CONFIG_PATH, ConfigSchema, DEFAULT_CONFIG, saveConfig, type Config } from "./config";
+import { CONFIG_PATH, DEFAULT_CONFIG, saveConfig, validateConfig, type Config } from "./config";
 import { setConfig } from "./state";
+import { NativeCoreError, nativeCore, nativeEnvelope, nativeError } from "./native-core";
 
 export type SettingType = "number" | "boolean" | "text" | "select" | "list";
 
@@ -744,6 +745,23 @@ export function coerceBoolean(raw: unknown): boolean | null {
   return null;
 }
 
+/** Only plain JSON values cross the native settings boundary. Exotic JS values
+ * retain the original coercion behavior in the TypeScript compatibility path. */
+function isPlainJsonValue(value: unknown, seen = new Set<object>()): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object") return false;
+  if (seen.has(value) || "toJSON" in value) return false;
+  if (!Array.isArray(value)) {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+  }
+  seen.add(value);
+  const valid = Object.values(value).every((entry) => isPlainJsonValue(entry, seen));
+  seen.delete(value);
+  return valid;
+}
+
 /**
  * Apply a partial settings patch: validate the merged config, persist it, and
  * make it live for the running engine.
@@ -772,54 +790,67 @@ export async function applySettings(
     };
   }
 
-  // Coerce to the field's declared type before validating, so "16" from a text
-  // input and 16 from JSON both work. A value that is not a usable
-  // representation of the declared type is REJECTED — never coerced to some
-  // default: "maybe" is not false, and silently turning it into a change would
-  // contradict the all-or-nothing rule the rest of this function enforces.
-  const coerced: Record<string, unknown> = {};
-  for (const field of EDITABLE_SETTINGS) {
-    if (!(field.key in patch)) continue;
-    const raw = patch[field.key];
-    if (field.type === "number") {
-      const n = typeof raw === "number" ? raw : Number(String(raw).trim());
-      // `Number("")` is 0 and `Number(" ")` is 0: an empty text input is not a
-      // number, it is a missing value.
-      if (typeof raw !== "number" && !String(raw ?? "").trim()) {
-        return { ok: false, error: `${field.label} must be a number`, changed: [] };
-      }
-      if (!Number.isFinite(n)) {
-        return { ok: false, error: `${field.label} must be a number`, changed: [] };
-      }
-      coerced[field.key] = n;
-    } else if (field.type === "boolean") {
-      const parsed = coerceBoolean(raw);
-      if (parsed === null) {
-        return { ok: false, error: `${field.label} must be true or false`, changed: [] };
-      }
-      coerced[field.key] = parsed;
-    } else if (field.type === "list") {
-      // A string of comma-separated values ("en, ja") or a real array both
-      // normalize to a clean string array.
-      const items = Array.isArray(raw) ? raw : String(raw ?? "").split(",");
-      const cleaned = items
-        .filter((x: any) => typeof x === "string" && x.trim())
-        .map((x: string) => x.trim());
-      coerced[field.key] = cleaned;
-    } else {
-      coerced[field.key] = typeof raw === "string" ? raw.trim() : String(raw);
-    }
-  }
-
-  const merged = { ...current, ...coerced };
-
+  let coerced: Record<string, unknown>;
   let validated: Config;
-  try {
-    validated = ConfigSchema.parse(merged);
-  } catch (e: any) {
-    const issue = e?.issues?.[0];
-    const where = issue?.path?.length ? `${issue.path.join(".")}: ` : "";
-    return { ok: false, error: `${where}${issue?.message || "invalid configuration"}`, changed: [] };
+  if (nativeCore && isPlainJsonValue(current) && isPlainJsonValue(patch)) {
+    const response = nativeEnvelope<{
+      config: Config;
+      coerced: Record<string, unknown>;
+    }>(nativeCore.prepareSettings(
+      JSON.stringify(current) ?? "null",
+      JSON.stringify(patch) ?? "null",
+      JSON.stringify(EDITABLE_SETTINGS.map(({ key, label, type }) => ({ key, label, type }))),
+    ));
+    if (!response.ok) {
+      if (["NATIVE_PANIC", "NATIVE_SERIALIZATION"].includes(response.error.code)) {
+        throw nativeError(response.error);
+      }
+      return { ok: false, error: response.error.message, changed: [] };
+    }
+    coerced = response.value.coerced;
+    validated = response.value.config;
+  } else {
+    // Compatibility path for development without the native binary and for
+    // exotic JavaScript values that JSON cannot represent faithfully.
+    coerced = {};
+    for (const field of EDITABLE_SETTINGS) {
+      if (!(field.key in patch)) continue;
+      const raw = patch[field.key];
+      if (field.type === "number") {
+        const n = typeof raw === "number" ? raw : Number(String(raw).trim());
+        // An empty text input is missing, not numeric zero.
+        if (typeof raw !== "number" && !String(raw ?? "").trim()) {
+          return { ok: false, error: `${field.label} must be a number`, changed: [] };
+        }
+        if (!Number.isFinite(n)) {
+          return { ok: false, error: `${field.label} must be a number`, changed: [] };
+        }
+        coerced[field.key] = n;
+      } else if (field.type === "boolean") {
+        const parsed = coerceBoolean(raw);
+        if (parsed === null) {
+          return { ok: false, error: `${field.label} must be true or false`, changed: [] };
+        }
+        coerced[field.key] = parsed;
+      } else if (field.type === "list") {
+        const items = Array.isArray(raw) ? raw : String(raw ?? "").split(",");
+        coerced[field.key] = items
+          .filter((x: any) => typeof x === "string" && x.trim())
+          .map((x: string) => x.trim());
+      } else {
+        coerced[field.key] = typeof raw === "string" ? raw.trim() : String(raw);
+      }
+    }
+
+    const merged = { ...current, ...coerced };
+    try {
+      validated = validateConfig(merged);
+    } catch (e: any) {
+      if (e instanceof NativeCoreError && e.code !== "CONFIG_VALIDATION") throw e;
+      const issue = e?.issues?.[0];
+      const where = issue?.path?.length ? `${issue.path.join(".")}: ` : "";
+      return { ok: false, error: `${where}${issue?.message || "invalid configuration"}`, changed: [] };
+    }
   }
 
   const changed = Object.keys(coerced).filter(

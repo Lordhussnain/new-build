@@ -31,6 +31,7 @@ import { jobFittedBaseFilename } from "./download-args";
 import { activeDownloadJobs, abortController, getConfig, isJobCancelled, isPaused } from "./state";
 import { engineFencing, holdsEngineLease, readEngineLease, describeEngineLease, withEngineLease } from "./lease";
 import type { Config } from "./config";
+import { nativeCore, nativeValue } from "./native-core";
 
 /**
  * Interrupted mid-download jobs become 'paused' + 'interrupted' so they are
@@ -101,6 +102,9 @@ export function reconcileCrashedJobs(): number {
  * matter how long it runs.
  */
 export function STALE_CLAIM_THRESHOLDS(config: Pick<Config, "maxDownloadMinutes">) {
+  if (nativeCore && Number.isFinite(config.maxDownloadMinutes)) {
+    return nativeValue<{ download: string; conversion: string; metadata: string }>(nativeCore.staleClaimThresholds(config.maxDownloadMinutes));
+  }
   return {
     download: `-${Math.max(20, config.maxDownloadMinutes)} minutes`,
     conversion: "-3 hours",
@@ -120,6 +124,9 @@ export function STALE_CLAIM_THRESHOLDS(config: Pick<Config, "maxDownloadMinutes"
  * panel cannot drift from what the reaper actually does.
  */
 export function staleClaimCondition(stage: ClaimStage, modifier: string, alias = ""): string {
+  if (nativeCore) {
+    return nativeValue<string>(nativeCore.staleClaimCondition(stage, modifier, alias));
+  }
   const c = claimColumns(stage);
   const heartbeat = `COALESCE(${alias}${c.heartbeat}, ${alias}${c.at})`;
   return `(${heartbeat} IS NULL OR ${heartbeat} < datetime('now', '${modifier}'))`;
@@ -580,7 +587,9 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
   // SQLite modifier built only from a validated integer — never user text.
   // With ignoreCooldown there is no age filter at all (a `-0 minutes` modifier
   // would still exclude rows whose updated_at falls in the current second).
-  const modifier = ignoreCooldown ? "" : `AND updated_at < datetime('now', '-${Math.floor(config.requeueFailedAfterMinutes)} minutes')`;
+  const modifier = nativeCore && Number.isFinite(config.requeueFailedAfterMinutes)
+    ? nativeValue<string>(nativeCore.requeueCooldownModifier(config.requeueFailedAfterMinutes, ignoreCooldown))
+    : ignoreCooldown ? "" : `AND updated_at < datetime('now', '-${Math.floor(config.requeueFailedAfterMinutes)} minutes')`;
 
   try {
     // --- Downloads -----------------------------------------------------------
@@ -676,6 +685,7 @@ export const ARIA2_CONTROL_SUFFIX = ".aria2";
 
 /** A partial download plus every sidecar that must travel with it. */
 export function partialSidecars(partialPath: string): string[] {
+  if (nativeCore) return nativeValue<string[]>(nativeCore.partialSidecars(partialPath));
   return [partialPath, `${partialPath}${ARIA2_CONTROL_SUFFIX}`];
 }
 
@@ -1001,7 +1011,11 @@ export async function cleanOrphanedFiles(
       if (!s) continue;
       const ageMs = Date.now() - s.mtimeMs;
       if (isSuperseded) {
-        if (!supersededOwners.has(pathKey(fullPath)) && ageMs > ORPHAN_PARTIAL_MAX_AGE_MS) {
+        const owned = supersededOwners.has(pathKey(fullPath));
+        const remove = nativeCore
+          ? nativeValue<{ remove: boolean }>(nativeCore.orphanCleanupDecision(ageMs, ORPHAN_PARTIAL_MAX_AGE_MS, owned, false)).remove
+          : !owned && ageMs > ORPHAN_PARTIAL_MAX_AGE_MS;
+        if (remove) {
           await unlink(fullPath).catch(() => {});
           removed++;
         }
@@ -1009,19 +1023,40 @@ export async function cleanOrphanedFiles(
       }
       const owner = owners.get(pathKey(fullPath));
       if (owner) {
-        const waitingForCooldownRetry =
+        const nativeDecision = nativeCore
+          ? nativeValue<{
+              waitingForCooldownRetry: boolean;
+              waitingForCookies: boolean;
+              mayResume: boolean;
+              exhausted: boolean;
+              abandoned: boolean;
+              ancient: boolean;
+              remove: boolean;
+            }>(nativeCore.partialCleanupDecision(JSON.stringify({
+              status: owner.status,
+              retries: owner.retries,
+              lastError: owner.lastError,
+              ageMs,
+              cap,
+              hasConfig: !!config,
+              requeueFailedAfterMinutes: config?.requeueFailedAfterMinutes ?? 0,
+              partialMaxAgeMs: PARTIAL_MAX_AGE_MS,
+            })))
+          : null;
+        const waitingForCooldownRetry = nativeDecision?.waitingForCooldownRetry ?? (
           owner.status === "failed" &&
           !!config &&
           config.requeueFailedAfterMinutes > 0 &&
-          !isPermanentDownloadError(owner.lastError);
-        const waitingForCookies = owner.status === "failed" && isCredentialBlockedError(owner.lastError);
-        const mayResume = waitingForCooldownRetry || waitingForCookies;
-        const exhausted = owner.status === "failed" && cap > 0 && owner.retries >= cap && !mayResume;
+          !isPermanentDownloadError(owner.lastError)
+        );
+        const waitingForCookies = nativeDecision?.waitingForCookies ?? (owner.status === "failed" && isCredentialBlockedError(owner.lastError));
+        const mayResume = nativeDecision?.mayResume ?? (waitingForCooldownRetry || waitingForCookies);
+        const exhausted = nativeDecision?.exhausted ?? (owner.status === "failed" && cap > 0 && owner.retries >= cap && !mayResume);
         // Cookie-blocked jobs can resume much later when credentials change,
         // independently of the normal cooldown setting or retry budget.
-        const abandoned = !RESUMABLE_PARTIAL_STATUSES.has(owner.status) && !mayResume;
-        const ancient = abandoned && ageMs > PARTIAL_MAX_AGE_MS;
-        if (exhausted || ancient) {
+        const abandoned = nativeDecision?.abandoned ?? (!RESUMABLE_PARTIAL_STATUSES.has(owner.status) && !mayResume);
+        const ancient = nativeDecision?.ancient ?? (abandoned && ageMs > PARTIAL_MAX_AGE_MS);
+        if (nativeDecision?.remove ?? (exhausted || ancient)) {
           // Take the aria2c control file with it, or the next attempt wedges.
           if (await removePartialAndReport(fullPath, summary)) removed++;
         }
@@ -1029,7 +1064,10 @@ export async function cleanOrphanedFiles(
         // Orphan: no job claims it — verify it does not match an active job's prefix before removing.
         const normalized = pathKey(fullPath);
         const isBelongingToActiveJob = Array.from(activeBasePrefixes).some((prefix) => normalized.startsWith(prefix));
-        if (!isBelongingToActiveJob && (await removePartialAndReport(fullPath, summary))) {
+        const remove = nativeCore
+          ? nativeValue<{ remove: boolean }>(nativeCore.orphanCleanupDecision(ageMs, ORPHAN_PARTIAL_MAX_AGE_MS, false, isBelongingToActiveJob)).remove
+          : !isBelongingToActiveJob && ageMs > ORPHAN_PARTIAL_MAX_AGE_MS;
+        if (remove && (await removePartialAndReport(fullPath, summary))) {
           removed++;
         }
       }

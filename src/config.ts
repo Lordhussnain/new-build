@@ -8,6 +8,7 @@ import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { z } from "zod";
+import { NativeCoreError, nativeCore, nativeValue } from "./native-core";
 
 export const CONFIG_PATH = "./config.json";
 
@@ -253,11 +254,38 @@ export const QUALITY_FORMATS: Record<string, string> = {
   audio: "ba/bestaudio",
 };
 
+/**
+ * Validate a complete config through Rust when the native core is available.
+ * Exotic JavaScript values that JSON cannot represent use the Zod fallback;
+ * native validation errors are never mistaken for an unavailable module.
+ */
+export function validateConfig(config: unknown): Config {
+  if (nativeCore) {
+    let serialized: string | undefined;
+    try {
+      serialized = JSON.stringify(config);
+    } catch {
+      return ConfigSchema.parse(config);
+    }
+    try {
+      return nativeValue<Config>(nativeCore.validateConfig(serialized ?? "null"));
+    } catch (error: any) {
+      // Only rejected user input is Zod-compatible. ABI, panic and malformed
+      // response failures must remain operational NativeCoreError instances.
+      if (error instanceof NativeCoreError && error.code === "CONFIG_VALIDATION") {
+        error.name = "ZodError";
+      }
+      throw error;
+    }
+  }
+  return ConfigSchema.parse(config);
+}
+
 /** Merge raw JSON over the defaults and validate the result. */
 export function parseConfig(raw: unknown): Config {
   const parsed = (raw ?? {}) as Record<string, unknown>;
   const merged = { ...DEFAULT_CONFIG, ...parsed };
-  return ConfigSchema.parse(merged);
+  return validateConfig(merged);
 }
 
 /**
@@ -280,7 +308,9 @@ export async function loadConfig(configPath: string = CONFIG_PATH): Promise<Conf
   try {
     return parseConfig(JSON.parse(raw));
   } catch (err: any) {
-    if (err?.name === "ZodError") {
+    if (err instanceof NativeCoreError && err.code !== "CONFIG_VALIDATION") {
+      console.error("❌ Native config validation failed:", err.message);
+    } else if (err?.name === "ZodError") {
       // Zod v4 exposes validation problems via `issues` (not `errors`).
       console.error("❌ Invalid config.json:", JSON.stringify(err.issues ?? [], null, 2));
     } else {
@@ -291,14 +321,19 @@ export async function loadConfig(configPath: string = CONFIG_PATH): Promise<Conf
 }
 
 /**
- * Config-manager loader: never exits, never throws — falls back to defaults so
- * the interactive tool stays usable with a corrupted file.
+ * Config-manager loader: malformed config falls back to defaults. Operational
+ * native failures are rethrown so a healthy file is never mistaken for damage
+ * and subsequently overwritten by the interactive tool.
  */
 export async function loadConfigSafe(configPath: string = CONFIG_PATH): Promise<Config> {
   if (!existsSync(configPath)) return { ...DEFAULT_CONFIG };
   try {
     return parseConfig(JSON.parse(await readFile(configPath, "utf-8")));
   } catch (err: any) {
+    if (err instanceof NativeCoreError && err.code !== "CONFIG_VALIDATION") {
+      console.error("❌ Native config validation failed; defaults were not loaded:", err.message);
+      throw err;
+    }
     if (err?.name === "ZodError") {
       console.error("❌ config.json is invalid or corrupted:", JSON.stringify(err.issues ?? [], null, 2));
     } else {
@@ -322,7 +357,7 @@ export function withConfigWriteLock<T>(update: () => Promise<T>): Promise<T> {
 
 /** Validate, then atomically replace the file (never truncate the live config). */
 export async function saveConfig(config: Config, configPath: string = CONFIG_PATH): Promise<void> {
-  const validated = ConfigSchema.parse(config);
+  const validated = validateConfig(config);
   // Same directory/volume so rename is atomic. A crash can leave a .tmp,
   // but it cannot leave a half-written config.json and erase saved sources.
   const tempPath = `${configPath}.${randomUUID()}.tmp`;
@@ -350,6 +385,7 @@ const OFFLINE_FALSE = new Set(["false", "0", "no", "off"]);
  * operator's back.
  */
 export function parseOfflineSwitch(raw: string): boolean | null {
+  if (nativeCore) return nativeValue<boolean | null>(nativeCore.parseOfflineSwitch(raw ?? ""));
   const value = (raw ?? "").trim().toLowerCase();
   if (value === "" || OFFLINE_TRUE.has(value)) return true;
   if (OFFLINE_FALSE.has(value)) return false;
@@ -377,6 +413,12 @@ export function offlineOverrideFromRuntime(
   argv: readonly string[] = process.argv.slice(2),
   env: Record<string, string | undefined> = process.env,
 ): boolean | null {
+  if (nativeCore) {
+    return nativeValue<boolean | null>(nativeCore.offlineOverride(
+      JSON.stringify(argv.map((arg) => String(arg))),
+      JSON.stringify(env) ?? "null",
+    ));
+  }
   let fromArgv: boolean | null = null;
   for (const raw of argv) {
     const arg = String(raw).trim().toLowerCase();
@@ -402,6 +444,11 @@ export function offlineOverrideFromRuntime(
  * the existing `--offline` override behavior.
  */
 export function webPortOverrideFromRuntime(argv: readonly string[] = process.argv.slice(2)): number | null {
+  if (nativeCore) {
+    return nativeValue<number | null>(nativeCore.webPortOverride(
+      JSON.stringify(argv.map((arg) => String(arg))),
+    ));
+  }
   let override: number | null = null;
   for (let i = 0; i < argv.length; i++) {
     const arg = String(argv[i]).trim();
@@ -463,6 +510,11 @@ export function effectiveWebToken(config: { webToken: string }): string {
  * expose the UI unprotected. The value keeps its case and is trimmed.
  */
 export function webTokenOverrideFromRuntime(argv: readonly string[] = process.argv.slice(2)): string | null {
+  if (nativeCore) {
+    return nativeValue<string | null>(nativeCore.webTokenOverride(
+      JSON.stringify(argv.map((arg) => String(arg))),
+    ));
+  }
   let override: string | null = null;
   for (let i = 0; i < argv.length; i++) {
     const arg = String(argv[i]).trim();
@@ -507,6 +559,12 @@ export function lanOverrideFromRuntime(
   argv: readonly string[] = process.argv.slice(2),
   env: Record<string, string | undefined> = process.env,
 ): boolean | null {
+  if (nativeCore) {
+    return nativeValue<boolean | null>(nativeCore.lanOverride(
+      JSON.stringify(argv.map((arg) => String(arg))),
+      JSON.stringify(env) ?? "null",
+    ));
+  }
   let fromArgv: boolean | null = null;
   for (const raw of argv) {
     const arg = String(raw).trim().toLowerCase();

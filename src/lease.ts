@@ -27,6 +27,7 @@
 import { hostname } from "node:os";
 import { db } from "./db";
 import { logError } from "./logger";
+import { nativeCore, nativeValue } from "./native-core";
 
 /** How long an engine lease stays valid without a heartbeat. */
 export const ENGINE_LEASE_TTL_MS = 60_000;
@@ -126,8 +127,11 @@ function parseSqliteUtc(value: string | null): number {
 
 /** True when `lease` is free or its heartbeat has lapsed. */
 export function isLeaseExpired(lease: EngineLease | null): boolean {
+  const expires = lease ? parseSqliteUtc(lease.expiresAt) : 0;
+  if (nativeCore) {
+    return nativeValue<boolean>(nativeCore.leaseExpired(JSON.stringify(lease), expires, Date.now()));
+  }
   if (!lease || !lease.owner) return true;
-  const expires = parseSqliteUtc(lease.expiresAt);
   if (!expires) return true;
   return expires <= Date.now();
 }
@@ -162,6 +166,14 @@ export function hasLiveLeaseOwner(): boolean {
 /** True when THIS process holds the unexpired lease. */
 export function holdsEngineLease(): boolean {
   const lease = readEngineLease();
+  if (nativeCore) {
+    return nativeValue<boolean>(nativeCore.holdsLease(
+      JSON.stringify(lease),
+      JSON.stringify(currentLease),
+      lease ? parseSqliteUtc(lease.expiresAt) : 0,
+      Date.now(),
+    ));
+  }
   return !!currentLease && !!lease && lease.owner === currentLease.owner &&
     lease.fencing === currentLease.fencing && !isLeaseExpired(lease);
 }
@@ -205,10 +217,19 @@ export function acquireEngineLease(opts: { ttlMs?: number } = {}): LeaseAcquireR
     // means the lease has not expired AND (when we can tell) its process still
     // exists — a hard-killed engine's lease must not block its own restart.
     const ownerGone = leaseOwnerIsDead(existing);
-    if (existing && !isLeaseExpired(existing) && !ownerGone) {
+    const nativeDecision = nativeCore
+      ? nativeValue<{ decision: "renew" | "refuse" | "acquire"; tookOver: boolean }>(nativeCore.leaseAcquisition(
+          JSON.stringify(existing),
+          owner,
+          existing ? parseSqliteUtc(existing.expiresAt) : 0,
+          Date.now(),
+          ownerGone,
+        ))
+      : null;
+    if (nativeDecision ? nativeDecision.decision === "refuse" : existing && !isLeaseExpired(existing) && !ownerGone) {
       return { acquired: false, lease: existing, tookOver: false };
     }
-    const tookOver = !!existing?.owner;
+    const tookOver = nativeDecision?.tookOver ?? !!existing?.owner;
     // The WHERE clause on DO UPDATE is the atomic "only if still expired"
     // guard: if another process slipped in between the read above and here,
     // the update is skipped and nothing is returned.

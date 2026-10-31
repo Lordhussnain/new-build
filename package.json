@@ -9,9 +9,10 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck && bun run test",
-    "build:win": "bun build --compile --target=bun-windows-x64 batch_playlist_downloader.ts --outfile dist/youtube-archive.exe",
-    "build:win:config": "bun build --compile --target=bun-windows-x64 update_config.ts --outfile dist/archive-config.exe",
-    "build:win:all": "bun run build:win && bun run build:win:config"
+    "build:native": "bun scripts/build-native.mjs",
+    "build:win": "bun scripts/build-native.mjs --windows && bun build --compile --target=bun-windows-x64 batch_playlist_downloader.ts --outfile dist/youtube-archive.exe && bun scripts/build-native.mjs --package",
+    "build:win:config": "bun scripts/build-native.mjs --windows && bun build --compile --target=bun-windows-x64 update_config.ts --outfile dist/archive-config.exe && bun scripts/build-native.mjs --package",
+    "build:win:all": "bun scripts/build-native.mjs --windows && bun build --compile --target=bun-windows-x64 batch_playlist_downloader.ts --outfile dist/youtube-archive.exe && bun build --compile --target=bun-windows-x64 update_config.ts --outfile dist/archive-config.exe && bun scripts/build-native.mjs --package"
   },
   "dependencies": {
     "zod": "^4.6.5"

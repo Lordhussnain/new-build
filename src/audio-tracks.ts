@@ -17,6 +17,36 @@
 
 import { createCookieInvocation, jsRuntimeArgs, ytDlp } from "./tools";
 import type { MultiAudioMode } from "./config";
+import { nativeCore, nativeValue } from "./native-core";
+
+function serializeForNative(value: unknown): string | null {
+  try {
+    return JSON.stringify(value) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Rust uses ordinal ordering; JavaScript's localeCompare is retained for
+ * nonstandard ids/language tags where its result can be locale-dependent. */
+function nativeAudioOrderingSafe(info: unknown): boolean {
+  const formats = (info as { formats?: unknown } | null)?.formats;
+  if (!Array.isArray(formats)) return true;
+  for (const raw of formats) {
+    if (!raw || typeof raw !== "object") continue;
+    const format = raw as Record<string, unknown>;
+    const formatId = typeof format.format_id === "string" ? format.format_id : "";
+    const acodec = typeof format.acodec === "string" ? format.acodec : "";
+    const vcodec = typeof format.vcodec === "string" ? format.vcodec : "";
+    if (!formatId || /-drc$/i.test(formatId) || !acodec || acodec === "none" || (vcodec && vcodec !== "none")) {
+      continue;
+    }
+    if (!/^\d+(?:-\d+)?$/.test(formatId)) return false;
+    const language = typeof format.language === "string" ? format.language.trim() : "";
+    if (language && !/^[a-z]{2,3}$/.test(language)) return false;
+  }
+  return true;
+}
 
 export interface AudioTrack {
   /** Best yt-dlp format id for this track (e.g. `251-1`). */
@@ -73,7 +103,7 @@ function preferStream(a: AudioTrack, b: AudioTrack): number {
  * collapse to their best stream. Tracks come back in video order: the
  * default/original track first, then by track index.
  */
-export function extractAudioTracks(info: unknown): AudioTrack[] {
+function extractAudioTracksTypeScript(info: unknown): AudioTrack[] {
   const formats = (info as { formats?: unknown } | null)?.formats;
   if (!Array.isArray(formats)) return [];
 
@@ -119,6 +149,16 @@ export function extractAudioTracks(info: unknown): AudioTrack[] {
   return tracks;
 }
 
+export function extractAudioTracks(info: unknown): AudioTrack[] {
+  if (nativeCore && nativeAudioOrderingSafe(info)) {
+    const serialized = serializeForNative(info);
+    if (serialized !== null) {
+      return nativeValue<AudioTrack[]>(nativeCore.extractAudioTracks(serialized));
+    }
+  }
+  return extractAudioTracksTypeScript(info);
+}
+
 function normalizeLangs(values?: string[] | null): Set<string> {
   return new Set(
     (values ?? [])
@@ -136,7 +176,7 @@ function normalizeLangs(values?: string[] | null): Set<string> {
  * global mode". `off` selects nothing — the caller falls back to the classic
  * single-track format selection.
  */
-export function selectAudioTracks(
+function selectAudioTracksTypeScript(
   tracks: AudioTrack[],
   mode: MultiAudioMode,
   wantedLanguages: string[],
@@ -155,13 +195,28 @@ export function selectAudioTracks(
   return [];
 }
 
+export function selectAudioTracks(
+  tracks: AudioTrack[],
+  mode: MultiAudioMode,
+  wantedLanguages: string[],
+  jobSelection?: string[] | null,
+): AudioTrack[] {
+  if (nativeCore) {
+    const serialized = serializeForNative({ tracks, mode, wantedLanguages, jobSelection });
+    if (serialized !== null) {
+      return nativeValue<AudioTrack[]>(nativeCore.selectAudioTracks(serialized));
+    }
+  }
+  return selectAudioTracksTypeScript(tracks, mode, wantedLanguages, jobSelection);
+}
+
 /**
  * Splice explicit audio format ids into a QUALITY_FORMATS preset:
  * `bv[height<=1080]+ba/b[height<=1080]` + `[251-0, 251-1]` becomes
  * `bv[height<=1080]+251-0+251-1/b[height<=1080]`. The video side and the
  * fallback of the preset are preserved.
  */
-export function multiAudioFormatSelector(
+function multiAudioFormatSelectorTypeScript(
   baseFormat: string,
   tracks: AudioTrack[],
 ): string {
@@ -170,6 +225,16 @@ export function multiAudioFormatSelector(
   const videoSide = primary.split("+")[0];
   const ids = tracks.map((t) => t.formatId).join("+");
   return fallback ? `${videoSide}+${ids}/${fallback}` : `${videoSide}+${ids}`;
+}
+
+export function multiAudioFormatSelector(baseFormat: string, tracks: AudioTrack[]): string {
+  if (nativeCore) {
+    const serialized = serializeForNative(tracks);
+    if (serialized !== null) {
+      return nativeValue<string>(nativeCore.multiAudioFormatSelector(baseFormat, serialized));
+    }
+  }
+  return multiAudioFormatSelectorTypeScript(baseFormat, tracks);
 }
 
 /**

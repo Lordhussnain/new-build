@@ -4,6 +4,7 @@
 import { CONFIG_PATH, saveConfig, withConfigWriteLock, type Config } from "./config";
 import { removeSourceJobsFromDatabase, type SourceJobCleanup } from "./db";
 import { getConfig, setConfig } from "./state";
+import { nativeCore, nativeValue } from "./native-core";
 
 export const SOURCE_KEYS = ["playlists", "channels", "channelPlaylists"] as const;
 export type SourceKey = (typeof SOURCE_KEYS)[number];
@@ -37,6 +38,9 @@ export interface BatchSourceError {
 /** Canonical identities ignore share/tracking params, not playlist/video ids. */
 export function parseSourceUrl(input: unknown, opts: ParseSourceOptions = {}): SourceUrl {
   if (typeof input !== "string" || !input.trim()) throw new Error("YouTube URL required");
+  if (nativeCore) {
+    return nativeValue<SourceUrl>(nativeCore.parseSourceUrl(input, Boolean(opts.singleVideo)));
+  }
   const text = input.trim();
   if (text.length > 8192 || /[\x00-\x20\x7f]/.test(text)) throw new Error("Invalid YouTube URL");
   let parsed: URL;
@@ -91,6 +95,7 @@ export function parseSourceUrl(input: unknown, opts: ParseSourceOptions = {}): S
 
 /** Stable key used to connect a config URL to its video jobs in SQLite. */
 export function sourceIdentity(input: string): string {
+  if (nativeCore) return nativeValue<string>(nativeCore.sourceIdentity(input));
   const trimmed = input.trim();
   try {
     return parseSourceUrl(trimmed).url;
@@ -178,13 +183,36 @@ export async function saveBatchSources(
   const errors: BatchSourceError[] = [];
   const parsed = new Map<string, SourceUrl>();
   let valid = 0;
-  for (const entry of entries) {
-    try {
-      const source = parseSourceUrl(entry.input, opts);
-      valid++;
-      if (!parsed.has(source.url)) parsed.set(source.url, source);
-    } catch (error: any) {
-      errors.push({ line: entry.line, input: entry.input, error: error?.message || "Invalid YouTube URL" });
+  if (nativeCore) {
+    const outcomes = nativeValue<{ source?: SourceUrl; error?: string }[]>(
+      nativeCore.parseSourceUrls(
+        JSON.stringify(entries.map((entry) => entry.input)),
+        Boolean(opts.singleVideo),
+      ),
+    );
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index];
+      const outcome = outcomes[index];
+      if (outcome?.source) {
+        valid++;
+        if (!parsed.has(outcome.source.url)) parsed.set(outcome.source.url, outcome.source);
+      } else {
+        errors.push({
+          line: entry.line,
+          input: entry.input,
+          error: outcome?.error || "Invalid YouTube URL",
+        });
+      }
+    }
+  } else {
+    for (const entry of entries) {
+      try {
+        const source = parseSourceUrl(entry.input, opts);
+        valid++;
+        if (!parsed.has(source.url)) parsed.set(source.url, source);
+      } catch (error: any) {
+        errors.push({ line: entry.line, input: entry.input, error: error?.message || "Invalid YouTube URL" });
+      }
     }
   }
   if (parsed.size === 0) return { saved: [], errors, valid };

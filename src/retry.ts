@@ -1,5 +1,28 @@
 // src/retry.ts — pure retry/resume policy (no I/O, fully unit-tested).
 
+import { nativeCore, nativeValue } from "./native-core";
+
+interface NativeRetryClassification {
+  nChallenge: boolean;
+  signatureChallenge: boolean;
+  diskFull: boolean;
+  permanent: boolean;
+  formatAvailability: boolean;
+  terminal: TerminalErrorInfo | null;
+  terminalMessage: boolean;
+  credentialBlocked: boolean;
+  transient: boolean;
+  unrecoverableResume: boolean;
+  downloaderArgs: boolean;
+}
+
+function nativeRetryClassification(message: string | null | undefined): NativeRetryClassification | null {
+  // Rust regex word boundaries and Unicode case folding deliberately do not
+  // replace JavaScript's exact semantics for non-ASCII diagnostic text.
+  if (!nativeCore || (message && /[^\x00-\x7F]/.test(message))) return null;
+  return nativeValue<NativeRetryClassification>(nativeCore.retryClassification(message ?? ""));
+}
+
 /**
  * Exponential backoff with jitter, in milliseconds.
  *
@@ -7,11 +30,11 @@
  * 30% random jitter so many workers that failed together don't retry in
  * lockstep. The RNG is injectable to keep tests deterministic.
  */
-export function computeBackoffMs(
+function computeBackoffMsTypeScript(
   attempt: number,
   baseSeconds: number,
   maxSeconds: number,
-  rnd: () => number = Math.random,
+  rnd: () => number,
 ): number {
   const a = Math.max(0, Math.floor(Number.isFinite(attempt) ? attempt : 0));
   const base = Math.max(1, baseSeconds);
@@ -19,6 +42,22 @@ export function computeBackoffMs(
   const exponential = Math.min(cap, base * 2 ** a);
   const jittered = exponential * (1 + 0.3 * Math.min(1, Math.max(0, rnd())));
   return Math.round(jittered * 1000);
+}
+
+export function computeBackoffMs(
+  attempt: number,
+  baseSeconds: number,
+  maxSeconds: number,
+  rnd: () => number = Math.random,
+): number {
+  if (nativeCore && [attempt, baseSeconds, maxSeconds].every(Number.isFinite)) {
+    const random = rnd();
+    if (Number.isFinite(random)) {
+      return nativeValue<number>(nativeCore.computeBackoffMs(attempt, baseSeconds, maxSeconds, random));
+    }
+    return computeBackoffMsTypeScript(attempt, baseSeconds, maxSeconds, () => random);
+  }
+  return computeBackoffMsTypeScript(attempt, baseSeconds, maxSeconds, rnd);
 }
 
 /**
@@ -33,6 +72,9 @@ export function computeDownloadTimeoutMs(
   durationSeconds: number | null | undefined,
   opts: { minMinutes: number; maxMinutes: number },
 ): number {
+  if (nativeCore && (durationSeconds == null || Number.isFinite(durationSeconds)) && Number.isFinite(opts.minMinutes) && Number.isFinite(opts.maxMinutes)) {
+    return nativeValue<number>(nativeCore.computeDownloadTimeoutMs(durationSeconds ?? 0, opts.minMinutes, opts.maxMinutes));
+  }
   const minMs = Math.max(1, opts.minMinutes) * 60_000;
   const maxMs = Math.max(minMs / 60_000, opts.maxMinutes) * 60_000;
   if (!durationSeconds || !Number.isFinite(durationSeconds) || durationSeconds <= 0) return minMs;
@@ -96,6 +138,8 @@ const PERMANENT_ERROR_PATTERNS: RegExp[] = [
  * `isPermanentDownloadError` itself refuses to match when this is set).
  */
 export function isNChallengeError(message: string | null | undefined): boolean {
+  const native = nativeRetryClassification(message);
+  if (native) return native.nChallenge;
   if (!message) return false;
   const m = message.toLowerCase();
   return (
@@ -114,6 +158,8 @@ export function isNChallengeError(message: string | null | undefined): boolean {
  * failures that `yt-dlp -U` cannot repair.
  */
 export function isSignatureChallengeError(message: string | null | undefined): boolean {
+  const native = nativeRetryClassification(message);
+  if (native) return native.signatureChallenge;
   if (!message) return false;
   return [
     /signature extraction failed/i,
@@ -127,6 +173,8 @@ export function isSignatureChallengeError(message: string | null | undefined): b
 
 /** Disk exhaustion is an engine-wide resource condition, not a video failure. */
 export function isDiskFullError(message: string | null | undefined): boolean {
+  const native = nativeRetryClassification(message);
+  if (native) return native.diskFull;
   if (!message) return false;
   return [
     /\b(?:enospc|error_disk_full)\b/i,
@@ -143,6 +191,8 @@ export function isDiskFullError(message: string | null | undefined): boolean {
  * retrying is pointless.
  */
 export function isPermanentDownloadError(message: string | null | undefined): boolean {
+  const native = nativeRetryClassification(message);
+  if (native) return native.permanent;
   // Our own durable record wins over everything (including the n-challenge
   // guard below): the terminal path is the ONLY writer of the marker, and it
   // never writes it for an n-challenge failure.
@@ -173,6 +223,8 @@ export function isPermanentDownloadError(message: string | null | undefined): bo
  * permanently: the video itself is perfectly downloadable.
  */
 export function isFormatAvailabilityError(message: string | null | undefined): boolean {
+  const native = nativeRetryClassification(message);
+  if (native) return native.formatAvailability;
   if (!message) return false;
   const m = message.toLowerCase();
   return (
@@ -310,6 +362,8 @@ const CREDENTIAL_NEVER_RESCUE: ReadonlySet<TerminalErrorCode> = new Set([
 
 /** Classify a raw yt-dlp error tail into a terminal reason, or null. */
 export function classifyTerminalDownloadError(message: string | null | undefined): TerminalErrorInfo | null {
+  const native = nativeRetryClassification(message);
+  if (native) return native.terminal;
   if (!message) return null;
   const hard = TERMINAL_ERROR_RULES.find((rule) => CREDENTIAL_NEVER_RESCUE.has(rule.code) && rule.pattern.test(message));
   if (hard) return { code: hard.code, label: hard.label };
@@ -321,6 +375,8 @@ export function classifyTerminalDownloadError(message: string | null | undefined
 
 /** True when `message` is a `jobs.last_error` written by the terminal path. */
 export function isTerminalErrorMessage(message: string | null | undefined): boolean {
+  const native = nativeRetryClassification(message);
+  if (native) return native.terminalMessage;
   if (typeof message !== "string") return false;
   return message.trimStart().toLowerCase().startsWith(TERMINAL_ERROR_MARKER);
 }
@@ -334,6 +390,8 @@ const CREDENTIAL_RESCUABLE_CODES: ReadonlySet<TerminalErrorCode> = new Set([
 // Generic "Video unavailable" can accompany a genuine login/cookie failure;
 // hard terminal evidence still wins even when a credential hint appears first.
 export function isCredentialBlockedError(message: string | null | undefined): boolean {
+  const native = nativeRetryClassification(message);
+  if (native) return native.credentialBlocked;
   if (!message) return false;
   const stored = parseStoredTerminalError(message);
   const detail = stored?.detail ?? message;
@@ -365,6 +423,9 @@ export function isCredentialBlockedError(message: string | null | undefined): bo
  * label in front are what the sweep, the API and the dashboard read.
  */
 export function formatTerminalErrorMessage(info: TerminalErrorInfo, raw: string | null | undefined): string {
+  if (nativeCore && (!raw || /^[\x00-\x7F]*$/.test(String(raw))) && /^[\x00-\x7F]*$/.test(`${info.code}${info.label}`)) {
+    return nativeValue<string>(nativeCore.formatTerminalErrorMessage(JSON.stringify(info), String(raw ?? "")));
+  }
   const fullDetail = String(raw ?? "").replace(/\s+/g, " ").trim();
   // Decide before truncating: the relevant login or hard-terminal evidence can
   // be at the far end of yt-dlp's output. A generic unavailable label needs a
@@ -385,6 +446,9 @@ export function formatTerminalErrorMessage(info: TerminalErrorInfo, raw: string 
 export function parseStoredTerminalError(
   message: string | null | undefined,
 ): { label: string; detail: string } | null {
+  if (nativeCore && (message == null || /^[\x00-\x7F]*$/.test(message))) {
+    return nativeValue<{ label: string; detail: string } | null>(nativeCore.parseStoredTerminalError(message ?? ""));
+  }
   if (!isTerminalErrorMessage(message)) return null;
   const rest = String(message).trimStart().slice(TERMINAL_ERROR_MARKER.length).trim();
   const [label, ...detail] = rest.split(" — ");
@@ -415,6 +479,9 @@ export const FORMAT_FALLBACK_LADDER: readonly string[] = ["4k", "1440p", "1080p"
  * terminal format failure.
  */
 export function nextFormatFallback(current: string | null | undefined): string | null {
+  if (nativeCore && (current == null || /^[\x00-\x7F]*$/.test(current))) {
+    return nativeValue<string | null>(nativeCore.nextFormatFallback(current ?? ""));
+  }
   const key = String(current ?? "")
     .trim()
     .toLowerCase();
@@ -432,6 +499,7 @@ export function nextFormatFallback(current: string | null | undefined): string |
  * a row must never be mistaken for a dead video by the cooldown sweep.
  */
 export function formatSwitchMessage(from: string, to: string): string {
+  if (nativeCore) return nativeValue<string>(nativeCore.formatSwitchMessage(from, to));
   return `Requested quality ${from} is not available for this video — switched to ${to} automatically.`;
 }
 
@@ -459,6 +527,9 @@ export function progressAwareRetryState(
   progress: number,
   retryCap: number,
 ): ProgressAwareRetryState {
+  if (nativeCore && [retryCount, bestProgress, progress, retryCap].every(Number.isFinite)) {
+    return nativeValue<ProgressAwareRetryState>(nativeCore.progressAwareRetryState(retryCount, bestProgress, progress, retryCap));
+  }
   const count = Math.max(0, Math.floor(Number.isFinite(retryCount) ? retryCount : 0));
   const best = Math.min(100, Math.max(0, Number.isFinite(bestProgress) ? bestProgress : 0));
   const current = Math.min(100, Math.max(0, Number.isFinite(progress) ? progress : 0));
@@ -478,6 +549,8 @@ export function progressAwareRetryState(
  * and an immediate-ish retry is worthwhile.
  */
 export function isTransientDownloadError(message: string): boolean {
+  const native = nativeRetryClassification(message);
+  if (native) return native.transient;
   if (isDiskFullError(message)) return false;
   if (isNChallengeError(message) || isSignatureChallengeError(message)) return true;
   const m = message.toLowerCase();
@@ -555,6 +628,8 @@ export function isTransientDownloadError(message: string): boolean {
  * downloader take over — routing it here would throw away good work.
  */
 export function isUnrecoverableResumeError(message: string | null | undefined): boolean {
+  const native = nativeRetryClassification(message);
+  if (native) return native.unrecoverableResume;
   if (!message) return false;
   const m = message.toLowerCase();
   return (
@@ -578,6 +653,8 @@ export function isUnrecoverableResumeError(message: string | null | undefined): 
  * actionable reason instead (see workers/download.ts).
  */
 export function isDownloaderArgsError(message: string | null | undefined): boolean {
+  const native = nativeRetryClassification(message);
+  if (native) return native.downloaderArgs;
   if (!message) return false;
   const m = message.toLowerCase();
   return (

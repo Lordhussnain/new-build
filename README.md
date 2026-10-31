@@ -47,6 +47,7 @@ a terminal UI and a web dashboard to watch it all happen.
 ## Tech Stack
 
 - [Bun](https://bun.sh) + TypeScript — runtime and application logic
+- [Rust](https://www.rust-lang.org/) + N-API — native validation, source/output parsing, audio-track processing, scaling, retry classification, claim/lease decisions, reconciliation planning and download-argument policy (with a TypeScript development fallback; SQLite, filesystem, process and timer side effects remain in TypeScript)
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) — video and metadata extraction
 - [aria2c](https://aria2.github.io/) — optional multi-connection downloading
 - [ffmpeg](https://ffmpeg.org) — format conversion
@@ -54,6 +55,7 @@ a terminal UI and a web dashboard to watch it all happen.
 ## Requirements
 
 - Bun ≥ 1.0
+- Stable Rust/Cargo when building the native core or standalone executables (not required for the TypeScript development fallback)
 - `yt-dlp` and `ffmpeg` available on `PATH` (or configured explicitly)
 - [aria2c](https://aria2.github.io/) **optional** — enables multi-connection downloads; without it the engine uses yt-dlp's native downloader
 - A JavaScript runtime for YouTube's n-challenge: [Deno](https://deno.com) (recommended; yt-dlp's default), Node.js ≥ 22, or Bun. The engine discovers one at startup and passes `--js-runtimes` to every yt-dlp call. Without a runtime, YouTube downloads fail with "n challenge solving failed" — that is retried, never parked as a permanent video error. See [yt-dlp EJS](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
@@ -67,16 +69,19 @@ reported as a warning and never blocks startup.
 
 ```bash
 bun install
-bun run typecheck   # tsc --noEmit
-bun test            # unit + end-to-end suite (mocked yt-dlp/ffmpeg, no network needed)
-bun run check       # both
+bun run build:native # optional in development; enables the Rust core
+bun run typecheck    # tsc --noEmit
+bun test             # unit + end-to-end suite (mocked yt-dlp/ffmpeg, no network needed)
+bun run check        # both
+cargo test --manifest-path native/Cargo.toml
 ```
 
 The checked-in `package-lock.json` also supports reproducible npm dependency
 installation with `npm ci`; Bun is still required to run the app and test suite.
 Runtime data (`config.json`, `cookies.txt`, `archive.db`, logs, and the default
 `downloads/` tree) is ignored by Git. Review `.gitignore` before adding any new
-runtime output path.
+runtime output path. See [Rust native core](docs/rust-core.md) for its build,
+packaging, fallback, and performance details.
 
 The end-to-end tests (`tests/integration.test.ts`) run the real engine against
 the mock binaries in `tests/mocks/`, covering the happy path, transient-failure
@@ -774,12 +779,15 @@ The engine is fully supported on Windows 11. Recommended setup:
 **Quick start (no runtime install):**
 
 ```powershell
-# 1. Build the standalone exe (requires Bun once, on any machine)
-bun run build:win          # → dist\youtube-archive.exe
+# 1. Build on a machine with Bun + stable Rust installed
+bun run build:win          # → dist\youtube-archive.exe + dist\yta-core.node
 
 # 2. Double-click:
 start-archive.bat
 ```
+
+Keep `yta-core.node` beside the compiled exe when copying the app to another
+machine. The target machine needs neither Bun nor Rust.
 
 `start-archive.bat` sets UTF-8 codepage, puts the app folder first on `PATH`
 (so a local `yt-dlp.exe` / `ffmpeg.exe` sitting next to the app is picked up
