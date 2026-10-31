@@ -33,7 +33,7 @@ const WIN = process.platform === "win32";
  */
 const TEST_TIMEOUT_MS = WIN ? 30_000 : 10_000;
 
-type FakeMode = "ok" | "empty" | "fail" | "hang" | "many" | "channel" | "slow";
+type FakeMode = "ok" | "empty" | "fail" | "hang" | "many" | "mixed" | "channel" | "slow";
 
 /**
  * What yt-dlp prints for a channel, keyed by the listing URL it was given: the
@@ -110,6 +110,7 @@ beforeAll(async () => {
       `if (mode === "hang") await new Promise(() => {});`,
       `if (mode === "fail") { console.error("ERROR: Failed to extract playlist: scanner test error"); process.exit(7); }`,
       `if (mode === "many") { const rows = []; for (let i = 1; i <= 120; i++) rows.push("Mock Playlist|||many" + String(i).padStart(3, "0") + "|||Video " + i + "|||60"); console.log(rows.join("\\n")); }`,
+      `if (mode === "mixed") { const rows = []; for (let i = 1; i <= 70; i++) { rows.push("Mock Playlist|||mixed" + String(i).padStart(3, "0") + "|||Video " + i + "|||60"); if (i % 3 === 0) rows.push(""); if (i % 4 === 0) rows.push("Mock Playlist|||UCabcdefghij|||Other channel|||NA"); } console.log(rows.join("\\n")); }`,
       // A channel listing as yt-dlp prints it, chosen by the URL it was given.
       `if (mode === "channel") { const url = process.argv.at(-1); const tables = ${JSON.stringify(CHANNEL_LISTINGS)}; const key = url.endsWith("/playlists") ? "tab" : url.includes("list=") ? url.split("list=")[1] : "root"; console.log((tables[key] || []).join("\\n")); }`,
       // Prints a line every 200ms for about a second: slow, but never silent.
@@ -335,9 +336,27 @@ describe("getPlaylistItems", () => {
       expect(items).toHaveLength(120);
       expect(items[0]?.id).toBe("many001");
       expect(items[119]?.id).toBe("many120");
-      expect(batches.length).toBeGreaterThanOrEqual(3);
+      expect(batches.map((batch) => batch.length)).toEqual([50, 50, 20]);
       expect(batches.every((batch) => batch.length > 0 && batch.length <= LISTING_BATCH_SIZE)).toBe(true);
       expect(batches.flat()).toEqual(items);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "counts only accepted items toward batch boundaries when blank/channel rows are interleaved",
+    async () => {
+      await useScanner("mixed");
+      const batches: ListingItem[][] = [];
+      const items = await getPlaylistItems("https://www.youtube.com/playlist?list=abc", DEFAULT_CONFIG, {
+        onItems: (batch) => {
+          batches.push(batch);
+        },
+      });
+      expect(items).toHaveLength(70);
+      expect(batches.map((batch) => batch.length)).toEqual([50, 20]);
+      expect(batches.flat()).toEqual(items);
+      expect(items.every((item) => item.id.startsWith("mixed"))).toBe(true);
     },
     TEST_TIMEOUT_MS,
   );

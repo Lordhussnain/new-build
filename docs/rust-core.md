@@ -17,17 +17,21 @@ TypeScript APIs have not changed.
 | `src/db.ts` | Claim column descriptors, claim references, CAS UPDATE SQL, release SET clauses and per-video retry-cap selection | Bun SQLite execution, transactions, bindings, heartbeats and all schema mutations |
 | `src/lease.ts` | Lease expiry, owner/fencing checks and acquire/renew/refuse/take-over decisions | Same-host PID probes, SQLite immediate transactions, renewal SQL and heartbeat timers |
 | `src/reconcile.ts` | Stale-claim thresholds/predicates, cooldown modifiers, partial sidecar paths and orphan/partial cleanup decisions | Filesystem walks/removal, resume-path discovery, SQLite sweeps and superseded-file recovery |
+| `src/scanner.ts` | Batched listing-field parsing, video/playlist/channel classification, channel/Shorts suffixes, compatible YouTube URL normalization, Shorts decisions and pure ingest-plan values | Streaming UTF-8 decoding, ECMAScript `parseFloat`, yt-dlp execution, source expansion, archive/dedupe lookups, index allocation and SQLite transactions |
+| `src/archive.ts` | One-pass unique ID extraction in stable order and exact archive-record removal/filtering | UTF-8 file decoding, existence checks, reads/writes/appends and the returned `Set` |
 
-The native functions are synchronous and intentionally limited to small CPU-only
-jobs. Network requests, `yt-dlp`/`ffmpeg`, filesystem operations, and SQLite stay
-in Bun; moving those behind blocking N-API calls would make the application less
-responsive.
+The native functions are synchronous and CPU-only. Batch APIs amortize the N-API
+boundary over listing lines and ingest items. Network requests, `yt-dlp`/`ffmpeg`,
+filesystem operations, and SQLite stay in Bun; moving those behind blocking
+N-API calls would make the application less responsive. Listing durations retain
+JavaScript `parseFloat` semantics, and unusual URLs/IDs use explicit TypeScript
+compatibility paths instead of risking parser differences.
 
 ## TypeScript connection audit
 
 `native/src/lib.rs` is the single N-API boundary and `src/native-core.ts` is the
-single TypeScript loader/bridge. The bridge currently checks **48 exports at ABI
-3** before a binary can be used. `tests/native-core.test.ts` also checks that
+single TypeScript loader/bridge. The bridge currently checks **56 exports at ABI
+4** before a binary can be used. `tests/native-core.test.ts` also checks that
 every Rust module is registered and every export has an explicit TypeScript
 consumer. `abiVersion` is consumed by the loader itself. `defaultConfig` is a
 direct parity contract only: shipped defaults intentionally remain owned by
@@ -73,8 +77,8 @@ different validation rules.
 
 ## Performance expectations
 
-Rust can reduce CPU time and allocation for large metadata/source batches,
-repeated validation and output parsing. It does not make YouTube transfers or
+Rust can reduce CPU time and allocation for large metadata/source/listing batches,
+archive parsing, repeated validation and output parsing. It does not make YouTube transfers or
 ffmpeg conversion inherently faster: those workloads are dominated by the
 network and external processes. Small N-API calls also have a boundary cost, so
 benchmark representative workloads before claiming an end-to-end speedup.

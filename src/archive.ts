@@ -5,6 +5,65 @@
 // we must scrub the id, otherwise yt-dlp will skip the video forever.
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { NativeCoreError, nativeCore, nativeValue } from "./native-core";
+
+function invalidNativeArchiveResult(detail: string): never {
+  throw new NativeCoreError(
+    `Rust native core returned an invalid archive result (${detail})`,
+    "NATIVE_INVALID_RESPONSE",
+  );
+}
+
+function parseArchiveIdsTextTypeScript(text: string): string[] {
+  const ids = new Set<string>();
+  for (const line of text.split("\n")) {
+    const parts = line.trim().split(/\s+/);
+    const id = parts[parts.length - 1];
+    if (id) ids.add(id);
+  }
+  return [...ids];
+}
+
+/** Unique archive ids in first-appearance order; file decoding stays in Bun. */
+export function parseArchiveIdsText(text: string): string[] {
+  if (nativeCore && text.isWellFormed()) {
+    const ids = nativeValue<string[]>(nativeCore.parseArchiveIds(text));
+    if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) {
+      return invalidNativeArchiveResult("expected a string id array");
+    }
+    return ids;
+  }
+  return parseArchiveIdsTextTypeScript(text);
+}
+
+export interface ArchiveRemoval {
+  text: string;
+  /** True exactly when at least one LF-delimited record was removed. */
+  changed: boolean;
+}
+
+function removeArchiveIdTextTypeScript(text: string, videoId: string): ArchiveRemoval {
+  const lines = text.split("\n");
+  const kept = lines.filter((line) => {
+    const parts = line.trim().split(/\s+/);
+    return parts.length === 0 || parts[parts.length - 1] !== videoId;
+  });
+  const changed = kept.length !== lines.length;
+  return { text: changed ? kept.join("\n") : text, changed };
+}
+
+/** Pure archive filtering with the legacy newline/whitespace semantics. */
+export function removeArchiveIdText(text: string, videoId: string): ArchiveRemoval {
+  if (nativeCore && text.isWellFormed() && videoId.isWellFormed()) {
+    const result = nativeValue<ArchiveRemoval>(nativeCore.removeArchiveId(text, videoId));
+    if (!result || typeof result !== "object" || typeof result.text !== "string" ||
+      typeof result.changed !== "boolean") {
+      return invalidNativeArchiveResult("malformed removal result");
+    }
+    return result;
+  }
+  return removeArchiveIdTextTypeScript(text, videoId);
+}
 
 /**
  * Remove a video id from the archive file (the id is the last field of each
@@ -13,35 +72,37 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
  * leave their ignore tombstone in place.
  */
 export function removeFromArchive(archiveFile: string, videoId: string): boolean {
+  let text: string;
   try {
     if (!archiveFile || !existsSync(archiveFile)) return true;
-    const lines = readFileSync(archiveFile, "utf-8").split("\n");
-    const kept = lines.filter((l) => {
-      const parts = l.trim().split(/\s+/);
-      return parts.length === 0 || parts[parts.length - 1] !== videoId;
-    });
-    if (kept.length !== lines.length) writeFileSync(archiveFile, kept.join("\n"));
-    return true;
+    text = readFileSync(archiveFile, "utf-8");
   } catch {
     // Callers that promise an explicit re-queue can leave the ignore in place.
     return false;
   }
+  // Keep native failures outside the filesystem compatibility catch: an
+  // operational bridge failure must not be mistaken for a missing archive.
+  const result = removeArchiveIdText(text, videoId);
+  if (result.changed) {
+    try {
+      writeFileSync(archiveFile, result.text);
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** All video ids currently present in the archive file. */
 export function readArchiveIds(archiveFile: string): Set<string> {
-  const ids = new Set<string>();
+  let text: string;
   try {
-    if (!existsSync(archiveFile)) return ids;
-    for (const line of readFileSync(archiveFile, "utf-8").split("\n")) {
-      const parts = line.trim().split(/\s+/);
-      const id = parts[parts.length - 1];
-      if (id) ids.add(id);
-    }
+    if (!existsSync(archiveFile)) return new Set<string>();
+    text = readFileSync(archiveFile, "utf-8");
   } catch {
-    // ignore
+    return new Set<string>();
   }
-  return ids;
+  return new Set(parseArchiveIdsText(text));
 }
 
 /**

@@ -1,7 +1,7 @@
 // src/native-core.ts — optional Rust N-API bridge.
 //
-// Native calls are synchronous and limited to small, CPU-only validation and
-// parsing jobs. Subprocesses, filesystem work, SQLite and cookie orchestration
+// Native calls are synchronous and limited to CPU-only validation, parsing and
+// planning jobs. Subprocesses, filesystem work, SQLite and cookie orchestration
 // stay in Bun so they never block the event loop behind a native call.
 
 import { existsSync } from "node:fs";
@@ -9,7 +9,7 @@ import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const NATIVE_ABI_VERSION = 3;
+export const NATIVE_ABI_VERSION = 4;
 
 export interface NativeCore {
   abiVersion(): number;
@@ -60,6 +60,14 @@ export interface NativeCore {
   effectiveDownloadFormat(jobQuality: string | null, jobTarget: string | null, configQuality: string, configTarget: string, validQualities: string): string;
   buildAria2cArgs(connectionsPerDownload: number, activeSlots: number, connectionBudget: number, split: string): string;
   computePerWorkerLimitBytesPerSec(maxBandwidthKBps: number, activeSlots: number): string;
+  parseListingLines(lines: string): string;
+  listingEntryKind(id: string): string;
+  channelFolderName(playlist: string, channel?: string): string;
+  isShortsTabItem(playlist: string): string;
+  normalizeVideoUrl(url: string): string;
+  prepareIngestBatch(request: string): string;
+  parseArchiveIds(text: string): string;
+  removeArchiveId(text: string, videoId: string): string;
 }
 
 export const NATIVE_CORE_METHODS = [
@@ -111,6 +119,14 @@ export const NATIVE_CORE_METHODS = [
   "effectiveDownloadFormat",
   "buildAria2cArgs",
   "computePerWorkerLimitBytesPerSec",
+  "parseListingLines",
+  "listingEntryKind",
+  "channelFolderName",
+  "isShortsTabItem",
+  "normalizeVideoUrl",
+  "prepareIngestBatch",
+  "parseArchiveIds",
+  "removeArchiveId",
 ] as const;
 
 export interface NativeIssue {

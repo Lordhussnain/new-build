@@ -1,3 +1,4 @@
+mod archive;
 mod audio;
 mod claims;
 mod config;
@@ -8,6 +9,7 @@ mod reconcile;
 mod retry;
 mod runtime;
 mod scaling;
+mod scanner;
 mod settings;
 mod sources;
 mod text;
@@ -19,7 +21,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-const YTA_CORE_ABI_VERSION: u32 = 3;
+const YTA_CORE_ABI_VERSION: u32 = 4;
 
 #[derive(Serialize)]
 struct ErrorBody {
@@ -561,6 +563,52 @@ pub fn native_compute_per_worker_limit(max_bandwidth_kbps: f64, active_slots: f6
             active_slots,
         ))
     })
+}
+
+#[napi(js_name = "parseListingLines")]
+pub fn native_parse_listing_lines(lines: String) -> String {
+    guarded(|| match parse_json::<Vec<String>>(&lines) {
+        Ok(lines) => success(scanner::parse_listing_lines(lines)),
+        Err(error) => failure(error),
+    })
+}
+
+#[napi(js_name = "listingEntryKind")]
+pub fn native_listing_entry_kind(id: String) -> String {
+    guarded(|| success(scanner::listing_entry_kind(&id)))
+}
+
+#[napi(js_name = "channelFolderName")]
+pub fn native_channel_folder_name(playlist: String, channel: Option<String>) -> String {
+    guarded(|| success(scanner::channel_folder_name(&playlist, channel.as_deref())))
+}
+
+#[napi(js_name = "isShortsTabItem")]
+pub fn native_is_shorts_tab_item(playlist: String) -> String {
+    guarded(|| success(scanner::shorts_tab_item(&playlist)))
+}
+
+#[napi(js_name = "normalizeVideoUrl")]
+pub fn native_normalize_video_url(url: String) -> String {
+    guarded(|| success(scanner::normalize_video_url(&url)))
+}
+
+#[napi(js_name = "prepareIngestBatch")]
+pub fn native_prepare_ingest_batch(request: String) -> String {
+    guarded(|| match parse_json::<scanner::IngestRequest>(&request) {
+        Ok(request) => success(scanner::prepare_ingest(request)),
+        Err(error) => failure(error),
+    })
+}
+
+#[napi(js_name = "parseArchiveIds")]
+pub fn native_parse_archive_ids(text: String) -> String {
+    guarded(|| success(archive::parse_archive_ids(&text)))
+}
+
+#[napi(js_name = "removeArchiveId")]
+pub fn native_remove_archive_id(text: String, video_id: String) -> String {
+    guarded(|| success(archive::remove_archive_id(&text, &video_id)))
 }
 
 #[cfg(test)]

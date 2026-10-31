@@ -298,4 +298,51 @@ describe("Rust native core", () => {
     expect(nativeValue<string>(nativeCore!.buildAria2cArgs(32, 1, 128, "banana"))).toBe("-x 16 -s 32 -j 32 --min-split-size banana");
     expect(nativeValue<number | null>(nativeCore!.computePerWorkerLimitBytesPerSec(100, 4))).toBe(25_600);
   });
+
+  test.skipIf(unavailable)("native scanner and archive planning preserve batch and text contracts", () => {
+    const listing = nativeValue<any[]>(nativeCore!.parseListingLines(JSON.stringify([
+      "P|||UCabcdefghij|||Channel|||NA",
+      "P|||vid00000001|||Title||| 12.5junk |||Channel",
+      "P|||PLabcdefghij|||Season|||NA",
+    ])));
+    expect(listing).toEqual([
+      { title: "Title", id: "vid00000001", playlist: "P", durationText: " 12.5junk ", channel: "Channel" },
+      { title: "Season", id: "PLabcdefghij", playlist: "P", durationText: "NA", isPlaylist: true },
+    ]);
+    expect(nativeValue<string>(nativeCore!.listingEntryKind(`UC${"😀".repeat(4)}`))).toBe("video");
+    expect(nativeValue<string>(nativeCore!.channelFolderName("Channel - Shorts"))).toBe("Channel");
+    expect(nativeValue<boolean>(nativeCore!.isShortsTabItem("Channel\u00a0-\tSHORTS"))).toBe(true);
+    expect(nativeValue<string>(nativeCore!.normalizeVideoUrl(
+      "https://youtu.be/AbCdEf12345?t=10",
+    ))).toBe("https://www.youtube.com/watch?v=AbCdEf12345");
+
+    const plan = nativeValue<any>(nativeCore!.prepareIngestBatch(JSON.stringify({
+      items: [{ id: "short00001", playlist: "Channel - Shorts", duration: null, isPlaylist: false }],
+      videoQuality: "1080p",
+      targetFormat: "mp4",
+      downloadSubtitles: false,
+      embedSubtitles: false,
+      writeThumbnail: false,
+      embedThumbnail: false,
+      writeDescription: false,
+      writeInfoJson: false,
+      skipShorts: true,
+      downloadShorts: false,
+    })));
+    expect(plan.conversionStatus).toBe("not_needed");
+    expect(plan.items).toEqual([{
+      isPlaylist: false,
+      short: true,
+      skipShort: true,
+      url: "https://www.youtube.com/watch?v=short00001",
+      duration: null,
+    }]);
+    expect(nativeValue<string[]>(nativeCore!.parseArchiveIds(
+      "youtube first\nextractor\tsecond\r\nyoutube first\n",
+    ))).toEqual(["first", "second"]);
+    expect(nativeValue<any>(nativeCore!.removeArchiveId(
+      "youtube keep\r\nyoutube remove\n",
+      "remove",
+    ))).toEqual({ text: "youtube keep\r\n", changed: true });
+  });
 });

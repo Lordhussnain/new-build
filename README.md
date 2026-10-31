@@ -47,7 +47,7 @@ a terminal UI and a web dashboard to watch it all happen.
 ## Tech Stack
 
 - [Bun](https://bun.sh) + TypeScript — runtime and application logic
-- [Rust](https://www.rust-lang.org/) + N-API — native validation, source/output parsing, audio-track processing, scaling, retry classification, claim/lease decisions, reconciliation planning and download-argument policy (with a TypeScript development fallback; SQLite, filesystem, process and timer side effects remain in TypeScript)
+- [Rust](https://www.rust-lang.org/) + N-API — native validation, source/listing/archive/output parsing, ingest planning, audio-track processing, scaling, retry classification, claim/lease decisions, reconciliation planning and download-argument policy (with a TypeScript development fallback; SQLite, filesystem, process and timer side effects remain in TypeScript)
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) — video and metadata extraction
 - [aria2c](https://aria2.github.io/) — optional multi-connection downloading
 - [ffmpeg](https://ffmpeg.org) — format conversion

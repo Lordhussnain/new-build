@@ -15,6 +15,7 @@ import { sanitizeFolderName } from "./util";
 import { getConfig, stats } from "./state";
 import { logError } from "./logger";
 import type { Config } from "./config";
+import { NativeCoreError, nativeCore, nativeValue } from "./native-core";
 
 export interface ListingItem {
   id: string;
@@ -44,10 +45,18 @@ const CHANNEL_TAB_SUFFIX = /\s+-\s+(?:Videos|Shorts|Live|Streams|Playlists|Home|
  * several folders, and the RSS watcher (which only sees the channel name) would
  * create yet another one.
  */
-export function channelFolderName(item: ListingItem): string {
+function channelFolderNameTypeScript(item: ListingItem): string {
   const channel = item.channel?.trim();
   if (channel) return channel;
   return (item.playlist || "").replace(CHANNEL_TAB_SUFFIX, "").trim();
+}
+
+export function channelFolderName(item: ListingItem): string {
+  const playlist = item.playlist || "";
+  if (nativeCore && playlist.isWellFormed() && (item.channel == null || item.channel.isWellFormed())) {
+    return nativeValue<string>(nativeCore.channelFolderName(playlist, item.channel ?? undefined));
+  }
+  return channelFolderNameTypeScript(item);
 }
 
 /** True for a channel source (@handle, /channel/, /c/, /user/), any tab. */
@@ -60,8 +69,16 @@ export function isChannelSource(url: string): boolean {
 }
 
 /** Items listed from a channel's Shorts tab (they report no duration). */
-export function isShortsTabItem(item: ListingItem): boolean {
+function isShortsTabItemTypeScript(item: ListingItem): boolean {
   return /\s+-\s+Shorts$/i.test(item.playlist || "");
+}
+
+export function isShortsTabItem(item: ListingItem): boolean {
+  const playlist = item.playlist || "";
+  if (nativeCore && playlist.isWellFormed()) {
+    return nativeValue<boolean>(nativeCore.isShortsTabItem(playlist));
+  }
+  return isShortsTabItemTypeScript(item);
 }
 
 /**
@@ -69,11 +86,20 @@ export function isShortsTabItem(item: ListingItem): boolean {
  * playlist ids (PL…, UU…), not 11-character video ids. A playlist entry is
  * expanded into its own scan; a channel entry (UC…) is not downloadable this way.
  */
-export function listingEntryKind(id: string): "video" | "playlist" | "channel" {
+export type ListingEntryKind = "video" | "playlist" | "channel";
+
+function listingEntryKindTypeScript(id: string): ListingEntryKind {
   if (id.length <= 11) return "video";
   if (/^UC/.test(id)) return "channel";
   if (/^(?:PL|UU|OL|FL|LL|RD|VL|EL)/.test(id)) return "playlist";
   return "video";
+}
+
+export function listingEntryKind(id: string): ListingEntryKind {
+  if (nativeCore && id.isWellFormed()) {
+    return nativeValue<ListingEntryKind>(nativeCore.listingEntryKind(id));
+  }
+  return listingEntryKindTypeScript(id);
 }
 
 /** A channel URL's root (no tab), so its playlists can be scanned too. */
@@ -91,7 +117,7 @@ export function isChannelRootUrl(url: string): boolean {
  * youtu.be short links into watch URLs, so the same video always produces the
  * same stored job URL regardless of how it was discovered.
  */
-export function normalizeVideoUrl(url: string): string {
+function normalizeVideoUrlTypeScript(url: string): string {
   const trimmed = (url || "").trim();
   if (!trimmed) return trimmed;
   try {
@@ -103,6 +129,20 @@ export function normalizeVideoUrl(url: string): string {
   } catch {
     return trimmed;
   }
+}
+
+export function normalizeVideoUrl(url: string): string {
+  const trimmed = (url || "").trim();
+  // Limit the native parser to ordinary YouTube HTTP(S) URLs. Exotic hosts,
+  // credentials, backslashes, Unicode and whitespace retain ECMAScript URL
+  // handling rather than letting a parser detail change a stored job URL.
+  const compatible = nativeCore !== null &&
+    /^https?:\/\/(?:youtu\.be|(?:www\.|m\.)?youtube\.com)(?::(?:80|443))?\/[\x21-\x7E]*$/i
+      .test(trimmed) && !trimmed.includes("\\");
+  if (nativeCore && compatible) {
+    return nativeValue<string>(nativeCore.normalizeVideoUrl(trimmed));
+  }
+  return normalizeVideoUrlTypeScript(url);
 }
 
 /** Maximum time a flat-playlist listing may keep its pipes and worker occupied. */
@@ -155,8 +195,14 @@ export interface PlaylistListingOptions {
   onItems?: (items: ListingItem[]) => Promise<void> | void;
 }
 
-/** Parse one `--print` line; null for blank lines and entries without an id. */
-export function parseListingLine(line: string): ListingItem | null {
+function invalidNativeResult(detail: string): never {
+  throw new NativeCoreError(
+    `Rust native core returned an invalid scanner result (${detail})`,
+    "NATIVE_INVALID_RESPONSE",
+  );
+}
+
+function parseListingLineTypeScript(line: string): ListingItem | null {
   if (!line.trim()) return null;
   const [playlist, id, title, duration, channel] = line.split("|||");
   const item: ListingItem = {
@@ -171,10 +217,59 @@ export function parseListingLine(line: string): ListingItem | null {
   const uploader = (channel || "").trim();
   if (uploader && uploader !== "NA") item.channel = uploader;
   if (!item.id) return null;
-  const kind = listingEntryKind(item.id);
+  const kind = listingEntryKindTypeScript(item.id);
   if (kind === "channel") return null;
   if (kind === "playlist") item.isPlaylist = true;
   return item;
+}
+
+interface NativeListingLineItem {
+  title: string;
+  id: string;
+  playlist: string;
+  /** Raw field: only ECMAScript parseFloat defines the public numeric value. */
+  durationText: string;
+  channel?: string;
+  isPlaylist?: boolean;
+}
+
+/**
+ * Parse a batch of `--print` lines, dropping blank/channel entries while
+ * retaining the order of every accepted video/playlist item.
+ */
+export function parseListingLines(lines: string[]): ListingItem[] {
+  if (nativeCore && lines.every((line) => line.isWellFormed())) {
+    const parsed = nativeValue<NativeListingLineItem[]>(nativeCore.parseListingLines(JSON.stringify(lines)));
+    if (!Array.isArray(parsed) || parsed.some((item) =>
+      !item || typeof item.title !== "string" || typeof item.id !== "string" ||
+      typeof item.playlist !== "string" || typeof item.durationText !== "string" ||
+      (item.channel !== undefined && typeof item.channel !== "string") ||
+      (item.isPlaylist !== undefined && typeof item.isPlaylist !== "boolean")
+    )) {
+      return invalidNativeResult("malformed listing batch");
+    }
+    return parsed.map((raw) => {
+      const item: ListingItem = {
+        title: raw.title,
+        id: raw.id,
+        playlist: raw.playlist,
+        // Do not replace this with a Rust float parser: parseFloat accepts a
+        // numeric prefix and can produce NaN/Infinity, which JSON cannot carry.
+        duration: parseFloat(raw.durationText),
+      };
+      if (raw.channel !== undefined) item.channel = raw.channel;
+      if (raw.isPlaylist) item.isPlaylist = true;
+      return item;
+    });
+  }
+  return lines
+    .map(parseListingLineTypeScript)
+    .filter((item): item is ListingItem => item !== null);
+}
+
+/** Parse one `--print` line; null for blank lines and entries without an id. */
+export function parseListingLine(line: string): ListingItem | null {
+  return parseListingLines([line])[0] ?? null;
 }
 
 /** Read yt-dlp's stdout incrementally, emitting batches of parsed items. */
@@ -189,13 +284,7 @@ async function streamListing(
   const decoder = new TextDecoder();
   let carry = "";
   let batch: ListingItem[] = [];
-  const take = (line: string) => {
-    const item = parseListingLine(line);
-    if (item) {
-      items.push(item);
-      batch.push(item);
-    }
-  };
+  let pendingLines: string[] = [];
   const emit = async () => {
     if (batch.length === 0 || !onItems) {
       batch = [];
@@ -210,6 +299,18 @@ async function streamListing(
       throw error;
     }
   };
+  // Amortize the native boundary over raw lines, but retain the public
+  // 50-VALID-item onItems batches (blank and channel lines never counted).
+  const parsePending = async (force = false) => {
+    if (pendingLines.length === 0 || (!force && pendingLines.length < LISTING_BATCH_SIZE)) return;
+    const lines = pendingLines;
+    pendingLines = [];
+    for (const item of parseListingLines(lines)) {
+      items.push(item);
+      batch.push(item);
+      if (batch.length >= LISTING_BATCH_SIZE) await emit();
+    }
+  };
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -217,14 +318,15 @@ async function streamListing(
     carry += decoder.decode(value, { stream: true });
     let newline = carry.indexOf("\n");
     while (newline !== -1) {
-      take(carry.slice(0, newline));
+      pendingLines.push(carry.slice(0, newline));
       carry = carry.slice(newline + 1);
-      if (batch.length >= LISTING_BATCH_SIZE) await emit();
+      await parsePending();
       newline = carry.indexOf("\n");
     }
   }
   carry += decoder.decode();
-  take(carry);
+  pendingLines.push(carry);
+  await parsePending(true);
   await emit();
 }
 
@@ -331,6 +433,104 @@ export async function getPlaylistItems(
   return items;
 }
 
+export interface IngestItemPlan {
+  /** Playlist entries are expanded by the scanner, never inserted as videos. */
+  isPlaylist: boolean;
+  short: boolean;
+  skipShort: boolean;
+  url: string;
+  /** Only a finite, positive duration is persisted. */
+  duration: number | null;
+}
+
+export interface IngestPlan {
+  targetFormat: string;
+  wantSubtitles: 0 | 1;
+  wantThumbnail: 0 | 1;
+  wantDescription: 0 | 1;
+  conversionStatus: "pending" | "not_needed";
+  metadataStatus: "pending" | "not_needed";
+  items: IngestItemPlan[];
+}
+
+function prepareIngestPlanTypeScript(items: ListingItem[], config: Config): IngestPlan {
+  const targetFormat = config.videoQuality === "audio" ? "mp3" : (config.targetFormat || "mp4");
+  // Embedding needs the sidecar file even when the operator turned the
+  // corresponding "save sidecars" switch off.
+  const wantSubtitles = config.downloadSubtitles || config.embedSubtitles ? 1 : 0;
+  const wantThumbnail = config.writeThumbnail || config.embedThumbnail ? 1 : 0;
+  const wantDescription = config.writeDescription ? 1 : 0;
+  const embedWanted = config.embedSubtitles || config.embedThumbnail;
+  const conversionStatus =
+    config.videoQuality === "audio" || targetFormat !== "mp4" || embedWanted ? "pending" : "not_needed";
+  const metadataStatus = wantSubtitles || wantThumbnail || wantDescription || config.writeInfoJson
+    ? "pending"
+    : "not_needed";
+  return {
+    targetFormat,
+    wantSubtitles,
+    wantThumbnail,
+    wantDescription,
+    conversionStatus,
+    metadataStatus,
+    items: items.map((item) => {
+      const short = Number.isFinite(item.duration) && item.duration > 0
+        ? item.duration < 60
+        : isShortsTabItemTypeScript(item);
+      return {
+        isPlaylist: Boolean(item.isPlaylist),
+        short,
+        skipShort: config.skipShorts && !config.downloadShorts && short,
+        url: normalizeVideoUrlTypeScript(`https://www.youtube.com/watch?v=${item.id}`),
+        duration: Number.isFinite(item.duration) && item.duration > 0 ? item.duration : null,
+      };
+    }),
+  };
+}
+
+/** Prepare every pure ingest decision without touching SQLite or the archive. */
+export function prepareIngestPlan(items: ListingItem[], config: Config): IngestPlan {
+  // For ordinary YouTube ids the generated watch URL is already canonical.
+  // Exotic ids keep the full ECMAScript URL path, including query/percent rules.
+  const compatible = nativeCore !== null && config.videoQuality.isWellFormed() && config.targetFormat.isWellFormed() &&
+    items.every((item) => /^[A-Za-z0-9_-]+$/.test(item.id) && item.playlist.isWellFormed());
+  if (nativeCore && compatible) {
+    const prepared = nativeValue<IngestPlan>(nativeCore.prepareIngestBatch(JSON.stringify({
+      items: items.map((item) => ({
+        id: item.id,
+        playlist: item.playlist,
+        duration: Number.isFinite(item.duration) ? item.duration : null,
+        isPlaylist: Boolean(item.isPlaylist),
+      })),
+      videoQuality: config.videoQuality,
+      targetFormat: config.targetFormat,
+      downloadSubtitles: config.downloadSubtitles,
+      embedSubtitles: config.embedSubtitles,
+      writeThumbnail: config.writeThumbnail,
+      embedThumbnail: config.embedThumbnail,
+      writeDescription: config.writeDescription,
+      writeInfoJson: config.writeInfoJson,
+      skipShorts: config.skipShorts,
+      downloadShorts: config.downloadShorts,
+    })));
+    if (!prepared || typeof prepared !== "object" || !Array.isArray(prepared.items) ||
+      prepared.items.length !== items.length || typeof prepared.targetFormat !== "string" ||
+      ![0, 1].includes(prepared.wantSubtitles) || ![0, 1].includes(prepared.wantThumbnail) ||
+      ![0, 1].includes(prepared.wantDescription) ||
+      !["pending", "not_needed"].includes(prepared.conversionStatus) ||
+      !["pending", "not_needed"].includes(prepared.metadataStatus) ||
+      prepared.items.some((plan) => !plan || typeof plan.isPlaylist !== "boolean" ||
+        typeof plan.short !== "boolean" || typeof plan.skipShort !== "boolean" ||
+        typeof plan.url !== "string" ||
+        !(plan.duration === null || (typeof plan.duration === "number" && Number.isFinite(plan.duration))))
+    ) {
+      return invalidNativeResult("malformed or misaligned ingest plan");
+    }
+    return prepared;
+  }
+  return prepareIngestPlanTypeScript(items, config);
+}
+
 /**
  * Insert (or skip) a batch of listing items into the jobs table. Shared by the
  * full scanner (yt-dlp flat listing) and the cheap RSS poller.
@@ -360,22 +560,15 @@ export async function ingestItems(
   // download history. Consult that history once per listing so another
   // playlist cannot re-queue the same completed video ID.
   const archivedIds = readArchiveIds(config.archiveFile);
-  const targetFormat = config.videoQuality === "audio" ? "mp3" : (config.targetFormat || "mp4");
-  // Embedding needs the sidecar file even when the operator turned the
-  // corresponding "save sidecars" switch off: the thumbnail is the cover art
-  // and the subtitle file is the track that gets muxed in.
-  const wantSubs = config.downloadSubtitles || config.embedSubtitles ? 1 : 0;
-  const wantThumb = config.writeThumbnail || config.embedThumbnail ? 1 : 0;
-  const wantDesc = config.writeDescription ? 1 : 0;
-  // Embedding happens in the converter (after metadata has written the
-  // sidecars), so a job that asks for it must reach the conversion stage even
-  // when yt-dlp already produced the requested container.
-  const embedWanted = config.embedSubtitles || config.embedThumbnail;
-  const conversionStatus =
-    config.videoQuality === "audio" || targetFormat !== "mp4" || embedWanted ? "pending" : "not_needed";
-  // Sidecar metadata (subs/thumbnail/description/info.json) is fetched by the
-  // metadata worker after the download completes.
-  const metadataStatus = wantSubs || wantThumb || wantDesc || config.writeInfoJson ? "pending" : "not_needed";
+  const ingestPlan = prepareIngestPlan(items, config);
+  const {
+    targetFormat,
+    wantSubtitles: wantSubs,
+    wantThumbnail: wantThumb,
+    wantDescription: wantDesc,
+    conversionStatus,
+    metadataStatus,
+  } = ingestPlan;
 
   let added = 0;
   let skipped = 0;
@@ -384,7 +577,7 @@ export async function ingestItems(
   // holding a single huge write lock. For a 10,000-item playlist this is the
   // difference between a 10-second stall and a series of fast micro-commits.
   const CHUNK_SIZE = 500;
-  const insertChunk = db.transaction((batch: ListingItem[]) => {
+  const insertChunk = db.transaction((batch: { item: ListingItem; plan: IngestItemPlan }[]) => {
     const stmt = db.prepare(
       `INSERT OR IGNORE INTO jobs
          (id, url, title, output_directory, target_format, want_subtitles, want_thumbnail, want_description, folder, "index", duration, download_status, conversion_status, metadata_status)
@@ -393,7 +586,7 @@ export async function ingestItems(
     const sourceStmt = sourceKey
       ? db.prepare("INSERT OR IGNORE INTO job_sources (source_url, job_id) VALUES (?, ?)")
       : null;
-    for (const item of batch) {
+    for (const { item, plan } of batch) {
       // A dashboard Delete is a durable opt-out, not just a temporary row
       // removal. Keep the video hidden across playlist/RSS scans and restarts
       // until the operator explicitly allows it again.
@@ -402,11 +595,9 @@ export async function ingestItems(
         stats.skipped++;
         continue;
       }
-      // A Shorts-tab entry carries no duration, so the tab itself marks it.
-      const short = Number.isFinite(item.duration) && item.duration > 0
-        ? item.duration < 60
-        : isShortsTabItem(item);
-      if (config.skipShorts && !config.downloadShorts && short) {
+      // The planner retains the historical rule: a Shorts-tab entry with no
+      // finite positive duration is marked by the tab itself.
+      if (plan.skipShort) {
         skipped++;
         stats.skipped++;
         continue;
@@ -435,7 +626,7 @@ export async function ingestItems(
       const index = takeReservedFileIndex(folder, item.id) ?? getNextIndex(folder);
       stmt.run(
         item.id,
-        normalizeVideoUrl(`https://www.youtube.com/watch?v=${item.id}`),
+        plan.url,
         item.title,
         outputDir,
         targetFormat,
@@ -444,7 +635,7 @@ export async function ingestItems(
         wantDesc,
         folder,
         index,
-        Number.isFinite(item.duration) && item.duration > 0 ? item.duration : null,
+        plan.duration,
         conversionStatus,
         metadataStatus,
       );
@@ -455,7 +646,10 @@ export async function ingestItems(
   });
 
   // Playlist entries are expanded by scanAndIngest, never queued as videos.
-  const videos = items.filter((item) => !item.isPlaylist);
+  // Zipping by index keeps every side-effect check in the original item order.
+  const videos = items
+    .map((item, index) => ({ item, plan: ingestPlan.items[index] }))
+    .filter(({ plan }) => !plan.isPlaylist);
   for (let i = 0; i < videos.length; i += CHUNK_SIZE) {
     insertChunk(videos.slice(i, i + CHUNK_SIZE));
   }
