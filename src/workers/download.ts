@@ -22,11 +22,12 @@ import {
   type Job,
 } from "../db";
 import { activeDlSlots, autoscaler } from "../autoscale";
-import { aria2cPath, jsRuntime, ytDlp } from "../tools";
-import { checkDiskSpace, killProcessTree, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
+import { aria2cPath, createCookieInvocation, jsRuntime, ytDlp } from "../tools";
+import { checkDiskSpace, killProcessTree, notePipelineFailure, notePipelineSuccess, recordDiskSpaceAtFailure, triggerPause } from "../resilience";
 import {
   dropSupersededFile,
   findPartialFile,
+  noteCredentialFailure,
   recordJobPartial,
   removePartialFiles,
   restoreSupersededFile,
@@ -38,6 +39,7 @@ import {
   formatSwitchMessage,
   formatTerminalErrorMessage,
   GENERIC_TERMINAL_INFO,
+  isCredentialBlockedError,
   isDiskFullError,
   isDownloaderArgsError,
   isFormatAvailabilityError,
@@ -66,11 +68,13 @@ import {
   activeDownloadJobs,
   activeProcs,
   getConfig,
+  interruptedDownloadJobs,
   isJobCancelled,
   isPaused,
   stats,
 } from "../state";
 import { logError } from "../logger";
+import { engineFencing, holdsEngineLease, withEngineLease } from "../lease";
 import type { Config } from "../config";
 
 export const aliveDownloadWorkers = new Set<number>();
@@ -127,7 +131,7 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
     // (POST /api/settings) take effect on the next job without a restart. The
     // parameter is only the initial value.
     config = getConfig();
-    if (isPaused()) {
+    if (isPaused() || !holdsEngineLease()) {
       await Bun.sleep(2000);
       continue;
     }
@@ -159,6 +163,12 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
     parkedShown = false;
 
     const disk = await checkDiskSpace(config.outputRoot, config.minFreeSpaceGB);
+    // The probe yields: a manual pause, lease loss, offline toggle or changed
+    // disk target may have arrived before it finished. Never claim or publish
+    // a stale disk pause using the old observation.
+    const live = getConfig();
+    if (abortController.signal.aborted || isPaused() || !holdsEngineLease() || live.offlineMode ||
+        live.outputRoot !== config.outputRoot || live.minFreeSpaceGB !== config.minFreeSpaceGB) continue;
     if (!disk.ok) {
       triggerPause(`LOW_DISK_SPACE (${disk.free.toFixed(1)}GB < ${config.minFreeSpaceGB}GB)`);
       await Bun.sleep(10000);
@@ -169,11 +179,13 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
     // so a parked slot can never take a job.
     if (!activeDlSlots.has(id)) continue;
 
-    const job = claimDownloadJob(workerId);
+    const fencing = engineFencing();
+    const job = withEngineLease(fencing, () => claimDownloadJob(workerId));
     if (!job) {
       await Bun.sleep(500);
       continue;
     }
+    interruptedDownloadJobs.delete(id);
     activeDownloadJobs.set(id, job.id);
     // The claim is a lease: heartbeat it for as long as this worker is on the
     // job, so a long transfer with no progress lines is never mistaken for a
@@ -193,19 +205,29 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
       }
     });
 
+    const cookie = createCookieInvocation(config);
     try {
-      await runDownload(id, job, config);
+      await runDownload(id, job, config, cookie.args, fencing);
       stopHeartbeat();
     } catch (err: any) {
       stopHeartbeat();
       // The failure handler itself must never break the loop ("a crashed loop
       // is restarted by supervise()" costs a claim-leak and a 5s stall): its
       // own DB writes can throw mid-shutdown just like the stage did.
-      await handleDownloadFailure(id, job, config, err).catch((handlerErr: any) => {
+      try {
+        if (interruptedDownloadJobs.get(id) === job.id && ownsClaim("download", job.id, downloadClaim(job))) {
+          if (isUserPaused(job.id)) parkUserPaused(job);
+          else parkPaused(job);
+        } else {
+          await handleDownloadFailure(id, job, config, err, cookie.fingerprint);
+        }
+      } catch (handlerErr: any) {
         logError("download", `${job.id} ${job.title}: failure handler crashed: ${handlerErr?.message || handlerErr}`);
-      });
+      }
     } finally {
+      cookie.cleanup();
       stopHeartbeat();
+      if (interruptedDownloadJobs.get(id) === job.id) interruptedDownloadJobs.delete(id);
       activeDownloadJobs.delete(id);
       activeProcs.delete(id);
       autoscaler.clearWorker(id);
@@ -216,11 +238,13 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
 }
 
 /** One download attempt for `job`. Throws on any failure. */
-async function runDownload(id: number, job: Job, config: Config): Promise<void> {
+async function runDownload(
+  id: number, job: Job, config: Config, cookieArgs: readonly string[], fencing: number | null,
+): Promise<void> {
   // Multi-audio support: know what the video offers (original + auto-dubbed
   // tracks) and which tracks this job wants, then hand the selection to the
   // plan so every wanted language is downloaded into one switchable file.
-  const discovered = await resolveJobAudioTracks(job, config);
+  const discovered = await resolveJobAudioTracks(id, job, config);
   const audioTracks = discovered
     ? selectAudioTracks(
         discovered,
@@ -239,17 +263,26 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     aria2cBinary: aria2cPath(),
     audioTracks,
     jsRuntime: jsRuntime(),
+    cookieArgs,
   });
   const { baseFilename, timeoutMs } = plan;
   const engineTag = plan.engine === "aria2c" ? `aria2c×${plan.connectionsPerDownload}` : "native";
   const audioTag = audioTracks.length > 0 ? `, ${audioTracks.length} audio track(s)` : "";
 
-  // The audio probe above is a network round-trip; the job can be paused,
-  // deleted, or purged while it runs. Spawning yt-dlp for a claim we no longer
-  // own is exactly how a cancelled job used to keep downloading in the
-  // terminal, so ownership is re-checked immediately before the spawn.
+  // The probe yields: pause, offline mode, shutdown, deletion, or a new lease
+  // generation can arrive while it runs. Never spawn using that stale claim.
   if (isJobCancelled(job.id) || !ownsClaim("download", job.id, downloadClaim(job))) {
     updateWorkerLine(id, `⏹️ Cancelled before starting | ${job.title}`, config);
+    return;
+  }
+  if (isUserPaused(job.id)) { parkUserPaused(job); return; }
+  if (interruptedDownloadJobs.get(id) === job.id || abortController.signal.aborted ||
+      isPaused() || !holdsEngineLease() || engineFencing() !== fencing) {
+    parkPaused(job);
+    return;
+  }
+  if (getConfig().offlineMode) {
+    releaseOwned(job, "deferring an offline download", `download_status = 'pending', pause_reason = NULL`);
     return;
   }
 
@@ -384,8 +417,9 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
   }
   const [stdoutText, stderrText, code] = output;
 
-  if (isPaused() && !isUserPaused(job.id)) {
-    parkPaused(job);
+  if (isPaused() || interruptedDownloadJobs.get(id) === job.id) {
+    if (isUserPaused(job.id)) parkUserPaused(job);
+    else parkPaused(job);
     updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
     return;
   }
@@ -677,13 +711,15 @@ export async function cleanupDownloadProcess(
  *                                        step DOWN the quality ladder and retry
  *                                        with the new selector; a bottomed-out
  *                                        ladder is terminal
- *   • permanent (private/removed/…)    → terminal skip: one attempt, no error.log
- *                                        line, never auto-requeued
+ *   • permanent (private/removed/…)    → terminal skip: no error.log line;
+ *                                        only credential blocks can later be rescued
  *   • n-challenge / missing JS runtime → retryable (not a dead video)
  *   • retry budget spent               → park as failed for the sweep
  *   • transient (network/timeout/5xx)  → requeue with exponential backoff
  */
-export async function handleDownloadFailure(id: number, job: Job, config: Config, err: any): Promise<void> {
+export async function handleDownloadFailure(
+  id: number, job: Job, config: Config, err: any, attemptedCookies?: string | null,
+): Promise<void> {
   if (isUserPaused(job.id)) {
     const parked = parkUserPaused(job);
     if (parked) updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
@@ -700,10 +736,17 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
   const base = baseNameOf(job);
 
   // Storage exhaustion affects every worker, not just this video. Pause the
-  // engine immediately, preserve any partial, and require an operator to free
-  // space before Resume All rather than spending retry budgets against ENOSPC.
+  // engine immediately and preserve the partial; recovery waits for measurable
+  // space on the affected volume instead of spending retries against ENOSPC.
   if (isDiskFullError(errMsg)) {
-    triggerPause("LOW_DISK_SPACE (download write failed; free space and Resume All)");
+    triggerPause("LOW_DISK_SPACE (download write failed; waiting for space)", {
+      diskPath: job.output_directory, diskWriteFailure: true,
+    });
+    // Begin measuring immediately. A filesystem can report ample free bytes
+    // even though this user's quota is full; recovery needs an observed rise,
+    // not just an apparently healthy statfs result.
+    void checkDiskSpace(job.output_directory, config.minFreeSpaceGB)
+      .then((disk) => recordDiskSpaceAtFailure(job.output_directory, disk.free)).catch(() => {});
     let partial = job.partial_file_path && existsSync(job.partial_file_path) ? job.partial_file_path : null;
     if (!partial) {
       try {
@@ -723,6 +766,24 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
     if (!parked) return;
     logError("download", `${job.id} ${job.title}: ${message}`);
     updateWorkerLine(id, `💾 Disk full — engine paused; free space and resume | ${job.title}`, config);
+    return;
+  }
+
+  // Credential failures should not spend a retry window, discard a partial, or
+  // loop against the same jar. Park them before format/corruption heuristics;
+  // hard private/removed/geo evidence is excluded by the classifier.
+  if (isCredentialBlockedError(errMsg)) {
+    if (restoreSupersededFile(job.id, `re-download blocked by credentials: ${errMsg.slice(0, 300)}`, downloadClaim(job))) {
+      updateWorkerLine(id, `🚫 Re-download blocked — previous file restored | ${job.title}`, config);
+      return;
+    }
+    const partial = job.partial_file_path && existsSync(job.partial_file_path)
+      ? job.partial_file_path : await findPartialFile(job.output_directory, base);
+    // Finding the partial yields; an operator pause may have arrived meanwhile.
+    if (isUserPaused(job.id)) { parkUserPaused(job); return; }
+    if (isPaused()) { parkPaused(job); return; }
+    const parked = parkTerminal(id, job, config, classifyTerminalDownloadError(errMsg) ?? GENERIC_TERMINAL_INFO, errMsg, partial || null);
+    if (parked && attemptedCookies !== undefined) noteCredentialFailure(job.id, attemptedCookies);
     return;
   }
 
@@ -757,8 +818,8 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
       `${job.id} ${job.title}: aria2c rejected the downloader arguments (exit 28). ` +
         `Check connectionsPerDownload/minSplitSize. ${errMsg.slice(0, 300)}`,
     );
-    parkPaused(job);
-    triggerPause(`BAD_DOWNLOADER_ARGS (${errMsg.slice(0, 120)})`);
+    if (!parkPaused(job)) return;
+    triggerPause(`BAD_DOWNLOADER_ARGS (${errMsg.slice(0, 120)})`, { downloaderConfig: config });
     updateWorkerLine(id, `⚙️ aria2c rejected downloader args — paused | ${job.title}`, config);
     return;
   }
@@ -781,8 +842,8 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
   //      ladder is monotonic, so it cannot loop and spends no retry budget.
   //
   // When the ladder is exhausted the video really has no usable formats: park
-  // it as terminal (never auto-requeued) with an explicit message instead of
-  // looping through cooldown sweeps.
+  // it as terminal with an explicit message instead of looping through normal
+  // cooldown sweeps.
   if (isFormatAvailabilityError(errMsg) && !isNChallengeError(errMsg)) {
     const current = readProgressState(job.id);
     const retry = progressAwareRetryState(
@@ -1168,13 +1229,12 @@ export async function handleDownloadFailure(id: number, job: Job, config: Config
 }
 
 /**
- * Park a job that retrying can never fix, as a TERMINAL skip.
+ * Park an unavailable job as a TERMINAL skip.
  *
  * The reason travels in `last_error` behind `TERMINAL_ERROR_MARKER` (see
- * retry.ts), which is what keeps the cooldown sweep, the dashboard's
- * "Requeue failed" button and `retryableFailed` on `/api/reliability` from
- * resurrecting it — while a human can still read *why* the video is missing
- * and a deliberate `/api/jobs/:id/retry` still works.
+ * retry.ts), keeping it out of the normal cooldown and "Requeue failed" sweep.
+ * A human can retry deliberately; the separate fresh-cookie recovery may also
+ * requeue credential-shaped skips, but never private/removed/geo failures.
  *
  * Deliberately quieter than a failure: one dashboard line and the job row, no
  * `error.log` entry (a private video in a playlist is an expected archival
@@ -1203,7 +1263,7 @@ function parkTerminal(
   // Only an unclassified permanent error is worth a line in error.log: the
   // description table knows every expected class, so "not downloadable" means
   // a message shape nobody has seen yet and an operator should look at it.
-  if (info.code === GENERIC_TERMINAL_INFO.code) {
+  if (info.code === GENERIC_TERMINAL_INFO.code && !isCredentialBlockedError(message)) {
     logError("download", `${job.id} ${job.title}: terminal failure (unclassified): ${errMsg.slice(0, 300)}`);
   }
   updateWorkerLine(id, `⛔ Skipped — ${info.label} | ${job.title}`, config);
@@ -1219,14 +1279,17 @@ function parkTerminal(
  * result, and a probe failure never fails the download — we just fall back to
  * the classic single-track plan.
  */
-async function resolveJobAudioTracks(job: Job, config: Config): Promise<AudioTrack[] | null> {
+async function resolveJobAudioTracks(id: number, job: Job, config: Config): Promise<AudioTrack[] | null> {
   if (effectiveVideoQuality(job, config) === "audio") return null;
   const known = parseTracksJson(job.audio_tracks);
   if (known) return known;
   const selection = parseSelectionJson(job.audio_selection) || [];
   if (config.multiAudioMode === "off" && selection.length === 0) return null;
   try {
-    const tracks = await probeAudioTracks(job.url, config);
+    const tracks = await probeAudioTracks(job.url, config, {
+      signal: abortController.signal,
+      onSpawn: (proc) => activeProcs.set(id, proc),
+    });
     // Claim-checked: the probe runs inside the claimed download slot, so a
     // stolen claim must not have its audio state overwritten by the loser.
     updateClaimedJob("download", job.id, downloadClaim(job), `audio_tracks = ?, updated_at = CURRENT_TIMESTAMP`, [
@@ -1234,11 +1297,15 @@ async function resolveJobAudioTracks(job: Job, config: Config): Promise<AudioTra
     ]);
     return tracks;
   } catch (err: any) {
-    logError(
-      "download",
-      `${job.id} audio-track probe failed (falling back to single audio): ${String(err?.message || err).slice(0, 200)}`,
-    );
+    if (!abortController.signal.aborted && !isPaused() && !isUserPaused(job.id)) {
+      logError(
+        "download",
+        `${job.id} audio-track probe failed (falling back to single audio): ${String(err?.message || err).slice(0, 200)}`,
+      );
+    }
     return null;
+  } finally {
+    activeProcs.delete(id);
   }
 }
 

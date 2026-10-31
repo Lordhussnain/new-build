@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 import { setConfig } from "../src/state";
 import { db, initDatabase } from "../src/db";
+import { acquireEngineLease } from "../src/lease";
 import { triggerPause, triggerResume } from "../src/resilience";
 import { handleRequest } from "../src/web";
 
@@ -45,12 +46,14 @@ async function expectInProgress(response: Response): Promise<void> {
 
 beforeEach(() => {
   initDatabase(":memory:");
+  acquireEngineLease();
   setConfig(baseConfig());
 });
 
 afterEach(() => {
   // pause/resume tests flip global engine state — always restore "running".
   if (triggerPauseTestOnlyWasUsed) triggerResume();
+  triggerPauseTestOnlyWasUsed = false;
 });
 let triggerPauseTestOnlyWasUsed = false;
 
@@ -678,8 +681,10 @@ describe("POST /api/jobs/:id/override", () => {
     expect(getJob("over07")).toMatchObject({ download_status: "paused", target_format: "mp4", video_quality: "720p" });
   });
 
-  test("retrying a job with overrides unpauses an engine stopped by BAD_DOWNLOADER_ARGS", async () => {
+  test("retrying one job does not clear BAD_DOWNLOADER_ARGS or other user pauses", async () => {
     insertJob("over08", { download_status: "paused", target_format: null, video_quality: null });
+    insertJob("held08", { download_status: "paused", pause_reason: "user" });
+    triggerPauseTestOnlyWasUsed = true;
     triggerPause("BAD_DOWNLOADER_ARGS (test)");
     const res = await api("/api/jobs/over08/override", {
       method: "POST",
@@ -688,7 +693,9 @@ describe("POST /api/jobs/:id/override", () => {
     });
     expect(res.status).toBe(200);
     const status = await (await api("/api/status")).json();
-    expect(status.isPaused).toBe(false);
+    expect(status.isPaused).toBe(true);
+    expect(status.pauseReason).toContain("BAD_DOWNLOADER_ARGS");
+    expect(getJob("held08").pause_reason).toBe("user");
   });
 
   test("an audio-track-only retry preserves the existing no-conversion policy", async () => {

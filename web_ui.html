@@ -1401,6 +1401,10 @@
         <div class="label">Download engine</div>
         <div class="value" id="relDownloader">--</div>
       </div>
+      <div class="reliability-item">
+        <div class="label">Cookies (local check)</div>
+        <div class="value" id="cookieStatus" role="status">--</div>
+      </div>
     </div>
     <div class="reliability-details-grid" id="reliabilityDetails">
       <div class="reliability-item">
@@ -1694,8 +1698,9 @@
         <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 12px;">
           Reads the YouTube and Google cookies of a browser you are signed in to, and saves them as
           <code>cookies.txt</code>. The current file is kept as <code>cookies.txt.bak</code>, and nothing is
-          replaced unless the export contains a signed-in session. If the export says the browser store is
-          locked, close that browser completely and try again.
+          replaced unless the export locally contains a signed-in session. This does not verify that YouTube
+          accepts it. The selected default browser profile is tried first, then the configured fallbacks.
+          If a browser store is locked, close that browser completely and try again.
         </p>
         <label for="cookieExportBrowser" style="font-size: 0.8rem; font-weight: 600;">Browser</label>
         <select id="cookieExportBrowser" style="width: 100%; margin-top: 6px;">
@@ -1711,7 +1716,7 @@
         <div id="cookieExportResult" role="status" style="font-size: 0.85rem; margin-top: 12px; white-space: pre-wrap;"></div>
       </div>
       <div class="modal-footer">
-        <span style="margin-right: auto; font-size: 0.78rem; color: var(--text-secondary);">Reading a browser can take up to two minutes.</span>
+        <span style="margin-right: auto; font-size: 0.78rem; color: var(--text-secondary);">Fallbacks may take up to four minutes in total.</span>
         <button class="btn btn-secondary" onclick="closeCookieExport()">Close</button>
         <button class="btn btn-primary" id="cookieExportRunBtn" onclick="runCookieExport()">🍪 Save cookies.txt</button>
       </div>
@@ -1778,6 +1783,8 @@
     let sortState = { key: null, dir: 1 };
     let lastSuccessfulFetch = null;
     let reliabilityDetailsExpanded = false;
+    let cookieExportInProgress = false;
+    let cookieExportOffline = false;
 
     const STATUS_ORDER = ['downloading', 'pending', 'waiting_live', 'paused', 'failed', 'done'];
 
@@ -1865,6 +1872,33 @@
       const h = Math.floor(m / 60);
       if (h < 24) return `${h}h ago`;
       return `${Math.floor(h / 24)}d ago`;
+    }
+
+    // Render metadata only; textContent keeps browser names and paths from
+    // becoming markup. A local session check is not YouTube authentication.
+    function renderCookieStatus(status, offline) {
+      cookieExportOffline = !!offline;
+      const button = document.getElementById('cookieExportRunBtn');
+      if (button) button.disabled = cookieExportOffline || cookieExportInProgress;
+      const el = document.getElementById('cookieStatus');
+      if (!el) return;
+      const cookie = status || {};
+      const parts = [];
+      if (offline) parts.push('Offline');
+      if (!cookie.present) {
+        parts.push('No cookies file');
+      } else {
+        parts.push(cookie.valid === true ? 'Locally valid' : cookie.valid === false ? 'Invalid or expired' : 'Unreadable');
+        parts.push(cookie.source || 'unknown source');
+        const count = Number.isFinite(cookie.cookies) ? cookie.cookies : 0;
+        parts.push(`${count} ${count === 1 ? 'cookie' : 'cookies'}`);
+        const modified = timeAgo(cookie.modifiedAt);
+        const exported = timeAgo(cookie.exportedAt);
+        if (modified) parts.push(`File updated ${modified}`);
+        if (exported) parts.push(`Exported ${exported}`);
+      }
+      el.textContent = parts.join(' · ');
+      el.title = 'Local file and expiry check only; YouTube may still reject these cookies.';
     }
 
     function updateUpdatedAgo() {
@@ -2214,7 +2248,9 @@
           pauseBtn.textContent = '▶️ Resume All';
           pauseBtn.className = 'btn btn-success';
           pauseBanner.classList.add('show');
-          pauseReason.textContent = data.pauseReason || 'paused';
+          const retryAt = parseStamp(data.recovery?.retryAt);
+          pauseReason.textContent = (data.pauseReason || 'paused') +
+            (retryAt ? ` · Automatic retry after ${retryAt.toLocaleString()}` : '');
         } else {
           pauseBtn.textContent = '⏸️ Pause All';
           pauseBtn.className = 'btn btn-warning';
@@ -2224,6 +2260,7 @@
 
         renderWorkers(data.workers);
         setOfflineBanner(data);
+        renderCookieStatus(data.cookies, data.offlineMode);
 
         const runtimeEl = document.getElementById('runtimeBadge');
         if (runtimeEl) {
@@ -2749,6 +2786,8 @@
       const button = document.getElementById('cookieExportRunBtn');
       const result = document.getElementById('cookieExportResult');
       const originalText = button.textContent;
+      if (cookieExportOffline || cookieExportInProgress) return;
+      cookieExportInProgress = true;
       button.disabled = true;
       button.textContent = '⏳ Reading ' + browser + '…';
       result.textContent = '';
@@ -2772,7 +2811,8 @@
         result.style.color = 'var(--danger, #c0392b)';
         result.textContent = err.message || 'Could not save browser cookies';
       } finally {
-        button.disabled = false;
+        cookieExportInProgress = false;
+        button.disabled = cookieExportOffline;
         button.textContent = originalText;
       }
     }

@@ -42,6 +42,10 @@ export const workerStatuses = new Map<string, string>();
 export const activeProcs = new Map<number, Bun.Subprocess>();
 // Logical download claims held through probing, child execution, and result handling.
 export const activeDownloadJobs = new Map<number, string>();
+// A pause can be resumed before the signalled child actually exits. Remember
+// that interruption until the owning attempt settles, even if global state has
+// already returned to running; otherwise the signal is counted as a failure.
+export const interruptedDownloadJobs = new Map<number, string>();
 // Conversion and metadata stages register their child processes the same way,
 // keyed by worker id. The job maps (worker id → job id) are what let the
 // dashboard's Stop / Delete / Purge actions find the process that belongs to a

@@ -9,7 +9,7 @@
 
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
+import { createCookieInvocation, jsRuntimeArgs, ytDlp } from "./tools";
 import { getPlaylistItems, PLAYLIST_SCAN_TIMEOUT_MS, type ListingItem } from "./scanner";
 import { missingSidecarArgs } from "./workers/metadata";
 import type { MetadataKind } from "./metadata-files";
@@ -165,10 +165,11 @@ async function fetchSidecars(
   config: Config,
   kinds: MetadataKind[],
 ): Promise<string | null> {
+  const cookie = createCookieInvocation(config);
   const args = [
     ytDlp(),
     `https://www.youtube.com/watch?v=${item.id}`,
-    ...cookiesArgs(config),
+    ...cookie.args,
     ...jsRuntimeArgs(),
     "--skip-download",
     "--no-simulate",
@@ -184,12 +185,14 @@ async function fetchSidecars(
   ];
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), ITEM_TIMEOUT_MS);
+  let proc: Bun.Subprocess | null = null;
   try {
-    const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: ctl.signal });
+    const child = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: ctl.signal });
+    proc = child;
     const [, stderr, code] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
     ]);
     if (ctl.signal.aborted) return `timed out after ${ITEM_TIMEOUT_MS / 60_000} minutes`;
     if (code !== 0) {
@@ -205,5 +208,10 @@ async function fetchSidecars(
     return String(err?.message || err).slice(0, 300);
   } finally {
     clearTimeout(timer);
+    if (proc && proc.exitCode === null) {
+      try { proc.kill("SIGKILL"); } catch {}
+      await proc.exited.catch(() => {});
+    }
+    cookie.cleanup();
   }
 }

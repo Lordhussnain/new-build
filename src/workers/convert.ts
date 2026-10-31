@@ -34,6 +34,7 @@ import {
 } from "../state";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
 import { logError } from "../logger";
+import { engineFencing, holdsEngineLease, withEngineLease } from "../lease";
 import { ffmpeg } from "../tools";
 import { effectiveTargetFormat } from "../download-args";
 import { findSidecarFiles } from "../metadata-files";
@@ -223,17 +224,20 @@ export async function converterWorker(id: number, config: Config): Promise<void>
     // (POST /api/settings) take effect on the next job without a restart. The
     // parameter is only the initial value.
     config = getConfig();
-    if (isPaused()) {
+    if (isPaused() || !holdsEngineLease()) {
       await Bun.sleep(2000);
       continue;
     }
     const disk = await checkDiskSpace(config.outputRoot, config.minFreeSpaceGB);
+    const live = getConfig();
+    if (abortController.signal.aborted || isPaused() || !holdsEngineLease() ||
+        live.outputRoot !== config.outputRoot || live.minFreeSpaceGB !== config.minFreeSpaceGB) continue;
     if (!disk.ok) {
       triggerPause(`LOW_DISK_SPACE (${disk.free.toFixed(1)}GB < ${config.minFreeSpaceGB}GB)`);
       await Bun.sleep(10000);
       continue;
     }
-    const job = claimConvertJob(workerId);
+    const job = withEngineLease(engineFencing(), () => claimConvertJob(workerId));
     if (!job) {
       await Bun.sleep(2000);
       continue;

@@ -101,13 +101,13 @@ describe("probeBrowserCookies", () => {
     }
   });
 
-  test.skipIf(WIN)("a browser store that cannot be read reports yt-dlp's reason", async () => {
+  test.skipIf(WIN)("a browser store that cannot be read reports a safe, actionable reason", async () => {
     const original = resolvedTools.ytDlp;
     try {
       resolvedTools.ytDlp = await fakeYtDlp("probe-locked", `console.error("ERROR: Could not copy Chrome cookie database"); process.exit(1);`);
       expect(await probeBrowserCookies("chrome")).toEqual({
         ok: false,
-        reason: "could not read chrome cookies: Could not copy Chrome cookie database",
+        reason: "could not read chrome cookies: Could not copy the browser cookie database. Close the browser and try again.",
       });
     } finally {
       resolvedTools.ytDlp = original;
@@ -182,7 +182,7 @@ describe("exportBrowserCookies", () => {
     expect(await readFile(target, "utf8")).toBe(SIGNED_IN);
   });
 
-  test.skipIf(WIN)("a browser store that cannot be read reports yt-dlp's real reason", async () => {
+  test.skipIf(WIN)("a browser store that cannot be read reports a safe, actionable reason", async () => {
     const target = join(dir, "locked", "cookies.txt");
     await Bun.write(join(dir, "locked", ".keep"), "");
     const fake = await fakeYtDlp(
@@ -191,7 +191,7 @@ describe("exportBrowserCookies", () => {
     );
     const result = await exportBrowserCookies("chrome", target, { ytDlp: fake });
     expect(result.ok).toBe(false);
-    expect(result.error).toBe("Could not read chrome cookies: Could not copy Chrome cookie database. Close Chrome and try again");
+    expect(result.error).toBe("Could not read chrome cookies: Could not copy the browser cookie database. Close the browser and try again.");
     expect(await readdir(join(dir, "locked"))).toEqual([".keep"]);
   });
 

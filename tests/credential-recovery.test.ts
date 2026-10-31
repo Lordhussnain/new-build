@@ -7,7 +7,8 @@ import { DEFAULT_CONFIG } from "../src/config";
 import { db, initDatabase } from "../src/db";
 import { acquireEngineLease, releaseEngineLease } from "../src/lease";
 import { requeueCredentialBlockedJobs } from "../src/reconcile";
-import { isCredentialBlockedError } from "../src/retry";
+import { classifyTerminalDownloadError, formatTerminalErrorMessage, isCredentialBlockedError } from "../src/retry";
+import { resetCookiesBaseline, usableCookieFingerprint } from "../src/tools";
 import { markJobCancelled, setConfig, setPaused } from "../src/state";
 
 beforeEach(() => {
@@ -69,6 +70,139 @@ describe("credential recovery", () => {
     for (const text of ["Private video. Sign in to view", "Video has been removed. Login required", "[terminal] Video not found — cookies expired", "not available in your country", "Connection reset", null]) {
       expect(isCredentialBlockedError(text)).toBe(false);
     }
+  });
+
+  test("stored generic login failures recover, but hard terminal reasons win anywhere in the tail", () => {
+    const raw = "ERROR: Video unavailable. Login required";
+    const info = classifyTerminalDownloadError(raw)!;
+    expect(info.code).toBe("unavailable");
+    const stored = formatTerminalErrorMessage(info, raw);
+    expect(isCredentialBlockedError(stored)).toBe(true);
+    expect(stored).toContain("until fresh usable cookies");
+    for (const text of [
+      "Sign in to confirm your age. Video has been removed by the uploader",
+      "Join this channel to get access. This video is not available in your country",
+      "[terminal] Age-restricted video — yt-dlp: Video has been removed",
+      "[terminal] Video unavailable — yt-dlp: Login required; this video is private",
+      "[terminal] Requested format not available — yt-dlp: cookies expired",
+    ]) expect(isCredentialBlockedError(text)).toBe(false);
+  });
+
+  test("truncated terminal diagnostics retain both hard and credential decisions", () => {
+    const longPrefix = "x".repeat(400);
+    const blocked = `Video unavailable. ${longPrefix} Login required`;
+    const blockedInfo = classifyTerminalDownloadError(blocked)!;
+    expect(isCredentialBlockedError(blocked)).toBe(true);
+    const blockedRecord = formatTerminalErrorMessage(blockedInfo, blocked);
+    expect(blockedRecord).toContain("Sign-in or cookies required");
+    expect(isCredentialBlockedError(blockedRecord)).toBe(true);
+
+    const removed = `Sign in to confirm your age. ${longPrefix} Video has been removed`;
+    const removedInfo = classifyTerminalDownloadError(removed)!;
+    expect(removedInfo.code).toBe("removed");
+    const removedRecord = formatTerminalErrorMessage(removedInfo, removed);
+    expect(isCredentialBlockedError(removedRecord)).toBe(false);
+    expect(removedRecord).toContain("will not be retried automatically");
+  });
+
+  test("a claimed failure waits for its claim without repeatedly rescuing an already retried job", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-cookie-claims-"));
+    const cookiesFile = join(dir, "cookies.txt");
+    setConfig({ ...DEFAULT_CONFIG, cookiesFile, cookieBrowsers: [] });
+    try {
+      failed("ready");
+      failed("held", { download_claim_token: "owner" });
+      await writeFile(cookiesFile, ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalid\n");
+      expect(await reconcile.refreshCookies()).toBe(1);
+      expect(row("held").download_status).toBe("failed");
+      db.run("UPDATE jobs SET download_status = 'failed', last_error = 'Login required' WHERE id = 'ready'");
+      db.run("UPDATE jobs SET download_claim_token = NULL WHERE id = 'held'");
+      expect(await reconcile.refreshCookies()).toBe(1);
+      expect(row("held").download_status).toBe("pending");
+      expect(row("ready").download_status).toBe("failed");
+      expect(await reconcile.refreshCookies()).toBe(0);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  test("a failure from an old in-flight cookie snapshot is rescued after the watcher already saw the refresh", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-cookie-inflight-"));
+    const cookiesFile = join(dir, "cookies.txt");
+    setConfig({ ...DEFAULT_CONFIG, cookiesFile, cookieBrowsers: [] });
+    try {
+      failed("late", { download_status: "downloading", last_error: null });
+      await writeFile(cookiesFile, ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\told\n");
+      const old = usableCookieFingerprint({ cookiesFile });
+      expect(await reconcile.refreshCookies()).toBe(0);
+      await writeFile(cookiesFile, ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tnew\n");
+      expect(await reconcile.refreshCookies()).toBe(0); // the job is still running
+      db.run("UPDATE jobs SET download_status = 'failed', last_error = 'Login required' WHERE id = 'late'");
+      reconcile.noteCredentialFailure("late", old);
+      expect(await reconcile.refreshCookies()).toBe(1);
+      expect(row("late").download_status).toBe("pending");
+      // A failure actually made using the new bytes must not loop on every tick.
+      db.run("UPDATE jobs SET download_status = 'failed', last_error = 'Login required' WHERE id = 'late'");
+      reconcile.noteCredentialFailure("late", usableCookieFingerprint({ cookiesFile }));
+      expect(await reconcile.refreshCookies()).toBe(0);
+      expect(await reconcile.refreshCookies()).toBe(0);
+      expect(row("late").download_status).toBe("failed");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  test("a failure using new bytes before the first observation is not retried with those same bytes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-cookie-observation-"));
+    const cookiesFile = join(dir, "cookies.txt");
+    setConfig({ ...DEFAULT_CONFIG, cookiesFile, cookieBrowsers: [] });
+    try {
+      await writeFile(cookiesFile, ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tnew\n");
+      failed("already-tried");
+      reconcile.noteCredentialFailure("already-tried", usableCookieFingerprint({ cookiesFile }));
+      expect(await reconcile.refreshCookies()).toBe(0);
+      expect(row("already-tried").download_status).toBe("failed");
+      await writeFile(cookiesFile, ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tnewer\n");
+      expect(await reconcile.refreshCookies()).toBe(1);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  test("an unwritable working copy never exposes the original and delays rescue until it is fixed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-cookie-copy-"));
+    const cookiesFile = join(dir, "cookies.txt");
+    const config = { ...DEFAULT_CONFIG, cookiesFile, cookieBrowsers: [] };
+    setConfig(config);
+    const jar = ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalid\n";
+    try {
+      await writeFile(cookiesFile, jar);
+      failed("protected");
+      // A nonexistent temp root blocks the private snapshot, without exposing
+      // the source jar. The normal temp root on the next tick is usable.
+      expect(await reconcile.refreshCookies({ tempRoot: join(dir, "missing-temp-root") })).toBe(0);
+      expect(row("protected").download_status).toBe("failed");
+      expect(await Bun.file(cookiesFile).text()).toBe(jar);
+      expect(await reconcile.refreshCookies()).toBe(1);
+      expect(row("protected").download_status).toBe("pending");
+      expect(await Bun.file(cookiesFile).text()).toBe(jar);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  test("a disappeared file that reappears with the same bytes is observed again", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yta-cookie-reappear-"));
+    const cookiesFile = join(dir, "cookies.txt");
+    const config = { ...DEFAULT_CONFIG, cookiesFile, cookieBrowsers: [] };
+    setConfig(config);
+    const jar = ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalid\n";
+    try {
+      resetCookiesBaseline();
+      await writeFile(cookiesFile, jar);
+      reconcile.cookiesWatch(config);
+      failed("again");
+      await reconcile.refreshCookies();
+      db.run("UPDATE jobs SET download_status = 'failed', last_error = 'Login required' WHERE id = 'again'");
+      await rm(cookiesFile);
+      expect(reconcile.cookiesWatch(config)).toBe("disappeared");
+      await writeFile(cookiesFile, jar);
+      expect(reconcile.cookiesWatch(config)).toBe("appeared");
+      expect(await reconcile.refreshCookies()).toBe(1);
+      expect(row("again").download_status).toBe("pending");
+    } finally { resetCookiesBaseline(); await rm(dir, { recursive: true, force: true }); }
   });
 
   test("rescues every eligible job with fresh budgets while preserving partial progress", () => {

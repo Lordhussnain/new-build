@@ -5,8 +5,9 @@
 // and automatic exports share the same atomic writer without an import cycle.
 
 import { createHash } from "node:crypto";
-import { copyFile, rename, rm, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { renameSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 
 /** Cookies that mean "signed in to YouTube/Google". */
 export const SESSION_COOKIE_NAMES = ["SID", "__Secure-1PSID", "__Secure-3PSID", "LOGIN_INFO"] as const;
@@ -25,11 +26,18 @@ export interface CookieFileDiagnosis {
 /** Netscape cookie lines have exactly 7 TAB-separated fields. */
 const NETSCAPE_FIELDS = 7;
 
+/** Refuse malformed UTF-8 instead of silently changing credential bytes. */
+export function decodeCookieBytes(bytes: Uint8Array): string {
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
 function onCookieSite(domain: string): boolean {
   return /^(?:[a-z0-9-]+\.)*(?:youtube|google)\.com$/i.test(domain.replace(/^\./, ""));
 }
 
 function cookieExpiry(value: string): number | null {
+  // yt-dlp accepts both an empty expiry and 0 as browser-session cookies.
+  if (value === "") return 0;
   if (!/^\d+$/.test(value)) return null;
   const expiry = Number(value);
   return Number.isSafeInteger(expiry) ? expiry : null;
@@ -39,18 +47,38 @@ function cookieFields(raw: string): string[] | null {
   const line = raw.startsWith("#HttpOnly_") ? raw.slice("#HttpOnly_".length) : raw;
   if (!line.trim() || line.startsWith("#")) return null;
   const fields = line.split("\t");
-  return fields.length === NETSCAPE_FIELDS ? fields : null;
+  // These rows cannot safely survive normalization or MozillaCookieJar's
+  // line parser. Diagnose exactly the rows that can be passed to yt-dlp.
+  return fields.length === NETSCAPE_FIELDS && !fields.some((field) => /[\x00-\x1f\x7f]/.test(field))
+    ? fields : null;
 }
 
-/** Only live YouTube/Google rows, retaining the HttpOnly prefix verbatim. */
-export function filterCookiesText(text: string, nowMs = Date.now()): string {
-  const rows = text.split(/\r?\n/).filter(raw => {
+/** Build a jar that yt-dlp's MozillaCookieJar can actually load. */
+function canonicalCookieRows(text: string, nowMs: number, siteOnly: boolean): string[] {
+  const rows: string[] = [];
+  for (const raw of text.split(/\r?\n/)) {
     const fields = cookieFields(raw);
-    if (!fields || !onCookieSite(fields[0])) return false;
+    if (!fields || !fields[0] || (siteOnly && !onCookieSite(fields[0]))) continue;
     const expiry = cookieExpiry(fields[4]);
-    return expiry !== null && (expiry === 0 || expiry * 1000 > nowMs) && !!fields[6].trim();
-  });
-  return `# Netscape HTTP Cookie File\n${rows.join("\n")}\n`;
+    if (expiry === null || (expiry !== 0 && expiry * 1000 <= nowMs)) continue;
+    // Python rejects the ENTIRE jar when the include-subdomains flag does not
+    // agree with the leading dot. Some browser exporters get that flag wrong.
+    fields[1] = fields[0].startsWith(".") ? "TRUE" : "FALSE";
+    fields[3] = fields[3].toUpperCase() === "TRUE" ? "TRUE" : "FALSE";
+    fields[4] = expiry === 0 ? "0" : fields[4];
+    rows.push(`${raw.startsWith("#HttpOnly_") ? "#HttpOnly_" : ""}${fields.join("\t")}`);
+  }
+  return rows;
+}
+
+/** Live YouTube/Google rows for a browser export, retaining empty-value cookies. */
+export function filterCookiesText(text: string, nowMs = Date.now()): string {
+  return `# Netscape HTTP Cookie File\n${canonicalCookieRows(text, nowMs, true).join("\n")}\n`;
+}
+
+/** Normalize a private invocation copy while retaining other sites in user-provided jars. */
+export function normalizeCookiesText(text: string, nowMs = Date.now()): string {
+  return `# Netscape HTTP Cookie File\n${canonicalCookieRows(text, nowMs, false).join("\n")}\n`;
 }
 
 /**
@@ -105,11 +133,22 @@ export function diagnoseCookiesText(text: string, nowMs: number = Date.now()): C
   return { entries, siteEntries, signedIn, problem };
 }
 
-/**
- * The most useful line from yt-dlp's stderr when it fails. yt-dlp's last line is
- * often a generic "failed to load cookies"; the real cause (a locked Chrome
- * database, a missing profile, DPAPI) is the line before it.
- */
+/** Browser stderr is untrusted and may contain cookie values or headers. */
+export function browserCookieFailureReason(stderr: string): string {
+  if (/decrypt|dpapi|keyring|keychain/i.test(stderr)) {
+    return "Could not decrypt browser cookies. Check the browser profile and operating-system keyring.";
+  }
+  if (/locked|\bbusy\b|copy[^\n]*cookie|cookie[^\n]*copy/i.test(stderr)) {
+    return "Could not copy the browser cookie database. Close the browser and try again.";
+  }
+  if (/profile|not found|no such file|not installed/i.test(stderr)) {
+    return "The browser profile or cookie database was not found.";
+  }
+  return "yt-dlp could not read the browser cookie store.";
+}
+
+/** Select a useful line for non-browser yt-dlp probes. Browser export uses the
+ * safe categories above instead, because stderr may include cookie values. */
 export function ytDlpFailureReason(stderr: string): string {
   const lines = stderr
     .split(/\r?\n/)
@@ -147,6 +186,7 @@ export async function persistCookieJar(
   file: string,
   jar: string,
   stillCurrent: () => boolean = () => true,
+  publish: (commit: () => boolean) => boolean = (commit) => commit(),
 ): Promise<{ ok: boolean; cookies?: number; backup?: string; error?: string }> {
   const key = cookiePathKey(file);
   const previous = exportLocks.get(key) ?? Promise.resolve();
@@ -155,20 +195,35 @@ export async function persistCookieJar(
     const diagnosis = diagnoseCookiesText(text);
     if (diagnosis.problem) return { ok: false, error: `${browser}: ${diagnosis.problem}` };
     if (!file.trim()) return { ok: false, error: "No cookies.txt path is configured (cookiesFile)." };
-    const incoming = `${file}.incoming`;
+    let dir: string | undefined;
     let backup: string | undefined;
     try {
       if (!stillCurrent()) return { ok: false, error: "Cookie configuration changed during extraction." };
-      await writeFile(incoming, text, { encoding: "utf8", mode: 0o600 });
+      // A private, unique directory on the same filesystem supports atomic
+      // renames without following pre-existing .incoming/.bak symlinks. Both
+      // the new jar and the backup are mode 0600, even if the source was not.
+      dir = await mkdtemp(join(dirname(key), `.${basename(key)}.tmp-`));
+      const incoming = join(dir, "incoming");
+      const backupCopy = join(dir, "backup");
+      await writeFile(incoming, text, { encoding: "utf8", mode: 0o600, flag: "wx" });
       if (!stillCurrent()) return { ok: false, error: "Cookie configuration changed during extraction." };
       try {
-        await copyFile(file, `${file}.bak`);
+        const oldBytes = await readFile(file);
+        await writeFile(backupCopy, oldBytes, { mode: 0o600, flag: "wx" });
         backup = `${file}.bak`;
       } catch (error: any) {
         if (error?.code !== "ENOENT") throw error;
       }
-      if (!stillCurrent()) return { ok: false, error: "Cookie configuration changed during extraction." };
-      await rename(incoming, file);
+      // The engine injects an immediate SQLite transaction here. It checks
+      // the exact lease generation and keeps that lock through both renames;
+      // no async gap permits an in-process configuration or lease change.
+      const committed = publish(() => {
+        if (!stillCurrent()) return false;
+        if (backup) renameSync(backupCopy, backup);
+        renameSync(incoming, file);
+        return true;
+      });
+      if (!committed) return { ok: false, error: "Cookie configuration or engine lease changed during extraction." };
       exportsByPath.set(key, {
         hash: createHash("sha256").update(text).digest("hex"),
         source: browser,
@@ -178,7 +233,7 @@ export async function persistCookieJar(
     } catch (error: any) {
       return { ok: false, error: `Could not write ${file}: ${error?.message || error}` };
     } finally {
-      await rm(incoming, { force: true }).catch(() => {});
+      if (dir) await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(() => {});
     }
   });
   exportLocks.set(key, write);

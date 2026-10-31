@@ -18,7 +18,7 @@
 //     partial-file tracking and `--continue` resume behave identically.
 
 import { join } from "node:path";
-import { cookiesArgs, jsRuntimeArgs, type JsRuntime } from "./tools";
+import { jsRuntimeArgs, type JsRuntime } from "./tools";
 import { DOWNLOAD_PATH_PREFIX } from "./download-output";
 import { fitBaseFilename, sanitizeFileName } from "./util";
 import { computeDownloadTimeoutMs } from "./retry";
@@ -220,6 +220,8 @@ export interface BuildDownloadPlanOptions {
    * `checkDependencies` found; omit/null to skip the flags (unit tests).
    */
   jsRuntime?: JsRuntime | null;
+  /** Invocation-owned cookie snapshot prepared by the caller, if any. */
+  cookieArgs?: readonly string[];
 }
 
 /** Build the complete yt-dlp invocation for one download attempt. */
@@ -244,7 +246,7 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
   const args: string[] = [
     // argv[0] is filled in by the caller (the resolved yt-dlp path).
     job.url,
-    ...cookiesArgs(config),
+    ...(opts.cookieArgs ?? []),
     ...jsRuntimeArgs(opts.jsRuntime ?? null),
     "--format",
     effectiveFormat,

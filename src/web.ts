@@ -24,6 +24,7 @@ import {
 import { autoscaler, activeDlSlots } from "./autoscale";
 import {
   activeDownloadJobs,
+  abortController,
   clearJobCancelled,
   getConfig,
   getPauseReason,
@@ -45,11 +46,12 @@ import {
   type BatchSourceEntry,
   type SourceUrl,
 } from "./sources";
-import { cancelActiveStages, diskUsage, interruptActiveDownloads, triggerPause, triggerResume, type CancelledStages } from "./resilience";
+import { automaticRecoveryTick, cancelActiveStages, diskUsage, interruptActiveDownloads, recoveryStatus, triggerPause, triggerResume, type CancelledStages } from "./resilience";
 import { METADATA_KINDS, listMetadataOnlyTasks, startMetadataOnly } from "./metadata-only";
 import { appendToArchive, readArchiveIds, removeFromArchive } from "./archive";
 import {
   findPartialFile,
+  refreshCookies,
   requeueFailedJobs,
   removePartialFiles,
   stashDownloadedFile,
@@ -58,18 +60,19 @@ import {
 } from "./reconcile";
 import { scanUnconvertedVideos } from "./unconverted-scan";
 import { relocationPendingCount } from "./relocate";
-import { holdsEngineLease, isLeaseExpired, readEngineLease } from "./lease";
+import { engineFencing, holdsEngineLease, isLeaseExpired, readEngineLease, withEngineLease } from "./lease";
 import { buildRunReport } from "./report";
-import { isPermanentDownloadError } from "./retry";
-import { aria2cPath, jsRuntime, resolveCookieSource } from "./tools";
-import { exportBrowserCookies } from "./cookies-export";
+import { isCredentialBlockedError, isPermanentDownloadError } from "./retry";
+import { aria2cPath, getCookieStatus, jsRuntime } from "./tools";
+import { cookiePathKey } from "./cookie-file";
+import { exportBrowserCookiesWithFallback } from "./cookies-export";
 import { applySettings, readSettings } from "./settings";
 import { effectiveTargetFormat, effectiveVideoQuality, jobFittedBaseFilename, resolveDownloaderEngine } from "./download-args";
 import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-tracks";
 import { formatBytesPerSec, formatDuration } from "./util";
 import { updateWorkerLine } from "./dashboard";
 import { errorLogPath, logError } from "./logger";
-import { QUALITY_FORMATS, effectiveWebToken, withConfigWriteLock, type Config } from "./config";
+import { COOKIE_BROWSER_NAMES, QUALITY_FORMATS, effectiveWebToken, withConfigWriteLock, type Config } from "./config";
 
 // --- Web UI auth (optional shared-secret token) ------------------------------
 // When webToken is set, every request except POST /api/auth must present it —
@@ -370,7 +373,7 @@ interface Route {
 
 /** Minutes-scale work: a playlist/channel scan over a large source. */
 const SCAN_DEADLINE_SECONDS = 15 * 60;
-/** A browser cookie read plus the live YouTube check it performs. */
+/** One bounded browser fallback sequence plus time for the response. */
 const COOKIE_EXPORT_DEADLINE_SECONDS = 5 * 60;
 /** A `yt-dlp -J` audio-track probe; the probe itself gives up at 90s. */
 const AUDIO_PROBE_DEADLINE_SECONDS = 120;
@@ -1063,6 +1066,10 @@ const ROUTES: Route[] = [
         workers,
         isPaused: isPaused(),
         pauseReason: getPauseReason(),
+        recovery: recoveryStatus(),
+        // Local file metadata only — never return cookie values or imply that
+        // YouTube has accepted the session.
+        cookies: getCookieStatus(config),
         // Offline mode: the dashboard shows this instead of letting the operator
         // wonder why the queue has stopped moving (src/engine.ts).
         offlineMode: !!config.offlineMode,
@@ -1168,7 +1175,7 @@ const ROUTES: Route[] = [
         if (changed === "in-progress") return jobInProgressResponse();
         if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
         if (retry && isPaused() && getPauseReason()?.startsWith("BAD_DOWNLOADER_ARGS")) {
-          triggerResume();
+          await automaticRecoveryTick();
         }
         const saved = db.query("SELECT target_format, video_quality, audio_selection FROM jobs WHERE id = ?").get(params.id) as any;
         return Response.json({
@@ -1194,7 +1201,7 @@ const ROUTES: Route[] = [
         if (result.changed === "in-progress") return jobInProgressResponse();
         if (result.changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
         if (isPaused() && getPauseReason()?.startsWith("BAD_DOWNLOADER_ARGS")) {
-          triggerResume();
+          await automaticRecoveryTick();
         }
         // A retry wipes partial state and restarts from 0% — tell the operator
         // when the wipe could not complete (locked partial).
@@ -1566,7 +1573,7 @@ const ROUTES: Route[] = [
         if (result.changed === "in-progress") return jobInProgressResponse();
         if (result.changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
         if (isPaused() && getPauseReason()?.startsWith("BAD_DOWNLOADER_ARGS")) {
-          triggerResume();
+          await automaticRecoveryTick();
         }
         return Response.json({ ok: true, ...(result.partialWarning ? { warning: result.partialWarning } : {}) });
       } catch (e: any) {
@@ -1891,36 +1898,58 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/cookies/export",
-    // Reads a browser cookie store and validates it against YouTube.
+    // Reads default browser profiles; validity is checked locally, not against YouTube.
     deadlineSeconds: COOKIE_EXPORT_DEADLINE_SECONDS,
     handler: async ({ req }) => {
-      // Save a browser's YouTube cookies as cookies.txt (see cookies-export.ts).
-      // Only one export at a time: each one starts a browser-store read.
       const body = await req.json().catch(() => null);
       const browser = typeof body?.browser === "string" ? body.browser.trim().toLowerCase() : "";
       if (!browser) {
         return Response.json({ ok: false, error: "Choose a browser (for example firefox)." }, { status: 400 });
       }
+      if (!(COOKIE_BROWSER_NAMES as readonly string[]).includes(browser)) {
+        return Response.json({ ok: false, error: `Unknown browser "${browser}".` }, { status: 422 });
+      }
       const live = getConfig();
       if (live.offlineMode) {
         return Response.json(
-          { ok: false, error: "Offline mode is on, and reading browser cookies needs a YouTube check. Turn offline mode off, then export." },
+          { ok: false, error: "Offline mode is on. Turn it off before reading browser cookies." },
           { status: 409 },
         );
       }
       if (cookieExportRunning) {
         return Response.json({ ok: false, error: "A cookie export is already running." }, { status: 409 });
       }
+      if (!holdsEngineLease() || getPauseReason() === "ENGINE_LEASE_LOST") {
+        return Response.json({ ok: false, error: "The engine lease is not held; browser cookies were not read." }, { status: 409 });
+      }
+      const originalPath = cookiePathKey(live.cookiesFile);
+      const originalBrowsers = JSON.stringify(live.cookieBrowsers);
+      const fencing = engineFencing();
+      const stillCurrent = () => {
+        const current = getConfig();
+        try {
+          return !abortController.signal.aborted && !current.offlineMode && getPauseReason() !== "ENGINE_LEASE_LOST" &&
+            holdsEngineLease() && engineFencing() === fencing && cookiePathKey(current.cookiesFile) === originalPath &&
+            JSON.stringify(current.cookieBrowsers) === originalBrowsers;
+        } catch { return false; }
+      };
       cookieExportRunning = true;
       try {
-        const result = await exportBrowserCookies(browser, live.cookiesFile);
-        if (!result.ok) return Response.json({ ...result, saved: false }, { status: 422 });
-        // Re-check sources now so the new file is used by the next download.
-        void resolveCookieSource(getConfig(), { force: true });
+        const result = await exportBrowserCookiesWithFallback(browser, live.cookiesFile, live.cookieBrowsers, {
+          shouldContinue: stillCurrent,
+          publish: (commit) => withEngineLease(fencing, commit) ?? false,
+        });
+        if (!result.ok) return Response.json({ ...result, saved: false }, { status: stillCurrent() ? 422 : 409 });
+        // Apply the freshly persisted jar immediately; the regular watcher
+        // retries this if the engine is paused or its lease is unavailable.
+        try { await refreshCookies(); }
+        catch (error) { logError("cookies", `Could not refresh after export: ${String(error)}`); }
+        const tried = `Browsers tried: ${result.attempted.join(", ")}.`;
+        const failures = result.errors.map((item) => `${item.browser}: ${item.error}`).join("; ");
         return Response.json({
           ...result,
           saved: true,
-          message: `Saved ${result.cookies} YouTube/Google cookie(s) from ${browser} to ${result.file}.${result.backup ? ` The previous file is at ${result.backup}.` : ""}`,
+          message: `Saved ${result.cookies} YouTube/Google cookie(s) from ${result.browser} to ${result.file}.${result.backup ? ` The previous file is at ${result.backup}.` : ""} ${tried}${failures ? ` Earlier attempts: ${failures}` : ""}`,
         });
       } finally {
         cookieExportRunning = false;
@@ -1965,7 +1994,9 @@ const ROUTES: Route[] = [
     methods: ["POST"],
     pattern: "/api/resume",
     handler: () => {
-      triggerResume();
+      if (!triggerResume()) {
+        return Response.json({ ok: false, success: false, paused: isPaused(), error: "Could not resume. Check the engine lease and error log before retrying." }, { status: 409 });
+      }
       return Response.json({ ok: true, success: true, paused: false });
     },
   },
@@ -2082,6 +2113,15 @@ const ROUTES: Route[] = [
             ]);
           }
         }
+      }
+      // A corrected downloader setting can resume immediately rather than
+      // waiting for the next minute tick. The tick is lease- and pause-gated.
+      if (isPaused() && getPauseReason()?.startsWith("BAD_DOWNLOADER_ARGS")) {
+        try { await automaticRecoveryTick(); }
+        catch (error) { logError("recovery", `Could not check updated settings: ${String(error)}`); }
+      }
+      if (result.changed.some((key) => ["cookiesFile", "cookieBrowsers", "validateCookiesOnStart", "offlineMode"].includes(key))) {
+        void refreshCookies().catch((error) => logError("cookies", `Could not check updated settings: ${String(error)}`));
       }
       // Echo back the fresh snapshot so the panel can re-render from the
       // server's view of the world rather than what it thinks it sent.
@@ -2210,6 +2250,7 @@ function reliabilityHandler(config: Config): Response {
   const resumableFailed = failedDownloads.filter(
     (r) => !isPermanentDownloadError(r.last_error),
   ).length;
+  const credentialBlocked = failedDownloads.filter((r) => isCredentialBlockedError(r.last_error)).length;
   const waitingLive = db
     .query(`SELECT COUNT(*) as count FROM jobs WHERE download_status = 'waiting_live'`)
     .get() as any;
@@ -2285,8 +2326,15 @@ function reliabilityHandler(config: Config): Response {
       id: "requeueFailed",
       label: "Failed jobs retried",
       cadence: "every 60s",
-      detail: "Failed jobs retry after a cooldown; permanent failures never do.",
+      detail: "Retryable failures start a fresh window after cooldown; terminal skips are handled separately.",
       pending: resumableFailed,
+    },
+    {
+      id: "cookies",
+      label: "Credential-blocked jobs",
+      cadence: "every 60s",
+      detail: "A new locally usable cookie file requeues eligible credential-blocked jobs; private, removed and region-blocked videos stay parked.",
+      pending: credentialBlocked,
     },
     {
       id: "relocate",
@@ -2302,6 +2350,9 @@ function reliabilityHandler(config: Config): Response {
     ok: true,
     paused: isPaused(),
     pauseReason: getPauseReason(),
+    recovery: recoveryStatus(),
+    cookies: getCookieStatus(config),
+    credentialBlocked,
     partialFiles: { count: partials?.count || 0, bytes: partials?.bytes || 0 },
     resumableFailed,
     waitingLive: waitingLive?.count || 0,

@@ -267,7 +267,7 @@ export async function main(): Promise<void> {
   } else {
     // cookies.txt first (if present and valid), then the browsers in
     // cookieBrowsers, then anonymous. See resolveCookieSource().
-    await refreshCookies();
+    await refreshCookies({ startup: true });
   }
 
   // 3) Load every link from config.json, fetch video details, store in DB.
@@ -343,14 +343,19 @@ export async function main(): Promise<void> {
     if (isPaused() || !holdsEngineLease()) return;
     requeueFailedJobs(getConfig());
   }, 60_000);
+  // Test-only override keeps full subprocess recovery scenarios fast; normal
+  // runs always check once a minute.
+  const overrideRecoveryMs = Number(process.env.YTA_RECOVERY_POLL_MS);
+  const recoveryPollMs = Number.isFinite(overrideRecoveryMs) && overrideRecoveryMs > 0
+    ? Math.max(50, overrideRecoveryMs) : 60_000;
   const recoveryTimer = setInterval(() => {
     void automaticRecoveryTick().catch((error) => logError("recovery", String(error)));
-  }, 60_000);
+  }, recoveryPollMs);
   abortController.signal.addEventListener("abort", () => clearInterval(recoveryTimer), { once: true });
   const cookiesTimer = setInterval(() => {
     const change = cookiesWatch(getConfig());
     void refreshCookies({ force: !!change }).catch((error) => logError("cookies", String(error)));
-  }, 60_000);
+  }, recoveryPollMs);
   abortController.signal.addEventListener("abort", () => clearInterval(cookiesTimer), { once: true });
   // Secondary-storage relocation: files that need no conversion still have to
   // reach secondary storage (src/relocate.ts).

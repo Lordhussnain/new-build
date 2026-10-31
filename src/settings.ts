@@ -566,7 +566,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     label: "Browser cookies (fallback)",
     type: "list",
     group: "storage",
-    help: "Browsers read in this order when cookies.txt is missing or invalid, e.g. firefox, chrome, brave. The first one that works is used. Empty = cookies.txt only. Changes apply at the next cookie check (within 30 minutes) or on restart.",
+    help: "Default browser profiles tried in this order when cookies.txt is missing or invalid (for example firefox, chrome, brave). The first locally usable export is saved. Empty = cookies.txt only. Failed sequences are retried at most every 30 minutes unless the file or settings change.",
   },
   // --- watching -------------------------------------------------------------
   {
@@ -643,7 +643,7 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     type: "boolean",
     group: "advanced",
     restartRequired: true,
-    help: "Probe cookies.txt at startup and warn when it is expired. Takes effect after a restart.",
+    help: "Locally check cookies.txt during startup. Turning this off skips that startup check; the online recovery watcher still checks later for expired or changed cookies. The startup choice takes effect after restart.",
   },
   {
     key: "webPort",

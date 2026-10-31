@@ -15,7 +15,7 @@
 // are pure and unit-tested; `probeAudioTracks` is the only function that
 // spawns yt-dlp (one `-J` metadata call per job).
 
-import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
+import { createCookieInvocation, jsRuntimeArgs, ytDlp } from "./tools";
 import type { MultiAudioMode } from "./config";
 
 export interface AudioTrack {
@@ -198,20 +198,26 @@ function probeTimeoutMs(): number {
 export async function probeAudioTracks(
   url: string,
   config: { cookiesFile: string; userAgent?: string },
-  opts: { timeoutMs?: number } = {},
+  opts: { timeoutMs?: number; signal?: AbortSignal; onSpawn?: (proc: Bun.Subprocess) => void } = {},
 ): Promise<AudioTrack[]> {
   const timeoutMs = opts.timeoutMs ?? probeTimeoutMs();
+  const cookie = createCookieInvocation(config);
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, timeoutMs);
+  const cancel = () => ctl.abort();
+  if (opts.signal?.aborted) cancel();
+  else opts.signal?.addEventListener("abort", cancel, { once: true });
   let out = "";
   let stderr = "";
   let code = -1;
+  let proc: Bun.Subprocess | null = null;
   try {
-    const proc = Bun.spawn(
+    const child = Bun.spawn(
       [
         ytDlp(),
         url,
-        ...cookiesArgs(config),
+        ...cookie.args,
         ...jsRuntimeArgs(),
         ...(config.userAgent ? ["--user-agent", config.userAgent] : []),
         "--dump-single-json",
@@ -226,18 +232,26 @@ export async function probeAudioTracks(
       ],
       { stdout: "pipe", stderr: "pipe", signal: ctl.signal },
     );
+    proc = child;
+    opts.onSpawn?.(child);
     [out, stderr, code] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
     ]);
   } catch {
-    clearTimeout(timer);
-    if (ctl.signal.aborted) throw new Error("audio-track probe timed out");
+    if (ctl.signal.aborted) throw new Error(timedOut ? "audio-track probe timed out" : "audio-track probe cancelled");
     throw new Error("audio-track probe could not start yt-dlp");
+  } finally {
+    clearTimeout(timer);
+    opts.signal?.removeEventListener("abort", cancel);
+    if (proc && proc.exitCode === null) {
+      try { proc.kill("SIGKILL"); } catch {}
+      await proc.exited.catch(() => {});
+    }
+    cookie.cleanup();
   }
-  clearTimeout(timer);
-  if (ctl.signal.aborted) throw new Error("audio-track probe timed out");
+  if (ctl.signal.aborted) throw new Error(timedOut ? "audio-track probe timed out" : "audio-track probe cancelled");
   if (code !== 0) {
     throw new Error(
       stderr

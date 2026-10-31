@@ -189,8 +189,8 @@ export function isFormatAvailabilityError(message: string | null | undefined): b
 // They are EXPECTED in archival, not incidents, so the engine must:
 //
 //   1. classify them once, precisely (what is the reason, in operator words),
-//   2. park the job as terminal — the cooldown sweep and every requeue path
-//      must keep their hands off it, and
+//   2. park the job as terminal — ordinary cooldown/force sweeps leave it
+//      alone; only a fresh-cookie rescue can revisit credential-shaped skips, and
 //   3. keep the rest of the playlist moving without spending retry budget,
 //      without tripping the circuit breaker, and without an error.log line per
 //      dead video (error.log is for things an operator must act on).
@@ -198,8 +198,8 @@ export function isFormatAvailabilityError(message: string | null | undefined): b
 // The classification is durable, not re-derived: the worker stores the marker
 // below in `jobs.last_error`, and `isPermanentDownloadError` trusts the marker
 // even if the raw tail was truncated. `requeueFailedJobs`, `/api/failed/requeue`
-// and `/api/reliability` all read the same predicate, so a skipped video can
-// never be resurrected by a sweep or counted as retryable.
+// and `/api/reliability` all read the same predicate. The separate cookie
+// recovery path is deliberately narrower and must never revive hard failures.
 
 /** Marker prefixing every `jobs.last_error` written by the terminal path. */
 export const TERMINAL_ERROR_MARKER = "[terminal]";
@@ -256,8 +256,7 @@ const TERMINAL_ERROR_RULES: ReadonlyArray<{ code: TerminalErrorCode; label: stri
   {
     // YouTube's anti-bot gate. Like age-gating it is credential-shaped — valid
     // cookies unblock it — but without them no retry will ever succeed, so it
-    // parks as a terminal skip and the cookie watcher counts it as rescuable
-    // (its "sign in" LIKE already matches this wording).
+    // parks as a terminal skip and the cookie watcher recognizes it as rescuable.
     code: "sign_in_required",
     label: "Sign-in required (bot check)",
     pattern: /sign in to confirm (?:you'?re not a bot|your age)|confirm you'?re not a bot/i,
@@ -303,9 +302,17 @@ const TERMINAL_ERROR_RULES: ReadonlyArray<{ code: TerminalErrorCode; label: stri
   },
 ];
 
+// Strong terminal evidence must survive when the raw error tail is truncated:
+// otherwise an early age/login hint could label a later removed/private video.
+const CREDENTIAL_NEVER_RESCUE: ReadonlySet<TerminalErrorCode> = new Set([
+  "private", "removed", "geo_blocked", "not_found", "terminated", "copyright", "payment_required",
+]);
+
 /** Classify a raw yt-dlp error tail into a terminal reason, or null. */
 export function classifyTerminalDownloadError(message: string | null | undefined): TerminalErrorInfo | null {
   if (!message) return null;
+  const hard = TERMINAL_ERROR_RULES.find((rule) => CREDENTIAL_NEVER_RESCUE.has(rule.code) && rule.pattern.test(message));
+  if (hard) return { code: hard.code, label: hard.label };
   for (const rule of TERMINAL_ERROR_RULES) {
     if (rule.pattern.test(message)) return { code: rule.code, label: rule.label };
   }
@@ -324,17 +331,30 @@ const CREDENTIAL_RESCUABLE_CODES: ReadonlySet<TerminalErrorCode> = new Set([
   "members_only",
 ]);
 
+// Generic "Video unavailable" can accompany a genuine login/cookie failure;
+// hard terminal evidence still wins even when a credential hint appears first.
 export function isCredentialBlockedError(message: string | null | undefined): boolean {
   if (!message) return false;
   const stored = parseStoredTerminalError(message);
-  if (stored) {
-    const rule = TERMINAL_ERROR_RULES.find((rule) => rule.label === stored.label);
-    return !!rule && CREDENTIAL_RESCUABLE_CODES.has(rule.code);
+  const detail = stored?.detail ?? message;
+  if (TERMINAL_ERROR_RULES.some((rule) => CREDENTIAL_NEVER_RESCUE.has(rule.code) && rule.pattern.test(detail))) {
+    return false;
   }
-  const info = classifyTerminalDownloadError(message);
-  if (info && info.code !== "unavailable") return CREDENTIAL_RESCUABLE_CODES.has(info.code);
-  return /sign in to confirm|not a bot|login required|login to confirm/i.test(message)
-    || (/cookies?/i.test(message) && /invalid|expired|required/i.test(message));
+  if (stored) {
+    if (stored.label === "Sign-in or cookies required") return true;
+    const rule = TERMINAL_ERROR_RULES.find((item) => item.label === stored.label);
+    if (rule && CREDENTIAL_NEVER_RESCUE.has(rule.code)) return false;
+    if (rule && CREDENTIAL_RESCUABLE_CODES.has(rule.code)) return true;
+    // Don't override a specific terminal classification just because its tail
+    // mentions cookies. An unavailable/generic label needs the tail examined.
+    if (rule && rule.code !== "unavailable") return false;
+    if (!rule && stored.label !== GENERIC_TERMINAL_INFO.label) return false;
+  }
+  const info = classifyTerminalDownloadError(detail);
+  if (info && CREDENTIAL_RESCUABLE_CODES.has(info.code)) return true;
+  if (info && info.code !== "unavailable") return false;
+  return /sign[ -]?in to confirm|not a bot|\b(?:log ?in|sign[ -]?in|authentication)\b.{0,80}\b(?:required|needed|to (?:view|watch|confirm|continue))\b/i.test(detail)
+    || (/cookies?/i.test(detail) && /invalid|not valid|expired|required|authentication/i.test(detail));
 }
 
 /**
@@ -345,11 +365,20 @@ export function isCredentialBlockedError(message: string | null | undefined): bo
  * label in front are what the sweep, the API and the dashboard read.
  */
 export function formatTerminalErrorMessage(info: TerminalErrorInfo, raw: string | null | undefined): string {
-  const detail = String(raw ?? "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 300);
-  return `${TERMINAL_ERROR_MARKER} ${info.label} — skipped, it will not be retried automatically.${detail ? ` yt-dlp: ${detail}` : ""}`;
+  const fullDetail = String(raw ?? "").replace(/\s+/g, " ").trim();
+  // Decide before truncating: the relevant login or hard-terminal evidence can
+  // be at the far end of yt-dlp's output. A generic unavailable label needs a
+  // durable credential-specific label if its login hint will be truncated.
+  const credentialBlocked = isCredentialBlockedError(
+    `${TERMINAL_ERROR_MARKER} ${info.label} — ${fullDetail}`,
+  );
+  const label = credentialBlocked && !CREDENTIAL_RESCUABLE_CODES.has(info.code)
+    ? "Sign-in or cookies required" : info.label;
+  const detail = fullDetail.slice(0, 300);
+  const outcome = credentialBlocked
+    ? "skipped until fresh usable cookies are available."
+    : "skipped, it will not be retried automatically.";
+  return `${TERMINAL_ERROR_MARKER} ${label} — ${outcome}${detail ? ` yt-dlp: ${detail}` : ""}`;
 }
 
 /** Split a stored terminal message back into label + detail (for reports/UI). */

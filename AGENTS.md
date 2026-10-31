@@ -80,8 +80,10 @@ happens not to have the binary.
 ### Local data, secrets, and generated files
 
 Runtime files are operator data, not source. Never stage or commit `config.json`
-(it can contain private source URLs and `webToken`), `cookies.txt` (account
-credentials), `archive.db` and its `-wal`/`-shm` files, `downloaded_videos.txt`,
+(it can contain private source URLs and `webToken`), `cookies.txt`, its `.bak`
+backup, staging directories and per-invocation temp snapshots (account
+credentials; custom paths and legacy `.working`/`.incoming` files also need
+protection), `archive.db` and its `-wal`/`-shm` files, `downloaded_videos.txt`,
 error/report logs, downloaded media, `.part`/`.aria2` partials, `dist/`, or
 `node_modules/`. Tests should use temporary working directories and the checked-in
 mock fixtures. When adding new runtime outputs, add appropriate `.gitignore`
@@ -104,7 +106,9 @@ src/
   db.ts          SQLite schema, migrations, atomic claim transactions, claim leases (token/heartbeat/CAS), helpers
   lease.ts       database-level engine lease (owner token, expiry, monotonic fencing) — one engine per archive.db
   state.ts       shared mutable runtime state (leaf module — imports nothing)
-  tools.ts       yt-dlp/ffmpeg/aria2c/JS-runtime discovery, cookiesArgs, jsRuntimeArgs, validateCookies
+  tools.ts       yt-dlp/ffmpeg/aria2c discovery, cookie source/recheck, per-child snapshots, local status
+  cookie-file.ts Netscape diagnosis/normalization and serialized, lease-fenced staged persistence with backup
+  cookies-export.ts selected browser + configured default-profile fallback export
   download-args.ts PURE yt-dlp command construction (downloader engine, tuning)
   download-output.ts bounded pipe decoding + validated FILEPATH records (no fs calls)
   audio-tracks.ts PURE multi-audio track parsing/selection + the yt-dlp -J probe
@@ -193,12 +197,12 @@ dependency-free — it is the module that breaks every import cycle.
    without the engine lease)
 7. `startRunHistory()` + heartbeat interval
 8. `mkdir(outputRoot)` → `cleanOrphanedFiles()` → `autoscaler.init()`
-9. cookie validation (if enabled)
+9. `cookiesWatch` baseline and `refreshCookies` (online only; startup diagnosis may be disabled)
 10. scan every configured playlist/channel into the jobs table (skipped in offline mode)
 11. `initDashboard()`
 12. `networkMonitor()` (if enabled; skips probes while offline),
     `reapStaleClaims` (60s, lease-gated), `autoscaleTick` (15s),
-    `requeueFailedJobs` (60s), `cookiesWatch` (60s, local file observation),
+    `requeueFailedJobs`, `cookiesWatch` + `refreshCookies`, and `automaticRecoveryTick` (60s),
     `startRssPolling()` (always armed; no fetch while offline/disabled),
     `startRelocation()` (one pass +5s, then every 60s)
 13. supervised worker pools (download × N, metadata × N, convert × N — the download
@@ -269,7 +273,7 @@ ingest ──► pending ──claim──► downloading ──success──►
               │                    ├─ corrupt ────► pending (resume_count++, .part kept)
               │                    ├─ resume refused (416 range / aria2c control file)
               │                    │                ► pending, .part + .aria2 DISCARDED (restart)
-              │                    ├─ permanent ──► failed immediately (never auto-requeued)
+              │                    ├─ terminal ───► failed immediately (only credential blocks may be rescued by fresh cookies)
               │                    ├─ live ───────► waiting_live (requeued by next scan)
               │                    └─ shutdown ───► paused + interrupted (auto-resume)
               └── sweep (cooldown) ── retryable failed → pending + fresh retry window
@@ -371,27 +375,28 @@ re-queues a failed sidecar pass on an already-converted job.
 | Exponential backoff + jitter | `retry.ts computeBackoffMs()` | base × 2^attempt, capped, +0–30% jitter; RNG injectable for tests |
 | Download watchdog | `retry.ts computeDownloadTimeoutMs()` | 3× duration + 5 min, clamped to config min/max; unknown duration → min |
 | Transient vs permanent errors | `retry.ts isTransientDownloadError / isPermanentDownloadError` | permanent = private/removed/unavailable/members-only/age-gated/paid/geo-blocked/404/410/copyright. The classifier also *labels* the reason (`classifyTerminalDownloadError` → `Private video`, `Video unavailable`, `Not available in your region`, …) for the dashboard, `last_error`, `/api/failed` and the run report |
-| Terminal skips stay skipped | `retry.ts TERMINAL_ERROR_MARKER` + `workers/download.ts parkTerminal()` | A permanent failure is written as `[terminal] <label> — skipped, it will not be retried automatically. yt-dlp: <tail>`, so the reason survives a truncated tail and every requeue path (`requeueFailedJobs`, `POST /api/failed/requeue`, `/api/reliability`'s `resumableFailed`, the orphan-partial sweep) reads the same predicate. The raw tail is kept for diagnosis; the skip writes **no** `error.log` line and spends no retry budget (a playlist full of dead videos must not trip the circuit breaker). Only an unclassified permanent message still logs |
+| Terminal skips | `retry.ts TERMINAL_ERROR_MARKER` + `workers/download.ts parkTerminal()` | A durable `[terminal] <label> — … yt-dlp: <tail>` prevents ordinary cooldown and force-requeue sweeps from retrying dead videos. Only `isCredentialBlockedError` + a newly observed usable jar may rescue age/bot/member/login failures; private, removed, geo and other hard terminal reasons win over credential hints even if the stored tail is truncated. Classified skips spend no retry budget, do not trip the circuit, and write no error.log line |
 | Format fallback ladder | `retry.ts nextFormatFallback()` + `workers/download.ts` format branch | `Requested format is not available` → clear a stale pinned audio probe if there is one, else persist the next lower `video_quality` override (`4k → 1440p → 1080p → 720p → 480p → highest`) and retry immediately with a readable message. The ladder is **monotonic**, so it cannot loop and needs no retry budget; `highest` is `bv+ba/b` (any stream), so failing there is a genuine terminal `No format available` skip. `audio` never falls back to a video preset |
 
-| Bad downloader arguments | `retry.ts isDownloaderArgsError` → pause in `workers/download.ts` | aria2c exit 28 + option help block; parks the job, pauses the engine (`BAD_DOWNLOADER_ARGS`) |
+| Bad downloader arguments | `retry.ts isDownloaderArgsError` → `workers/download.ts` → `automaticRecoveryTick()` | aria2c exit 28 parks the job and pauses the engine. Changing live downloader settings resumes interrupted jobs; compare against the failing child's config snapshot, not whatever settings happened to be current when it exited |
 | Retry-budget forgiveness | `workers/download.ts handleDownloadFailure()` + `retry.ts progressAwareRetryState()` | `retry_count` only increments when `progress <= best_progress`; `best_progress` is committed at a failure boundary, not every progress update |
 | Resume budget | `workers/download.ts` corrupt branch | `.part` kept until `resume_count >= maxResumeAttempts`, then discarded |
 | Unrecoverable resume (HTTP 416) | `retry.ts isUnrecoverableResumeError` → `workers/download.ts` | `--continue` asks the CDN for a range the remote stream no longer has — the "stuck at 99.0%" loop. Resuming can never finish, so the `.part` AND its `.aria2` go through `removePartialFiles`, `progress`/`best_progress` are zeroed, and the job restarts from scratch |
 | Claim-lost reporting | `db.ts startClaimHeartbeat()` | `onLost` fires AT MOST ONCE per claim: the worker releases its own claim in the statement that records the outcome and then sleeps for the backoff, so a per-tick report printed "download claim lost" every 30 s per retrying video and buried error.log |
 | Partial-file bookkeeping | `workers/download.ts` + `reconcile.ts findPartialFile()` | recorded on failure, cleared on success |
 | Partial-path freeze | `reconcile.ts recordJobPartial() / recordPartialPaths()` | records the on-disk `.part` before a job stops being `downloading`, so a paused/interrupted job really resumes instead of restarting |
-| Pause bookkeeping | `workers/download.ts parkPaused()` | parks an in-flight job as `paused` **and** freezes its partial path |
-| Circuit breaker | `resilience.ts notePipelineFailure()` | N consecutive failures per stage pauses the engine (`TOO_MANY_FAILURES`) |
-| Pause / resume | `resilience.ts triggerPause / triggerResume` | SIGINTs child yt-dlp; resume re-queues paused jobs and clears their claim columns. Parking an in-flight download keeps its claim (owner+token) so the worker's own release still matches |
-| Network monitor | `resilience.ts networkMonitor()` | probes 3 hosts, pauses after 2 consecutive failures |
-| Cookies watcher | `reconcile.ts cookiesWatch()` + `tools.ts detectCookiesChange()` | 60s sweep: reports cookies.txt appearing / changing / vanishing mid-run and counts the credential-blocked jobs it may rescue (never auto-requeues them) |
-| Disk guard | `resilience.ts diskUsage()` → `checkDiskSpace()` | `diskUsage` is the **only** `statfs` caller: statfs → PowerShell `Get-PSDrive` fallback → `-1/-1` degraded mode (never bricks the engine, never 500s `/api/status`) |
+| Pause bookkeeping | `workers/download.ts parkPaused()` + `state.ts interruptedDownloadJobs` | parks an interrupted job and freezes its partial; retain an attempt-local interruption marker until the child settles so an early resume cannot count SIGINT as a download failure |
+| Circuit breaker | `resilience.ts notePipelineFailure()` + `automaticRecoveryTick()` | N consecutive failures per stage pause (`TOO_MANY_FAILURES`); auto-resume after 10m, doubling to 6h. A successful download resets trips; state is process-local. `recoveryStatus()` exposes the retry time |
+| Pause / resume | `resilience.ts triggerPause / triggerResume / resumeAutomatically` | Automatic resume requires the engine lease, keeps user-paused, cancelled and claimed jobs held, and never clears manual, shutdown or lease-loss reasons. Stale asynchronous disk checks cannot overwrite a newer manual pause. Explicit resume of a lost lease is rejected until it is held again |
+| Network monitor | `resilience.ts networkMonitor()` | pauses after 2 failures and resumes only its own network-caused pause |
+| Cookies watcher / rescue | `reconcile.ts cookiesWatch / refreshCookies / requeueCredentialBlockedJobs` + `tools.ts` | 60s local observation; online recovery locally diagnoses changed bytes and requeues every eligible credential-blocked failure with fresh budgets. Per-database fingerprints prevent retry loops, pending snapshots defer claimed rows, and pause/lease/offline gates and claim CAS predicates protect the queue. Preserve partials while waiting for fresh cookies |
+| Browser export | `tools.ts`, `cookie-file.ts`, `cookies-export.ts` | Default profiles only. Each browser once per bounded sequence (2m/browser, 4m total), 30m throttle after failure; local expiry/session diagnosis is not proof YouTube accepts credentials. Filter expired/unrelated rows, retain empty/zero-expiry sessions, and reject invalid UTF-8. Serialize private staged writes, keep `.bak`, and recheck the original file hash just before automatic publication. Manual and automatic publication are fenced by the original engine-lease generation; skip when offline or live config changes, and never echo raw browser stderr |
+| Disk guard | `resilience.ts diskUsage()` → `checkDiskSpace()` | `diskUsage` is the **only** `statfs` caller: statfs → PowerShell `Get-PSDrive` → `-1/-1`. Auto-resume requires measured healthy space on the affected volume; after a write-full error it also requires observed growth since a baseline, so quotas/unknown probes do not blindly resume |
 | Crash recovery | `reconcile.ts reconcileCrashedJobs()` | `downloading` → `paused + interrupted` (auto-claimable); also clears orphan claims from legacy user-paused downloads while keeping them held. **Refuses to run without the engine lease** — this sweep resets every in-flight claim, so it may only touch a database its own process owns. Clearing each row's claim token is what fences the previous engine's stale workers out |
 | Stale-claim reaper | `reconcile.ts reapStaleClaims(config)` | Lease-gated (only the engine holding the engine lease reaps) and **heartbeat-based**: downloads silent >`max(20 min, maxDownloadMinutes)` (actively owned jobs are additionally protected in-process, and progress renews the heartbeat), conversions silent >3 h, metadata silent >15 min — `staleClaimCondition()` is the single predicate, shared with the dashboard's stale-claims panel so the two cannot drift. Each reclaim is `reapStaleClaim()`, a CAS on `(token, owner, status, expired-heartbeat)`: a worker that renewed its heartbeat, or a second reaper that got there first, makes the update match 0 rows and the job is left alone. Also sweeps the stranded `.aria2` control files of the jobs it actually reclaimed this tick (a dead worker's pair whose data file is gone would wedge the next attempt) through the same `removePartialFiles` contract: a locked control file is reported and retried on the next tick, never forced |
 | Missing-file reconciliation | `reconcile.ts reconcileMissingFiles()` | scrubs the yt-dlp archive + re-queues |
 | Failed-job sweep | `reconcile.ts requeueFailedJobs()` | after cooldown, non-permanent failures start a fresh per-video retry window; permanent download and metadata source errors stay parked; `ignoreCooldown` for the UI button. The engine's interval is lease- and pause-gated (like the reaper): without the lease this process must not flip rows another engine owns, and a paused engine (`BAD_DOWNLOADER_ARGS`, disk full, `ENGINE_LEASE_LOST`) must not re-arm rows the operator parked. The web's force-requeue button bypasses the gate deliberately — it is a human action, not a sweep |
-| Partial-file cleanup | `reconcile.ts cleanOrphanedFiles()` | keeps every resume-able partial — `pending`/`downloading`/`paused`/`waiting_live` owners and retryable failures waiting for cooldown are **never** aged out; deletes exhausted partials when auto-requeue is disabled, partials nothing will resume once they are a week old (`PARTIAL_MAX_AGE_MS`), day-old orphans (`ORPHAN_PARTIAL_MAX_AGE_MS`) and unowned `.superseded` backups. Recorded paths and walked paths are compared through `pathKey()` (absolute + case-folded), because the DB stores absolute paths while the walk is relative to `outputRoot`. Returns `{removed, locked}`: a partial whose control file is locked keeps BOTH files, is counted as `locked`, logged, and retried by a later sweep — never counted as removed |
+| Partial-file cleanup | `reconcile.ts cleanOrphanedFiles()` | keeps every resume-able partial — `pending`/`downloading`/`paused`/`waiting_live` owners, retryable failures waiting for cooldown, and credential-blocked failures waiting for fresh cookies are **never** aged out; deletes other exhausted partials when auto-requeue is disabled, partials nothing will resume once they are a week old (`PARTIAL_MAX_AGE_MS`), day-old orphans (`ORPHAN_PARTIAL_MAX_AGE_MS`) and unowned `.superseded` backups. Recorded paths and walked paths are compared through `pathKey()` (absolute + case-folded), because the DB stores absolute paths while the walk is relative to `outputRoot`. Returns `{removed, locked}`: a partial whose control file is locked keeps BOTH files, is counted as `locked`, logged, and retried by a later sweep — never counted as removed |
 | Per-video ignore | `db.ts ignored_videos` + `scanner.ts ingestItems()` + `web_ui.html` Ignored Videos panel | Explicit job deletion stores a durable tombstone outside `jobs`/`job_sources`, so startup scans and RSS rescans do not recreate the video. `DELETE /api/ignored-videos/:id` clears the tombstone and archive entry; a later scan can queue it for an intentional re-download |
 | Cross-source video dedupe | `scanner.ts ingestItems()` + `archive.ts readArchiveIds()` | `jobs.id` deduplicates queued rows across source URLs and records extra `job_sources` ownership. If source cleanup removes a completed row, the configured downloader archive is the fallback that keeps another playlist from re-queueing that ID |
 | Metadata sidecar backfill | `metadata-files.ts` + `metadata-scan.ts` + `workers/metadata.ts` + `POST /api/metadata/scan` | Manual dashboard action, database-tracked downloaded jobs only. Respects per-job subtitle/thumbnail/description choices and global info.json setting; caches directory listings, skips missing media/unreadable folders/active stages, and queues only absent requested types. The worker rechecks and writes only missing sidecars without downloading media again. Successful source-side absences are persisted in `metadata_unavailable`; failed jobs keep their retry budget. Per-job sidecar toggles explicitly clear that kind to allow a deliberate recheck. Offline mode is rejected; no automatic recurring scans |
@@ -421,11 +426,11 @@ would park a perfectly downloadable video forever. Inside it, the stale-audio
 clear must run before the quality ladder (re-probing is cheaper and fixes the
 common cause), and the ladder before the terminal skip.
 
-**Terminal means terminal, but only for the sweeps.** `parkTerminal` writes the
-marker; a human can still re-queue the job deliberately
-(`POST /api/jobs/:id/retry` clears `last_error`). Do not add a "helpful"
-auto-requeue for these rows — the original complaint this class exists for is a
-playlist that retried its dead videos forever and filled `error.log` doing it.
+**Terminal skips bypass the normal cooldown and force-requeue sweeps.**
+`parkTerminal` writes the marker; a human can still re-queue a job deliberately
+(`POST /api/jobs/:id/retry` clears `last_error`). The narrow fresh-cookie rescue
+is the only automatic exception; never include private, deleted or geo-blocked
+videos, and never retry the same credential failure every watcher tick.
 
 The **downloader-args** class (`retry.ts isDownloaderArgsError`, aria2c exit 28
 + the option's help block) is a global misconfiguration, not a video problem:
@@ -748,7 +753,7 @@ button useless for exactly the job the operator is clicking it about.
 | GET | `/` | dashboard (login page when a token is required) |
 | GET · HEAD | `/api/ping` | liveness probe used by the UI |
 | GET | `/api/version` | engine/runtime info (`Bun.version`, platform/arch, uptime seconds) |
-| GET | `/api/status` | stats, speed, ETA, disk, live worker lines, pause state, `runtime`; `diskSpace.free` reads `"unknown"` when no disk probe could answer |
+| GET | `/api/status` | stats, speed, ETA, disk, workers, pause and circuit retry state, `runtime`, plus local cookie source/count/validity and file/export timestamps (never cookie values); `diskSpace.free` reads `"unknown"` when no probe answers |
 | GET | `/api/jobs` | `{ ok, jobs }` — up to 500 jobs with status/retry/progress fields (`JOB_COLUMNS` in `web.ts` is the single source of truth for what the dashboard may read: per-stage retry counters, `best_progress`, `partial_file_path`, `relocated_to`, the `created_at` / `updated_at` stamps the drawer and the history tab show), plus parsed `audio_tracks` / `audio_selection` / `metadata_files` / `metadata_unavailable` and boolean `want_*` sidecar flags |
 | GET | `/api/jobs/:id` | one job, read fresh from the DB — the detail drawer fetches this instead of trusting a poll-cycle-old list row |
 | POST | `/api/scan` | `{url, folder?, singleVideo?}` → validate/canonicalize → save source to `config.json` → scan & ingest; returns `saved`, `source: {url, key, added}`, and counts. `singleVideo: true` keeps only `v=` from a `watch?v=…&list=…` link (`parseSourceUrl(url, {singleVideo})`). Save failure starts no scan; scan failure keeps the saved source. Folder override applies only to this scan |
@@ -760,6 +765,7 @@ button useless for exactly the job the operator is clicking it about.
 | POST | `/api/jobs/:id/reset-failures` | zero the per-stage retry counters; 404 for an unknown id |
 | POST | `/api/jobs/:id/sidecars` | per-job sidecar toggles: `{subtitles?, thumbnail?, description?}` (booleans). Flipping a flag on for a finished download re-opens the metadata stage so the worker fetches the files against the existing media; flipping off never deletes fetched files. 400 for an empty/non-boolean body |
 | POST | `/api/metadata/scan` | manual whole-library sidecar check; only downloaded DB jobs, skips offline mode, queues missing requested metadata without re-downloading media |
+| POST | `/api/cookies/export` | `{browser}`: selected default profile then configured fallbacks; returns actual browser, attempted names, safe errors and backup. Local diagnosis only. Offline/config changes, a missing or changed lease, and concurrent manual export return 409 |
 | POST | `/api/jobs/pause` | bulk user-pause by `{ids: []}`: parks each row with `pause_reason = 'user'` and interrupts its transfer, keeping a mid-download claim so the `.part` still resumes; 400 when no ids are given |
 | DELETE | `/api/jobs` | bulk delete by `{ids: []}`, cancelling active children the same way; `{ok, deleted, stopped}` |
 | POST | `/api/jobs/:id/audio-tracks` | per-job audio-track selection: `{tracks:["es",…]}` saves it, `{tracks:null}` returns the job to the global mode |
@@ -812,7 +818,10 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/db.test.ts` | schema + legacy migration, atomic claims, the pipeline claim exclusions, all reconcile/requeue sweeps, cross-source ingestion dedupe, durable ignored-video tombstones across a database reopen, and the busy-wait on an archive another process still holds |
 | `tests/engine-lease.test.ts` | the database-level engine lease: acquisition/refusal, takeover of an expired lease and of one whose owning process is gone, renewal failure after a takeover, the heartbeat's lost-lease signal, release + clean restart (fencing survives), and that the startup/reaper sweeps refuse to run without the lease. Uses file-backed databases and a real second process (`tests/fixtures/claim-worker.ts`) |
 | `tests/claim-races.test.ts` | claim ownership across SEPARATE connections and PROCESSES: two handles cannot claim the same job twice, three processes draining 40 jobs never double-claim (unique token per row), a crashed owner reclaimed only after its lease lapses, a stale worker's progress/release refused after its claim was taken, a long-running heartbeating conversion never reaped (and reaped once the heartbeat stops), metadata reaped on its heartbeat rather than `updated_at`, and two reapers racing one expired claim where exactly one CAS wins |
-| `tests/cookies.test.ts` | `cookiesArgs`/`cookiesState` on a missing/empty/present file, the appeared/updated/disappeared transitions, and `cookiesWatch`'s credential-blocked count |
+| `tests/cookies.test.ts` | private cookie invocations and `cookiesState` for missing/empty/present files, appeared/updated/disappeared transitions, and `cookiesWatch`'s credential-blocked count |
+| `tests/cookie-extraction.test.ts` | default-profile fallback, expired-row filtering, bounded subprocesses, atomic backups, changed-config and manual-vs-automatic races, safe status/API |
+| `tests/credential-recovery.test.ts` | no-cap credential rescue, fresh budgets, hard-terminal exclusions, fingerprints, deferred claims and protected working copies |
+| `tests/auto-recovery.test.ts` | circuit backoff, manual/lease safety, disk observations and changed-downloader-settings resume |
 | `tests/rss.test.ts` | `parseRssFeed` against a realistic feed (CDATA, missing duration); timer picks up live-added channels after an empty startup |
 | `tests/webauth.test.ts` | token extraction, timing-safe compare, authorization |
 | `tests/report.test.ts` | run report contents |
@@ -944,6 +953,7 @@ Mock controls (environment variables):
 
 | Variable | Effect |
 | --- | --- |
+| `YTA_RECOVERY_POLL_MS=N` | test-only override of the 60-second cookie/automatic-recovery tick (minimum 50 ms) |
 | `FAKE_FAIL_TIMES=N` | fail the first N download attempts, leaving a `.part` file behind |
 | `FAKE_FAIL_MODE` | `transient` \| `permanent` \| `corrupt` (which error message to emit) |
 | `FAKE_DELAY_MS` | artificial per-attempt delay |
@@ -1026,22 +1036,17 @@ Windows — an environment assumption is still a broken test:
 5. **`partial_file_path` must always point at a real `.part` file or NULL.**
    Storing a completed path there makes the corrupt-handler delete good files
    (that was a real bug). Keep it in sync: set on failure, NULL on success.
-6. **Never re-queue permanent errors.** `isPermanentDownloadError()` gates the
-   sweep; bypassing it causes infinite retry loops against dead videos.
+6. **Do not re-queue hard terminal errors.** `isPermanentDownloadError()`
+   gates the cooldown and manual force-requeue sweeps. The only automatic
+   exception is the separate cookie-change rescue, narrowed by
+   `isCredentialBlockedError` to age/bot/member/login failures; private,
+   removed and geo-blocked wording takes precedence even inside a credential
+   tail. One snapshot per usable fingerprint prevents repeated retries with the
+   same jar, and eligible claims defer until released. Preserve their partials.
    YouTube **n-challenge** failures (`n challenge solving failed`, missing JS
-   runtime) are *not* permanent even when the same stderr also says
-   `Requested format is not available` — that text is a symptom of the unsolved
-   player JS. `isNChallengeError()` wins (and is checked before the reason
-   table, but *after* the `[terminal]` marker: only the terminal path writes
-   that, and it never writes it for an n-challenge failure). Widening the
-   patterns is cheap; **narrowing** them is how the retry loop comes back — every
-   wording that fails to classify falls into the transient budget, parks as
-   `failed`, and is re-queued by the cooldown sweep forever. Members-only
-   includes YouTube's `Join this channel to get access` wording, and the
-   anti-bot gate (`Sign in to confirm you're not a bot`) parks as a terminal
-   `Sign-in required (bot check)` skip — credential-shaped like age-gating, so
-   the cookie watcher's rescue count includes it, but no retry succeeds
-   without operator action.
+   runtime) are *not* permanent even when stderr also says `Requested format is
+   not available`: `isNChallengeError()` wins before the reason table, but
+   after the durable `[terminal]` marker. Do not weaken these distinctions.
 7. **`bun:sqlite` specifics.** `MAX(a,b)` is the scalar two-arg form; use
    `COALESCE` before it. `datetime('now', '-N minutes')` modifiers must be
    built from validated integers, never user text. Open read-only handles
@@ -1328,6 +1333,23 @@ Windows — an environment assumption is still a broken test:
     allow-again route must clear both the ignore tombstone and archive entry,
     or the scanner will continue suppressing the user's opt-in. Pin both paths
     with distinct-source and source-cleanup regressions.
+45. **Cookie recovery and automatic pause recovery are safety-sensitive.**
+    `refreshCookies` uses locally validated bytes, an engine lease, and a
+    per-fingerprint candidate snapshot; do not mark held candidates complete or
+    rearm a failed job repeatedly with the same jar. The export guard checks
+    live offline/path/browser configuration and (for automatic work) the old
+    file hash before persistence. Browser output is filtered and written via
+    a path lock and private staging directory; final renames hold the exact
+    lease generation. A failed write preserves the old jar; a successful one
+    backs it up. `createCookieInvocation` creates a separate private copy per
+    child, and must never fall back to the source if copying fails: yt-dlp
+    writes its cookie input. Local session diagnosis is not a YouTube
+    authentication test. `automaticRecoveryTick` can clear only its own
+    automatic pause reason and must recheck lease, pause state and disk settings
+    after every awaited probe. Workers fence claims under the engine lease and
+    recheck pause/offline after disk and audio probes. `tests/cookie-extraction.test.ts`,
+    `tests/credential-recovery.test.ts`, `tests/auto-recovery.test.ts`, the UI
+    contract and the end-to-end recovery scenarios pin these rules.
 
 ---
 

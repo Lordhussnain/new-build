@@ -11,11 +11,12 @@ import { statfs } from "node:fs/promises";
 import { resolve } from "node:path";
 import { db } from "./db";
 import { logError } from "./logger";
-import { holdsEngineLease } from "./lease";
+import { engineFencing, holdsEngineLease } from "./lease";
 import {
   activeConvertJobs,
   activeConvertProcs,
   activeDownloadJobs,
+  interruptedDownloadJobs,
   activeMetadataJobs,
   activeMetadataProcs,
   activeProcs,
@@ -23,6 +24,7 @@ import {
   isPaused,
   getPauseReason,
   getConfig,
+  isJobCancelled,
   setPaused,
 } from "./state";
 import type { Config } from "./config";
@@ -134,11 +136,27 @@ export function interruptChild(proc: Bun.Subprocess | undefined): boolean {
   return true;
 }
 
-export function triggerPause(reason: string): void {
-  if (isPaused() && getPauseReason() === reason) return;
-  if (reason.startsWith("BAD_DOWNLOADER_ARGS")) badArgsSettings = downloaderSettings(getConfig());
+export function triggerPause(reason: string, opts: { downloaderConfig?: Config; diskPath?: string; diskWriteFailure?: boolean } = {}): void {
+  if (isPaused()) {
+    const current = getPauseReason();
+    if (current === reason || current === "SHUTDOWN_REQUESTED") return;
+    if (current === "ENGINE_LEASE_LOST" && reason !== "SHUTDOWN_REQUESTED") return;
+    // An asynchronous disk/network check must not replace a later manual
+    // pause (or another active recovery condition) and then resume it.
+    if (/^(NETWORK_DISCONNECTED|LOW_DISK_SPACE|TOO_MANY_FAILURES|BAD_DOWNLOADER_ARGS)(?: |$)/.test(reason)) return;
+  }
+  if (reason.startsWith("BAD_DOWNLOADER_ARGS")) {
+    // The failed child may have been started with an older settings snapshot.
+    badArgsSettings = downloaderSettings(opts.downloaderConfig ?? getConfig());
+  }
+  if (reason.startsWith("LOW_DISK_SPACE")) {
+    lowDiskPath = opts.diskPath ?? getConfig().outputRoot;
+    lowDiskWriteFailure = !!opts.diskWriteFailure;
+    lowDiskBaseline = null;
+  }
   setPaused(true, reason);
   console.log(`⏸️ Triggering pause: ${reason}`);
+  for (const [workerId, jobId] of activeDownloadJobs) interruptedDownloadJobs.set(workerId, jobId);
   for (const [, proc] of activeProcs.entries()) {
     try {
       interruptChild(proc);
@@ -204,6 +222,7 @@ export function interruptActiveDownloads(jobIds: Iterable<string>): string[] {
   for (const [workerId, jobId] of activeDownloadJobs) {
     if (!wanted.has(jobId)) continue;
     interrupted.push(jobId);
+    interruptedDownloadJobs.set(workerId, jobId);
     interruptChild(activeProcs.get(workerId));
   }
   return interrupted;
@@ -214,25 +233,36 @@ export function cancelAllActiveStages(): CancelledStages {
   return stagesFor(() => true);
 }
 
-export function triggerResume(): void {
-  setPaused(false, null);
+export function triggerResume(): boolean {
+  // A human action cannot give this process ownership of another engine's DB,
+  // even in the window before the heartbeat reports a lost lease.
+  if (abortController.signal.aborted || !holdsEngineLease()) return false;
+  const fencing = engineFencing();
   try {
-    // Re-queue ALL paused jobs (global + user-paused) on an explicit Resume All.
-    // In-flight jobs still holding a claim finish naturally in their worker —
-    // the claim's owner and token are left exactly as they are, so the worker's
-    // own release still matches.
-    const stmt = db.run(
-      `UPDATE jobs SET download_status = 'pending', pause_reason = NULL,
-         download_claimed_by = NULL, download_claimed_at = NULL,
-         download_claim_token = NULL, download_heartbeat_at = NULL,
-         updated_at = CURRENT_TIMESTAMP
-       WHERE download_status = 'paused' AND download_claimed_by IS NULL`,
-    );
-    if (stmt.changes > 0) console.log(`▶️ Re-queued ${stmt.changes} paused job(s).`);
-  } catch {}
-  // A human resumed the engine — give the failure circuit a clean slate.
+    // Re-queue ALL paused jobs (global + user-paused) on explicit Resume All,
+    // but never replace a claim that is still settling. Check the lease again
+    // once the write transaction is held.
+    const changes = db.transaction(() => {
+      if (abortController.signal.aborted || !holdsEngineLease() || engineFencing() !== fencing) return null;
+      return db.run(
+        `UPDATE jobs SET download_status = 'pending', pause_reason = NULL,
+           download_claimed_by = NULL, download_claimed_at = NULL,
+           download_claim_token = NULL, download_heartbeat_at = NULL,
+           updated_at = CURRENT_TIMESTAMP
+         WHERE download_status = 'paused' AND download_claimed_by IS NULL AND download_claim_token IS NULL`,
+      ).changes;
+    }).immediate();
+    if (changes === null) return false;
+    if (changes > 0) console.log(`▶️ Re-queued ${changes} paused job(s).`);
+  } catch (error) {
+    logError("recovery", `could not resume jobs: ${String(error)}`);
+    return false;
+  }
+  setPaused(false, null);
   failureCircuit.dl = 0;
   failureCircuit.post = 0;
+  failureCircuit.retryAt = null;
+  return true;
 }
 
 // --- Circuit breaker ---------------------------------------------------------
@@ -242,7 +272,20 @@ export function triggerResume(): void {
 // it burn through the queue one video at a time.
 const failureCircuit = { dl: 0, post: 0, trips: 0, retryAt: null as number | null };
 let badArgsSettings: string | null = null;
+/** The volume that actually caused the pause, even if outputRoot changes later. */
+let lowDiskPath: string | null = null;
+let lowDiskWriteFailure = false;
+let lowDiskBaseline: number | null = null;
 let recoveryRunning = false;
+
+/** Record free space at an actual ENOSPC; statfs can still report healthy
+ * free space for quota-limited writes, so recovery must observe an increase. */
+export function recordDiskSpaceAtFailure(path: string, free: number): void {
+  if (isPaused() && getPauseReason()?.startsWith("LOW_DISK_SPACE") && lowDiskWriteFailure &&
+      lowDiskPath === path && lowDiskBaseline === null && Number.isFinite(free) && free >= 0) {
+    lowDiskBaseline = free;
+  }
+}
 
 function downloaderSettings(config: Config): string {
   return JSON.stringify([
@@ -287,12 +330,24 @@ export function recoveryStatus(): { retryAt: string | null; circuitTrips: number
 export function resumeAutomatically(reason: string): boolean {
   if (!/^(NETWORK_DISCONNECTED$|LOW_DISK_SPACE(?: |$)|TOO_MANY_FAILURES(?: |$)|BAD_DOWNLOADER_ARGS(?: |$))/.test(reason)) return false;
   if (abortController.signal.aborted || !holdsEngineLease() || !isPaused() || getPauseReason() !== reason) return false;
-  db.run(`UPDATE jobs SET download_status = 'pending', pause_reason = NULL, updated_at = CURRENT_TIMESTAMP
-    WHERE download_status = 'paused' AND pause_reason = 'interrupted'
-      AND download_claimed_by IS NULL AND download_claim_token IS NULL
-      AND conversion_claimed_by IS NULL AND conversion_claim_token IS NULL
-      AND metadata_claimed_by IS NULL AND metadata_claim_token IS NULL
-      AND conversion_status != 'in_progress' AND metadata_status != 'in_progress'`);
+  const fencing = engineFencing();
+  const resumed = db.transaction(() => {
+    if (abortController.signal.aborted || !holdsEngineLease() || engineFencing() !== fencing ||
+        !isPaused() || getPauseReason() !== reason) return false;
+    const rows = db.query(`SELECT id FROM jobs WHERE download_status = 'paused' AND pause_reason = 'interrupted'`)
+      .all() as { id: string }[];
+    for (const row of rows) {
+      if (isJobCancelled(row.id)) continue;
+      db.run(`UPDATE jobs SET download_status = 'pending', pause_reason = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND download_status = 'paused' AND pause_reason = 'interrupted'
+          AND download_claimed_by IS NULL AND download_claim_token IS NULL
+          AND conversion_claimed_by IS NULL AND conversion_claim_token IS NULL
+          AND metadata_claimed_by IS NULL AND metadata_claim_token IS NULL
+          AND conversion_status != 'in_progress' AND metadata_status != 'in_progress'`, [row.id]);
+    }
+    return true;
+  }).immediate();
+  if (!resumed) return false;
   setPaused(false, null);
   failureCircuit.dl = 0;
   failureCircuit.post = 0;
@@ -315,10 +370,18 @@ export async function automaticRecoveryTick(opts: {
     } else if (reason.startsWith("BAD_DOWNLOADER_ARGS") && badArgsSettings !== null && badArgsSettings !== downloaderSettings(config)) {
       resumeAutomatically(reason);
     } else if (reason.startsWith("LOW_DISK_SPACE")) {
-      const disk = await (opts.diskProbe ?? checkDiskSpace)(config.outputRoot, config.minFreeSpaceGB);
+      const path = lowDiskPath ?? config.outputRoot;
+      const disk = await (opts.diskProbe ?? checkDiskSpace)(path, config.minFreeSpaceGB);
       const live = getConfig();
-      if (live.outputRoot === config.outputRoot && live.minFreeSpaceGB === config.minFreeSpaceGB && disk.free >= 0 && disk.ok) {
-        resumeAutomatically(reason);
+      if (live.outputRoot === config.outputRoot && live.minFreeSpaceGB === config.minFreeSpaceGB &&
+          (lowDiskPath ?? config.outputRoot) === path && isPaused() && getPauseReason() === reason && Number.isFinite(disk.free) && disk.free >= 0) {
+        if (lowDiskWriteFailure && lowDiskBaseline === null) {
+          // No trustworthy measurement at the failure: establish one now and
+          // wait for evidence of returned space instead of blindly resuming.
+          lowDiskBaseline = disk.free;
+        } else if (disk.ok && (!lowDiskWriteFailure || disk.free > lowDiskBaseline!)) {
+          resumeAutomatically(reason);
+        }
       }
     }
   } finally {
@@ -404,7 +467,9 @@ export function networkMonitorTick(
   return {
     consecutiveFails: 0,
     shouldPause: false,
-    shouldResume: consecutiveFails > 0 && currentPauseReason === "NETWORK_DISCONNECTED",
+    // Retry while that exact pause remains, even if an earlier resume failed
+    // (e.g. the database was busy or the engine lease was temporarily lost).
+    shouldResume: currentlyPaused && currentPauseReason === "NETWORK_DISCONNECTED",
   };
 }
 
@@ -434,7 +499,12 @@ export async function networkMonitor(opts: NetworkMonitorOptions = {}): Promise<
     // Don't even issue a probe in offline mode. Re-check after the awaited
     // probe as well: the setting may have changed while a request was in flight.
     const offlineBeforeProbe = getConfig().offlineMode;
-    const isUp = offlineBeforeProbe ? false : await checkInternet(probe);
+    let isUp = false;
+    if (!offlineBeforeProbe) {
+      try { isUp = await checkInternet(probe); }
+      catch (error) { logError("network", `connectivity probe failed: ${String(error)}`); }
+    }
+    if (signal.aborted) break;
     // Preserve the offline observation even if the mode was turned off before
     // the next line; no probe actually ran during that tick.
     const offlineNow = offlineBeforeProbe || getConfig().offlineMode;
@@ -447,12 +517,24 @@ export async function networkMonitor(opts: NetworkMonitorOptions = {}): Promise<
     );
     consecutiveFails = decision.consecutiveFails;
     if (decision.shouldPause) {
-      triggerPause("NETWORK_DISCONNECTED");
-      console.log("🌐 Network down detected. Pausing engine gracefully.");
+      try {
+        if (holdsEngineLease()) {
+          triggerPause("NETWORK_DISCONNECTED");
+          console.log("🌐 Network down detected. Pausing engine gracefully.");
+        }
+      } catch (error) {
+        logError("network", `could not pause after connectivity failed: ${String(error)}`);
+      }
     }
     if (decision.shouldResume) {
-      console.log(offlineNow ? "🌐 Offline mode: clearing the network-caused pause for local work." : "🌐 Network restored!");
-      if (!signal.aborted) resumeAutomatically("NETWORK_DISCONNECTED");
+      try {
+        if (resumeAutomatically("NETWORK_DISCONNECTED")) {
+          console.log(offlineNow ? "🌐 Offline mode: clearing the network-caused pause for local work." : "🌐 Network restored!");
+        }
+      } catch (error) {
+        // A transient DB failure must not permanently kill the monitor.
+        logError("network", `could not resume after connectivity returned: ${String(error)}`);
+      }
     }
     await Bun.sleep(intervalMs);
   }

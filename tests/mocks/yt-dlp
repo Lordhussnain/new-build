@@ -29,6 +29,7 @@
 //                            quality-ladder fallback is observable
 //   FAKE_FAIL_PROGRESS_SEQUENCE=20,40 emit progress before failed attempts
 //   FAKE_HANG=1             hang forever (watchdog test)
+//   FAKE_SIGNAL_DELAY_MS=N  delay exit after an interrupt (pause/resume race)
 //   FAKE_DELAY_MS=250       per-attempt delay (progress parsing)
 //   FAKE_OUTPUT_STRESS=1    noisy pipes + split Unicode final path without LF
 //   FAKE_OMIT_FINAL_PATH=1  exercise directory-based final-path recovery
@@ -37,6 +38,8 @@
 //   FAKE_PROBE_FAIL=1|json  make the -J audio-track probe fail (non-zero exit /
 //                           unparsable JSON) so the single-audio fallback runs
 //   FAKE_PROBE_HANG=1       make -J hang forever (probe timeout tests)
+//   FAKE_PROBE_LOG=path     record each audio probe PID
+//   FAKE_DOWNLOAD_LOG=path  record each actual download invocation
 //   FAKE_KEEP_ALIVE=1       keep the aria2c readout window open for
 //                           FAKE_DELAY_MS instead of ending it when the
 //                           transfer finishes (progress-visibility tests)
@@ -93,6 +96,7 @@ if (flag("-U")) {
 // (original + two dubs), each in two quality variants plus a -drc duplicate
 // the engine must ignore.
 if (flag("--dump-single-json")) {
+  if (process.env.FAKE_PROBE_LOG) await appendFile(process.env.FAKE_PROBE_LOG, `${process.pid}\n`);
   // Probe-failure injection: a real -J call fails on network errors, and the
   // engine's promise is that the download still proceeds single-audio.
   if (process.env.FAKE_PROBE_FAIL === "1") {
@@ -155,6 +159,7 @@ if (flag("--flat-playlist")) {
 }
 
 // --- download -----------------------------------------------------------------
+if (process.env.FAKE_DOWNLOAD_LOG) await appendFile(process.env.FAKE_DOWNLOAD_LOG, `${process.pid}\n`);
 // The engine always puts the video URL first (yt-dlp <url> --flags …).
 const url = argv[0] && !argv[0].startsWith("-") ? argv[0] : "";
 let videoId = "";
@@ -227,7 +232,11 @@ if (process.env.FAKE_HANG === "1") {
   const signalled = `${base}.hang-signalled`;
   const record = () => {
     try {
-      Bun.write(signalled, String(process.pid)).finally(() => process.exit(130));
+      Bun.write(signalled, String(process.pid)).finally(async () => {
+        const delay = num("FAKE_SIGNAL_DELAY_MS", 0);
+        if (delay > 0) await Bun.sleep(delay);
+        process.exit(130);
+      });
       return;
     } catch {}
     process.exit(130);

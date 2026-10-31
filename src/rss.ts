@@ -6,7 +6,7 @@
 // net via rescanIntervalHours. New video ids go through the same ingestItems
 // dedup as every other source.
 
-import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
+import { createCookieInvocation, jsRuntimeArgs, ytDlp } from "./tools";
 import { ingestItems, type ListingItem } from "./scanner";
 import { logError } from "./logger";
 import { getConfig } from "./state";
@@ -39,6 +39,7 @@ export async function resolveChannelId(
   const timeoutMs = Number.isFinite(opts.timeoutMs) && (opts.timeoutMs ?? 0) > 0
     ? opts.timeoutMs!
     : CHANNEL_ID_RESOLVE_TIMEOUT_MS;
+  const cookie = createCookieInvocation(config);
   const controller = new AbortController();
   let proc: Bun.PipedSubprocess | null = null;
   let timedOut = false;
@@ -59,7 +60,7 @@ export async function resolveChannelId(
     const child = spawn(
       [
         ytDlp(),
-        ...cookiesArgs(config),
+        ...cookie.args,
         ...jsRuntimeArgs(),
         "--flat-playlist",
         "--playlist-end",
@@ -99,6 +100,11 @@ export async function resolveChannelId(
     return null;
   } finally {
     clearTimeout(timer);
+    if (proc && proc.exitCode === null) {
+      try { proc.kill("SIGKILL"); } catch {}
+      await proc.exited.catch(() => {});
+    }
+    cookie.cleanup();
   }
 }
 

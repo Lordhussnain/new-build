@@ -3,13 +3,13 @@
 // yt-dlp reads a browser's cookie store (`--cookies-from-browser`) and writes its
 // cookie jar to a file (`--cookies`) when it exits, so one yt-dlp run with a
 // known video (see readBrowserCookieJar in tools.ts) is an export. The export
-// only replaces cookies.txt when the jar verifiably contains a signed-in YouTube
-// session, so a failed export never overwrites a working file. The previous file
-// is kept as `<cookiesFile>.bak`.
+// only replaces cookies.txt when local expiry/session checks pass. This does not
+// verify YouTube accepts the credentials. A failed export never overwrites a
+// working file; the previous file is kept as `<cookiesFile>.bak`.
 
 import { COOKIE_BROWSER_NAMES } from "./config";
-import { diagnoseCookiesText, persistCookieJar, ytDlpFailureReason } from "./cookie-file";
-import { readBrowserCookieJar } from "./tools";
+import { browserCookieFailureReason, diagnoseCookiesText, persistCookieJar } from "./cookie-file";
+import { COOKIE_EXPORT_BUDGET_MS, COOKIE_PROBE_TIMEOUT_MS, readBrowserCookieJar } from "./tools";
 
 export interface CookieExportResult {
   ok: boolean;
@@ -27,7 +27,13 @@ export interface CookieExportResult {
 export interface CookieExportOptions {
   /** Override the yt-dlp executable (tests). */
   ytDlp?: string;
+  /** Per-browser and whole-sequence time limits. */
   timeoutMs?: number;
+  totalTimeoutMs?: number;
+  /** Stop publishing/falling back when the live configuration has changed. */
+  shouldContinue?: () => boolean;
+  /** Optionally fence the final synchronous filesystem renames with the engine lease. */
+  publish?: (commit: () => boolean) => boolean;
 }
 
 /** Export the cookies of `browser` into `cookiesFile`. Never throws. */
@@ -43,13 +49,18 @@ export async function exportBrowserCookies(
     return { ok: false, browser, error: "No cookies.txt path is configured (cookiesFile)." };
   }
 
-  const read = await readBrowserCookieJar(browser, { ytDlp: opts.ytDlp, timeoutMs: opts.timeoutMs });
+  const shouldContinue = opts.shouldContinue ?? (() => true);
+  if (!shouldContinue()) return { ok: false, browser, error: "Cookie configuration changed during extraction." };
+  const read = await readBrowserCookieJar(browser, {
+    ytDlp: opts.ytDlp, timeoutMs: opts.timeoutMs, shouldContinue,
+  });
+  if (!shouldContinue()) return { ok: false, browser, error: "Cookie configuration changed during extraction." };
   if (read.timedOut) {
     return { ok: false, browser, error: `Reading ${browser} cookies took too long. Close ${browser} and try again.` };
   }
   if (read.jar === null) {
     // yt-dlp writes the jar on exit; no file means the browser store was never read.
-    return { ok: false, browser, error: `Could not read ${browser} cookies: ${ytDlpFailureReason(read.stderr)}` };
+    return { ok: false, browser, error: `Could not read ${browser} cookies: ${browserCookieFailureReason(read.stderr)}` };
   }
 
   const text = read.jar;
@@ -69,12 +80,13 @@ export async function exportBrowserCookies(
     };
   }
 
-  const result = await persistCookieJar(browser, cookiesFile, text);
+  const result = await persistCookieJar(browser, cookiesFile, text, shouldContinue, opts.publish);
   return { ...result, browser, ...(result.ok ? { file: cookiesFile } : {}) };
 }
 
 export interface CookieFallbackExportResult extends CookieExportResult {
-  /** Failed candidates, including failures before a successful fallback. */
+  /** Candidates actually attempted, in order, and failures before success. */
+  attempted: string[];
   errors: { browser: string; error: string }[];
 }
 
@@ -86,11 +98,24 @@ export async function exportBrowserCookiesWithFallback(
   opts: CookieExportOptions = {},
 ): Promise<CookieFallbackExportResult> {
   const errors: CookieFallbackExportResult["errors"] = [];
+  const attempted: string[] = [];
+  const deadline = Date.now() + (opts.totalTimeoutMs ?? COOKIE_EXPORT_BUDGET_MS);
+  let stopped: string | null = null;
   for (const candidate of new Set([browser, ...browsers])) {
-    const result = await exportBrowserCookies(candidate, cookiesFile, opts);
-    if (result.ok) return { ...result, errors };
+    if (opts.shouldContinue && !opts.shouldContinue()) {
+      stopped = "Cookie configuration changed during extraction.";
+      break;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) { stopped = "Browser fallback time limit reached."; break; }
+    attempted.push(candidate);
+    const result = await exportBrowserCookies(candidate, cookiesFile, {
+      ...opts, timeoutMs: Math.max(1, Math.min(opts.timeoutMs ?? COOKIE_PROBE_TIMEOUT_MS, remaining)),
+    });
+    if (result.ok) return { ...result, attempted, errors };
     errors.push({ browser: candidate, error: result.error ?? "Cookie export failed." });
     if (!cookiesFile.trim()) break;
   }
-  return { ok: false, browser, errors, error: errors.map(item => `${item.browser}: ${item.error}`).join("; ") };
+  const detail = errors.map((item) => `${item.browser}: ${item.error}`).join("; ");
+  return { ok: false, browser, attempted, errors, error: [detail, stopped].filter(Boolean).join("; ") };
 }

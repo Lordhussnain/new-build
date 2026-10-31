@@ -1812,6 +1812,64 @@ describe("integration: degradation paths (missing tool, failed audio probe)", ()
     }
   }, TEST_TIMEOUT);
 
+  test.skipIf(WIN)("a pause during the audio probe kills it and never starts the download", async () => {
+    const dir = await makeRunDir();
+    const probes = join(dir, "probe-pids.log");
+    const downloads = join(dir, "download-pids.log");
+    const engine = await startEngine(dir, 4104, BASE_CONFIG(4104, {
+      multiAudioMode: "all", maxConcurrentDownloads: 1, maxDownloadWorkers: 1,
+    }), {
+      FAKE_PROBE_HANG: "1", FAKE_PROBE_LOG: probes, FAKE_DOWNLOAD_LOG: downloads,
+      YTA_AUDIO_PROBE_TIMEOUT_MS: "30000",
+    });
+    const inspection = new Database(join(dir, "archive.db"), { readonly: true });
+    try {
+      await waitFor("audio probe to start", async () => existsSync(probes), 15_000);
+      const pid = Number((await readFile(probes, "utf8")).trim().split("\n")[0]);
+      expect(pid).toBeGreaterThan(1);
+      await engine.api("/api/pause", { method: "POST" });
+      await waitFor("the interrupted claim to be released", async () => {
+        const row = inspection.query(`SELECT download_status, pause_reason, download_claim_token FROM jobs
+          WHERE download_status = 'paused' AND pause_reason = 'interrupted' LIMIT 1`).get() as any;
+        return !!row && row.download_claim_token === null;
+      }, 10_000);
+      await Bun.sleep(500);
+      expect((await engine.api("/api/status")).isPaused).toBe(true);
+      expect(existsSync(downloads)).toBe(false);
+      expect(() => process.kill(pid, 0)).toThrow();
+    } finally {
+      inspection.close();
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test.skipIf(WIN)("resuming before an interrupted downloader exits does not spend retries", async () => {
+    const dir = await makeRunDir();
+    const downloads = join(dir, "download-pids.log");
+    const engine = await startEngine(dir, 4105, BASE_CONFIG(4105, {
+      maxConcurrentDownloads: 1, maxDownloadWorkers: 1,
+      maxFailures: 1, maxRetryAttempts: 1, maxFailuresPerVideo: 1,
+    }), {
+      FAKE_HANG: "1", FAKE_SIGNAL_DELAY_MS: "800", FAKE_DOWNLOAD_LOG: downloads,
+    });
+    const inspection = new Database(join(dir, "archive.db"), { readonly: true });
+    try {
+      await waitFor("first downloader to start", async () => existsSync(downloads), 15_000);
+      await engine.api("/api/pause", { method: "POST" });
+      const resumed = await engine.api("/api/resume", { method: "POST" });
+      expect(resumed.ok).toBe(true);
+      await waitFor("interrupted job to start again", async () =>
+        (await readFile(downloads, "utf8")).trim().split("\n").length >= 2, 15_000);
+      const row = inspection.query("SELECT retry_count, last_error FROM jobs WHERE id = 'mockvid001'").get() as any;
+      expect(row.retry_count).toBe(0);
+      expect(row.last_error).toBeNull();
+      expect((await engine.api("/api/status")).isPaused).toBe(false);
+    } finally {
+      inspection.close();
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
   test("a multi-audio probe that never answers times out and falls back", async () => {
     // Same promise, watchdog branch: the -J call hangs forever, so the probe's
     // own timeout must abort it (the env override shortens the 90 s cap) and
@@ -2747,7 +2805,7 @@ describe("mock contract: aria2c", () => {
     }
   }, TEST_TIMEOUT);
 
-  test("rejected arguments: engine pauses with BAD_DOWNLOADER_ARGS and no job is failed", async () => {
+  test("rejected arguments pause once, then corrected settings resume interrupted work but not user-held jobs", async () => {
     const dir = await makeRunDir();
     const engine = await startEngine(
       dir,
@@ -2760,8 +2818,25 @@ describe("mock contract: aria2c", () => {
         return s.isPaused === true && String(s.pauseReason || "").includes("BAD_DOWNLOADER_ARGS");
       }, 30_000);
       const jobs = await getJobs(engine);
-      expect(jobs.length).toBeGreaterThan(0);
+      expect(jobs.length).toBeGreaterThan(1);
       for (const j of jobs) expect(j.download_status).not.toBe("failed");
+      const held = (jobs.find((j) => j.download_status === "pending") ?? jobs[0]).id;
+      const userPause = await engine.api("/api/jobs/pause", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids: [held] }),
+      });
+      expect(userPause.paused).toBe(1);
+      const update = await engine.api("/api/settings", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ minSplitSize: "8M" }),
+      });
+      expect(update.ok).toBe(true);
+      await waitFor("corrected settings automatically resume the other jobs", async () => {
+        const current = await getJobs(engine);
+        const status = await engine.api("/api/status");
+        return !status.isPaused && current.filter((j) => j.id !== held).every((j) => j.download_status === "downloaded");
+      }, 30_000);
+      const final = await getJobs(engine);
+      expect(final.find((j) => j.id === held)?.download_status).toBe("paused");
+      expect((final.find((j) => j.id === held) as any).pause_reason).toBe("user");
     } finally {
       await engine.stop();
     }
@@ -3422,6 +3497,101 @@ describe("integration: offline mode", () => {
     // the next ordinary start downloads again.
     const saved = JSON.parse(await Bun.file(join(dir, "config.json")).text());
     expect("offlineMode" in saved).toBe(false);
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
+// Cookie change -> validation -> credential requeue, through the real engine.
+describe("integration: credential self-healing", () => {
+  test("a cookie refresh rescues an old in-flight attempt without looping failures made with the new jar", async () => {
+    const dir = await makeRunDir();
+    const file = join(dir, "cookies.txt");
+    const jar = (value: string) => `# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\t${value}\n`;
+    await writeFile(file, jar("old"));
+    const engine = await startEngine(dir, 4102, BASE_CONFIG(4102, {
+      maxDownloadWorkers: 1, maxConcurrentDownloads: 1,
+      requeueFailedAfterMinutes: 0, maxFailures: 50,
+    }), {
+      FAKE_FAIL_TIMES: "1", FAKE_FAIL_MESSAGE: "ERROR: Login required",
+      FAKE_DELAY_MS: "2500", YTA_RECOVERY_POLL_MS: "100",
+    });
+    try {
+      const folder = join(dir, "downloads", "Mock Playlist");
+      await waitFor("old-cookie download has started", async () => {
+        const names = await readdir(folder).catch(() => [] as string[]);
+        return names.some((name) => name.includes("First Mock Video") && name.endsWith(".attempts"));
+      }, 20_000);
+      await writeFile(file, jar("new"));
+      await waitFor("the watcher sees new cookies before the old child exits", async () =>
+        engine.stdout().includes("cookies.txt changed"), 2_000);
+      await waitFor("the old attempt is rescued", async () =>
+        (await getJobs(engine)).find((job) => job.id === "mockvid001")?.download_status === "downloaded", 30_000);
+      await waitFor("a failure that used the new cookie is parked", async () =>
+        (await getJobs(engine)).find((job) => job.id === "mockvid002")?.download_status === "failed", 30_000);
+      await Bun.sleep(600);
+      const other = (await getJobs(engine)).find((job) => job.id === "mockvid002")!;
+      expect(other.download_status).toBe("failed");
+      expect(await readFile(file, "utf8")).toBe(jar("new"));
+    } finally { await engine.stop(); }
+  }, TEST_TIMEOUT);
+
+  test("new valid cookies rescue age gates after manual resume; invalid cookies and private videos stay parked", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 4101, BASE_CONFIG(4101, {
+      requeueFailedAfterMinutes: 0, maxFailures: 50,
+    }), {
+      FAKE_FAIL_TIMES: "1",
+      FAKE_FAIL_MESSAGE: "ERROR: Sign in to confirm your age",
+      YTA_RECOVERY_POLL_MS: "250",
+    });
+    try {
+      await waitFor("all three age-gated jobs are parked", async () => {
+        const jobs = await getJobs(engine);
+        return jobs.length === 3 && jobs.every((job) => job.download_status === "failed" &&
+          String(job.last_error).includes("Age-restricted"));
+      }, 30_000);
+
+      // Give one terminal row an explicitly non-rescuable reason. The other
+      // two remain the real failures produced by the mock yt-dlp process.
+      const archive = new Database(join(dir, "archive.db"));
+      try {
+        archive.run("UPDATE jobs SET last_error = ? WHERE id = ?", [
+          "[terminal] Private video — skipped. yt-dlp: Private video; sign in required", "mockvid003",
+        ]);
+      } finally { archive.close(); }
+
+      await writeFile(join(dir, "cookies.txt"), "not a Netscape cookie file");
+      await Bun.sleep(900);
+      expect((await getJobs(engine)).every((job) => job.download_status === "failed")).toBe(true);
+      expect((await engine.api("/api/status")).cookies.valid).toBe(false);
+      expect((await engine.api("/api/reliability")).credentialBlocked).toBe(2);
+
+      expect((await engine.api("/api/pause", { method: "POST" })).ok).toBe(true);
+      const jar = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tintegration-session\n";
+      await writeFile(join(dir, "cookies.txt"), jar);
+      await Bun.sleep(900);
+      expect((await engine.api("/api/status")).isPaused).toBe(true);
+      expect((await getJobs(engine)).every((job) => job.download_status === "failed")).toBe(true);
+
+      expect((await engine.api("/api/resume", { method: "POST" })).ok).toBe(true);
+      await waitFor("fresh cookies rescue the two age gates", async () => {
+        const jobs = await getJobs(engine);
+        return jobs.filter((job) => job.id !== "mockvid003").every((job) => job.download_status === "downloaded");
+      }, 30_000);
+      const jobs = await getJobs(engine);
+      expect(jobs.find((job) => job.id === "mockvid003")?.download_status).toBe("failed");
+      const status = await engine.api("/api/status");
+      expect(status.cookies).toMatchObject({ present: true, valid: true, source: "file", cookies: 1 });
+      expect(JSON.stringify(status)).not.toContain("integration-session");
+      const folder = join(dir, "downloads", "Mock Playlist");
+      // Finished files and their associated test artifacts may have moved to
+      // secondary storage; the parked private job's counter stays in place.
+      const privateCounter = (await readdir(folder)).find((name) => name.includes("Third Mock Video") && name.endsWith(".attempts"));
+      expect(privateCounter).toBeTruthy();
+      expect(await readFile(join(folder, privateCounter!), "utf8")).toBe("1");
+    } finally {
+      await engine.stop();
+    }
   }, TEST_TIMEOUT);
 });
 

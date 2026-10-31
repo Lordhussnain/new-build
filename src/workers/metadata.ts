@@ -11,13 +11,14 @@ import {
   claimMetadataJob,
   claimRef,
   db,
+  ownsClaim,
   perVideoCap,
   releaseClaimedJob,
   startClaimHeartbeat,
   type ClaimRef,
   type Job,
 } from "../db";
-import { cookiesArgs, jsRuntimeArgs, ytDlp } from "../tools";
+import { createCookieInvocation, jsRuntimeArgs, ytDlp } from "../tools";
 import { computeBackoffMs, isPermanentDownloadError } from "../retry";
 import {
   findSidecarFiles,
@@ -39,6 +40,7 @@ import {
 } from "../state";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
 import { logError } from "../logger";
+import { engineFencing, holdsEngineLease, withEngineLease } from "../lease";
 import type { Config } from "../config";
 
 /**
@@ -125,7 +127,7 @@ export async function metadataWorker(id: number, config: Config): Promise<void> 
     // (POST /api/settings) take effect on the next job without a restart. The
     // parameter is only the initial value.
     config = getConfig();
-    if (isPaused()) {
+    if (isPaused() || !holdsEngineLease()) {
       await Bun.sleep(2000);
       continue;
     }
@@ -145,12 +147,16 @@ export async function metadataWorker(id: number, config: Config): Promise<void> 
       continue;
     }
     const disk = await checkDiskSpace(config.outputRoot, config.minFreeSpaceGB);
+    const live = getConfig();
+    if (abortController.signal.aborted || isPaused() || !holdsEngineLease() || live.offlineMode ||
+        live.outputRoot !== config.outputRoot || live.minFreeSpaceGB !== config.minFreeSpaceGB) continue;
     if (!disk.ok) {
       triggerPause(`LOW_DISK_SPACE (${disk.free.toFixed(1)}GB < ${config.minFreeSpaceGB}GB)`);
       await Bun.sleep(10000);
       continue;
     }
-    const job = claimMetadataJob(workerId);
+    const fencing = engineFencing();
+    const job = withEngineLease(fencing, () => claimMetadataJob(workerId));
     if (!job) {
       await Bun.sleep(2000);
       continue;
@@ -172,7 +178,7 @@ export async function metadataWorker(id: number, config: Config): Promise<void> 
     });
     activeMetadataJobs.set(id, job.id);
     try {
-      await runMetadataJob(job, config, id);
+      await runMetadataJob(job, config, id, fencing);
     } catch (err: any) {
       // The failure handler must never break the loop — supervise() would
       // restart it at the cost of a claim-leak and a stall.
@@ -217,7 +223,7 @@ async function stopMetadataProcess(proc: Bun.Subprocess): Promise<void> {
   await proc.exited.catch(() => {});
 }
 
-async function runMetadataJob(job: Job, config: Config, id: number): Promise<void> {
+async function runMetadataJob(job: Job, config: Config, id: number, fencing: number | null): Promise<void> {
   updateMetadataWorkerLine(id, `📎 Metadata | ${job.title}`, config);
 
   if (!job.file_path || !existsSync(job.file_path)) {
@@ -241,19 +247,23 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
     },
     parseUnavailableMetadataKinds(job.metadata_unavailable),
   );
+  // Directory inspection yields; re-check ownership and all live gates before
+  // recording success or launching a network fetch.
+  if (abortController.signal.aborted || isPaused() || getConfig().offlineMode ||
+      !holdsEngineLease() || engineFencing() !== fencing || !ownsClaim("metadata", job.id, metadataClaim(job))) {
+    releaseClaimedJob("metadata", job.id, metadataClaim(job), `metadata_status = 'pending'`);
+    return;
+  }
   if (missing.length === 0) {
-    if (isPaused()) {
-      releaseClaimedJob("metadata", job.id, metadataClaim(job), `metadata_status = 'pending'`);
-      return;
-    }
     recordMetadataSuccess(job, config, id, existingSidecars, true);
     return;
   }
 
+  const cookie = createCookieInvocation(config);
   const args = [
     ytDlp(),
     job.url,
-    ...cookiesArgs(config),
+    ...cookie.args,
     ...jsRuntimeArgs(),
     "--skip-download",
     "--no-simulate",
@@ -300,6 +310,7 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
     // If pipe setup/reading fails before proc.exited settles, do not leave an
     // untracked yt-dlp child running against a job whose claim will be released.
     if (proc) await stopMetadataProcess(proc);
+    cookie.cleanup();
   }
 
   if (isPaused()) {

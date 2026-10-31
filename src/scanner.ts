@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { readArchiveIds } from "./archive";
 import { db, getNextIndex, isVideoIgnored, isVideoInDb, takeReservedFileIndex } from "./db";
 import { isSourceBlocked, parseSourceUrl, sourceIdentity } from "./sources";
-import { cookiesArgs, jsRuntimeArgs, ytDlp } from "./tools";
+import { createCookieInvocation, jsRuntimeArgs, ytDlp } from "./tools";
 import { sanitizeFolderName } from "./util";
 import { getConfig, stats } from "./state";
 import { logError } from "./logger";
@@ -238,9 +238,10 @@ export async function getPlaylistItems(
   config: Config,
   opts: PlaylistListingOptions = {},
 ): Promise<ListingItem[]> {
+  const cookie = createCookieInvocation(config);
   const args = [
     ytDlp(),
-    ...cookiesArgs(config),
+    ...cookie.args,
     ...jsRuntimeArgs(),
     "--flat-playlist",
     // --ignore-errors: do NOT abort the scan when a video in the playlist is
@@ -314,6 +315,7 @@ export async function getPlaylistItems(
     throw new Error(`Could not start yt-dlp playlist scan: ${error instanceof Error ? error.message : error}`);
   } finally {
     clearTimeout(timer);
+    cookie.cleanup();
   }
   if (timedOut) throw new Error(timeoutMessage);
   if (code !== 0) {

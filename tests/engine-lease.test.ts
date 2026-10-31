@@ -263,6 +263,36 @@ describe("engine lease: renewal, fencing and release", () => {
     expect(holdsEngineLease()).toBe(false);
   });
 
+  test("an expired lease cannot be revived without a new fencing generation", () => {
+    const first = acquireEngineLease();
+    db.run("UPDATE engine_lease SET expires_at = datetime('now', '-1 second') WHERE id = 1");
+    expect(holdsEngineLease()).toBe(false);
+    expect(renewEngineLease()).toBe(false);
+    const second = acquireEngineLease();
+    expect(second.acquired).toBe(true);
+    expect(second.lease?.fencing).toBe((first.lease?.fencing ?? 0) + 1);
+  });
+
+  test("a changed fencing generation cannot be held, renewed, or released by the old generation", () => {
+    const acquired = acquireEngineLease();
+    db.run("UPDATE engine_lease SET fencing = fencing + 1 WHERE id = 1");
+    expect(holdsEngineLease()).toBe(false);
+    expect(renewEngineLease()).toBe(false);
+    expect(releaseEngineLease()).toBe(false);
+    expect(readEngineLease()?.owner).toBe(acquired.lease?.owner);
+    expect(readEngineLease()?.fencing).toBe((acquired.lease?.fencing ?? 0) + 1);
+  });
+
+  test("a process with no local lease cannot adopt or release a same-owner generation", () => {
+    const first = acquireEngineLease();
+    expect(releaseEngineLease()).toBe(true);
+    db.run(`UPDATE engine_lease SET owner = ?, fencing = fencing + 1,
+      expires_at = datetime('now', '+5 minutes') WHERE id = 1`, [first.lease?.owner ?? null]);
+    expect(renewEngineLease()).toBe(false);
+    expect(releaseEngineLease()).toBe(false);
+    expect(readEngineLease()?.owner).toBe(first.lease?.owner);
+  });
+
   test("the lease heartbeat reports loss after consecutive failed renewals", async () => {
     acquireEngineLease();
     let lost = 0;

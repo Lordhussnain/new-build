@@ -680,6 +680,20 @@ describe("cleanOrphanedFiles owner matching and ages", () => {
     expect(existsSync(part)).toBe(true);
   });
 
+  test("keeps credential-blocked partials and aria2 state until fresh cookies can rescue them", async () => {
+    const dir = await makeDir();
+    const part = await writeAria2Partial(dir, "credential.part");
+    insertJob("cookie-blocked-old", {
+      download_status: "failed", retry_count: 99,
+      last_error: "[terminal] Age-restricted video — skipped. yt-dlp: Sign in to confirm your age",
+      output_directory: dir, partial_file_path: part,
+    });
+    await ageFile(part, 30 * 24 * 60 * 60 * 1000);
+    await cleanOrphanedFiles(dir, testConfig({ requeueFailedAfterMinutes: 0 }));
+    expect(existsSync(part)).toBe(true);
+    expect(existsSync(`${part}${ARIA2_CONTROL_SUFFIX}`)).toBe(true);
+  });
+
   test("still ages out a partial nothing will ever resume", async () => {
     // The other half of the contract: a permanently failed download's partial
     // is litter, and the sweep is the only thing that cleans it. The fix

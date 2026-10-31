@@ -25,18 +25,18 @@ import {
 } from "./db";
 import { removeFromArchive } from "./archive";
 import { logError } from "./logger";
-import { detectCookiesChange, resolveCookieSource, usableCookieFingerprint, type CookiesChange } from "./tools";
+import { createCookieInvocation, detectCookiesChange, resolveCookieSource, usableCookieFingerprint, type CookiesChange } from "./tools";
 import { isCredentialBlockedError, isPermanentDownloadError } from "./retry";
 import { jobFittedBaseFilename } from "./download-args";
 import { activeDownloadJobs, abortController, getConfig, isJobCancelled, isPaused } from "./state";
-import { holdsEngineLease, readEngineLease, describeEngineLease } from "./lease";
+import { engineFencing, holdsEngineLease, readEngineLease, describeEngineLease, withEngineLease } from "./lease";
 import type { Config } from "./config";
 
 /**
  * Interrupted mid-download jobs become 'paused' + 'interrupted' so they are
  * visible as paused AND automatically re-claimed (resuming where they left
- * off via yt-dlp --continue). User-paused jobs stay held; orphan claims left
- * by older per-job pause requests are cleared without resuming those jobs.
+ * off via yt-dlp --continue). User-paused jobs stay held; any paused row's
+ * claims from the previous engine generation are cleared at startup.
  */
 export function reconcileCrashedJobs(): number {
   // The engine lease gates this sweep: it resets EVERY in-flight claim, so it
@@ -75,7 +75,7 @@ export function reconcileCrashedJobs(): number {
        updated_at = CURRENT_TIMESTAMP
      WHERE download_status = 'downloading'
         OR (download_status = 'paused' AND pause_reason IS NULL)
-        OR (download_status = 'paused' AND pause_reason = 'user' AND download_claimed_by IS NOT NULL)
+        OR (download_status = 'paused' AND (download_claimed_by IS NOT NULL OR download_claim_token IS NOT NULL))
         OR conversion_status = 'in_progress'
         OR metadata_status = 'in_progress'`,
   );
@@ -411,24 +411,9 @@ export function cookiesWatch(config: Config): CookiesChange {
   });
   if (!change) return null;
   if (change === "appeared" || change === "updated") {
-    const blocked =
-      (
-        db
-          .query(
-            `SELECT COUNT(*) AS n FROM jobs
-              WHERE download_status = 'failed'
-                AND (lower(COALESCE(last_error, '')) LIKE '%sign in%'
-                  OR lower(COALESCE(last_error, '')) LIKE '%login%'
-                  OR lower(COALESCE(last_error, '')) LIKE '%cookie%'
-                  OR lower(COALESCE(last_error, '')) LIKE '%not a bot%'
-                  OR lower(COALESCE(last_error, '')) LIKE '%members%'
-                  OR lower(COALESCE(last_error, '')) LIKE '%private%'
-                  OR lower(COALESCE(last_error, '')) LIKE '%confirm your age%'
-                  OR lower(COALESCE(last_error, '')) LIKE '%age-restricted%'
-                  OR lower(COALESCE(last_error, '')) LIKE '%age restricted%')`,
-          )
-          .get() as any
-      )?.n || 0;
+    const rows = db.query(`SELECT last_error FROM jobs WHERE download_status = 'failed'`)
+      .all() as { last_error: string | null }[];
+    const blocked = rows.filter((row) => isCredentialBlockedError(row.last_error)).length;
     console.log(
       `cookies.txt ${change === "appeared" ? "found" : "changed"} (${state.size} bytes) — checking the updated file.`, 
     );
@@ -442,6 +427,9 @@ export function cookiesWatch(config: Config): CookiesChange {
       `cookies.txt ${change} (${state.size} bytes) at ${state.file}; ${blocked} job(s) parked with a credential-style error`,
     );
   } else {
+    // A later appearance is a new observation even when its bytes happen to
+    // match the file that disappeared (including while the engine is paused).
+    cookieRecoveryByDb.delete(db);
     console.warn(
       "⚠️ cookies.txt disappeared — continuing without cookies; age-gated/private/member-only videos will now fail.",
     );
@@ -456,29 +444,104 @@ export interface RequeueResult {
   metadata: number;
 }
 
-const rescuedCookieFingerprints = new WeakMap<object, string>();
+interface CookieRecovery {
+  fingerprint: string;
+  // Snapshot failed rows on the change. A temporarily claimed row can be
+  // revisited when the claim clears; a job that already retried with these
+  // cookies must not be endlessly requeued on every watcher tick.
+  pending: Map<string, string | null>;
+}
+const cookieRecoveryByDb = new WeakMap<object, CookieRecovery>();
+const credentialAttemptsByDb = new WeakMap<object, Map<string, { error: string | null; fingerprint: string | null }>>();
 
-export async function refreshCookies(opts: { force?: boolean } = {}): Promise<number> {
-  const config = getConfig();
-  if (abortController.signal.aborted || config.offlineMode || !holdsEngineLease()) return 0;
-  await resolveCookieSource(config, opts);
-  if (abortController.signal.aborted || getConfig() !== config || config.offlineMode || isPaused() || !holdsEngineLease()) return 0;
-  const fingerprint = usableCookieFingerprint(config);
-  if (!fingerprint || rescuedCookieFingerprints.get(db) === fingerprint) return 0;
-  const rescued = requeueCredentialBlockedJobs(config);
-  rescuedCookieFingerprints.set(db, fingerprint);
-  return rescued;
+/** Record the jar actually used by a just-failed download, including anonymous.
+ * A refresh may have been observed while the old child was still running. */
+export function noteCredentialFailure(id: string, fingerprint: string | null): void {
+  const row = db.query(`SELECT download_status, last_error FROM jobs WHERE id = ?`).get(id) as
+    | { download_status: string; last_error: string | null } | null;
+  if (!row || row.download_status !== "failed" || !isCredentialBlockedError(row.last_error)) return;
+  let attempts = credentialAttemptsByDb.get(db);
+  if (!attempts) { attempts = new Map(); credentialAttemptsByDb.set(db, attempts); }
+  attempts.set(id, { error: row.last_error, fingerprint });
+  const recovery = cookieRecoveryByDb.get(db);
+  if (recovery) {
+    if (recovery.fingerprint === fingerprint) recovery.pending.delete(id);
+    else recovery.pending.set(id, row.last_error);
+  }
 }
 
-export function requeueCredentialBlockedJobs(config: Config): number {
-  if (config.offlineMode || isPaused() || abortController.signal.aborted || !holdsEngineLease()) return 0;
-  const rescued = db.transaction(() => {
-    let count = 0;
+export async function refreshCookies(opts: { force?: boolean; startup?: boolean; tempRoot?: string } = {}): Promise<number> {
+  const config = getConfig();
+  if (abortController.signal.aborted || config.offlineMode || !holdsEngineLease()) return 0;
+  const fencing = engineFencing();
+  // The legacy switch skips the startup check only; ongoing self-healing still
+  // diagnoses local expiry before exporting or rearming credential failures.
+  await resolveCookieSource(config, {
+    force: opts.force,
+    diagnoseFile: !opts.startup,
+    shouldContinue: () => {
+      try { return !abortController.signal.aborted && holdsEngineLease() && engineFencing() === fencing; }
+      catch { return false; }
+    },
+    publish: (commit) => withEngineLease(fencing, commit) ?? false,
+  });
+  if (abortController.signal.aborted || getConfig() !== config || config.offlineMode ||
+      !holdsEngineLease() || engineFencing() !== fencing) return 0;
+  const fingerprint = usableCookieFingerprint(config);
+  if (!fingerprint) {
+    cookieRecoveryByDb.delete(db);
+    return 0;
+  }
+  // Do not rearm jobs unless a private snapshot of THESE bytes is writable.
+  // A later tick retries if the temporary directory is unavailable or the
+  // operator changed the file between the fingerprint and the snapshot.
+  if (isPaused()) return 0;
+  const candidate = createCookieInvocation(config, { tempRoot: opts.tempRoot });
+  const ready = candidate.args.length > 0 && candidate.fingerprint === fingerprint;
+  candidate.cleanup();
+  if (!ready) return 0;
+  let recovery = cookieRecoveryByDb.get(db);
+  if (!recovery || recovery.fingerprint !== fingerprint) {
     const rows = db.query(`SELECT id, last_error FROM jobs WHERE download_status = 'failed'`)
       .all() as { id: string; last_error: string | null }[];
+    const attempts = credentialAttemptsByDb.get(db);
+    const failedIds = new Set(rows.map((row) => row.id));
+    if (attempts) for (const id of attempts.keys()) if (!failedIds.has(id)) attempts.delete(id);
+    recovery = {
+      fingerprint,
+      pending: new Map(rows.filter((row) => {
+        if (!isCredentialBlockedError(row.last_error)) return false;
+        const attempt = attempts?.get(row.id);
+        // This failure already used the newly observed bytes: retrying them
+        // again would create a loop rather than a fresh-cookie rescue.
+        return !attempt || attempt.error !== row.last_error || attempt.fingerprint !== fingerprint;
+      }).map((row) => [row.id, row.last_error])),
+    };
+    cookieRecoveryByDb.set(db, recovery);
+  }
+  return requeueCredentialBlockedJobs(config, recovery.pending);
+}
+
+/** Lease/claim-safe; with a snapshot, leave temporarily claimed candidates for a later tick. */
+export function requeueCredentialBlockedJobs(config: Config, pending?: Map<string, string | null>): number {
+  if (config.offlineMode || isPaused() || abortController.signal.aborted || !holdsEngineLease()) return 0;
+  const rescued = db.transaction(() => {
+    // Recheck under SQLite's write lock: the lease may have changed while this
+    // connection waited to start the transaction.
+    if (config.offlineMode || isPaused() || abortController.signal.aborted || !holdsEngineLease()) return 0;
+    let count = 0;
+    const rows = db.query(`SELECT id, last_error, pause_reason FROM jobs WHERE download_status = 'failed'`)
+      .all() as { id: string; last_error: string | null; pause_reason: string | null }[];
+    const seen = new Set<string>();
     for (const row of rows) {
-      if (!isCredentialBlockedError(row.last_error) || isJobCancelled(row.id)) continue;
-      count += db.run(
+      if (pending && !pending.has(row.id)) continue;
+      seen.add(row.id);
+      if ((pending && pending.get(row.id) !== row.last_error) || !isCredentialBlockedError(row.last_error) ||
+          row.pause_reason === 'user' || isJobCancelled(row.id)) {
+        pending?.delete(row.id);
+        continue;
+      }
+      const changed = db.run(
         `UPDATE jobs SET download_status = 'pending', pause_reason = NULL,
            retry_count = 0, resume_count = 0, last_error = NULL, updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND download_status = 'failed' AND last_error IS ?
@@ -489,17 +552,20 @@ export function requeueCredentialBlockedJobs(config: Config): number {
            AND metadata_status != 'in_progress' AND conversion_status != 'in_progress'`,
         [row.id, row.last_error],
       ).changes;
+      if (changed) pending?.delete(row.id);
+      count += changed;
     }
+    if (pending) for (const id of pending.keys()) if (!seen.has(id)) pending.delete(id);
     return count;
-  })();
+  }).immediate();
   if (rescued > 0) console.log(`Fresh cookies: re-queued ${rescued} credential-blocked job(s).`);
   return rescued;
 }
 
 /**
  * Re-queue failed jobs once they have cooled down for
- * `requeueFailedAfterMinutes`. Permanent download failures (private, removed,
- * age-gated, geo-blocked, dead URLs) are never retried. A cooldown starts a
+ * `requeueFailedAfterMinutes`. Terminal download failures are not retried by
+ * this sweep; credential-blocked skips have their own fresh-cookie rescue. A cooldown starts a
  * fresh retry window for each stage; the worker's per-video cap still bounds
  * each burst of immediate retries, while a later sweep can recover from a
  * longer outage without operator intervention.
@@ -861,9 +927,8 @@ const RESUMABLE_PARTIAL_STATUSES = new Set(["pending", "downloading", "paused", 
  *   • orphan `.superseded` backups with no matching job are deleted once they
  *     are a day old — a backup the DB does not reference can never be restored,
  *     so it is a stale duplicate next to a job that re-downloaded over it
- *   • everything else — including in-flight downloads from a previous run and
- *     resume-able partials of failed jobs waiting for cooldown — is kept so
- *     `--continue` can pick up exactly where the download stopped
+ *   • everything else — including in-flight downloads and failed jobs waiting
+ *     for cooldown or fresh cookies — is kept so `--continue` can resume
  *
  * Deleting a partial also deletes its aria2c control file, and control files
  * whose data file is gone are swept on their own — a stranded `.aria2` makes
@@ -908,13 +973,15 @@ export async function cleanOrphanedFiles(
       }
     }
 
-    // Protect all partial files belonging to pending, downloading, or paused jobs
-    // even if partial_file_path has not been explicitly populated on their row yet.
+    // Protect resumable jobs, including credential-blocked failures, even if
+    // partial_file_path has not been populated yet (e.g. a legacy row).
     const activeJobs = db
-      .query(`SELECT id, "index", title, output_directory FROM jobs WHERE download_status IN ('pending', 'downloading', 'paused')`)
+      .query(`SELECT id, "index", title, output_directory, download_status, last_error FROM jobs
+        WHERE download_status IN ('pending', 'downloading', 'paused', 'waiting_live', 'failed')`)
       .all() as any[];
     const activeBasePrefixes = new Set<string>();
     for (const j of activeJobs) {
+      if (j.download_status === "failed" && !isCredentialBlockedError(j.last_error)) continue;
       if (j.output_directory && j.title) {
         activeBasePrefixes.add(pathKey(join(resolve(j.output_directory), jobFittedBaseFilename(j))));
       }
@@ -947,12 +1014,12 @@ export async function cleanOrphanedFiles(
           !!config &&
           config.requeueFailedAfterMinutes > 0 &&
           !isPermanentDownloadError(owner.lastError);
-        const exhausted = owner.status === "failed" && cap > 0 && owner.retries >= cap && !waitingForCooldownRetry;
-        // Only partials no attempt will ever resume are aged out. A paused or
-        // pending job's resume state must survive indefinitely — deleting it
-        // because a week passed silently throws away the download progress the
-        // job exists to continue from.
-        const abandoned = !RESUMABLE_PARTIAL_STATUSES.has(owner.status) && !waitingForCooldownRetry;
+        const waitingForCookies = owner.status === "failed" && isCredentialBlockedError(owner.lastError);
+        const mayResume = waitingForCooldownRetry || waitingForCookies;
+        const exhausted = owner.status === "failed" && cap > 0 && owner.retries >= cap && !mayResume;
+        // Cookie-blocked jobs can resume much later when credentials change,
+        // independently of the normal cooldown setting or retry budget.
+        const abandoned = !RESUMABLE_PARTIAL_STATUSES.has(owner.status) && !mayResume;
         const ancient = abandoned && ageMs > PARTIAL_MAX_AGE_MS;
         if (exhausted || ancient) {
           // Take the aria2c control file with it, or the next attempt wedges.

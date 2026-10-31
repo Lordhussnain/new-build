@@ -162,12 +162,22 @@ export function hasLiveLeaseOwner(): boolean {
 /** True when THIS process holds the unexpired lease. */
 export function holdsEngineLease(): boolean {
   const lease = readEngineLease();
-  return !!currentLease && !!lease && lease.owner === currentLease.owner && !isLeaseExpired(lease);
+  return !!currentLease && !!lease && lease.owner === currentLease.owner &&
+    lease.fencing === currentLease.fencing && !isLeaseExpired(lease);
 }
 
-/** The fencing generation of this process's lease, or null when it holds none. */
+/** The locally acquired generation, or null; check holdsEngineLease() for expiry. */
 export function engineFencing(): number | null {
   return currentLease?.fencing ?? null;
+}
+
+/** Execute a short synchronous mutation under the exact live lease generation. */
+export function withEngineLease<T>(fencing: number | null, action: () => T): T | null {
+  if (fencing === null || !holdsEngineLease() || engineFencing() !== fencing) return null;
+  return db.transaction(() => {
+    if (!holdsEngineLease() || engineFencing() !== fencing) return null;
+    return action();
+  }).immediate();
 }
 
 /**
@@ -185,8 +195,9 @@ export function acquireEngineLease(opts: { ttlMs?: number } = {}): LeaseAcquireR
   const owner = engineLeaseOwner();
   const attempt = db.transaction(() => {
     const existing = readEngineLease();
-    // Re-acquiring our own lease is a renewal (fencing stays put).
-    if (existing && existing.owner === owner) {
+    // Only a still-live lease is a renewal. Reacquiring an expired lease must
+    // fence work that started under the previous, discontinuous generation.
+    if (existing && existing.owner === owner && !isLeaseExpired(existing)) {
       const renewed = renewEngineLease(ttlSeconds * 1000);
       return { acquired: renewed, lease: readEngineLease(), tookOver: false };
     }
@@ -240,15 +251,15 @@ export function acquireEngineLease(opts: { ttlMs?: number } = {}): LeaseAcquireR
  * must then stop behaving like the owner (the heartbeat path pauses the engine).
  */
 export function renewEngineLease(ttlMs: number = engineLeaseTtlMs()): boolean {
-  const owner = currentLease?.owner ?? engineLeaseOwner();
+  if (!currentLease) return false;
+  const { owner, fencing } = currentLease;
   const ttlSeconds = Math.max(1, Math.round(ttlMs / 1000));
   const changes = db.run(
     `UPDATE engine_lease
         SET heartbeat_at = CURRENT_TIMESTAMP, expires_at = datetime('now', ?)
-      WHERE id = 1 AND owner = ?`,
-    [`+${ttlSeconds} seconds`, owner],
+      WHERE id = 1 AND owner = ? AND fencing = ? AND expires_at > datetime('now')`,
+    [`+${ttlSeconds} seconds`, owner, fencing],
   ).changes;
-  if (changes === 1 && !currentLease) currentLease = { owner, fencing: readEngineLease()?.fencing ?? 0 };
   return changes === 1;
 }
 
@@ -258,12 +269,13 @@ export function renewEngineLease(ttlMs: number = engineLeaseTtlMs()): boolean {
  * needs no release at all — expiry does the same job.
  */
 export function releaseEngineLease(): boolean {
-  const owner = currentLease?.owner ?? engineLeaseOwner();
+  if (!currentLease) return false;
+  const { owner, fencing } = currentLease;
   const changes = db.run(
     `UPDATE engine_lease
         SET owner = NULL, heartbeat_at = CURRENT_TIMESTAMP, expires_at = datetime('now')
-      WHERE id = 1 AND owner = ?`,
-    [owner],
+      WHERE id = 1 AND owner = ? AND fencing = ?`,
+    [owner, fencing],
   ).changes;
   currentLease = null;
   return changes === 1;

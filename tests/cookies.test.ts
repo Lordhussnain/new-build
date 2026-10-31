@@ -2,8 +2,8 @@
 // startup.
 //
 // Operators export cookies.txt from the browser *after* the engine is already
-// running, and replace it when it expires. `cookiesArgs()` re-stats the file on
-// every yt-dlp invocation so the next attempt uses it either way; the sweep is
+// running, and replace it when it expires. Each yt-dlp invocation snapshots
+// the file so the next attempt uses it either way; the sweep is
 // what makes that visible and what tells the operator how many parked jobs the
 // new cookies may rescue.
 
@@ -13,7 +13,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { unlinkSync, writeFileSync } from "node:fs";
-import { cookiesArgs, cookiesState, detectCookiesChange, resetCookiesBaseline } from "../src/tools";
+import { createCookieInvocation, cookiesState, detectCookiesChange, resetCookiesBaseline } from "../src/tools";
 import { cookiesWatch } from "../src/reconcile";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 import { db, initDatabase } from "../src/db";
@@ -41,20 +41,24 @@ afterEach(async () => {
   }
 });
 
-describe("cookiesArgs", () => {
+describe("cookie invocation", () => {
   test("omits --cookies when the file is missing", () => {
-    expect(cookiesArgs(cfg())).toEqual([]);
+    expect(createCookieInvocation(cfg()).args).toEqual([]);
   });
 
   test("omits --cookies when the file is empty", async () => {
     await writeFile(cookiesFile, "");
-    expect(cookiesArgs(cfg())).toEqual([]);
+    expect(createCookieInvocation(cfg()).args).toEqual([]);
   });
 
-  test("passes the file once it has content", async () => {
+  test("passes a private snapshot once the file has content", async () => {
     await writeFile(cookiesFile, "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tx\n");
-    // yt-dlp gets the private working copy, never the operator's export.
-    expect(cookiesArgs(cfg())).toEqual(["--cookies", `${cookiesFile}.working`]);
+    const cookie = createCookieInvocation(cfg());
+    try {
+      expect(cookie.args[0]).toBe("--cookies");
+      expect(cookie.args[1]).not.toBe(cookiesFile);
+      expect(await Bun.file(cookie.args[1]).text()).toContain("\tSID\tx");
+    } finally { cookie.cleanup(); }
   });
 });
 
@@ -199,7 +203,7 @@ describe("cookiesWatch", () => {
     unlinkSync(cookiesFile);
     expect(cookiesWatch(cfg())).toBe("disappeared");
     // And downloads now run anonymously.
-    expect(cookiesArgs(cfg())).toEqual([]);
+    expect(createCookieInvocation(cfg()).args).toEqual([]);
   });
 
   test("is quiet while nothing changes", async () => {

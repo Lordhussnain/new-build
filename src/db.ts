@@ -336,6 +336,11 @@ export function initDatabase(path: string = "archive.db"): void {
              -- "file deleted before conversion finished".
              AND COALESCE(conversion_status, '') != 'in_progress'
              AND COALESCE(metadata_status, '') != 'in_progress'
+             -- An interrupted row may still be settling after a global pause.
+             -- Never replace any live claim merely because its status changed.
+             AND download_claimed_by IS NULL AND download_claim_token IS NULL
+             AND conversion_claimed_by IS NULL AND conversion_claim_token IS NULL
+             AND metadata_claimed_by IS NULL AND metadata_claim_token IS NULL
            ORDER BY created_at, rowid LIMIT 1
          )
          RETURNING *`,

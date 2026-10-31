@@ -20,8 +20,8 @@ a terminal UI and a web dashboard to watch it all happen.
 - **A resume that can never finish is discarded, not retried** — when the saved partial no longer matches what the server will serve (`HTTP Error 416: Requested range not satisfiable`, or aria2c refusing a file whose control state is gone), resuming repeats the failure forever and the video sits at 99.0%. The engine deletes the `.part` **and** its `.aria2` control file, resets progress, and restarts that video from zero
 - **Automatic retries** with exponential backoff + jitter on transient failures (network drops, throttling, timeouts)
 - **Signature-extraction failures self-heal once** — only yt-dlp's signature/nsig decipher errors trigger `yt-dlp -U`; updater output is bounded, it has a hard timeout, concurrent requests share one update, and a failed update leaves the normal retry budget intact
-- **Disk-full failures pause the engine** — ENOSPC and common Windows/POSIX “disk full” errors preserve the partial and pause all workers for operator action instead of burning retries against an unwritable drive
-- **Unavailable videos are skipped, not retried** — private, deleted, members-only (including YouTube's "Join this channel" wording), age-gated, bot-gated (`Sign in to confirm you're not a bot`), paid or geo-blocked videos are attempted **once**, classified with a plain-language reason (`Private video`, `Video unavailable`, `Not available in your region`, …), and parked as a terminal skip: no retry budget, no cooldown requeue, no `error.log` line per dead video, and no circuit-breaker trip for a whole playlist of them. The rest of the playlist keeps downloading, and the reason stays readable in the dashboard, the Failed tab, `/api/failed` and the run report
+- **Disk-full failures pause the engine** — ENOSPC and common Windows/POSIX “disk full” errors preserve the partial and pause workers rather than burning retries. The engine resumes only after it measures enough returned space (see below).
+- **Unavailable videos are classified and parked** — private, deleted, members-only, age-gated, bot-gated, paid or geo-blocked videos are skipped without consuming the retry budget or tripping the circuit breaker. Age gates, bot checks and members-only failures can be retried when fresh usable cookies appear; private, deleted and region-blocked videos stay parked. Reasons remain visible in the dashboard, `/api/failed` and the run report.
 - **An unavailable format is switched, not retried** — when yt-dlp answers `Requested format is not available`, the engine steps the quality down one rung (`4k → 1440p → 1080p → 720p → 480p → highest`), persists it as that job's quality override, and says so: `🎚️ Format 1080p not available — switched to 720p`. The ladder only ever moves down, so it cannot loop, and a stale multi-audio probe is cleared and re-probed first. Only a job that fails at every rung — a video with no usable formats — is parked, with `No format available` recorded as its reason
 
 - **Self-healing sweeps** — crashed jobs resume, stale claims are reclaimed, deleted downloads are re-fetched, and failed jobs are retried after a cooldown. With aria2c these sweeps resume from the download's `.aria2` control file, and a discarded partial always takes its control file with it
@@ -38,8 +38,8 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Multi-audio tracks** — YouTube's multi-language audio (the player's *Audio track* menu: original + auto-dubbed tracks). Keep every track, or just the languages you want, muxed into one MKV whose audio is switchable in any player — plus a per-video track picker in the dashboard
 - **Subtitles and cover art embedded in the video** — the converter muxes the downloaded subtitle files into the finished file as selectable tracks (MP4 `mov_text`, MKV `copy`, WebM `webvtt`) and attaches the saved thumbnail as cover art, in the same pass that remuxes to the target container. The tracks therefore survive a webm/mkv → mp4 conversion, which used to drop both (the old remux mapped only the first video stream and the audio). Sidecar files are still written next to the media. Two independent switches (`embedSubtitles`, `embedThumbnail`) control it; turning either on also makes new jobs fetch the file it needs. Subtitle tracks are tagged with ISO 639-2 language codes (`en` → `eng`) so players show the right language, and live-chat "subtitles" are excluded from the fetch.
 - Compatible with authenticated downloads (`--cookies`) and YouTube's n-challenge (a JS runtime — Deno, Node, or Bun — is discovered at startup and passed to yt-dlp)
-- **cookies.txt is watched while the engine runs** — export it from your browser after startup (or replace it when it expires) and the next download attempt uses it; the engine logs the switch and tells you how many credential-blocked jobs it may rescue
-- **Save Browser Cookies** — the dashboard's 🍪 button (or `POST /api/cookies/export`) reads a browser you are signed in to and saves its YouTube/Google cookies as `cookies.txt`. The export is staged first and only replaces `cookies.txt` when it contains a signed-in session; the previous file is kept as `cookies.txt.bak`. Close the browser if it reports that its cookie store is locked. When `cookies.txt` is rejected, the log now says why (JSON instead of Netscape format, fields not TAB-separated, no YouTube session, or expired), and each browser fallback logs yt-dlp's actual reason instead of a generic "no usable cookies"
+- **Self-healing cookies** — in online mode the engine watches for changed or expired cookies, can export from configured signed-in browsers, and requeues eligible credential-blocked jobs with fresh budgets. Local diagnosis cannot guarantee YouTube accepts the session.
+- **Save Browser Cookies** — the dashboard's 🍪 button (or `POST /api/cookies/export`) tries the selected default browser profile, then configured fallback browsers, and reports the attempts. It stages a locally usable YouTube/Google jar and preserves the previous file as `cookies.txt.bak`.
 - **Offline mode** — one switch (`offlineMode`, the dashboard's 📴 toggle, `--offline`, or `YTA_OFFLINE=1`) stops every download, scan, RSS watch and sidecar fetch, and leaves the engine doing the work that needs no network: converting files that still need conversion and moving finished files to secondary storage. Queued downloads wait untouched and start when the mode ends
 - **Files that need no conversion still reach secondary storage** — a relocation pass moves finished media (sidecars included) whose conversion is already done, adopts a file a crashed run copied but never recorded, and re-relocates everything when `secondaryStoragePath` points somewhere new. It never copies a file onto itself and never overwrites a job that was re-downloaded meanwhile
 - **Web dashboard** with live job status, bulk actions, failed-job recovery, a reliability panel, per-job detail, and an in-browser settings editor for the downloader
@@ -115,8 +115,13 @@ For example (omitted keys use their defaults):
 ```
 
 Keep `config.json` private: it can contain source URLs and a `webToken`.
-`cookies.txt` contains authentication credentials and must also stay local; do
-not commit either file.
+`cookies.txt`, `cookies.txt.bak`, and cookie staging files contain
+credentials and must stay local; do not commit them. The default names are
+ignored by Git. **Custom `cookiesFile` paths, their `.bak` files, and staging
+directories must also be kept private and ignored.** Per-process cookie
+snapshots and browser exports use private temporary directories; after an abrupt
+crash, any leftover temporary files should be treated as secrets too. Older
+versions may also have left `.working` or `.incoming` siblings.
 
 ### Offline mode (no downloads)
 
@@ -130,7 +135,7 @@ downloaded**, and the only work left is the work that needs no network.
 | Metadata sidecars (subs/thumbnail/description/info.json) | **off** — every sidecar is a network fetch; `pending` stays `pending` |
 | Conversion (ffmpeg) | **on** — files that still need conversion are converted |
 | Secondary-storage move | **on** — finished files are moved, sidecars included |
-| Cookie validation, network probes | **off** — the monitor does not probe or pause local work while offline; local cookie-file watching continues |
+| Browser-cookie export, network probes | **off** — local cookie-file watching and status display continue, but no browser extraction or credential-job rescue runs offline |
 
 Queued downloads are *left exactly as they are*: they are not skipped, failed,
 or paused, so turning offline mode off resumes the queue where it stood. The
@@ -239,6 +244,61 @@ you can fix them and import again.
   using the terminal manager). Purging the queue alone does not remove sources
   from future scans.
 
+### Cookies and automatic recovery
+
+- **Finding cookies.** In online mode the engine checks `cookiesFile` (default
+  `cookies.txt`) at startup and watches it every 60 seconds. If it is missing,
+  invalid or expired, it tries `cookieBrowsers` in order (default `firefox`,
+  `chrome`, `brave`). Only the **default profile** of each browser is supported.
+  Sign in to YouTube in one of those browsers first; a locked cookie store may
+  require closing the browser. Set `cookieBrowsers` to `[]` to disable automatic
+  browser extraction. A failed fallback sequence is retried after 30 minutes,
+  or earlier when the file or relevant settings change. Each browser is tried
+  at most once per sequence, for at most two minutes per browser and four
+  minutes overall. Offline mode never starts an export.
+- **What “valid” means.** The local check looks for a nonempty Netscape-format
+  YouTube/Google session cookie with an unexpired timestamp (or a session
+  expiry of `0` or empty). Malformed UTF-8 is rejected. This check does **not**
+  verify that YouTube accepts the credentials,
+  that a membership exists, or that the account can access a particular video.
+  Browser extraction runs yt-dlp and may make a network request. The dashboard
+  shows local validity, source, live cookie count and file modification age;
+  the export time/browser are only known for an export in the current process,
+  otherwise the source is shown as `file` and export age is unknown.
+- **Safe exports.** Expired, malformed and non-YouTube/Google rows are removed;
+  session cookies are retained. The new jar is staged and locally checked before
+  replacement, and the previous file is saved as `<cookiesFile>.bak`. If a
+  browser, backup or write fails, the previous file remains untouched. Each
+  yt-dlp invocation gets its own private, normalized temporary snapshot; it
+  cannot rewrite the source export or another invocation's cookies. If a copy
+  cannot be made, the source is not passed to yt-dlp. Manual and automatic
+  exports require the active engine lease, and browser error messages do not
+  echo raw cookie-store diagnostics. Turning `validateCookiesOnStart` off skips
+  the startup check only; the online watcher still checks later for expiry and
+  recovery.
+- **Rescuing jobs.** A locally usable file observed at startup, appearing after
+  absence, or changing bytes requeues **all** eligible failed age-gated,
+  bot-check, members-only and login/cookie-blocked jobs with fresh download and
+  resume budgets. There is no per-cycle cap. A timestamp-only touch does not
+  trigger a retry. The same credentials do not repeatedly rescue an already
+  retried job; a temporarily claimed candidate waits for its claim to clear.
+  User-held, cancelled and in-progress jobs are not disturbed. Private, deleted,
+  geo-blocked and other non-credential terminal failures remain parked. The
+  rescue waits while the engine is paused, offline, or lacks its engine lease;
+  no cookie check can override a manual pause.
+- **Automatic engine resume.** A `TOO_MANY_FAILURES` circuit pause waits 10
+  minutes on the first trip, doubles on subsequent trips up to six hours, and
+  then resumes interrupted jobs. A successful download resets the trip history;
+  the history is in memory and resets on process restart. A low-disk pause
+  resumes only when the affected volume reports more than `minFreeSpaceGB`
+  free. After an actual write-full error it must also observe free-space growth;
+  if a quota or an unavailable disk probe makes that impossible, resolve the
+  condition and resume manually. A `BAD_DOWNLOADER_ARGS` pause resumes its
+  interrupted work after a relevant live downloader setting changes; settings
+  marked restart-required still need a restart. Network recovery continues to
+  resume network-caused pauses. User pauses, shutdown and `ENGINE_LEASE_LOST`
+  are never auto-cleared. A lost lease must be held again before a manual resume.
+
 ### Reliability settings
 
 ```json
@@ -257,7 +317,7 @@ you can fix them and import again.
 | --- | --- |
 | `maxResumeAttempts` | How many times one video may resume from its `.part` file before the partial is discarded and the download restarts from scratch |
 | `retryBackoffBaseSeconds` / `retryBackoffMaxSeconds` | Exponential backoff window (with jitter) for transient failures — base doubles per no-progress retry, capped at the max |
-| `requeueFailedAfterMinutes` | Cooldown before failed jobs start a fresh retry window (`0` disables the sweep). Permanent download failures are never re-queued |
+| `requeueFailedAfterMinutes` | Cooldown before retryable failed jobs start a fresh window (`0` disables that sweep). Terminal credential failures can separately be rescued by fresh cookies; other terminal failures stay parked |
 | `verifyExistingFiles` | On startup, verify that files recorded as downloaded still exist; missing ones are scrubbed from the yt-dlp archive and queued again |
 | `downloadTimeoutMinutes` | Minimum per-video download timeout |
 | `maxDownloadMinutes` | Ceiling for the timeout. The effective timeout scales with the video's real duration (3× realtime + 5 min) between the two |
@@ -416,11 +476,13 @@ not a static list of settings:
   the sweep.
 - **Engine lease** — the owner token, fencing generation and expiry of the
   database-level lock, and whether the dashboard's own process holds it.
+- **Cookies and circuit** — locally checked source, cookie count and age, plus
+  the next circuit retry time when paused. Cookie validity is not an online
+  authentication check.
 - **Self-healing sweeps** — each sweep with its cadence and a pending count:
-  crashed jobs, stale claims, deleted files, failed jobs, and the
-  secondary-storage relocation pass (`every 60s`, the count of finished files
-  still waiting to move). Deleted-files is `startup`-only and stats every
-  recorded file, so its count is reported as unknown rather than guessed.
+  crashed jobs, stale claims, deleted files, retryable failures,
+  credential-blocked jobs and secondary-storage relocation. Deleted-files is
+  `startup`-only and stats every recorded file, so its count is unknown.
 
 Every count comes from `GET /api/reliability`, which reads the live config (not
 a startup snapshot) and the job table.
@@ -446,7 +508,7 @@ CLI/API clients.
 | `POST /api/auth` | `{ "token" }` → validate the sign-in secret and set an `HttpOnly` cookie (same-origin only; 404 when token auth is not configured). |
 | `GET /api/ping` | Liveness probe (also answers `HEAD`). |
 | `GET /api/version` | Engine/runtime info (Bun version, platform, uptime). |
-| `GET /api/status` | Stats, aggregate speed, workers, pause state, disk/RAM, ETA. |
+| `GET /api/status` | Stats, aggregate speed, workers, pause state and circuit retry time, local cookie metadata, disk/RAM, ETA. |
 | `GET /api/jobs` | The 500 newest jobs. |
 | `GET /api/ignored-videos` | Videos explicitly removed from the queue and suppressed from future scans. |
 | `DELETE /api/ignored-videos/:id` | Allow one ignored video again; clears its yt-dlp archive entry so a later source scan can queue it for an intentional re-download. |
@@ -464,7 +526,7 @@ CLI/API clients.
 | `DELETE /api/sources` | `{ "url" }` → remove the source from `config.json` and delete jobs owned only by it; jobs shared with other configured sources remain. |
 | `POST /api/scan` | `{ "url", "folder?", "singleVideo?" }` → save the source to `config.json`, then scan/add jobs. `singleVideo: true` saves only the video of a `watch?v=…&list=…` link. Returns `saved`, `source: {url, key, added}`, and `found`/`added`/`skipped`. |
 | `POST /api/scan/batch` | `{ "urls": text or [links], "folder?", "singleVideo?" }` → save every valid line in one config write, then scan in the background. Returns `total`, `valid`, `invalid`, `duplicates`, `errors` (`line`, `input`, `error`), `sources` (`added`, `existing`, `videos`, `playlists`, `channels`), and `scanning`. Up to 2000 links per request. |
-| `POST /api/cookies/export` | `{ "browser" }` → save that browser's YouTube/Google cookies to `cookiesFile` (staged, verified signed in, previous file kept as `.bak`). `422` with `error` when the browser cannot be read or is not signed in; `409` in offline mode or while another export runs. |
+| `POST /api/cookies/export` | `{ "browser" }` → try that default browser profile, then configured fallbacks; return actual `browser`, `attempted`, per-browser `errors` and backup path. The jar is locally checked, not authenticated against YouTube. `422` when no usable export is found; `409` when offline, another manual export is running, or configuration changes mid-export. |
 | `POST /api/queue/purge` | Clear pending/paused/waiting/failed/downloading jobs now; unlike Delete Selected, it does not create ignore rules, so a later source scan can queue them again. |
 | `POST /api/pause` · `POST /api/resume` | Pause/resume the whole engine. |
 | `GET /api/failed` · `POST /api/failed/requeue` | Failed jobs; requeue retryable failures (ignores cooldown), while permanent source errors remain parked. |
@@ -566,12 +628,10 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
    downloader. Failures keep the `.part` file and retry with exponential
    backoff; the retry budget only shrinks while the video makes no forward
    progress. If a retry window is exhausted, a later cooldown sweep opens a
-   fresh window and continues from the retained partial. Two classes are
-   deliberately exempt from that loop: a video that will never download
-   (private / deleted / members-only / region-locked) is skipped after one
-   attempt with its reason recorded, and a selector that matches nothing steps
-   the quality down the fallback ladder instead of re-running the same command
-   — both are described in `jobs.last_error` and never auto-requeued.
+   fresh window and continues from the retained partial. Unavailable videos
+   are parked with their reason; credential-shaped skips may be rescued when
+   fresh cookies appear, but private/deleted/region-locked videos stay parked.
+   A selector that matches nothing instead steps down the quality fallback ladder.
 4. **Metadata workers** — fetch subtitles, thumbnails, and descriptions per video, based on config flags
 5. **Converter workers** — convert completed downloads into the target format
    (queued whenever a finished file's container differs from the requested one,
@@ -636,11 +696,11 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
   every `rssPollIntervalMinutes` (one HTTP GET per channel, ~15 min latency)
   instead of waiting for a full rescan.
 - **Circuit breaker** — after `maxFailures` consecutive pipeline failures
-  (dead cookies overnight, a YouTube outage) the engine pauses itself with
-  `TOO_MANY_FAILURES` instead of burning through the queue. Resume from the
-  UI when you're ready. Per-video, the effective retry cap is
-  `min(maxRetryAttempts, maxFailuresPerVideo)` within each retry window; an
-  eligible failure starts a fresh window after the configured cooldown.
+  (dead cookies overnight, a YouTube outage) the engine pauses with
+  `TOO_MANY_FAILURES`, then retries after 10 minutes, doubling on repeated trips
+  to a six-hour cap. A successful download resets the trip history; an operator
+  can also resume manually. Per-video, the effective retry cap is
+  `min(maxRetryAttempts, maxFailuresPerVideo)` within each retry window.
 - **yt-dlp download archive** — `archiveFile` is passed to
   `--download-archive` as a second idempotence layer and is also consulted
   by source scans when a completed job row is no longer in SQLite, preventing
@@ -666,9 +726,8 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
 - [x] Resume interrupted downloads from exactly where they left off
       (`.part` files kept, `--continue`, bounded resume budget)
 - [x] Fully independent, parallel metadata and conversion pipelines
-- [x] Unavailable videos skipped after one attempt (reason recorded, never
-      auto-requeued) and unavailable formats switched automatically down the
-      quality ladder instead of retried
+- [x] Unavailable videos classified and parked (credential blocks can recover
+      on fresh cookies); unavailable formats use the quality fallback ladder
 - [x] Modular architecture with a unit + end-to-end test suite
 - [ ] Deduplicate identical videos across playlists by content hash
 - [ ] Per-link quality/format overrides in the web dashboard
