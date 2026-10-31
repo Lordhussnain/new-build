@@ -390,7 +390,7 @@ re-queues a failed sidecar pass on an already-converted job.
 | Pause / resume | `resilience.ts triggerPause / triggerResume / resumeAutomatically` | Automatic resume requires the engine lease, keeps user-paused, cancelled and claimed jobs held, and never clears manual, shutdown or lease-loss reasons. Stale asynchronous disk checks cannot overwrite a newer manual pause. Explicit resume of a lost lease is rejected until it is held again |
 | Network monitor | `resilience.ts networkMonitor()` | pauses after 2 failures and resumes only its own network-caused pause |
 | Cookies watcher / rescue | `reconcile.ts cookiesWatch / refreshCookies / requeueCredentialBlockedJobs` + `tools.ts` | 60s local observation; online recovery locally diagnoses changed bytes and requeues every eligible credential-blocked failure with fresh budgets. Per-database fingerprints prevent retry loops, pending snapshots defer claimed rows, and pause/lease/offline gates and claim CAS predicates protect the queue. Preserve partials while waiting for fresh cookies |
-| Browser export | `tools.ts`, `cookie-file.ts`, `cookies-export.ts` | Default profiles only. Each browser once per bounded sequence (2m/browser, 4m total), 30m throttle after failure; local expiry/session diagnosis is not proof YouTube accepts credentials. Filter expired/unrelated rows, retain empty/zero-expiry sessions, and reject invalid UTF-8. Serialize private staged writes, keep `.bak`, and recheck the original file hash just before automatic publication. Manual and automatic publication are fenced by the original engine-lease generation; skip when offline or live config changes, and never echo raw browser stderr |
+| Browser export | `tools.ts`, `cookie-file.ts`, `cookies-export.ts` | The engine's OS account and default browser profiles only; defaults try Firefox, Chrome, Brave. A locally valid file is reused, even if YouTube later rejects it; the dashboard can explicitly request another export. Each browser is tried once per bounded sequence (2m/browser, 4m total), with a 30m throttle after failure. Filter expired/unrelated rows, retain empty/zero-expiry sessions, and reject invalid UTF-8. Serialize private staged writes, keep `.bak`, and recheck the original file hash just before automatic publication. Manual and automatic publication are fenced by the original engine-lease generation; skip when offline or live config changes, and never echo raw browser stderr |
 | Disk guard | `resilience.ts diskUsage()` → `checkDiskSpace()` | `diskUsage` is the **only** `statfs` caller: statfs → PowerShell `Get-PSDrive` → `-1/-1`. Auto-resume requires measured healthy space on the affected volume; after a write-full error it also requires observed growth since a baseline, so quotas/unknown probes do not blindly resume |
 | Crash recovery | `reconcile.ts reconcileCrashedJobs()` | `downloading` → `paused + interrupted` (auto-claimable); also clears orphan claims from legacy user-paused downloads while keeping them held. **Refuses to run without the engine lease** — this sweep resets every in-flight claim, so it may only touch a database its own process owns. Clearing each row's claim token is what fences the previous engine's stale workers out |
 | Stale-claim reaper | `reconcile.ts reapStaleClaims(config)` | Lease-gated (only the engine holding the engine lease reaps) and **heartbeat-based**: downloads silent >`max(20 min, maxDownloadMinutes)` (actively owned jobs are additionally protected in-process, and progress renews the heartbeat), conversions silent >3 h, metadata silent >15 min — `staleClaimCondition()` is the single predicate, shared with the dashboard's stale-claims panel so the two cannot drift. Each reclaim is `reapStaleClaim()`, a CAS on `(token, owner, status, expired-heartbeat)`: a worker that renewed its heartbeat, or a second reaper that got there first, makes the update match 0 rows and the job is left alone. Also sweeps the stranded `.aria2` control files of the jobs it actually reclaimed this tick (a dead worker's pair whose data file is gone would wedge the next attempt) through the same `removePartialFiles` contract: a locked control file is reported and retried on the next tick, never forced |
@@ -1350,6 +1350,23 @@ Windows — an environment assumption is still a broken test:
     recheck pause/offline after disk and audio probes. `tests/cookie-extraction.test.ts`,
     `tests/credential-recovery.test.ts`, `tests/auto-recovery.test.ts`, the UI
     contract and the end-to-end recovery scenarios pin these rules.
+46. **Firefox extraction reads the engine host, not the dashboard client.** The
+    engine must run online under an OS account whose default Firefox profile is
+    signed in to YouTube. Defaults are `cookiesFile: "cookies.txt"` and
+    `cookieBrowsers: ["firefox", "chrome", "brave"]`; relative paths resolve
+    from the engine's working directory. A locked browser store may require
+    closing Firefox. No profile/container selector is supported. The dashboard's
+    **Save Browser Cookies** action explicitly tries the selected browser and
+    then the configured fallbacks, even when `cookieBrowsers` is empty.
+    Automatic recovery only exports when the file is missing or locally
+    invalid/expired; a server-side rejection alone does not cause a new browser
+    read if local diagnosis still passes. An explicit re-export whose bytes are
+    unchanged does not repeatedly rescue the same failure within that process.
+    `cookieRecoveryByDb` and `credentialAttemptsByDb` are process-local, so a
+    restart establishes a new startup observation and can retry an eligible
+    blocked job once with the same file. The cookie extraction and engine
+    integration tests use mocks; they do not verify real Firefox access or live
+    YouTube authentication.
 
 ---
 

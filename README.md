@@ -246,25 +246,56 @@ you can fix them and import again.
 
 ### Cookies and automatic recovery
 
-- **Finding cookies.** In online mode the engine checks `cookiesFile` (default
-  `cookies.txt`) at startup and watches it every 60 seconds. If it is missing,
-  invalid or expired, it tries `cookieBrowsers` in order (default `firefox`,
-  `chrome`, `brave`). Only the **default profile** of each browser is supported.
-  Sign in to YouTube in one of those browsers first; a locked cookie store may
-  require closing the browser. Set `cookieBrowsers` to `[]` to disable automatic
-  browser extraction. A failed fallback sequence is retried after 30 minutes,
-  or earlier when the file or relevant settings change. Each browser is tried
-  at most once per sequence, for at most two minutes per browser and four
-  minutes overall. Offline mode never starts an export.
+#### Automatic Firefox setup
+
+1. On the **same machine and OS account that run the engine**, sign in to
+   YouTube in Firefox's default profile. A browser on a different computer from
+   the engine cannot be read through the dashboard. If Firefox's cookie store is
+   locked, close Firefox completely before trying again.
+2. Run the engine in online mode. The relevant defaults are shown below; change
+   them in the dashboard's settings or in your existing `config.json` if needed:
+
+   ```json
+   {
+     "offlineMode": false,
+     "cookiesFile": "cookies.txt",
+     "cookieBrowsers": ["firefox", "chrome", "brave"],
+     "validateCookiesOnStart": true
+   }
+   ```
+
+3. When the cookie file is missing or locally invalid/expired, the engine tries
+   Firefox first and saves a locally usable export to `cookiesFile` (by default,
+   `cookies.txt` relative to the engine's working directory). If Firefox fails,
+   it tries Chrome and Brave in order. If no browser succeeds, it leaves any
+   previous file untouched. A successful replacement keeps the old file as
+   `<cookiesFile>.bak`.
+4. Check cookie status in the dashboard. To force a browser read, select
+   **🍪 Save Browser Cookies**, choose **Firefox**, and click **🍪 Save
+   cookies.txt**. The result shows the browser actually used and the attempts.
+
+- **When extraction runs.** With the default startup validation enabled, the
+  engine checks the file at startup and watches it every 60 seconds. It reuses
+  a locally valid file instead of exporting on every check. A failed fallback
+  sequence is retried after 30 minutes, or earlier when the file or relevant
+  settings change. Each browser is tried at most once per sequence, for at most
+  two minutes per browser and four minutes overall. Offline mode never starts
+  an export. Set `cookieBrowsers` to `[]` to disable *automatic* browser
+  extraction; the dashboard's explicit export still works. Only default browser
+  profiles are supported.
 - **What “valid” means.** The local check looks for a nonempty Netscape-format
   YouTube/Google session cookie with an unexpired timestamp (or a session
-  expiry of `0` or empty). Malformed UTF-8 is rejected. This check does **not**
-  verify that YouTube accepts the credentials,
-  that a membership exists, or that the account can access a particular video.
-  Browser extraction runs yt-dlp and may make a network request. The dashboard
-  shows local validity, source, live cookie count and file modification age;
-  the export time/browser are only known for an export in the current process,
-  otherwise the source is shown as `file` and export age is unknown.
+  expiry of `0` or empty). Malformed UTF-8 is rejected. This does **not** verify
+  that YouTube accepts the credentials, that a membership exists, or that the
+  account can access a particular video. If YouTube rejects cookies that still
+  look valid locally, that rejection alone does not trigger another automatic
+  browser export. Sign in again and use **🍪 Save Browser Cookies**; changed,
+  locally usable bytes can then rescue eligible failed jobs. An identical
+  export does not repeatedly retry them. Browser extraction runs yt-dlp and may
+  make a network request. The dashboard shows local validity, source, live
+  cookie count and file modification age; the export time/browser are known
+  only for an export in the current process, otherwise the source is shown as
+  `file` and export age is unknown.
 - **Safe exports.** Expired, malformed and non-YouTube/Google rows are removed;
   session cookies are retained. The new jar is staged and locally checked before
   replacement, and the previous file is saved as `<cookiesFile>.bak`. If a
@@ -280,9 +311,12 @@ you can fix them and import again.
   absence, or changing bytes requeues **all** eligible failed age-gated,
   bot-check, members-only and login/cookie-blocked jobs with fresh download and
   resume budgets. There is no per-cycle cap. A timestamp-only touch does not
-  trigger a retry. The same credentials do not repeatedly rescue an already
-  retried job; a temporarily claimed candidate waits for its claim to clear.
-  User-held, cancelled and in-progress jobs are not disturbed. Private, deleted,
+  trigger a retry. During one process run, the same credentials do not repeatedly
+  rescue an already retried job; a temporarily claimed candidate waits for its
+  claim to clear. Fingerprint history is process-local, so a restart treats a
+  usable file as a new startup observation and may retry a blocked job once even
+  if its bytes are unchanged. User-held, cancelled and in-progress jobs are not
+  disturbed. Private, deleted,
   geo-blocked and other non-credential terminal failures remain parked. The
   rescue waits while the engine is paused, offline, or lacks its engine lease;
   no cookie check can override a manual pause.
@@ -526,7 +560,7 @@ CLI/API clients.
 | `DELETE /api/sources` | `{ "url" }` → remove the source from `config.json` and delete jobs owned only by it; jobs shared with other configured sources remain. |
 | `POST /api/scan` | `{ "url", "folder?", "singleVideo?" }` → save the source to `config.json`, then scan/add jobs. `singleVideo: true` saves only the video of a `watch?v=…&list=…` link. Returns `saved`, `source: {url, key, added}`, and `found`/`added`/`skipped`. |
 | `POST /api/scan/batch` | `{ "urls": text or [links], "folder?", "singleVideo?" }` → save every valid line in one config write, then scan in the background. Returns `total`, `valid`, `invalid`, `duplicates`, `errors` (`line`, `input`, `error`), `sources` (`added`, `existing`, `videos`, `playlists`, `channels`), and `scanning`. Up to 2000 links per request. |
-| `POST /api/cookies/export` | `{ "browser" }` → try that default browser profile, then configured fallbacks; return actual `browser`, `attempted`, per-browser `errors` and backup path. The jar is locally checked, not authenticated against YouTube. `422` when no usable export is found; `409` when offline, another manual export is running, or configuration changes mid-export. |
+| `POST /api/cookies/export` | `{ "browser" }` → try that default browser profile on the engine's machine, then configured fallbacks; return actual `browser`, `attempted`, per-browser `errors` and backup path. The jar is locally checked, not authenticated against YouTube. `422` when no usable export is found; `409` when offline, the engine lease is missing or changes, another manual export is running, or configuration changes mid-export. |
 | `POST /api/queue/purge` | Clear pending/paused/waiting/failed/downloading jobs now; unlike Delete Selected, it does not create ignore rules, so a later source scan can queue them again. |
 | `POST /api/pause` · `POST /api/resume` | Pause/resume the whole engine. |
 | `GET /api/failed` · `POST /api/failed/requeue` | Failed jobs; requeue retryable failures (ignores cooldown), while permanent source errors remain parked. |
