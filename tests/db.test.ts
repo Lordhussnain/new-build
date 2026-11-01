@@ -18,6 +18,7 @@ import {
   allowIgnoredVideo,
   listIgnoredVideos,
   getNextIndex,
+  getVideoIngestState,
   heartbeatClaim,
   initDatabase,
   isVideoIgnored,
@@ -782,6 +783,28 @@ describe("ingestItems", () => {
     expect(r.added).toBe(0);
     expect(r.skipped).toBe(1);
     expect(isVideoInDb("vid001")).toBe(true);
+  });
+
+  test("bulk state honors ignore/existing IDs and chunks large lookup sets", () => {
+    insertJob("existing");
+    insertJob("ignored");
+    deleteJobsAndIgnore(["ignored"]);
+    const ids = Array.from({ length: 501 }, (_, index) => `new${index}`);
+    ids.push("existing", "ignored", "existing");
+    const state = getVideoIngestState(ids);
+    expect(state.existingIds).toEqual(new Set(["existing"]));
+    expect(state.ignoredIds).toEqual(new Set(["ignored"]));
+  });
+
+  test("dedupes repeated IDs within the same ingest transaction", async () => {
+    const c = config();
+    const first = { id: "dup001", title: "First title", playlist: "P", duration: 120 };
+    const result = await ingestItems([
+      first,
+      { ...first, title: "Second title" },
+    ], c);
+    expect(result).toEqual({ found: 2, added: 1, skipped: 1 });
+    expect(getJob("dup001").title).toBe("First title");
   });
 
   test("dedupes an existing video ID across distinct source URLs", async () => {

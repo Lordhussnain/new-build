@@ -647,6 +647,38 @@ export function isVideoIgnored(videoId: string): boolean {
   return !!db.query("SELECT 1 FROM ignored_videos WHERE video_id = ? LIMIT 1").get(videoId);
 }
 
+export interface VideoIngestState {
+  ignoredIds: Set<string>;
+  existingIds: Set<string>;
+}
+
+/**
+ * Bulk-load the two dedupe predicates for one ingest transaction. Keep chunks
+ * bounded for SQLite builds with a low host-parameter limit. The caller still
+ * applies the predicates in the original per-item order.
+ */
+export function getVideoIngestState(ids: Iterable<string>): VideoIngestState {
+  const uniqueIds = [...new Set(ids)];
+  const ignoredIds = new Set<string>();
+  const existingIds = new Set<string>();
+  const CHUNK_SIZE = 500;
+  for (let offset = 0; offset < uniqueIds.length; offset += CHUNK_SIZE) {
+    const chunk = uniqueIds.slice(offset, offset + CHUNK_SIZE);
+    const placeholders = chunk.map(() => "?").join(",");
+    for (const row of db.query(
+      `SELECT video_id FROM ignored_videos WHERE video_id IN (${placeholders})`,
+    ).all(...chunk) as { video_id: string }[]) {
+      ignoredIds.add(row.video_id);
+    }
+    for (const row of db.query(
+      `SELECT id FROM jobs WHERE id IN (${placeholders})`,
+    ).all(...chunk) as { id: string }[]) {
+      existingIds.add(row.id);
+    }
+  }
+  return { ignoredIds, existingIds };
+}
+
 export interface IgnoredVideo {
   video_id: string;
   url: string;

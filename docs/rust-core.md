@@ -1,8 +1,8 @@
 # Rust native core
 
 CPU-only validation, parsing and policy hot paths are implemented in
-`native/src/` and loaded through N-API by `src/native-core.ts`. The public
-TypeScript APIs have not changed.
+`native/src/` and loaded through N-API by `src/native-core.ts`. Existing
+TypeScript call sites remain compatible; every native fast path is optional.
 
 | Area | Rust implementation | TypeScript responsibility |
 | --- | --- | --- |
@@ -17,11 +17,14 @@ TypeScript APIs have not changed.
 | `src/db.ts` | Claim column descriptors, claim references, CAS UPDATE SQL, release SET clauses and per-video retry-cap selection | Bun SQLite execution, transactions, bindings, heartbeats and all schema mutations |
 | `src/lease.ts` | Lease expiry, owner/fencing checks and acquire/renew/refuse/take-over decisions | Same-host PID probes, SQLite immediate transactions, renewal SQL and heartbeat timers |
 | `src/reconcile.ts` | Stale-claim thresholds/predicates, cooldown modifiers, partial sidecar paths and orphan/partial cleanup decisions | Filesystem walks/removal, resume-path discovery, SQLite sweeps and superseded-file recovery |
-| `src/scanner.ts` | Batched listing-field parsing, video/playlist/channel classification, channel/Shorts suffixes, compatible YouTube URL normalization, Shorts decisions and pure ingest-plan values | Streaming UTF-8 decoding, ECMAScript `parseFloat`, yt-dlp execution, source expansion, archive/dedupe lookups, index allocation and SQLite transactions |
-| `src/archive.ts` | One-pass unique ID extraction in stable order and exact archive-record removal/filtering | UTF-8 file decoding, existence checks, reads/writes/appends and the returned `Set` |
+| `src/scanner.ts` | Batched listing-field parsing, video/playlist/channel classification, channel/Shorts suffixes, compatible YouTube URL normalization, Shorts decisions and pure ingest-plan values | Streaming UTF-8 decoding, ECMAScript `parseFloat`, yt-dlp execution, source expansion, bulk dedupe lookups, metadata-validated archive reuse, index allocation and SQLite transactions |
+| `src/archive.ts` | One-pass unique ID extraction in stable order and exact archive-record removal/filtering | UTF-8 file decoding, existence/version checks, scan-scoped cache invalidation, reads/writes/appends and the returned `Set` |
 
 The native functions are synchronous and CPU-only. Batch APIs amortize the N-API
-boundary over listing lines and ingest items. Network requests, `yt-dlp`/`ffmpeg`,
+boundary over up to 5,000 available listing lines and over ingest items without
+delaying the existing 50-valid-item download batches. Database existence/ignore
+predicates are bulk-loaded inside each 500-item transaction, and archive IDs are
+reused only while the file version remains unchanged. Network requests, `yt-dlp`/`ffmpeg`,
 filesystem operations, and SQLite stay in Bun; moving those behind blocking
 N-API calls would make the application less responsive. Listing durations retain
 JavaScript `parseFloat` semantics, and unusual URLs/IDs use explicit TypeScript

@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  createArchiveIdCache,
   parseArchiveIdsText,
   readArchiveIds,
   removeArchiveIdText,
@@ -70,5 +71,45 @@ describe("archive filesystem boundary", () => {
     expect(readArchiveIds(missing)).toEqual(new Set());
     expect(removeFromArchive(missing, "vid001")).toBe(true);
     expect(removeFromArchive(directory, "vid001")).toBe(false);
+  });
+
+  test("cache reuses only unchanged snapshots and observes rewrites, appends and scrubs", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "yta-archive-cache-"));
+    temporaryDirectories.push(directory);
+    const file = join(directory, "archive.txt");
+    await writeFile(file, "youtube one\n", "utf8");
+    const cache = createArchiveIdCache(file);
+
+    const first = cache.readIds();
+    expect([...first]).toEqual(["one"]);
+    expect(cache.readIds()).toBe(first); // Unchanged: no second file parse.
+
+    // Same byte length: freshness must not rely on file size alone.
+    await Bun.sleep(20);
+    await writeFile(file, "youtube two\n", "utf8");
+    const rewritten = cache.readIds();
+    expect(rewritten).not.toBe(first);
+    expect([...rewritten]).toEqual(["two"]);
+    expect(cache.readIds()).toBe(rewritten);
+
+    await writeFile(file, "youtube two\nyoutube three\n", "utf8");
+    expect([...cache.readIds()]).toEqual(["two", "three"]);
+    expect(removeFromArchive(file, "two")).toBe(true);
+    expect([...cache.readIds()]).toEqual(["three"]);
+
+    const beforeInvalidation = cache.readIds();
+    cache.invalidate();
+    expect(cache.readIds()).not.toBe(beforeInvalidation);
+    expect([...cache.readIds()]).toEqual(["three"]);
+  });
+
+  test("cache notices a missing archive that appears during a scan", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "yta-archive-cache-"));
+    temporaryDirectories.push(directory);
+    const file = join(directory, "archive.txt");
+    const cache = createArchiveIdCache(file);
+    expect([...cache.readIds()]).toEqual([]);
+    await writeFile(file, "youtube appeared\n", "utf8");
+    expect([...cache.readIds()]).toEqual(["appeared"]);
   });
 });

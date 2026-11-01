@@ -4,7 +4,7 @@
 // (optionally prefixed by the extractor). When our copy of a file disappears
 // we must scrub the id, otherwise yt-dlp will skip the video forever.
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { NativeCoreError, nativeCore, nativeValue } from "./native-core";
 
 function invalidNativeArchiveResult(detail: string): never {
@@ -93,16 +93,75 @@ export function removeFromArchive(archiveFile: string, videoId: string): boolean
   return true;
 }
 
-/** All video ids currently present in the archive file. */
-export function readArchiveIds(archiveFile: string): Set<string> {
+interface ArchiveReadResult {
+  /** False only for the legacy missing/unreadable-file compatibility path. */
+  ok: boolean;
+  ids: Set<string>;
+}
+
+function readArchiveIdsFresh(archiveFile: string): ArchiveReadResult {
   let text: string;
   try {
-    if (!existsSync(archiveFile)) return new Set<string>();
+    if (!existsSync(archiveFile)) return { ok: true, ids: new Set<string>() };
     text = readFileSync(archiveFile, "utf-8");
   } catch {
-    return new Set<string>();
+    return { ok: false, ids: new Set<string>() };
   }
-  return new Set(parseArchiveIdsText(text));
+  return { ok: true, ids: new Set(parseArchiveIdsText(text)) };
+}
+
+/** All video ids currently present in the archive file. */
+export function readArchiveIds(archiveFile: string): Set<string> {
+  return readArchiveIdsFresh(archiveFile).ids;
+}
+
+function archiveFileVersion(archiveFile: string): string | null {
+  try {
+    const stats = statSync(archiveFile, { bigint: true });
+    return [stats.dev, stats.ino, stats.size, stats.mtimeNs, stats.ctimeNs, stats.mode].join(":");
+  } catch {
+    return null;
+  }
+}
+
+export interface ArchiveIdCache {
+  /** A stable snapshot while the file version is unchanged; never a mutable global Set. */
+  readIds(): ReadonlySet<string>;
+  invalidate(): void;
+}
+
+/**
+ * Scan-scoped archive cache. A metadata check is deliberately retained on every
+ * read: yt-dlp workers append asynchronously and recovery routes can scrub IDs,
+ * so blindly caching for a whole scan could requeue or suppress the wrong job.
+ */
+export function createArchiveIdCache(archiveFile: string): ArchiveIdCache {
+  let cachedVersion: string | null = null;
+  let cachedIds: Set<string> | null = null;
+  const invalidate = () => {
+    cachedVersion = null;
+    cachedIds = null;
+  };
+  return {
+    readIds() {
+      const before = archiveFileVersion(archiveFile);
+      if (before !== null && cachedIds !== null && before === cachedVersion) {
+        return cachedIds;
+      }
+      invalidate();
+      const result = readArchiveIdsFresh(archiveFile);
+      if (!result.ok) return result.ids;
+      // Do not cache a file that changed between stat/read/stat. The returned
+      // IDs are still the same fresh read the legacy path would have used.
+      const after = archiveFileVersion(archiveFile);
+      if (before !== null && after === before) {
+        cachedVersion = before;
+        cachedIds = result.ids;
+      }
+      return result.ids;
+    },
+    invalidate,
+  };
 }
 
 /**

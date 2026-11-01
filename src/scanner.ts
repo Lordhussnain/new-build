@@ -7,8 +7,8 @@
 
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { readArchiveIds } from "./archive";
-import { db, getNextIndex, isVideoIgnored, isVideoInDb, takeReservedFileIndex } from "./db";
+import { createArchiveIdCache, readArchiveIds, type ArchiveIdCache } from "./archive";
+import { db, getNextIndex, getVideoIngestState, takeReservedFileIndex } from "./db";
 import { isSourceBlocked, parseSourceUrl, sourceIdentity } from "./sources";
 import { createCookieInvocation, jsRuntimeArgs, ytDlp } from "./tools";
 import { sanitizeFolderName } from "./util";
@@ -180,6 +180,8 @@ export function isScanErrorTransient(message: string): boolean {
 
 /** Items per ingest batch while a listing is still running. */
 export const LISTING_BATCH_SIZE = 50;
+/** Maximum available raw lines per native parse call; never a buffering delay. */
+export const LISTING_PARSE_BATCH_SIZE = 5_000;
 
 export interface PlaylistListingOptions {
   /** Total limit (or, with `idle`, the limit between outputs). */
@@ -299,10 +301,11 @@ async function streamListing(
       throw error;
     }
   };
-  // Amortize the native boundary over raw lines, but retain the public
-  // 50-VALID-item onItems batches (blank and channel lines never counted).
-  const parsePending = async (force = false) => {
-    if (pendingLines.length === 0 || (!force && pendingLines.length < LISTING_BATCH_SIZE)) return;
+  // Amortize the native boundary over every complete line already available,
+  // up to 5,000 at once. Do not wait for 500 lines: that would delay downloads.
+  // The public 50-VALID-item onItems batches remain unchanged.
+  const parsePending = async () => {
+    if (pendingLines.length === 0) return;
     const lines = pendingLines;
     pendingLines = [];
     for (const item of parseListingLines(lines)) {
@@ -316,17 +319,17 @@ async function streamListing(
     if (done) break;
     onActivity();
     carry += decoder.decode(value, { stream: true });
-    let newline = carry.indexOf("\n");
-    while (newline !== -1) {
-      pendingLines.push(carry.slice(0, newline));
-      carry = carry.slice(newline + 1);
-      await parsePending();
-      newline = carry.indexOf("\n");
+    const completeLines = carry.split("\n");
+    carry = completeLines.pop() ?? "";
+    for (const line of completeLines) {
+      pendingLines.push(line);
+      if (pendingLines.length >= LISTING_PARSE_BATCH_SIZE) await parsePending();
     }
+    await parsePending();
   }
   carry += decoder.decode();
   pendingLines.push(carry);
-  await parsePending(true);
+  await parsePending();
   await emit();
 }
 
@@ -543,6 +546,7 @@ export async function ingestItems(
   config: Config,
   overrideFolderName?: string,
   sourceUrl?: string,
+  archiveCache?: ArchiveIdCache,
 ): Promise<{ found: number; added: number; skipped: number }> {
   if (config.offlineMode || getConfig().offlineMode) return { found: 0, added: 0, skipped: 0 };
   if (items.length === 0) return { found: 0, added: 0, skipped: 0 };
@@ -557,9 +561,9 @@ export async function ingestItems(
     return { found: items.length, added: 0, skipped: items.length };
   }
   // Source cleanup can remove a completed job row while yt-dlp keeps its
-  // download history. Consult that history once per listing so another
-  // playlist cannot re-queue the same completed video ID.
-  const archivedIds = readArchiveIds(config.archiveFile);
+  // download history. Reuse an unchanged scan snapshot, but revalidate its file
+  // version on every batch so appends/scrubs are never hidden by the cache.
+  const archivedIds = archiveCache?.readIds() ?? readArchiveIds(config.archiveFile);
   const ingestPlan = prepareIngestPlan(items, config);
   const {
     targetFormat,
@@ -586,11 +590,12 @@ export async function ingestItems(
     const sourceStmt = sourceKey
       ? db.prepare("INSERT OR IGNORE INTO job_sources (source_url, job_id) VALUES (?, ?)")
       : null;
+    const { ignoredIds, existingIds } = getVideoIngestState(batch.map(({ item }) => item.id));
     for (const { item, plan } of batch) {
       // A dashboard Delete is a durable opt-out, not just a temporary row
       // removal. Keep the video hidden across playlist/RSS scans and restarts
       // until the operator explicitly allows it again.
-      if (isVideoIgnored(item.id)) {
+      if (ignoredIds.has(item.id)) {
         skipped++;
         stats.skipped++;
         continue;
@@ -602,7 +607,7 @@ export async function ingestItems(
         stats.skipped++;
         continue;
       }
-      if (isVideoInDb(item.id)) {
+      if (existingIds.has(item.id)) {
         // Record additional source ownership even though the video job itself
         // is deduplicated globally.
         if (sourceKey) sourceStmt?.run(sourceKey, item.id);
@@ -639,6 +644,9 @@ export async function ingestItems(
         conversionStatus,
         metadataStatus,
       );
+      // A repeated ID later in this same transaction must observe the insert,
+      // just as the former per-item SELECT did.
+      existingIds.add(item.id);
       if (sourceKey) sourceStmt?.run(sourceKey, item.id);
       added++;
       stats.totalQueued++;
@@ -671,6 +679,8 @@ interface ListingScanOptions {
   folder?: string;
   /** Configured source the jobs belong to (the channel, for its playlists). */
   owner: string;
+  /** Metadata-validated archive snapshot shared by every listing in this scan. */
+  archiveCache: ArchiveIdCache;
 }
 
 /**
@@ -701,7 +711,7 @@ async function scanListing(
       channelFolder ??= channelFolderName(videos[0]) || undefined;
       folder = channelFolder;
     }
-    const result = await ingestItems(videos, config, folder, opts.owner);
+    const result = await ingestItems(videos, config, folder, opts.owner, opts.archiveCache);
     totals.found += result.found;
     totals.added += result.added;
     totals.skipped += result.skipped;
@@ -736,7 +746,12 @@ async function scanListing(
  * by `owner`. One failing playlist (private, removed, …) is logged and never
  * stops the rest.
  */
-async function expandPlaylists(entries: ListingItem[], config: Config, owner: string): Promise<ScanTotals> {
+async function expandPlaylists(
+  entries: ListingItem[],
+  config: Config,
+  owner: string,
+  archiveCache: ArchiveIdCache,
+): Promise<ScanTotals> {
   const totals: ScanTotals = { found: 0, added: 0, skipped: 0, playlists: 0 };
   const seen = new Set<string>();
   for (const entry of entries) {
@@ -748,6 +763,7 @@ async function expandPlaylists(entries: ListingItem[], config: Config, owner: st
       const { totals: part } = await scanListing(url, config, {
         folder: entry.title || undefined,
         owner,
+        archiveCache,
       });
       totals.found += part.found;
       totals.added += part.added;
@@ -780,21 +796,26 @@ export async function scanAndIngest(url: string, config: Config, overrideFolderN
   if (config.offlineMode || getConfig().offlineMode || isSourceBlocked(url)) {
     return { found: 0, added: 0, skipped: 0 };
   }
-  const { totals, playlists } = await scanListing(url, config, { folder: overrideFolderName, owner: url });
+  const archiveCache = createArchiveIdCache(config.archiveFile);
+  const { totals, playlists } = await scanListing(url, config, {
+    folder: overrideFolderName,
+    owner: url,
+    archiveCache,
+  });
   const expanded = [...playlists];
   // A channel root also owns its /playlists tab. A channel with no playlists
   // tab is normal, so a failure there is logged and never fails the scan.
   if (isChannelRootUrl(url)) {
     const tabUrl = `${url.replace(/\/+$/, "")}/playlists`;
     try {
-      const tab = await scanListing(tabUrl, config, { owner: url });
+      const tab = await scanListing(tabUrl, config, { owner: url, archiveCache });
       expanded.push(...tab.playlists);
     } catch (err: any) {
       logError("scan", `${tabUrl}: ${String(err?.message || err)}`);
     }
   }
   if (expanded.length === 0) return totals;
-  const more = await expandPlaylists(expanded, config, url);
+  const more = await expandPlaylists(expanded, config, url, archiveCache);
   return {
     found: totals.found + more.found,
     added: totals.added + more.added,
