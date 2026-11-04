@@ -31,6 +31,7 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Claims are leases, not names** — every job claim carries a unique token and a heartbeat: download progress renews a download's lease, conversion and metadata stages heartbeat on an interval, and every progress, success, failure and release update must present that token (compare-and-swap). A worker that lost its claim — reaped after its lease lapsed, or superseded by a restarted engine — changes no job state instead of overwriting the new owner's
 - **Locked work is never destroyed to make progress** — if a restart-from-scratch hits a partial file locked by another program (orphaned aria2c/ffmpeg, antivirus), the video is retried later with that exact reason in `last_error` instead of being wedged. The same rule holds for every sweep: a locked resume pair is kept intact and reported, never counted as cleaned, and a stranded `.aria2` control file left by a dead worker is swept before the reclaimed job retries — a control file whose data is gone makes aria2c neither resume nor restart
 - **Duration-aware watchdog** — long videos are not killed by a flat 15-minute timeout
+- **Stalled-transfer recovery** — the engine tracks reported bytes separately for each video/audio stream and aria2c group. After 3 minutes without reported progress it stops the transfer and retries with any usable partial. Rounded aria2c counters receive a bounded grace when a fresh positive speed suggests slow progress; the normal overall timeout still applies. A stall warning describes the downloader's reported progress, not a direct measurement of network or disk activity
 - **Disk space precheck** before starting a batch
 - **Graceful shutdown** — safely stops in-flight downloads on exit
 - **Terminal UI (TUI)** with live progress across all workers
@@ -331,7 +332,20 @@ you can fix them and import again.
   interrupted work after a relevant live downloader setting changes; settings
   marked restart-required still need a restart. Network recovery continues to
   resume network-caused pauses. User pauses, shutdown and `ENGINE_LEASE_LOST`
-  are never auto-cleared. A lost lease must be held again before a manual resume.
+  are never auto-cleared. After a lease-loss pause, **Resume** can manually
+  reacquire the lease only if it is still the same expired owner and fencing
+  generation, tracked workers and file-mutating maintenance/metadata-only tasks
+  have settled, and tracked interrupted descendants have stopped. If Windows
+  cannot confirm a process-tree stop, recovery requires a restart. Reacquisition
+  increments the fencing number; it never clears old
+  claims. A restart safely reconciles leftover claims; the stale-claim reaper
+  can also reclaim stages still marked in progress after their heartbeat expires
+  (at least 20 minutes or the configured download window, 15 minutes for
+  metadata, or three hours for conversion, plus the next sweep). A paused row
+  with an orphaned download claim needs a restart. If the
+  owner/generation changed, or workers will not stop, stop all engines using
+  that archive and start only one. Keep `archive.db`, its WAL/SHM files,
+  cookies and partial downloads; do not delete the database to clear the lease.
 
 ### Reliability settings
 

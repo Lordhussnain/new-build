@@ -14,6 +14,7 @@
 //   • the sweeps that rewrite job state refuse to run without the lease.
 
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { hostname } from "node:os";
@@ -26,12 +27,14 @@ import {
   holdsEngineLease,
   isLeaseExpired,
   leaseOwnerIsDead,
+  reacquireOwnExpiredEngineLease,
   readEngineLease,
   releaseEngineLease,
   renewEngineLease,
   startEngineLeaseHeartbeat,
 } from "../src/lease";
 import { reapStaleClaims, reconcileCrashedJobs } from "../src/reconcile";
+import { errorLogPath } from "../src/logger";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "claim-worker.ts");
@@ -273,6 +276,68 @@ describe("engine lease: renewal, fencing and release", () => {
     expect(second.lease?.fencing).toBe((first.lease?.fencing ?? 0) + 1);
   });
 
+  test("manual reacquisition advances only our unchanged expired generation", () => {
+    const first = acquireEngineLease();
+    // The helper is not a normal renewal and will not churn a live generation.
+    expect(reacquireOwnExpiredEngineLease().acquired).toBe(false);
+    db.run("UPDATE engine_lease SET expires_at = datetime('now', '-1 second') WHERE id = 1");
+    const recovered = reacquireOwnExpiredEngineLease();
+    expect(recovered.acquired).toBe(true);
+    expect(recovered.lease?.owner).toBe(first.lease?.owner);
+    expect(recovered.lease?.fencing).toBe((first.lease?.fencing ?? 0) + 1);
+    expect(holdsEngineLease()).toBe(true);
+    expect(renewEngineLease()).toBe(true);
+  });
+
+  test("manual reacquisition never takes a foreign or changed generation, even if expired", () => {
+    const first = acquireEngineLease();
+    db.run("UPDATE engine_lease SET owner = 'other-engine', fencing = fencing + 1, expires_at = datetime('now', '-1 second') WHERE id = 1");
+    const foreign = readEngineLease();
+    expect(reacquireOwnExpiredEngineLease().acquired).toBe(false);
+    expect(readEngineLease()).toEqual(foreign);
+    // Even the same owner token is insufficient once the generation changed.
+    db.run("UPDATE engine_lease SET owner = ? WHERE id = 1", [first.lease?.owner ?? null]);
+    const changed = readEngineLease();
+    expect(reacquireOwnExpiredEngineLease().acquired).toBe(false);
+    expect(readEngineLease()).toEqual(changed);
+  });
+
+  test("manual recovery and a real competing process cannot both take the lease", async () => {
+    const first = acquireEngineLease();
+    const path = (db as unknown as { filename: string }).filename;
+    db.run("UPDATE engine_lease SET expires_at = datetime('now', '-1 second') WHERE id = 1");
+    expect(reacquireOwnExpiredEngineLease().acquired).toBe(true);
+    const refused = spawnWorker(["lease", path, "0"]);
+    const refusedResult = JSON.parse((await refused.waitForLine("LEASE ")).slice("LEASE ".length));
+    expect(refusedResult.acquired).toBe(false);
+    expect(refusedResult.owner).toBe(first.lease?.owner);
+    await refused.done();
+
+    // The other process wins the next expired generation; the old process
+    // cannot regain it even after the other row is made expired again.
+    db.run("UPDATE engine_lease SET expires_at = datetime('now', '-1 second') WHERE id = 1");
+    const contender = spawnWorker(["lease", path, "1500", "release"]);
+    try {
+      const won = JSON.parse((await contender.waitForLine("LEASE ")).slice("LEASE ".length));
+      expect(won.acquired).toBe(true);
+      expect(won.owner).not.toBe(first.lease?.owner);
+      expect(reacquireOwnExpiredEngineLease().acquired).toBe(false);
+      db.run("UPDATE engine_lease SET expires_at = datetime('now', '-1 second') WHERE id = 1");
+      const before = readEngineLease();
+      expect(reacquireOwnExpiredEngineLease().acquired).toBe(false);
+      expect(readEngineLease()).toEqual(before);
+    } finally {
+      await contender.done();
+    }
+  }, 10_000);
+
+  test("a process without a local generation cannot manually reacquire", () => {
+    const first = acquireEngineLease();
+    expect(releaseEngineLease()).toBe(true);
+    db.run("UPDATE engine_lease SET owner = ?, expires_at = datetime('now', '-1 second') WHERE id = 1", [first.lease?.owner ?? null]);
+    expect(reacquireOwnExpiredEngineLease().acquired).toBe(false);
+  });
+
   test("a changed fencing generation cannot be held, renewed, or released by the old generation", () => {
     const acquired = acquireEngineLease();
     db.run("UPDATE engine_lease SET fencing = fencing + 1 WHERE id = 1");
@@ -303,6 +368,38 @@ describe("engine lease: renewal, fencing and release", () => {
            fencing = fencing + 1, expires_at = datetime('now', '+5 minutes') WHERE id = 1`,
         [process.pid, hostname()],
       );
+      const deadline = Date.now() + 3000;
+      while (lost === 0 && Date.now() < deadline) await Bun.sleep(20);
+    } finally {
+      stop();
+    }
+    expect(lost).toBe(1);
+  });
+
+  test("repeated missed renewals are rate-limited in the log", async () => {
+    acquireEngineLease();
+    db.run("UPDATE engine_lease SET expires_at = datetime('now', '-1 second') WHERE id = 1");
+    const path = errorLogPath();
+    const before = existsSync(path) ? readFileSync(path, "utf8").length : 0;
+    let lost = 0;
+    const stop = startEngineLeaseHeartbeat({ renewMs: 250, onLost: () => lost++ });
+    try {
+      await Bun.sleep(1_100); // at least four misses
+    } finally {
+      stop();
+    }
+    const recent = readFileSync(path, "utf8").slice(before);
+    const logged = [...recent.matchAll(/engine lease renewal failed \(miss (\d+)\)/g)].map((match) => Number(match[1]));
+    expect(lost).toBe(1);
+    expect(logged).toEqual([1, 2]);
+  });
+
+  test("consecutive database errors also trigger the lease-loss callback", async () => {
+    acquireEngineLease();
+    let lost = 0;
+    const stop = startEngineLeaseHeartbeat({ renewMs: 250, onLost: () => lost++ });
+    try {
+      db.close(); // renewal throws instead of returning false
       const deadline = Date.now() + 3000;
       while (lost === 0 && Date.now() < deadline) await Bun.sleep(20);
     } finally {
@@ -351,6 +448,16 @@ describe("engine lease: sweeps are gated on ownership", () => {
     expect(summary).toEqual({ downloads: 0, conversions: 0, metadata: 0, stranded: 0, locked: 0 });
     expect(jobRow("stale-dl").download_status).toBe("downloading");
     expect(jobRow("stale-cv").conversion_status).toBe("in_progress");
+  });
+
+  test("repeated lease-gated reaper skips produce one warning per interval", async () => {
+    const marker = `skip-${crypto.randomUUID()}`;
+    writeForeignLease({ owner: marker, fencing: 1, pid: process.pid, host: hostname(), expiresInSeconds: 600 });
+    await reapStaleClaims(testConfig());
+    await reapStaleClaims(testConfig());
+    await reapStaleClaims(testConfig());
+    const entries = readFileSync(errorLogPath(), "utf8").split("\n").filter((line) => line.includes(marker));
+    expect(entries).toHaveLength(1);
   });
 
   test("startup reconciliation refuses to blanket-reset a live engine's claims", () => {

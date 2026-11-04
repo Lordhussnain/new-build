@@ -6,17 +6,24 @@
 // paused+interrupted, and the job resumes from its .part file on the next
 // attempt — nothing already downloaded is thrown away.
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { statfs } from "node:fs/promises";
 import { resolve } from "node:path";
 import { db } from "./db";
 import { logError } from "./logger";
-import { engineFencing, holdsEngineLease } from "./lease";
+import {
+  engineFencing,
+  engineLeaseOwner,
+  holdsEngineLease,
+  reacquireOwnExpiredEngineLease,
+  readEngineLease,
+} from "./lease";
 import {
   activeConvertJobs,
   activeConvertProcs,
   activeDownloadJobs,
   interruptedDownloadJobs,
+  activeLeaseOperations,
   activeMetadataJobs,
   activeMetadataProcs,
   activeProcs,
@@ -35,6 +42,11 @@ import type { Config } from "./config";
  * dies immediately, and a wedged one must never pin a worker.
  */
 const KILL_GRACE_MS = 2_000;
+// A downloader's parent can exit before an aria2c/ffmpeg descendant. Manual
+// lease recovery waits for tracked descendants, not just their parent or the
+// kill-grace timer. An unconfirmed Windows taskkill requires a full restart.
+let pendingChildInterrupts = 0;
+let unconfirmedChildTree = false;
 
 /** Recursively discover all descendant process IDs before a parent process is killed. */
 export function findDescendantPids(pid: number): number[] {
@@ -63,36 +75,26 @@ export function findDescendantPids(pid: number): number[] {
   return descendants;
 }
 
-/**
- * Signal a process and all its descendant children (e.g. aria2c spawned under yt-dlp).
- * Returns the list of descendant PIDs that were discovered and signaled.
- */
-export function killProcessTree(
+/** Signal a process tree and report whether Windows confirmed taskkill. */
+function signalProcessTree(
   proc: Bun.Subprocess | { pid: number } | undefined,
-  signal: "SIGINT" | "SIGTERM" | "SIGKILL" = "SIGINT",
-): number[] {
-  if (!proc) return [];
+  signal: "SIGINT" | "SIGTERM" | "SIGKILL",
+): { children: number[]; confirmed: boolean } {
+  if (!proc || !proc.pid || proc.pid <= 1) return { children: [], confirmed: false };
   const pid = proc.pid;
-  if (!pid || pid <= 1) return [];
 
   try {
     if (process.platform === "win32") {
-      try {
-        Bun.spawnSync(["taskkill", "/pid", String(pid), "/t", "/f"]);
-      } catch {}
-      return [];
+      const result = Bun.spawnSync(["taskkill", "/pid", String(pid), "/t", "/f"]);
+      return { children: [], confirmed: result.exitCode === 0 };
     }
 
-    // Crucial: discover all descendants BEFORE signaling the parent, because once the
-    // parent terminates, children get adopted by PID 1 (init) and `pgrep -P <pid>` is empty!
+    // Discover descendants before signaling their parent, or reparenting can
+    // make them invisible to pgrep before the escalation runs.
     const children = findDescendantPids(pid);
-
-    // Try killing process group first if pgid == pid
     try {
       process.kill(-pid, signal);
     } catch {}
-
-    // Kill all descendants with SIGTERM (and signal) so background tools (like aria2c) exit gracefully
     for (const cpid of children) {
       try {
         process.kill(cpid, signal === "SIGKILL" ? "SIGKILL" : "SIGTERM");
@@ -103,34 +105,102 @@ export function killProcessTree(
         } catch {}
       }
     }
-
-    // Signal the root process itself
     try {
       (proc as Bun.Subprocess).kill?.(signal);
     } catch {}
     try {
       process.kill(pid, signal);
     } catch {}
-
-    return children;
+    return { children, confirmed: true };
   } catch {
-    return [];
+    return { children: [], confirmed: false };
   }
 }
 
-/** SIGINT a child and all its descendants (aria2c/ffmpeg), escalating to SIGKILL after the grace period. */
+/** Signal a process and its descendants; return the discovered descendant PIDs. */
+export function killProcessTree(
+  proc: Bun.Subprocess | { pid: number } | undefined,
+  signal: "SIGINT" | "SIGTERM" | "SIGKILL" = "SIGINT",
+): number[] {
+  return signalProcessTree(proc, signal).children;
+}
+
+/** Conservatively check known descendants; Linux zombies cannot write files. */
+function descendantMayStillWrite(pid: number): boolean {
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const state = stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3);
+      if (state === "Z" || state === "X") return false;
+    } catch {
+      // Fall through to the portable existence check.
+    }
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: any) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+/** Bun leaves exitCode null when a child exits from a signal. */
+function subprocessIsRunning(proc: Bun.Subprocess): boolean {
+  return proc.exitCode === null && proc.signalCode == null;
+}
+
+/** SIGINT a child and descendants, escalating after the grace period. */
 export function interruptChild(proc: Bun.Subprocess | undefined): boolean {
-  if (!proc || proc.exitCode !== null) return false;
-  const children = killProcessTree(proc, "SIGINT");
+  if (!proc || !subprocessIsRunning(proc)) return false;
+  const initial = signalProcessTree(proc, "SIGINT");
+  const descendants = new Set(initial.children);
+  let treeConfirmed = initial.confirmed;
+  pendingChildInterrupts++;
+  let finished = false;
+  const finish = () => {
+    if (!finished) {
+      finished = true;
+      pendingChildInterrupts--;
+    }
+  };
   const timer = setTimeout(() => {
     try {
-      killProcessTree(proc, "SIGKILL");
-      for (const cpid of children) {
-        try {
-          process.kill(cpid, "SIGKILL");
-        } catch {}
+      // Do not signal a reused parent PID after the original child has exited.
+      if (subprocessIsRunning(proc)) {
+        const forced = signalProcessTree(proc, "SIGKILL");
+        for (const pid of forced.children) descendants.add(pid);
+        treeConfirmed ||= forced.confirmed;
       }
-    } catch {}
+      for (const pid of descendants) {
+        try { process.kill(pid, "SIGKILL"); } catch {}
+      }
+      if (!treeConfirmed) {
+        // On Windows, taskkill is the only way we can enumerate the tree. If it
+        // failed and the parent already exited, descendants are unknowable.
+        unconfirmedChildTree = true;
+        logError("recovery", `could not confirm interrupted process tree ${proc.pid} stopped; restart the engine before lease recovery`);
+        finish();
+        return;
+      }
+      const stillRunning = () => subprocessIsRunning(proc) || [...descendants].some(descendantMayStillWrite);
+      if (!stillRunning()) {
+        finish();
+        return;
+      }
+      // SIGKILL is asynchronous on POSIX; a child stuck in kernel I/O may
+      // remain alive after the grace period. Do not restart work over it.
+      const wait = setInterval(() => {
+        if (!stillRunning()) {
+          clearInterval(wait);
+          finish();
+        }
+      }, 500);
+      (wait as unknown as { unref?: () => void }).unref?.();
+    } catch (error) {
+      unconfirmedChildTree = true;
+      logError("recovery", `could not confirm interrupted process tree ${proc.pid} stopped: ${String(error)}`);
+      finish();
+    }
   }, KILL_GRACE_MS);
   (timer as unknown as { unref?: () => void }).unref?.();
   return true;
@@ -233,36 +303,110 @@ export function cancelAllActiveStages(): CancelledStages {
   return stagesFor(() => true);
 }
 
-export function triggerResume(): boolean {
-  // A human action cannot give this process ownership of another engine's DB,
-  // even in the window before the heartbeat reports a lost lease.
-  if (abortController.signal.aborted || !holdsEngineLease()) return false;
-  const fencing = engineFencing();
+export interface ManualResumeResult {
+  ok: boolean;
+  error?: string;
+  code?: "shutdown" | "lease_missing" | "lease_changed" | "workers_active" | "resume_failed";
+  reacquired?: boolean;
+  unreconciledClaims?: number;
+}
+
+/**
+ * Explicit human resume. If our own unchanged generation merely expired, we
+ * can acquire a new generation after tracked workers, maintenance and known
+ * interrupted descendants settle. Never take a changed/foreign lease
+ * here or sweep old claims; a restart reconciles them, and the stale-claim
+ * reaper may also reclaim stages still marked in progress.
+ */
+export function resumeEngineManually(): ManualResumeResult {
+  if (abortController.signal.aborted) {
+    return { ok: false, code: "shutdown", error: "The engine is shutting down. Start it again to resume." };
+  }
   try {
+    const leaseLost = isPaused() && getPauseReason() === "ENGINE_LEASE_LOST";
+    let reacquired = false;
+    if (leaseLost) {
+      const current = readEngineLease();
+      const generation = engineFencing();
+      if (!current || generation === null || current.owner !== engineLeaseOwner() || current.fencing !== generation) {
+        return {
+          ok: false, code: "lease_changed",
+          error: "The engine lease changed or another engine may own it. Stop all engines using this archive, then start only one. Do not delete archive.db.",
+        };
+      }
+      if (unconfirmedChildTree) {
+        return {
+          ok: false, code: "workers_active",
+          error: "The engine could not confirm that an interrupted process tree stopped. Stop the engine, ensure its child processes have exited, and restart it.",
+        };
+      }
+      if (activeDownloadJobs.size || activeProcs.size || activeMetadataJobs.size || activeMetadataProcs.size ||
+          activeConvertJobs.size || activeConvertProcs.size || activeLeaseOperations.size || pendingChildInterrupts) {
+        return {
+          ok: false, code: "workers_active",
+          error: "Previous work is still stopping or finishing. Wait a few seconds and retry Resume; if it stays active, stop the engine and restart it.",
+        };
+      }
+      if (!holdsEngineLease()) {
+        const acquired = reacquireOwnExpiredEngineLease();
+        if (!acquired.acquired) {
+          return {
+            ok: false, code: "lease_changed",
+            error: "The engine lease changed or another engine may own it. Stop all engines using this archive, then start only one. Do not delete archive.db.",
+          };
+        }
+        reacquired = true;
+        const message = `manually reacquired this engine's expired lease (fencing ${acquired.lease?.fencing}); old claims were left intact`;
+        console.log(`🔐 ${message}`);
+        logError("lease", message);
+      }
+    } else if (!holdsEngineLease()) {
+      // Before the heartbeat has reported loss, Resume must not silently
+      // acquire a lease or override a different pause reason.
+      return {
+        ok: false, code: "lease_missing",
+        error: "This engine does not hold a valid lease. Wait for the lease-loss pause and retry, or stop all engines using this archive and restart one.",
+      };
+    }
+    const fencing = engineFencing();
     // Re-queue ALL paused jobs (global + user-paused) on explicit Resume All,
     // but never replace a claim that is still settling. Check the lease again
     // once the write transaction is held.
-    const changes = db.transaction(() => {
+    const result = db.transaction(() => {
       if (abortController.signal.aborted || !holdsEngineLease() || engineFencing() !== fencing) return null;
-      return db.run(
+      const changes = db.run(
         `UPDATE jobs SET download_status = 'pending', pause_reason = NULL,
            download_claimed_by = NULL, download_claimed_at = NULL,
            download_claim_token = NULL, download_heartbeat_at = NULL,
            updated_at = CURRENT_TIMESTAMP
          WHERE download_status = 'paused' AND download_claimed_by IS NULL AND download_claim_token IS NULL`,
       ).changes;
+      const row = leaseLost ? db.query(
+        `SELECT COUNT(*) AS count FROM jobs
+          WHERE download_status = 'downloading'
+             OR (download_status = 'paused' AND (download_claimed_by IS NOT NULL OR download_claim_token IS NOT NULL))
+             OR conversion_status = 'in_progress' OR metadata_status = 'in_progress'`,
+      ).get() as { count: number } : null;
+      return { changes, unreconciledClaims: row?.count ?? 0 };
     }).immediate();
-    if (changes === null) return false;
-    if (changes > 0) console.log(`▶️ Re-queued ${changes} paused job(s).`);
+    if (!result) {
+      return { ok: false, code: "lease_changed", error: "The engine lease changed while resuming. Stop all engines using this archive, then start only one." };
+    }
+    if (result.changes > 0) console.log(`▶️ Re-queued ${result.changes} paused job(s).`);
+    setPaused(false, null);
+    failureCircuit.dl = 0;
+    failureCircuit.post = 0;
+    failureCircuit.retryAt = null;
+    return { ok: true, reacquired, unreconciledClaims: result.unreconciledClaims };
   } catch (error) {
     logError("recovery", `could not resume jobs: ${String(error)}`);
-    return false;
+    return { ok: false, code: "resume_failed", error: "Could not resume safely. Check error.log; if the problem persists, stop the engine and restart it." };
   }
-  setPaused(false, null);
-  failureCircuit.dl = 0;
-  failureCircuit.post = 0;
-  failureCircuit.retryAt = null;
-  return true;
+}
+
+/** Backward-compatible boolean wrapper used by non-HTTP callers. */
+export function triggerResume(): boolean {
+  return resumeEngineManually().ok;
 }
 
 // --- Circuit breaker ---------------------------------------------------------

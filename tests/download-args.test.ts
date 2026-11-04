@@ -181,6 +181,9 @@ describe("buildDownloadPlan", () => {
       expect(plan.args).toContain(f);
     }
     expect(flagValue(plan.args, "--progress-template")).toContain("PROGRESS:");
+    expect(flagValue(plan.args, "--progress-template")).toContain("%(progress._percent).1f");
+    expect(flagValue(plan.args, "--progress-template")).toContain("%(progress.total_bytes,progress.total_bytes_estimate)s");
+    expect(flagValue(plan.args, "--progress-template")).toContain("%(info.format_id)j");
     expect(flagValue(plan.args, "--print")).toBe("after_move:FILEPATH:%(filepath)s");
   });
 

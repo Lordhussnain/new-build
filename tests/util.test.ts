@@ -43,6 +43,13 @@ describe("parseSpeedToBytesPerSec", () => {
     expect(parseSpeedToBytesPerSec("100B")).toBe(100);
   });
 
+  test("reads yt-dlp raw floating-point bytes per second", () => {
+    expect(parseSpeedToBytesPerSec("524288.000000")).toBe(524288);
+    expect(parseSpeedToBytesPerSec(" 0.125 ")).toBe(0.125);
+    expect(parseSpeedToBytesPerSec("2e3")).toBe(2000);
+    expect(parseSpeedToBytesPerSec("1e999")).toBe(0);
+  });
+
   test("returns 0 for unusable values", () => {
     expect(parseSpeedToBytesPerSec("")).toBe(0);
     expect(parseSpeedToBytesPerSec("NA")).toBe(0);

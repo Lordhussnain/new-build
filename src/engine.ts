@@ -199,10 +199,12 @@ export async function main(): Promise<void> {
   console.log(
     `🔐 Engine lease acquired (fencing ${lease.lease?.fencing}${lease.tookOver ? ", took over an expired lease" : ""}).`,
   );
-  // Renew it for the life of the process. Losing it means another engine took
-  // over while this one was stalled; pausing stops new claims immediately, and
-  // the per-claim tokens fence everything already in flight.
+  // Renew it for the life of the process. A miss can mean expiry, takeover or
+  // a DB error; pausing stops new claims while a human investigates.
+  // Test subprocesses may shorten the interval without changing production.
+  const testRenewMs = process.env.NODE_ENV === "test" ? Number(process.env.YTA_ENGINE_LEASE_RENEW_MS) : NaN;
   const stopLeaseHeartbeat = startEngineLeaseHeartbeat({
+    ...(Number.isFinite(testRenewMs) && testRenewMs > 0 ? { renewMs: testRenewMs } : {}),
     onLost: () => {
       logError("lease", "engine lease lost — pausing so this instance stops claiming work");
       triggerPause("ENGINE_LEASE_LOST");

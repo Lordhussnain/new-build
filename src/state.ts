@@ -56,6 +56,16 @@ export const activeConvertJobs = new Map<number, string>();
 export const activeMetadataProcs = new Map<number, Bun.Subprocess>();
 export const activeMetadataJobs = new Map<number, string>();
 
+// File-mutating maintenance and one-off tasks are not represented by worker
+// maps. Manual lease recovery must also wait for any such old operation to
+// settle, rather than restarting workers into a still-running sweep or move.
+export const activeLeaseOperations = new Map<symbol, string>();
+export function trackLeaseOperation(name: string): () => void {
+  const token = Symbol(name);
+  activeLeaseOperations.set(token, name);
+  return () => { activeLeaseOperations.delete(token); };
+}
+
 export const abortController = new AbortController();
 export const startTime = Date.now();
 

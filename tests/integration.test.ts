@@ -860,6 +860,102 @@ describe("integration: aria2c multi-connection downloads", () => {
 });
 
 // ---------------------------------------------------------------------------
+describe("integration: progress-based stall watchdog", () => {
+  test("a smaller native audio stream keeps advancing without a false stall", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      4108,
+      BASE_CONFIG(4108, {
+        videoQuality: "audio", useAria2c: false, maxConcurrentDownloads: 1, maxDownloadWorkers: 1,
+      }),
+      {
+        NODE_ENV: "test", YTA_TEST_DOWNLOAD_STALL_MS: "1200", YTA_TEST_STALL_CHECK_MS: "150",
+        FAKE_MULTI_STREAM_PROGRESS: "1", FAKE_OMIT_SECOND_DESTINATION: "1",
+      },
+    );
+    try {
+      // Real yt-dlp's %(progress.speed)f is numeric, not "16KiB". Catch it
+      // while the mock audio stream is actively growing below the video peak.
+      await waitFor("numeric native speed to reach the dashboard", async () => {
+        const status = await engine.api("/api/status");
+        return (status.activeDownloads || []).some((row: any) => row.speed === 16_384);
+      });
+      const jobs = await waitForAllJobs(
+        engine, (j) => j.download_status === "downloaded" && j.conversion_status === "done",
+      );
+      expect(jobs.every((j) => j.retry_count === 0)).toBe(true);
+      expect(jobs.every((j) => !j.last_error)).toBe(true);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("separate aria2c group counters advance below an earlier group's high-water mark", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      4110,
+      BASE_CONFIG(4110, {
+        videoQuality: "audio", useAria2c: true, maxConcurrentDownloads: 1, maxDownloadWorkers: 1,
+      }),
+      {
+        NODE_ENV: "test", YTA_TEST_DOWNLOAD_STALL_MS: "1200", YTA_TEST_STALL_CHECK_MS: "150",
+        FAKE_MULTI_ARIA_PROGRESS: "1",
+      },
+    );
+    try {
+      const jobs = await waitForAllJobs(
+        engine, (j) => j.download_status === "downloaded" && j.conversion_status === "done",
+      );
+      expect(jobs.every((j) => j.retry_count === 0)).toBe(true);
+      expect(jobs.every((j) => !j.last_error)).toBe(true);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("unchanged progress is stopped and its partial survives a successful retry", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      4109,
+      BASE_CONFIG(4109, {
+        videoQuality: "audio", useAria2c: false, maxConcurrentDownloads: 1, maxDownloadWorkers: 1,
+        maxRetryAttempts: 5, maxFailuresPerVideo: 5, maxFailures: 50,
+        retryBackoffBaseSeconds: 1, retryBackoffMaxSeconds: 1,
+      }),
+      {
+        NODE_ENV: "test", YTA_TEST_DOWNLOAD_STALL_MS: "1200", YTA_TEST_STALL_CHECK_MS: "150",
+        FAKE_STATIC_PROGRESS: "1", FAKE_STATIC_ONCE: "1", FAKE_STALL_VIDEO_ID: "mockvid001",
+      },
+    );
+    try {
+      let stalled: JobRow | undefined;
+      await waitFor("stalled job to preserve its partial", async () => {
+        stalled = (await getJobs(engine)).find((j) =>
+          j.id === "mockvid001" && !!j.partial_file_path && !!j.last_error?.includes("no reported byte progress"));
+        return !!stalled;
+      });
+      expect(await readFile(stalled!.partial_file_path!, "utf8")).toBe("preserve-this-partial");
+
+      const jobs = await waitForAllJobs(
+        engine, (j) => j.download_status === "downloaded" && j.conversion_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+      const folder = join(dir, "downloads", "Mock Playlist");
+      const marker = (await readdir(folder)).find((name) => name.endsWith(".resumed-partial"));
+      expect(marker).toBeTruthy();
+      expect(await readFile(join(folder, marker!), "utf8")).toBe("preserve-this-partial");
+      const argvName = marker!.replace(/\.resumed-partial$/, ".ytdlp-args");
+      expect(JSON.parse(await readFile(join(folder, argvName), "utf8"))).toContain("--continue");
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
 describe("integration: live download progress", () => {
   test("an aria2c transfer drives the dashboard's progress, speed and ETA", async () => {
     // yt-dlp fires no progress hook of its own while an external downloader
@@ -3595,6 +3691,90 @@ describe("integration: credential self-healing", () => {
   }, TEST_TIMEOUT);
 });
 
+// ---------------------------------------------------------------------------
+// Reproduce the dashboard lease-loss report through a real engine subprocess.
+describe("integration: manual engine lease recovery", () => {
+  test.skipIf(WIN)("an expired unchanged lease stays paused until old work stops and Resume is pressed", async () => {
+    const dir = await makeRunDir();
+    const downloads = join(dir, "lease-downloads.log");
+    const engine = await startEngine(dir, 4106, BASE_CONFIG(4106, {
+      maxDownloadWorkers: 1, maxConcurrentDownloads: 1,
+      maxFailures: 1, maxRetryAttempts: 1, maxFailuresPerVideo: 1,
+    }), {
+      FAKE_HANG: "1", FAKE_SIGNAL_DELAY_MS: "1500", FAKE_DOWNLOAD_LOG: downloads,
+      YTA_ENGINE_LEASE_RENEW_MS: "250", YTA_RECOVERY_POLL_MS: "100",
+    });
+    const archive = new Database(join(dir, "archive.db"));
+    try {
+      await waitFor("downloader starts", async () => existsSync(downloads), 15_000);
+      const folder = join(dir, "downloads", "Mock Playlist");
+      const attempts = (await readdir(folder)).find((name) => name.endsWith(".attempts"))!;
+      expect(attempts).toBeTruthy();
+      const partial = join(folder, attempts.replace(/\.attempts$/, ".f137.mp4.part"));
+      await writeFile(partial, "keep the partial bytes");
+      const original = archive.query("SELECT owner, fencing FROM engine_lease WHERE id = 1").get() as any;
+      archive.run("UPDATE engine_lease SET expires_at = datetime('now', '-1 second') WHERE id = 1");
+      await waitFor("lease-loss pause", async () => (await engine.api("/api/status")).pauseReason === "ENGINE_LEASE_LOST", 5_000);
+      const early = await engine.api("/api/resume", { method: "POST" });
+      expect(early).toMatchObject({ ok: false, code: "workers_active", paused: true });
+      const during = archive.query("SELECT owner, fencing FROM engine_lease WHERE id = 1").get() as any;
+      expect(during).toEqual(original);
+      await waitFor("interrupted download settles", async () => {
+        const row = archive.query("SELECT download_status, download_claim_token FROM jobs WHERE id = 'mockvid001'").get() as any;
+        return row?.download_status === "paused" && row.download_claim_token === null;
+      }, 6_000);
+      // No automatic recovery, even though the same expired owner still exists.
+      await Bun.sleep(700);
+      expect((await engine.api("/api/status")).pauseReason).toBe("ENGINE_LEASE_LOST");
+      expect(await readFile(partial, "utf8")).toBe("keep the partial bytes");
+      let resumed: any;
+      await waitFor("the explicit resume to acquire a new generation", async () => {
+        resumed = await engine.api("/api/resume", { method: "POST" });
+        return resumed.ok === true;
+      }, 6_000);
+      expect(resumed.reacquiredLease).toBe(true);
+      const recovered = archive.query("SELECT owner, fencing FROM engine_lease WHERE id = 1").get() as any;
+      expect(recovered.owner).toBe(original.owner);
+      expect(recovered.fencing).toBe(original.fencing + 1);
+      await waitFor("a fresh downloader starts", async () => (await readFile(downloads, "utf8")).trim().split("\n").length >= 2, 10_000);
+      const job = archive.query("SELECT retry_count, last_error FROM jobs WHERE id = 'mockvid001'").get() as any;
+      expect(job.retry_count).toBe(0);
+      expect(job.last_error).toBeNull();
+      expect(await readFile(partial, "utf8")).toBe("keep the partial bytes");
+      await Bun.sleep(600); // the restarted heartbeat renews the new generation
+      expect((await engine.api("/api/status")).isPaused).toBe(false);
+      expect((archive.query("SELECT fencing FROM engine_lease WHERE id = 1").get() as any).fencing).toBe(recovered.fencing);
+    } finally {
+      archive.close();
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("Resume never overwrites a different live or expired owner", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 4107, BASE_CONFIG(4107, { playlists: [] }), {
+      YTA_ENGINE_LEASE_RENEW_MS: "250", YTA_RECOVERY_POLL_MS: "100",
+    });
+    const archive = new Database(join(dir, "archive.db"));
+    try {
+      await waitFor("engine is running", async () => engine.stdout().includes("Engine started"), 10_000);
+      archive.run(`UPDATE engine_lease SET owner = 'foreign-owner', fencing = fencing + 1,
+        host = 'different-host', pid = 12345, expires_at = datetime('now', '+5 minutes') WHERE id = 1`);
+      await waitFor("pause after changed owner", async () => (await engine.api("/api/status")).pauseReason === "ENGINE_LEASE_LOST", 5_000);
+      const foreign = archive.query("SELECT owner, fencing, expires_at FROM engine_lease WHERE id = 1").get();
+      const response = await engine.api("/api/resume", { method: "POST" });
+      expect(response).toMatchObject({ ok: false, code: "lease_changed", paused: true });
+      expect(archive.query("SELECT owner, fencing, expires_at FROM engine_lease WHERE id = 1").get()).toEqual(foreign);
+      archive.run("UPDATE engine_lease SET expires_at = datetime('now', '-1 second') WHERE id = 1");
+      const expiredForeign = archive.query("SELECT owner, fencing, expires_at FROM engine_lease WHERE id = 1").get();
+      expect((await engine.api("/api/resume", { method: "POST" })).code).toBe("lease_changed");
+      expect(archive.query("SELECT owner, fencing, expires_at FROM engine_lease WHERE id = 1").get()).toEqual(expiredForeign);
+    } finally {
+      archive.close();
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});
 // ---------------------------------------------------------------------------
 // Compatibility smoke test (opt-in).
 //

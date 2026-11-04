@@ -30,6 +30,7 @@ import {
   getPauseReason,
   isPaused,
   markJobCancelled,
+  trackLeaseOperation,
   workerStatuses,
 } from "./state";
 import { getPlaylistItems, scanAndIngest, scanSourcesBatch } from "./scanner";
@@ -46,7 +47,7 @@ import {
   type BatchSourceEntry,
   type SourceUrl,
 } from "./sources";
-import { automaticRecoveryTick, cancelActiveStages, diskUsage, interruptActiveDownloads, recoveryStatus, triggerPause, triggerResume, type CancelledStages } from "./resilience";
+import { automaticRecoveryTick, cancelActiveStages, diskUsage, interruptActiveDownloads, recoveryStatus, resumeEngineManually, triggerPause, type CancelledStages } from "./resilience";
 import { METADATA_KINDS, listMetadataOnlyTasks, startMetadataOnly } from "./metadata-only";
 import { appendToArchive, readArchiveIds, removeFromArchive } from "./archive";
 import {
@@ -666,6 +667,15 @@ interface RetryJobResult {
  *     (see reconcile.ts).
  */
 async function retryJobById(id: string, config: Config, override?: JobOverride): Promise<RetryJobResult> {
+  const finishOperation = trackLeaseOperation("job retry cleanup");
+  try {
+    return await retryJobByIdPass(id, config, override);
+  } finally {
+    finishOperation();
+  }
+}
+
+async function retryJobByIdPass(id: string, config: Config, override?: JobOverride): Promise<RetryJobResult> {
   let partialPath: string | null = null;
   let fallbackDir = "";
   let fallbackBase = "";
@@ -1994,10 +2004,19 @@ const ROUTES: Route[] = [
     methods: ["POST"],
     pattern: "/api/resume",
     handler: () => {
-      if (!triggerResume()) {
-        return Response.json({ ok: false, success: false, paused: isPaused(), error: "Could not resume. Check the engine lease and error log before retrying." }, { status: 409 });
+      const result = resumeEngineManually();
+      if (!result.ok) {
+        return Response.json({ ok: false, success: false, paused: isPaused(), code: result.code, error: result.error }, { status: 409 });
       }
-      return Response.json({ ok: true, success: true, paused: false });
+      const remaining = result.unreconciledClaims ?? 0;
+      return Response.json({
+        ok: true, success: true, paused: false,
+        ...(result.reacquired ? { reacquiredLease: true } : {}),
+        ...(remaining ? {
+          unreconciledClaims: remaining,
+          warning: `${remaining} job(s) still have claims. They were left untouched; restart the engine to reconcile them. The reaper may clear claims whose stages remain in progress.`,
+        } : {}),
+      });
     },
   },
   {

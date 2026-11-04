@@ -261,7 +261,12 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
     "--newline",
     "--no-colors",
     "--progress-template",
-    "download:PROGRESS:%(progress.percent).1f|%(progress.speed)f|%(progress.eta)f|%(progress.total_bytes)s|%(progress.downloaded_bytes)s",
+    // _percent is yt-dlp's derived field; progress.percent is not populated.
+    // Include the JSON-escaped format id so separate video/audio counters do
+    // not share a high-water mark. Unlike a JSON-escaped full path, an id does
+    // not routinely push a progress record over the bounded line length. It
+    // is the final field: the parser rejoins any literal '|' in the id.
+    "download:PROGRESS:%(progress._percent).1f|%(progress.speed)f|%(progress.eta)f|%(progress.total_bytes,progress.total_bytes_estimate)s|%(progress.downloaded_bytes)s|%(info.format_id)j",
     // Mark the final path explicitly: other stdout (including aria2c progress)
     // must never be probed as a filesystem path.
     // --print implies --simulate, so --no-simulate is required to actually write files.

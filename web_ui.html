@@ -2869,10 +2869,10 @@
         const res = await fetch(endpoint, { method: 'POST' });
         const data = await res.json();
         if (data.ok) {
-          showNotification(isPaused ? 'Engine resumed' : 'Engine paused', 'success');
+          showNotification(data.warning || (isPaused ? 'Engine resumed' : 'Engine paused'), data.warning ? 'info' : 'success', data.warning ? 12000 : undefined);
           refreshData();
         } else {
-          showNotification(data.error || 'Failed to toggle pause', 'error');
+          showNotification(data.error || 'Failed to toggle pause', 'error', 12000);
         }
       } catch (err) {
         showNotification(err.message, 'error');

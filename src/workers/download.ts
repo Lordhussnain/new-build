@@ -54,6 +54,7 @@ import {
 } from "../retry";
 import { buildDownloadPlan, effectiveTargetFormat, effectiveVideoQuality, jobFittedBaseFilename } from "../download-args";
 import { parseAria2cReadout, parseDownloadPath, readProcessOutput } from "../download-output";
+import { DownloadStallTracker } from "../download-stall";
 import {
   parseSelectionJson,
   parseTracksJson,
@@ -295,9 +296,10 @@ async function runDownload(
   let downloadTimer: ReturnType<typeof setTimeout> | undefined;
   let finalFilePath = "";
   let lastProgressUpdate = 0;
-  // Stall tracking: the newest downloaded-byte count and when it last grew.
-  let lastBytes = -1;
-  let lastByteAt = Date.now();
+  // Track each format/group separately: a smaller audio stream must not be
+  // compared with the previous video's much larger byte counter.
+  const stallTracker = new DownloadStallTracker();
+  let downloadPhase = 0;
   let postProcessing = false;
   let stalledMs = 0;
   let stallTimer: ReturnType<typeof setInterval> | undefined;
@@ -320,23 +322,24 @@ async function runDownload(
       timedOut = true;
       downloadCtl.abort();
     }, timeoutMs);
+    const { stallMs, checkMs } = downloadStallTiming();
     stallTimer = setInterval(() => {
       // A pause is a deliberate wait, and post-processing is silent by design:
       // neither counts toward the stall clock.
+      const now = Date.now();
       if (postProcessing || isPaused() || isUserPaused(job.id)) {
-        lastByteAt = Date.now();
+        stallTracker.resetClock(now);
         return;
       }
-      const idle = Date.now() - lastByteAt;
-      if (idle < DOWNLOAD_STALL_MS || downloadCtl.signal.aborted) return;
-      stalledMs = idle;
+      if (!stallTracker.isStalled(stallMs, now) || downloadCtl.signal.aborted) return;
+      stalledMs = stallTracker.idleMs(now);
       logError(
         "download",
-        `${job.id} ${job.title}: no bytes for ${Math.round(idle / 1000)}s — stopping the transfer to resume from its partial`,
+        `${job.id} ${job.title}: no reported byte progress for ${Math.round(stalledMs / 1000)}s — stopping the transfer to retry with any available partial`,
       );
-      updateWorkerLine(id, `⚠️ Stalled — restarting from partial | ${job.title}`, config);
+      updateWorkerLine(id, `⚠️ Stalled — retrying | ${job.title}`, config);
       downloadCtl.abort();
-    }, STALL_CHECK_MS);
+    }, checkMs);
 
     // Every downloader engine funnels through this one writer: the native
     // engine via yt-dlp's --progress-template, aria2c via its console readout
@@ -349,11 +352,17 @@ async function runDownload(
       etaNum: number,
       totalBytes: number | null,
       downloadedBytes: number | null,
+      stream: string,
+      resolutionBytes = 0,
     ) => {
-      if (downloadedBytes !== null && downloadedBytes > lastBytes) {
-        lastBytes = downloadedBytes;
-        lastByteAt = Date.now();
-      }
+      stallTracker.observe({
+        stream,
+        downloadedBytes,
+        // Only aria2c's abbreviated counters need rate-based grace; native
+        // yt-dlp counters are exact and need no such exception.
+        speedBps: resolutionBytes > 0 ? bps : 0,
+        resolutionBytes,
+      });
       if (isUserPaused(job.id)) {
         updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
         return;
@@ -372,19 +381,31 @@ async function runDownload(
     };
 
     const stdoutPromise = readProcessOutput(proc.stdout, (line) => {
-      if (POST_PROCESSING_LINE.test(line.trim())) postProcessing = true;
+      const trimmed = line.trim();
+      if (/^\[download\] Destination:/.test(trimmed)) {
+        // yt-dlp may restart a filename or spawn another aria2c with a reused
+        // group id. A new destination is a new counter generation.
+        downloadPhase++;
+        postProcessing = false;
+      } else if (POST_PROCESSING_LINE.test(trimmed)) postProcessing = true;
       if (line.startsWith("PROGRESS:")) {
-        const parts = line.replace("PROGRESS:", "").split("|");
+        const parts = line.slice("PROGRESS:".length).split("|");
         const sizeNum = parseInt(parts[3], 10);
         const dlNum = parseInt(parts[4], 10);
         let pctNum = parseFloat(parts[0]);
         if (Number.isNaN(pctNum) && dlNum > 0 && sizeNum > 0) pctNum = (dlNum / sizeNum) * 100;
+        // Format id is the final JSON-escaped template field. Joining retains
+        // literal '|' characters in it; older/mocked records fall back to the
+        // destination generation when the field is absent.
+        const formatId = parts.length > 5 ? parts.slice(5).join("|") : "";
+        const nativeStream = formatId && formatId !== "NA" ? formatId : "legacy";
         reportProgress(
           pctNum,
           parseSpeedToBytesPerSec(parts[1]),
           parseFloat(parts[2]) || 0,
           Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : null,
           Number.isFinite(dlNum) && dlNum >= 0 ? dlNum : null,
+          `native:${downloadPhase}:${nativeStream}`,
         );
       } else {
         const path = parseDownloadPath(line);
@@ -401,6 +422,8 @@ async function runDownload(
               readout.etaSeconds,
               readout.totalBytes > 0 ? readout.totalBytes : null,
               readout.downloadedBytes >= 0 ? readout.downloadedBytes : null,
+              `aria2c:${downloadPhase}:${readout.groupId}`,
+              readout.downloadedResolutionBytes,
             );
           }
         }
@@ -426,7 +449,7 @@ async function runDownload(
 
   if (timedOut) throw new Error(`Process timed out (${Math.round(timeoutMs / 60000)}m)`);
   if (stalledMs > 0) {
-    throw new Error(`Download stalled — no bytes for ${Math.round(stalledMs / 1000)}s; resuming from partial`);
+    throw new Error(`Download stalled — no reported byte progress for ${Math.round(stalledMs / 1000)}s; retrying with any available partial`);
   }
 
   if (code === 0) {
@@ -483,15 +506,25 @@ async function runDownload(
 const DOWNLOAD_PROCESS_CLEANUP_GRACE_MS = 2_000;
 
 /**
- * A transfer that moves no bytes for this long is stalled: its child is stopped
- * and the job resumes from its partial. Before this existed, a child that went
- * silent (a hung socket, a fragment the server stopped serving) kept its slot
- * and its claim lease until the total timeout — 15 to 180 minutes — while the
- * dashboard showed the last percentage. The signal is downloaded bytes, not the
- * percentage, so a slow transfer that is still moving is left alone.
+ * Stop an attempt after this long without reported byte progress, so a silent
+ * child does not hold its slot and claim until the total 15–180 minute timeout.
+ * This is a progress-output heuristic, not a direct disk/network measurement.
+ * aria2c's rounded counters may receive a bounded grace for a fresh positive
+ * rate (see DownloadStallTracker); the overall download timeout still applies.
  */
 export const DOWNLOAD_STALL_MS = 180_000;
 const STALL_CHECK_MS = 15_000;
+
+/** Only integration tests can shorten these timings for a real child process. */
+function downloadStallTiming(): { stallMs: number; checkMs: number } {
+  if (process.env.NODE_ENV !== "test") return { stallMs: DOWNLOAD_STALL_MS, checkMs: STALL_CHECK_MS };
+  const stall = Number(process.env.YTA_TEST_DOWNLOAD_STALL_MS);
+  const check = Number(process.env.YTA_TEST_STALL_CHECK_MS);
+  return {
+    stallMs: Number.isFinite(stall) && stall > 0 ? stall : DOWNLOAD_STALL_MS,
+    checkMs: Number.isFinite(check) && check > 0 ? check : STALL_CHECK_MS,
+  };
+}
 /**
  * yt-dlp lines that mean the transfer has finished and post-processing has
  * started. Those phases are silent for minutes by design, so stall detection

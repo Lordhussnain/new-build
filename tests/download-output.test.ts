@@ -148,6 +148,8 @@ describe("parseAria2cReadout", () => {
     // The live shape, byte for byte, from aria2's ConsoleStatCalc on a piped
     // stdout: no padding, no colours, newline-terminated.
     expect(parseAria2cReadout("[#208c72 1.4MiB/3.0MiB(48%) CN:16 DL:1.2MiB ETA:2m30s]")).toEqual({
+      groupId: "208c72",
+      downloadedResolutionBytes: 0.1 * 1024 * 1024,
       percent: 48,
       speedBps: 1.2 * 1024 * 1024,
       etaSeconds: 150,
@@ -161,6 +163,8 @@ describe("parseAria2cReadout", () => {
     // sizes are still usable — and the raw-byte form (511B, 1023B, long runs)
     // must parse too, since abbrevSize only abbreviates above 1KiB.
     expect(parseAria2cReadout("[#a1b2c3 524288B/10485760B CN:4 DL:671088B ETA:3s]")).toEqual({
+      groupId: "a1b2c3",
+      downloadedResolutionBytes: 1,
       percent: 5,
       speedBps: 671088,
       etaSeconds: 3,
@@ -169,6 +173,25 @@ describe("parseAria2cReadout", () => {
     });
     expect(parseAria2cReadout("[#a1b2c3 1,000B/2.0MiB(0%) CN:1 DL:1,000B ETA:3h]")?.percent).toBe(0);
     expect(parseAria2cReadout("[#a1b2c3 0B/0B CN:1 DL:0B]")).toBeNull();
+  });
+
+  test("keeps group identity and the precision of rounded byte counters", () => {
+    expect(parseAria2cReadout("[#ABCDEF 922MiB/2GiB(45%) CN:4 DL:1,000B]")).toMatchObject({
+      groupId: "abcdef",
+      downloadedResolutionBytes: 1024 * 1024,
+      speedBps: 1000,
+    });
+    expect(parseAria2cReadout("[#ABCDEF 1.0GiB/2GiB(50%) CN:4 DL:1KiB]")?.downloadedResolutionBytes)
+      .toBe(1024 ** 3 / 10);
+  });
+
+  test("an unknown total can still report bytes or speed without inventing a percentage", () => {
+    const readout = parseAria2cReadout("[#abc123 1.4MiB/0B CN:4 DL:1KiB]");
+    expect(readout).not.toBeNull();
+    expect(Number.isNaN(readout!.percent)).toBe(true);
+    expect(readout!.downloadedBytes).toBe(1.4 * 1024 * 1024);
+    expect(readout!.speedBps).toBe(1024);
+    expect(parseAria2cReadout("[#abc123 0B/0B CN:4 DL:0B]")).toBeNull();
   });
 
   test("tolerates the padding and CR a Windows console leaves behind", () => {
@@ -183,6 +206,8 @@ describe("parseAria2cReadout", () => {
 
   test("a finished transfer reports 100% with no speed or ETA", () => {
     expect(parseAria2cReadout("[#abcdef 3.0MiB/3.0MiB(100%) CN:16]")).toEqual({
+      groupId: "abcdef",
+      downloadedResolutionBytes: 0.1 * 1024 * 1024,
       percent: 100,
       speedBps: 0,
       etaSeconds: 0,

@@ -30,15 +30,22 @@ export function formatBytesPerSec(bps: number): string {
   return formatBytes(bps) + "/s";
 }
 
-/** Parse a yt-dlp speed string ("1.5MiB", "512KiB", "NA") into bytes/second. */
+/** Parse a yt-dlp/aria2c speed string into bytes/second. */
 export function parseSpeedToBytesPerSec(speedStr: string): number {
-  if (!speedStr || speedStr.trim() === "" || speedStr.toLowerCase() === "na") return 0;
-  const match = speedStr.match(/([\d.]+)\s*([KMGT]?i?B)/i);
+  if (!speedStr || speedStr.trim() === "" || speedStr.trim().toLowerCase() === "na") return 0;
+  const text = speedStr.trim();
+  // yt-dlp's %(progress.speed)f is a plain number of bytes/second, whereas
+  // aria2c's DL and older mock output use human-readable sizes with units.
+  if (/^\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(text)) {
+    const numeric = Number(text);
+    return Number.isFinite(numeric) ? numeric : 0;
+  }
+  const match = text.match(/([\d.]+)\s*([KMGT]?i?B)/i);
   if (!match) return 0;
   const val = parseFloat(match[1]);
   const unit = match[2].toLowerCase().replace("ib", "b");
   const multipliers: Record<string, number> = { b: 1, kb: 1024, mb: 1024 ** 2, gb: 1024 ** 3, tb: 1024 ** 4 };
-  return val * (multipliers[unit] || 1);
+  return Number.isFinite(val) ? val * (multipliers[unit] || 1) : 0;
 }
 
 export function formatDuration(seconds: number): string {

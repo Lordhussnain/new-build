@@ -247,6 +247,41 @@ export function acquireEngineLease(opts: { ttlMs?: number } = {}): LeaseAcquireR
 }
 
 /**
+ * Reacquire only this process's unchanged, expired generation. This is NOT a
+ * general takeover: if any other owner or generation appeared, even one that
+ * later expired, only a fresh engine startup may take over. Callers must also
+ * ensure old in-process work has settled before resuming workers.
+ *
+ * The comparison and generation increment are one SQLite transaction, so an
+ * engine racing to acquire the expired row can never be overwritten. Update the
+ * in-memory identity only after the transaction commits.
+ */
+export function reacquireOwnExpiredEngineLease(ttlMs: number = engineLeaseTtlMs()): LeaseAcquireResult {
+  const previous = currentLease;
+  if (!previous) return { acquired: false, lease: readEngineLease(), tookOver: false };
+  const ttlSeconds = Math.max(1, Math.round(ttlMs / 1000));
+  const attempt = db.transaction((): LeaseAcquireResult => {
+    const existing = readEngineLease();
+    if (!existing || existing.owner !== previous.owner || existing.fencing !== previous.fencing || !isLeaseExpired(existing)) {
+      return { acquired: false, lease: existing, tookOver: false };
+    }
+    const changes = db.run(
+      `UPDATE engine_lease
+          SET acquired_at = CURRENT_TIMESTAMP, heartbeat_at = CURRENT_TIMESTAMP,
+              expires_at = datetime('now', ?), fencing = fencing + 1
+        WHERE id = 1 AND owner = ? AND fencing = ?
+          AND (expires_at IS NULL OR datetime(expires_at) IS NULL OR datetime(expires_at) <= datetime('now'))`,
+      [`+${ttlSeconds} seconds`, previous.owner, previous.fencing],
+    ).changes;
+    return { acquired: changes === 1, lease: readEngineLease(), tookOver: changes === 1 };
+  }).immediate();
+  if (attempt.acquired && attempt.lease?.owner) {
+    currentLease = { owner: attempt.lease.owner, fencing: attempt.lease.fencing };
+  }
+  return attempt;
+}
+
+/**
  * Extend our lease. Returns false when we are no longer the owner — the caller
  * must then stop behaving like the owner (the heartbeat path pauses the engine).
  */
@@ -282,29 +317,37 @@ export function releaseEngineLease(): boolean {
 }
 
 /**
- * Keep the lease renewed for the life of the process.
- *
- * A renewal failure means another engine took over (our event loop was blocked
- * long enough for the lease to expire, e.g. a suspended laptop). Retrying is
- * not a fix: two engines now believe they own the archive. The callback is
- * invoked after the second consecutive miss — the engine pauses and stops
- * claiming work, while every in-flight write is already fenced by its claim
- * token.
+ * Keep the lease renewed for the life of the process. A missed renewal can
+ * mean the lease expired during a stall, a different owner took over, or the
+ * database could not be written. It is not proof of a takeover. After two
+ * consecutive misses the callback pauses the engine; only a human can resume.
  */
 export function startEngineLeaseHeartbeat(opts: { renewMs?: number; onLost?: () => void } = {}): () => void {
   const renewMs = Math.max(250, opts.renewMs ?? ENGINE_LEASE_RENEW_MS);
   let missed = 0;
   const timer = setInterval(() => {
+    let renewed = false;
+    let detail = "the lease may have expired or its owner changed";
     try {
-      if (renewEngineLease()) {
-        missed = 0;
-        return;
-      }
-      missed++;
-      logError("lease", `engine lease renewal failed (miss ${missed}) — another engine may have taken over`);
-      if (missed === 2) opts.onLost?.();
+      renewed = renewEngineLease();
     } catch (e: any) {
-      logError("lease", String(e?.message || e));
+      detail = `database error: ${String(e?.message || e)}`;
+    }
+    if (renewed) {
+      missed = 0;
+      return;
+    }
+    missed++;
+    // Do not fill the log every 20 seconds while a human has not resumed yet.
+    if (missed <= 2 || missed % 15 === 0) {
+      logError("lease", `engine lease renewal failed (miss ${missed}) — ${detail}`);
+    }
+    if (missed === 2) {
+      try {
+        opts.onLost?.();
+      } catch (e: any) {
+        logError("lease", `could not pause after lease loss: ${String(e?.message || e)}`);
+      }
     }
   }, renewMs);
   (timer as unknown as { unref?: () => void }).unref?.();

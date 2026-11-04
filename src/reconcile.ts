@@ -28,7 +28,7 @@ import { logError } from "./logger";
 import { createCookieInvocation, detectCookiesChange, resolveCookieSource, usableCookieFingerprint, type CookiesChange } from "./tools";
 import { isCredentialBlockedError, isPermanentDownloadError } from "./retry";
 import { jobFittedBaseFilename } from "./download-args";
-import { activeDownloadJobs, abortController, getConfig, isJobCancelled, isPaused } from "./state";
+import { activeDownloadJobs, abortController, getConfig, isJobCancelled, isPaused, trackLeaseOperation } from "./state";
 import { engineFencing, holdsEngineLease, readEngineLease, describeEngineLease, withEngineLease } from "./lease";
 import type { Config } from "./config";
 
@@ -171,18 +171,30 @@ export interface ReapSummary {
   locked: number;
 }
 
+// A lease-loss pause may last for hours while an operator is away. Log the
+// first skipped sweep and periodic reminders, not the same warning each minute.
+const reaperLeaseWarningAt = new WeakMap<object, number>();
+const REAPER_LEASE_WARNING_INTERVAL_MS = 5 * 60_000;
+
 export async function reapStaleClaims(config: Config): Promise<ReapSummary> {
   const thresholds = STALE_CLAIM_THRESHOLDS(config);
   const reaped: ReapSummary = { downloads: 0, conversions: 0, metadata: 0, stranded: 0, locked: 0 };
   // Lease-aware: only the engine that owns `archive.db` may reclaim claims. A
   // process without the lease would be guessing about rows it does not own.
   if (!holdsEngineLease()) {
-    logError(
-      "reaper",
-      `skipped: this process does not hold the engine lease (${describeEngineLease(readEngineLease())})`,
-    );
+    const now = Date.now();
+    const last = reaperLeaseWarningAt.get(db);
+    if (last === undefined || now - last >= REAPER_LEASE_WARNING_INTERVAL_MS) {
+      logError(
+        "reaper",
+        `skipped: this process does not hold the engine lease (${describeEngineLease(readEngineLease())})`,
+      );
+      reaperLeaseWarningAt.set(db, now);
+    }
     return reaped;
   }
+  reaperLeaseWarningAt.delete(db);
+  const finishOperation = trackLeaseOperation("stale-claim reaper");
   try {
     // Freeze each in-flight download's `.part` path while the job is still
     // 'downloading' (that is this function's own filter) — otherwise the
@@ -283,6 +295,8 @@ export async function reapStaleClaims(config: Config): Promise<ReapSummary> {
     }
   } catch (e: any) {
     logError("reaper", String(e?.message || e));
+  } finally {
+    finishOperation();
   }
   return reaped;
 }
@@ -939,6 +953,7 @@ export async function cleanOrphanedFiles(
   config?: Config,
 ): Promise<{ removed: number; locked: number }> {
   const summary = { removed: 0, locked: 0 };
+  const finishOperation = trackLeaseOperation("orphan-file cleanup");
   try {
     const cap = config ? perVideoCap(config) : 0;
     const rows = db
@@ -1076,6 +1091,8 @@ export async function cleanOrphanedFiles(
     }
   } catch (e: any) {
     logError("reconcile", String(e?.message || e));
+  } finally {
+    finishOperation();
   }
   return summary;
 }

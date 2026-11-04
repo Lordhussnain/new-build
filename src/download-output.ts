@@ -100,10 +100,15 @@ export async function readProcessOutput(
  *
  * Returns null for anything that is not a usable single-group readout: the
  * compact multi-group form ("[DL:…][#gid …][#gid …]"), aria2c's other
- * bracketed extras ([FileAlloc:#…], [Checksum:#…]), and readouts whose total
- * size is not known yet (nothing to report a percentage against).
+ * bracketed extras ([FileAlloc:#…], [Checksum:#…]), and readouts with neither
+ * a percentage nor any byte/rate information. A transfer whose total is not
+ * known can still give the stall detector a useful byte or rate sample.
  */
 export interface Aria2cReadout {
+  /** The six-character aria2c group id, used to separate stream counters. */
+  groupId: string;
+  /** Resolution of the displayed byte count, in bytes, or 0 when unavailable. */
+  downloadedResolutionBytes: number;
   /** Percent complete; NaN only when it cannot be derived at all. */
   percent: number;
   /** Transfer speed in bytes/second, 0 when aria2c did not report one. */
@@ -131,6 +136,16 @@ function parseAria2cSize(size: string): number {
   return parseSpeedToBytesPerSec(size.replace(/,/g, ""));
 }
 
+/** Resolution of an abbreviated size: e.g. 1.4MiB represents 0.1MiB steps. */
+function aria2cSizeResolution(size: string): number {
+  const match = /^\d+(?:,\d{3})*(?:\.(\d+))?([KMGT]?i?)B$/i.exec(size);
+  if (!match) return 0;
+  const unit = match[2].toUpperCase().replace(/I$/, "");
+  const power = { "": 0, K: 1, M: 2, G: 3, T: 4 }[unit];
+  if (power === undefined) return 0;
+  return 1024 ** power / 10 ** (match[1]?.length ?? 0);
+}
+
 /** aria2's util::secfmt output ("45s", "2m30s", "1h5m") into seconds. */
 function parseAria2cEta(eta: string): number {
   const m = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(eta);
@@ -154,15 +169,18 @@ export function parseAria2cReadout(line: string): Aria2cReadout | null {
   const pctMatch = ARIA2C_PERCENT.exec(body);
   let percent = pctMatch ? parseFloat(pctMatch[1]) : NaN;
   if (Number.isNaN(percent) && totalBytes > 0) percent = (downloadedBytes / totalBytes) * 100;
-  // No percentage and no total size: there is nothing the dashboard can show,
-  // and reporting 0% here would wipe a previously known percentage.
-  if (!Number.isFinite(percent)) return null;
-
   const speedMatch = ARIA2C_SPEED.exec(body);
+  const speedBps = speedMatch ? parseAria2cSize(speedMatch[1]) : 0;
+  // Unknown totals cannot drive the dashboard's percentage, but a real byte
+  // counter or positive speed is still useful to the stall detector.
+  if (!Number.isFinite(percent) && downloadedBytes <= 0 && speedBps <= 0) return null;
+
   const etaMatch = ARIA2C_ETA.exec(body);
   return {
+    groupId: group[1].toLowerCase(),
+    downloadedResolutionBytes: sizes ? aria2cSizeResolution(sizes[1]) : 0,
     percent,
-    speedBps: speedMatch ? parseSpeedToBytesPerSec(speedMatch[1]) : 0,
+    speedBps,
     etaSeconds: etaMatch ? parseAria2cEta(etaMatch[1]) : 0,
     totalBytes,
     downloadedBytes,

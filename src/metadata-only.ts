@@ -16,7 +16,7 @@ import type { MetadataKind } from "./metadata-files";
 import { sanitizeFolderName } from "./util";
 import { db, reserveFileIndex } from "./db";
 import { jobFittedBaseFilename } from "./download-args";
-import { getConfig } from "./state";
+import { getConfig, trackLeaseOperation } from "./state";
 import { logError } from "./logger";
 import type { Config } from "./config";
 
@@ -72,7 +72,14 @@ export function startMetadataOnly(url: string, kinds: MetadataKind[], config: Co
   };
   tasks.set(task.id, task);
   trimTasks();
-  queue = queue.then(() => runTask(task, config)).catch(() => {});
+  queue = queue.then(async () => {
+    const finishOperation = trackLeaseOperation("metadata-only fetch");
+    try {
+      await runTask(task, config);
+    } finally {
+      finishOperation();
+    }
+  }).catch(() => {});
   return task;
 }
 

@@ -29,6 +29,11 @@
 //                            quality-ladder fallback is observable
 //   FAKE_FAIL_PROGRESS_SEQUENCE=20,40 emit progress before failed attempts
 //   FAKE_HANG=1             hang forever (watchdog test)
+//   FAKE_MULTI_STREAM_PROGRESS=1  emit a large video then a slowly growing audio stream
+//   FAKE_MULTI_ARIA_PROGRESS=1    emit sequential aria2c group readouts for the same case
+//   FAKE_STATIC_PROGRESS=1  leave a partial and repeat one unchanged progress record
+//   FAKE_STATIC_ONCE=1      hang only on the first attempt, then record the resumed partial
+//   FAKE_STALL_VIDEO_ID=id  restrict the static-progress scenario to one video
 //   FAKE_SIGNAL_DELAY_MS=N  delay exit after an interrupt (pause/resume race)
 //   FAKE_DELAY_MS=250       per-attempt delay (progress parsing)
 //   FAKE_OUTPUT_STRESS=1    noisy pipes + split Unicode final path without LF
@@ -314,7 +319,18 @@ if (selectorFails) {
 // because a bare name would have to be re-discovered on the child's PATH and on
 // Windows it often is not there. Match the basename so both forms work.
 const downloaderArg = flagValue("--downloader") || "";
-if (/(^|[\\/])aria2c(\.exe)?$/i.test(downloaderArg)) {
+const usesAria2c = /(^|[\\/])aria2c(\.exe)?$/i.test(downloaderArg);
+if (usesAria2c && process.env.FAKE_MULTI_ARIA_PROGRESS === "1") {
+  console.log(`[download] Destination: ${base}.f137.mp4`);
+  console.log("[#a1b2c3 900MiB/900MiB(100%) CN:4 DL:0B]");
+  // No second Destination marker: the group ID alone must separate counters
+  // even when the boundary message is absent from captured output.
+  for (let i = 1; i <= 22; i++) {
+    console.log(`[#d4e5f6 ${i}KiB/100KiB(${i}%) CN:4 DL:0B]`);
+    await Bun.sleep(120);
+  }
+}
+if (usesAria2c && process.env.FAKE_MULTI_ARIA_PROGRESS !== "1") {
   const raw = flagValue("--downloader-args") || "";
   // Strip the aria2c: prefix (plus any legacy wrapping quotes — the engine no
   // longer emits them) — a simplified shlex — and split into argv.
@@ -429,6 +445,40 @@ if (/(^|[\\/])aria2c(\.exe)?$/i.test(downloaderArg)) {
   try {
     await rename(partPath, finalPath);
   } catch {}
+}
+
+// Exercise separate native video/audio counters with the engine's real child
+// process and a shortened test-only watchdog. The audio advances for longer
+// than the stall threshold, but never reaches the video counter's high water.
+if (process.env.FAKE_MULTI_STREAM_PROGRESS === "1") {
+  await Bun.write(partPath, "preserve-this-partial");
+  console.log(`[download] Destination: ${base}.f137.mp4`);
+  // A literal '|' in the JSON format id makes splitting only part[5] lose the
+  // identifying suffix; the worker must rejoin the final template field.
+  console.log(`PROGRESS:100.0|524288.000000|0|900000000|900000000|${JSON.stringify("format|137")}`);
+  if (process.env.FAKE_OMIT_SECOND_DESTINATION !== "1") console.log(`[download] Destination: ${base}.f140.m4a`);
+  for (let i = 1; i <= 22; i++) {
+    console.log(`PROGRESS:${i}.0|16384.000000|12|100000|${i * 1000}|${JSON.stringify("format|140")}`);
+    await Bun.sleep(120);
+  }
+  try { await Bun.file(partPath).unlink(); } catch {}
+}
+
+// Emitting unchanged records must not fool the watchdog into keeping a hung
+// transfer alive. The partial stays on disk for the retry handler to discover.
+const staticTarget = process.env.FAKE_STATIC_PROGRESS === "1" &&
+  (!process.env.FAKE_STALL_VIDEO_ID || process.env.FAKE_STALL_VIDEO_ID === videoId);
+if (staticTarget && (process.env.FAKE_STATIC_ONCE !== "1" || attempts === 1)) {
+  await Bun.write(partPath, "preserve-this-partial");
+  console.log(`[download] Destination: ${base}.f137.mp4`);
+  while (true) {
+    console.log(`PROGRESS:10.0|0.000000|0|1000|100|${JSON.stringify("137")}`);
+    await Bun.sleep(120);
+  }
+}
+if (staticTarget && process.env.FAKE_STATIC_ONCE === "1" && attempts > 1 && await Bun.file(partPath).exists()) {
+  await Bun.write(`${base}.resumed-partial`, await Bun.file(partPath).text());
+  await Bun.file(partPath).unlink();
 }
 
 // Progress output in the engine's PROGRESS format, then the final path.

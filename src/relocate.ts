@@ -43,7 +43,7 @@ import { logError } from "./logger";
 import { isPathInside } from "./util";
 import { moveToSecondaryStorage } from "./workers/convert";
 import { holdsEngineLease } from "./lease";
-import { getConfig, isPaused } from "./state";
+import { getConfig, isPaused, trackLeaseOperation } from "./state";
 import type { Config } from "./config";
 
 /**
@@ -96,6 +96,15 @@ export function resetRelocationBackoff(): void {
  * database is what removes the need for claim tokens here.
  */
 export async function relocateFinishedJobs(config: Config): Promise<RelocationReport> {
+  const finishOperation = trackLeaseOperation("secondary-storage relocation");
+  try {
+    return await relocateFinishedJobsPass(config);
+  } finally {
+    finishOperation();
+  }
+}
+
+async function relocateFinishedJobsPass(config: Config): Promise<RelocationReport> {
   const report: RelocationReport = { moved: 0, adopted: 0, alreadyThere: 0, skipped: 0, failed: 0 };
   const root = (config.secondaryStoragePath || "").trim();
   // No destination configured: nothing "needs" moving, so the pass is a no-op.
