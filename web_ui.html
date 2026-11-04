@@ -757,6 +757,7 @@
     .status-done, .status-downloaded { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }
     .status-failed { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
     .status-converting { background: rgba(139, 92, 246, 0.2); color: #c4b5fd; border: 1px solid rgba(139, 92, 246, 0.4); }
+    .status-metadata { background: rgba(14, 165, 233, 0.2); color: #7dd3fc; border: 1px solid rgba(14, 165, 233, 0.4); }
     .status-waiting_live { background: rgba(6, 182, 212, 0.2); color: #67e8f9; border: 1px solid rgba(6, 182, 212, 0.4); }
 
     .pill {
@@ -1468,6 +1469,8 @@
       <select id="statusFilter" class="search-box" onchange="renderJobs(lastJobs)">
         <option value="all">All statuses</option>
         <option value="downloading">⬇️ Downloading</option>
+        <option value="converting">🔄 Converting</option>
+        <option value="metadata">📝 Metadata</option>
         <option value="pending">Not started</option>
         <option value="paused">⏸️ Paused</option>
         <option value="waiting_live">Waiting for VOD</option>
@@ -1509,7 +1512,7 @@
             <th style="width: 40px;"><input type="checkbox" id="selectAll" onchange="toggleSelectAll()" /></th>
             <th class="sortable" data-sort="title" onclick="sortBy('title')">Title <span class="arrow"></span></th>
             <th class="sortable" data-sort="progress" onclick="sortBy('progress')" style="width: 170px;">Progress <span class="arrow"></span></th>
-            <th class="sortable" data-sort="speed" onclick="sortBy('speed')" style="width: 110px;">Speed <span class="arrow"></span></th>
+            <th class="sortable" data-sort="speed" onclick="sortBy('speed')" style="width: 130px;" title="Current network transfer rate for this job">Bandwidth <span class="arrow"></span></th>
             <th class="sortable" data-sort="eta" onclick="sortBy('eta')" style="width: 90px;">ETA <span class="arrow"></span></th>
             <th class="sortable" data-sort="status" onclick="sortBy('status')">Status <span class="arrow"></span></th>
             <th style="width: 100px;">Metadata</th>
@@ -1786,7 +1789,7 @@
     let cookieExportInProgress = false;
     let cookieExportOffline = false;
 
-    const STATUS_ORDER = ['downloading', 'pending', 'waiting_live', 'paused', 'failed', 'done'];
+    const STATUS_ORDER = ['downloading', 'converting', 'metadata', 'pending', 'waiting_live', 'paused', 'failed', 'done'];
 
     // Shared by the detail drawer and the row popover so the two never drift.
     const JOB_QUALITY_OPTIONS = [
@@ -1816,22 +1819,31 @@
       if (btn) btn.textContent = reliabilityDetailsExpanded ? '▲ Hide Details' : '▼ Technical Details';
     }
 
-    // One badge per row, derived from the three stage columns the engine owns:
-    //   download_status   pending | downloading | downloaded | paused | waiting_live | failed
-    //   conversion_status pending | in_progress | done | not_needed | failed
-    //   metadata_status   pending | in_progress | done | not_needed | failed
-    // "downloaded" (not "done") is what the DB writes when a media file lands.
+    // Show the actual current pipeline stage instead of collapsing conversion
+    // and metadata work into the misleading "downloading" badge. A downloaded
+    // job gets its next required stage; before the download finishes the later
+    // stages do not mask the download queue state.
     function jobStatus(job) {
       if (job.download_status === 'failed' || job.conversion_status === 'failed' || job.metadata_status === 'failed') return 'failed';
-      if (job.download_status === 'downloading' || job.conversion_status === 'in_progress' || job.metadata_status === 'in_progress') return 'downloading';
+      if (job.download_status === 'downloading') return 'downloading';
+      if (job.conversion_status === 'in_progress') return 'converting';
+      if (job.metadata_status === 'in_progress') return 'metadata';
       if (job.download_status === 'waiting_live') return 'waiting_live';
       if (job.download_status === 'paused') {
         return job.pause_reason === 'waiting_live' ? 'waiting_live' : 'paused';
       }
-      if (job.download_status === 'downloaded' && (job.conversion_status === 'done' || job.conversion_status === 'not_needed')) {
-        return 'done';
+      if (job.download_status === 'downloaded') {
+        if (job.metadata_status === 'pending') return 'metadata';
+        if (job.conversion_status === 'pending') return 'converting';
+        if ((job.conversion_status === 'done' || job.conversion_status === 'not_needed') &&
+            (job.metadata_status === 'done' || job.metadata_status === 'not_needed' || !job.metadata_status)) return 'done';
       }
       return 'pending';
+    }
+
+    function jobSpeedBytesPerSecond(job) {
+      const speed = Number(job && job.speed);
+      return Number.isFinite(speed) && speed > 0 ? speed : 0;
     }
 
     function sortBy(key) {
@@ -2471,6 +2483,7 @@
 
       tbody.innerHTML = filtered.map(job => {
         const progress = Number(job.progress) || 0;
+        const networkSpeed = jobSpeedBytesPerSecond(job);
         const status = jobStatus(job);
         const statusClass = `status-${status}`;
         let statusLabel = status === 'pending' ? 'not started' : status;
@@ -2519,8 +2532,8 @@
                 <small style="color: var(--text-secondary); font-weight: 600;">${progress.toFixed(1)}%</small>
               ` : '<span style="color: var(--text-muted);">–</span>'}
             </td>
-            <td style="font-weight: 600; color: ${job.download_status === 'downloading' && job.speed ? '#38bdf8' : 'var(--text-muted)'};">
-              ${job.download_status === 'downloading' && job.speed ? formatBytesPerSec(job.speed) : '–'}
+            <td title="Current per-job network throughput" style="font-weight: 600; color: ${job.download_status === 'downloading' && networkSpeed > 0 ? '#38bdf8' : 'var(--text-muted)'};">
+              ${job.download_status === 'downloading' ? formatBytesPerSec(networkSpeed) : '–'}
             </td>
             <td style="color: var(--text-secondary);">
               ${job.download_status === 'downloading' && job.eta ? formatETA(job.eta) : '–'}
@@ -4010,7 +4023,7 @@
           ${detailRow('Video quality', job.video_quality)}
           ${detailRow('Download status', job.download_status)}
           ${detailRow('Progress', job.progress !== null && job.progress !== undefined ? `${Number(job.progress).toFixed(1)}%` : '')}
-          ${detailRow('Speed', isDL && job.speed ? formatBytesPerSec(job.speed) : '')}
+          ${detailRow('Network speed', isDL ? formatBytesPerSec(jobSpeedBytesPerSecond(job)) : '')}
           ${detailRow('ETA', isDL && job.eta ? formatETA(job.eta) : '')}
           ${detailRow('Partial file', job.partial_file_path, true)}
           ${detailRow('Final file', job.file_path, true)}

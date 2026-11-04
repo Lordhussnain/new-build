@@ -47,6 +47,8 @@ describe("parseMediaStreamProbe", () => {
       audioStreams: 2,
       subtitleStreams: 2,
       attachmentStreams: 1,
+      attachmentStreamIndices: [5],
+      coverAttachmentStreamIndices: [5],
       hasAttachedPicture: false,
       hasCoverAttachment: true,
     });
@@ -140,6 +142,19 @@ describe("buildRemuxArgs", () => {
     expect(flagValue(args, "-c:s")).toBe("mov_text");
   });
 
+  test("replaces an existing attached picture when a downloaded thumbnail is available", () => {
+    const args = buildRemuxArgs({
+      sourcePath: "in.mp4",
+      outputPath: "out.mp4",
+      container: "mp4",
+      probe: probe({ videoStreams: 1, hasAttachedPicture: true }),
+      subtitles: [],
+      coverPath: "fresh.jpg",
+    });
+    expect(pairs(args, "-map")).toEqual(["0:V?", "0:a?", "1:v"]);
+    expect(flagValue(args, "-disposition:v:1")).toBe("attached_pic");
+  });
+
   test("keeps the source's attached picture when no new cover is supplied", () => {
     const args = buildRemuxArgs({
       sourcePath: "in.mp4",
@@ -162,8 +177,33 @@ describe("buildRemuxArgs", () => {
       subtitles: [],
       coverPath: null,
     });
-    expect(pairs(args, "-map")).toEqual(["0:v?", "0:a?", "0:t?"]);
+    expect(pairs(args, "-map")).toEqual(["0:v?", "0:a?", "0:5"]);
     expect(flagValue(args, "-c:s")).toBeUndefined();
+  });
+
+  test("replaces an existing MKV cover attachment with a native cover.jpg attachment", () => {
+    const args = buildRemuxArgs({
+      sourcePath: "in.mkv",
+      outputPath: "out.mkv",
+      container: "mkv",
+      probe: probe({
+        videoStreams: 1,
+        attachmentStreams: 2,
+        attachmentStreamIndices: [4, 5],
+        coverAttachmentStreamIndices: [5],
+        hasCoverAttachment: true,
+      }),
+      subtitles: [{ path: "001.en.ass", language: "en" }],
+      coverPath: "001.jpg",
+    });
+    // Keep the font attachment, discard only the old cover, and add the new
+    // cover using Matroska's -attach convention (rather than an attached pic).
+    expect(pairs(args, "-map")).toEqual(["0:V?", "0:a?", "0:4", "1:s:0"]);
+    expect(pairs(args, "-metadata:s:t:1")).toEqual(["mimetype=image/jpeg", "filename=cover.jpg"]);
+    expect(args).toContain("-attach");
+    expect(args).toContain("001.jpg");
+    expect(args).not.toContain("-disposition:v:1");
+    expect(flagValue(args, "-c:s")).toBe("copy");
   });
 
   test("webm drops cover art it cannot store, and converts subtitles to webvtt", () => {

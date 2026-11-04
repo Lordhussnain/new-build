@@ -301,6 +301,28 @@ describe("the dashboard renders the queue", () => {
     expect(ui.errors).toEqual([]);
   });
 
+  test("rows show the active pipeline stage and per-job network bandwidth", async () => {
+    insertJob("uiconvert1", {
+      title: "Converting Video",
+      download_status: "downloaded",
+      conversion_status: "in_progress",
+      metadata_status: "done",
+    });
+    insertJob("uimetadata1", {
+      title: "Metadata Video",
+      download_status: "downloaded",
+      conversion_status: "pending",
+      metadata_status: "pending",
+    });
+    await ui.run("fetchStatus");
+    const html = String(ui.el("jobsTableBody").innerHTML);
+    expect(html).toContain('status-converting">converting</span>');
+    expect(html).toContain('status-metadata">metadata</span>');
+    expect(html).toContain("27.00 KB/s");
+    expect(readFileSync(UI_PATH, "utf8")).toContain(">Bandwidth <span");
+    expect(ui.errors).toEqual([]);
+  });
+
   test("the header cards read the fields /api/status actually answers with", async () => {
     await ui.run("fetchStatus");
     expect(ui.el("downloadingCount").textContent).toBe(1);
@@ -346,7 +368,10 @@ describe("the dashboard renders the queue", () => {
     // 'downloaded' — not 'done' — is what the DB writes when media lands, and
     // a VOD wait is its own download_status rather than a pause reason.
     expect(ui.run("jobStatus", { download_status: "downloaded", conversion_status: "not_needed" })).toBe("done");
-    expect(ui.run("jobStatus", { download_status: "downloaded", conversion_status: "pending" })).toBe("pending");
+    expect(ui.run("jobStatus", { download_status: "downloaded", conversion_status: "pending", metadata_status: "done" })).toBe("converting");
+    expect(ui.run("jobStatus", { download_status: "downloaded", conversion_status: "pending", metadata_status: "pending" })).toBe("metadata");
+    expect(ui.run("jobStatus", { download_status: "downloaded", conversion_status: "in_progress", metadata_status: "done" })).toBe("converting");
+    expect(ui.run("jobStatus", { download_status: "downloaded", conversion_status: "done", metadata_status: "in_progress" })).toBe("metadata");
     expect(ui.run("jobStatus", { download_status: "waiting_live" })).toBe("waiting_live");
     expect(ui.run("jobStatus", { download_status: "paused", pause_reason: "user" })).toBe("paused");
     expect(ui.run("jobStatus", { download_status: "failed" })).toBe("failed");

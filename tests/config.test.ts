@@ -44,6 +44,10 @@ describe("DEFAULT_CONFIG", () => {
     expect(DEFAULT_CONFIG.downloadTimeoutMinutes).toBeLessThanOrEqual(DEFAULT_CONFIG.maxDownloadMinutes);
     expect(DEFAULT_CONFIG.targetFormat).toBe("mp4");
     expect(DEFAULT_CONFIG.subtitleFormat).toBe("srt");
+    expect(DEFAULT_CONFIG.downloadSubtitles).toBe(true);
+    expect(DEFAULT_CONFIG.embedSubtitles).toBe(true);
+    expect(DEFAULT_CONFIG.writeThumbnail).toBe(true);
+    expect(DEFAULT_CONFIG.embedThumbnail).toBe(true);
   });
 });
 

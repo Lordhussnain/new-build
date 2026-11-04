@@ -21,6 +21,10 @@ export interface MediaStreamProbe {
   subtitleStreams: number;
   /** Matroska attachments (fonts, cover.jpg). */
   attachmentStreams: number;
+  /** Input stream indexes for Matroska attachments, used to retain fonts while replacing cover art. */
+  attachmentStreamIndices: number[];
+  /** Input stream indexes of Matroska cover attachments. */
+  coverAttachmentStreamIndices: number[];
   /** A cover-art video stream (`disposition:attached_pic`, mp4/mkv/mp3). */
   hasAttachedPicture: boolean;
   /** A Matroska attachment named cover.* — how yt-dlp embeds into MKV. */
@@ -32,6 +36,8 @@ export const EMPTY_MEDIA_PROBE: MediaStreamProbe = {
   audioStreams: 0,
   subtitleStreams: 0,
   attachmentStreams: 0,
+  attachmentStreamIndices: [],
+  coverAttachmentStreamIndices: [],
   hasAttachedPicture: false,
   hasCoverAttachment: false,
 };
@@ -46,11 +52,12 @@ export const EMPTY_MEDIA_PROBE: MediaStreamProbe = {
  */
 export function parseMediaStreamProbe(banner: string): MediaStreamProbe {
   const probe: MediaStreamProbe = { ...EMPTY_MEDIA_PROBE };
-  const streamLine = /^\s*Stream #\d+:\d+(?:\([^)]*\))?:\s*(Video|Audio|Subtitle|Attachment|Data):/i;
+  const streamLine = /^\s*Stream #\d+:(\d+)(?:\([^)]*\))?:\s*(Video|Audio|Subtitle|Attachment|Data):/i;
   for (const line of banner.split(/\r?\n/)) {
     const match = line.match(streamLine);
     if (!match) continue;
-    switch (match[1].toLowerCase()) {
+    const streamIndex = Number(match[1]);
+    switch (match[2].toLowerCase()) {
       case "video":
         if (/\(attached pic\)/i.test(line)) probe.hasAttachedPicture = true;
         else probe.videoStreams++;
@@ -63,7 +70,11 @@ export function parseMediaStreamProbe(banner: string): MediaStreamProbe {
         break;
       case "attachment":
         probe.attachmentStreams++;
-        if (/attachment:\s*cover\b/i.test(line)) probe.hasCoverAttachment = true;
+        probe.attachmentStreamIndices.push(streamIndex);
+        if (/attachment:\s*cover\b/i.test(line)) {
+          probe.hasCoverAttachment = true;
+          probe.coverAttachmentStreamIndices.push(streamIndex);
+        }
         break;
     }
   }
@@ -126,7 +137,10 @@ export function buildRemuxArgs(input: RemuxInput): string[] {
   for (const sub of subtitleInputs) args.push("-i", sub.path);
   const coverInput = 1 + subtitleInputs.length;
   const addCover = Boolean(coverPath) && supportsCoverArt(container);
-  if (addCover) args.push("-i", coverPath!);
+  // MP4 stores cover art as an attached-picture video stream. Matroska's
+  // native representation is an attachment, so use -attach instead of
+  // pretending the image is another video stream.
+  if (addCover && container !== "mkv") args.push("-i", coverPath!);
 
   // Keep the source's own subtitles only when no sidecar set replaces them.
   const keepSourceSubtitles = subtitleInputs.length === 0 && probe.subtitleStreams > 0;
@@ -138,14 +152,29 @@ export function buildRemuxArgs(input: RemuxInput): string[] {
   args.push("-map", keepSourceCover ? "0:v?" : "0:V?");
   args.push("-map", "0:a?");
   if (keepSourceSubtitles) args.push("-map", "0:s?");
-  // MKV attachments (fonts, embedded cover) survive only when no fresh cover
-  // replaces the embedded one.
-  if (container === "mkv" && !addCover && probe.attachmentStreams > 0) {
-    args.push("-map", "0:t?");
+  // Retain fonts and other Matroska attachments, but do not carry the stale
+  // cover attachment forward when a fresh thumbnail replaces it. The probe
+  // gives global stream indexes so this can be done without dropping fonts.
+  const attachmentIndexes = probe.attachmentStreamIndices ?? [];
+  const replacedCoverIndexes = addCover ? new Set(probe.coverAttachmentStreamIndices ?? []) : new Set<number>();
+  const retainedAttachmentIndexes = attachmentIndexes.filter((index) => !replacedCoverIndexes.has(index));
+  if (container === "mkv" && probe.attachmentStreams > 0) {
+    if (attachmentIndexes.length > 0) {
+      for (const index of retainedAttachmentIndexes) args.push("-map", `0:${index}`);
+    } else {
+      // Defensive fallback for callers with a legacy/incomplete probe.
+      args.push("-map", "0:t?");
+    }
   }
-  if (addCover) {
+  if (addCover && container !== "mkv") {
     args.push("-map", `${coverInput}:v`);
     args.push("-disposition:v:" + probe.videoStreams, "attached_pic");
+  }
+  if (addCover && container === "mkv") {
+    const attachmentOutputIndex = retainedAttachmentIndexes.length;
+    args.push("-attach", coverPath!);
+    args.push(`-metadata:s:t:${attachmentOutputIndex}`, "mimetype=image/jpeg");
+    args.push(`-metadata:s:t:${attachmentOutputIndex}`, "filename=cover.jpg");
   }
   subtitleInputs.forEach((_, index) => {
     args.push("-map", `${1 + index}:s:0`);

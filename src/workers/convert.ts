@@ -143,6 +143,8 @@ const EMPTY_PROBE: MediaStreamProbe = {
   audioStreams: 0,
   subtitleStreams: 0,
   attachmentStreams: 0,
+  attachmentStreamIndices: [],
+  coverAttachmentStreamIndices: [],
   hasAttachedPicture: false,
   hasCoverAttachment: false,
 };
@@ -591,7 +593,9 @@ async function convertJob(job: Job, config: Config, id: number): Promise<void> {
       const alreadyTarget = sourceContainer === container;
       const cover = preparedCover && supportsCoverArt(container) ? preparedCover : null;
       // A fresh sidecar cover replaces the source's own art; never add a second.
-      const addCover = Boolean(cover) && !probe.hasAttachedPicture && !probe.hasCoverAttachment;
+      // The downloaded sidecar is authoritative: replace a cover yt-dlp may
+      // already have embedded instead of silently keeping stale art.
+      const addCover = Boolean(cover);
       // A sidecar subtitle set replaces whatever the source carries, so a
       // retried embed cannot duplicate tracks.
       const addSubtitles = embed.subtitles.length > 0;
