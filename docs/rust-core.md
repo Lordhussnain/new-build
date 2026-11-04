@@ -19,6 +19,9 @@ TypeScript call sites remain compatible; every native fast path is optional.
 | `src/reconcile.ts` | Stale-claim thresholds/predicates, cooldown modifiers, partial sidecar paths and orphan/partial cleanup decisions | Filesystem walks/removal, resume-path discovery, SQLite sweeps and superseded-file recovery |
 | `src/scanner.ts` | Batched listing-field parsing, video/playlist/channel classification, channel/Shorts suffixes, compatible YouTube URL normalization, Shorts decisions and pure ingest-plan values | Streaming UTF-8 decoding, ECMAScript `parseFloat`, yt-dlp execution, source expansion, bulk dedupe lookups, metadata-validated archive reuse, index allocation and SQLite transactions |
 | `src/archive.ts` | One-pass unique ID extraction in stable order and exact archive-record removal/filtering | UTF-8 file decoding, existence/version checks, scan-scoped cache invalidation, reads/writes/appends and the returned `Set` |
+| `src/metadata-files.ts` | Case-insensitive sidecar discovery, metadata-kind presence, persisted unavailable-kind filtering and missing-kind planning | Directory reads, SQLite metadata state and all file operations |
+| `src/subtitles.ts` | Live-chat-safe language selectors, yt-dlp subtitle arguments, embeddable-file classification, sidecar language extraction and ISO-639 conversion | Metadata worker orchestration, sidecar discovery and subtitle file I/O |
+| `src/media-embed.ts` | ffmpeg stream-banner parsing, container capabilities, remux/MP3 argv, language tags and cover-normalization arguments | ffmpeg probing/execution, path construction, temporary files, conversion claims and media replacement |
 
 The native functions are synchronous and CPU-only. Batch APIs amortize the N-API
 boundary over up to 5,000 available listing lines and over ingest items without
@@ -33,8 +36,8 @@ compatibility paths instead of risking parser differences.
 ## TypeScript connection audit
 
 `native/src/lib.rs` is the single N-API boundary and `src/native-core.ts` is the
-single TypeScript loader/bridge. The bridge currently checks **56 exports at ABI
-4** before a binary can be used. `tests/native-core.test.ts` also checks that
+single TypeScript loader/bridge. The bridge currently checks **73 exports at ABI
+5** before a binary can be used. `tests/native-core.test.ts` also checks that
 every Rust module is registered and every export has an explicit TypeScript
 consumer. `abiVersion` is consumed by the loader itself. `defaultConfig` is a
 direct parity contract only: shipped defaults intentionally remain owned by

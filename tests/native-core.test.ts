@@ -345,4 +345,92 @@ describe("Rust native core", () => {
       "remove",
     ))).toEqual({ text: "youtube keep\r\n", changed: true });
   });
+
+  test.skipIf(unavailable)("native metadata, subtitle and ffmpeg planning preserve sidecar and argv contracts", () => {
+    expect(nativeValue<string[]>(nativeCore!.findSidecarFiles(
+      JSON.stringify(["001.en.SRT", "001.INFO.JSON", "001.jpg", "0012.jpg", "001.MP4"]),
+      "001",
+      "001.mp4",
+    ))).toEqual(["001.en.SRT", "001.INFO.JSON", "001.jpg"]);
+    expect(nativeValue<string[]>(nativeCore!.parseUnavailableMetadataKinds(
+      '["thumbnail","unknown","thumbnail",1,"subtitles"]',
+    ))).toEqual(["thumbnail", "subtitles"]);
+    expect(nativeValue<boolean>(nativeCore!.hasMetadataKind(
+      JSON.stringify(["001.en.SRT"]),
+      "subtitles",
+    ))).toBe(true);
+    expect(nativeValue<string[]>(nativeCore!.updateUnavailableMetadataKinds(JSON.stringify({
+      sidecars: ["001.jpg"],
+      previouslyUnavailable: '["thumbnail","subtitles"]',
+      attempted: ["thumbnail", "description"],
+    })))).toEqual(["subtitles", "description"]);
+    expect(nativeValue<string[]>(nativeCore!.missingMetadataKinds(JSON.stringify({
+      sidecars: ["001.en.srt"],
+      requested: { subtitles: true, thumbnail: true, description: true, infoJson: true },
+      unavailable: ["thumbnail"],
+    })))).toEqual(["description", "infoJson"]);
+
+    expect(nativeValue<string>(nativeCore!.subtitleSelector("en,es,,"))).toBe("en,es,-live_chat");
+    expect(nativeValue<string[]>(nativeCore!.subtitleArgs(JSON.stringify({
+      subtitleLanguages: "all",
+      subtitleFormat: "",
+    })))).toEqual([
+      "--write-subs", "--write-auto-subs", "--sub-langs", "all.*,-live_chat", "--convert-subs", "srt",
+    ]);
+    expect(nativeValue<boolean>(nativeCore!.isEmbeddableSubtitleFile("001.en.SSA"))).toBe(true);
+    expect(nativeValue<string | null>(nativeCore!.parseSubtitleLanguage(
+      "001 - Video.zh-Hans.vtt",
+      "001 - Video",
+    ))).toBe("zh-hans");
+    expect(nativeValue<string>(nativeCore!.iso639_2("iw"))).toBe("heb");
+    expect(nativeValue<string>(nativeCore!.iso639_2("😀a"))).toBe("😀a");
+
+    const probe = nativeValue<any>(nativeCore!.parseMediaStreamProbe([
+      "  Stream #0:0: Video: h264, yuv420p",
+      "  Stream #0:1(eng): Audio: aac",
+      "  Stream #0:2: Subtitle: subrip",
+      "  Stream #0:3: Video: mjpeg, 320x180 (attached pic)",
+      "  Stream #0:4: Attachment: cover.jpg",
+      "  Stream #0:5: Data: bin_data",
+    ].join("\n")));
+    expect(probe).toEqual({
+      videoStreams: 1,
+      audioStreams: 1,
+      subtitleStreams: 1,
+      attachmentStreams: 1,
+      hasAttachedPicture: true,
+      hasCoverAttachment: true,
+    });
+    expect(nativeValue<string | null>(nativeCore!.subtitleCodecFor("mp4"))).toBe("mov_text");
+    expect(nativeValue<boolean>(nativeCore!.supportsCoverArt("webm"))).toBe(false);
+
+    const remux = nativeValue<string[]>(nativeCore!.buildRemuxArgs(JSON.stringify({
+      sourcePath: "in.mkv",
+      outputPath: "out.mp4",
+      container: "mp4",
+      probe: { ...probe, hasAttachedPicture: false },
+      subtitles: [{ path: "001.en.srt", language: "en" }],
+      coverPath: "001.jpg",
+    })));
+    expect(remux).toEqual([
+      "-y", "-i", "in.mkv", "-i", "001.en.srt", "-i", "001.jpg",
+      "-map", "0:V?", "-map", "0:a?", "-map", "2:v", "-disposition:v:1", "attached_pic",
+      "-map", "1:s:0", "-metadata:s:s:0", "language=eng", "-c:v", "copy", "-c:a", "aac",
+      "-c:s", "mov_text", "-map_metadata", "0", "-map_chapters", "0", "-movflags", "+faststart", "out.mp4",
+    ]);
+    expect(nativeValue<string[]>(nativeCore!.buildMp3Args(JSON.stringify({
+      sourcePath: "in.m4a",
+      outputPath: "out.mp3",
+      probe,
+      coverPath: null,
+    })))).toEqual([
+      "-y", "-i", "in.m4a", "-map", "0:a:0", "-map", "0:v:0?", "-c:v", "copy",
+      "-disposition:v:0", "attached_pic", "-c:a", "libmp3lame", "-q:a", "2",
+      "-map_metadata", "0", "-id3v2_version", "3", "out.mp3",
+    ]);
+    expect(nativeValue<boolean>(nativeCore!.coverNeedsJpeg("001.JPEG"))).toBe(false);
+    expect(nativeValue<string[]>(nativeCore!.coverToJpegArgs("001.webp", "cover.jpg"))).toEqual([
+      "-y", "-i", "001.webp", "-frames:v", "1", "-c:v", "mjpeg", "-q:v", "2", "cover.jpg",
+    ]);
+  });
 });

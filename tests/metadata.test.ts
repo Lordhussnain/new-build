@@ -102,4 +102,29 @@ describe("metadata sidecar discovery", () => {
       ),
     ).toEqual(["subtitles", "description"]);
   });
+
+  test("canonical unavailable state preserves first-appearance order without duplicate attempts", () => {
+    expect(parseUnavailableMetadataKinds(
+      '["infoJson","subtitles","thumbnail","subtitles","description","infoJson"]',
+    )).toEqual(["infoJson", "subtitles", "thumbnail", "description"]);
+    expect(updateUnavailableMetadataKinds(
+      [],
+      '["subtitles","thumbnail"]',
+      ["subtitles", "description", "subtitles", "infoJson"],
+    )).toEqual(["subtitles", "thumbnail", "description", "infoJson"]);
+  });
+
+  test("classification retains directory order and excludes unrecognised subtitle sidecars", () => {
+    expect(findSidecarFiles(
+      ["Movie.ZH-HANS.VTT", "Movie.en.ssa", "Movie.info.json", "Movie.jpg", "Other.en.srt"],
+      "movie",
+      "Movie.mkv",
+    )).toEqual(["Movie.ZH-HANS.VTT", "Movie.info.json", "Movie.jpg"]);
+    expect(missingMetadataKinds([], {
+      infoJson: true,
+      description: true,
+      thumbnail: false,
+      subtitles: true,
+    })).toEqual(["subtitles", "description", "infoJson"]);
+  });
 });

@@ -3,7 +3,23 @@
 //
 // Pure module: both the metadata worker (which fetches the sidecar files) and
 // the converter (which embeds them into the media) use it, and `download-args`
-// may use it without importing a worker.
+// may use it without importing a worker. Rust provides the same pure planning
+// fast path; no subprocess or filesystem work crosses the native boundary.
+
+import { NativeCoreError, nativeCore, nativeValue } from "./native-core";
+
+function invalidNativeSubtitleResult(detail: string): never {
+  throw new NativeCoreError(
+    `Rust native core returned an invalid subtitle result (${detail})`,
+    "NATIVE_INVALID_RESPONSE",
+  );
+}
+
+function subtitleSelectorTypeScript(languages: string): string {
+  const langs = (languages || "").trim();
+  const base = (!langs || langs.toLowerCase() === "all" ? "all.*" : langs).replace(/,+$/, "");
+  return /live[_-]?chat/i.test(base) ? base : `${base},-live_chat`;
+}
 
 /**
  * The yt-dlp `--sub-langs` value for the operator's setting.
@@ -15,13 +31,13 @@
  * timeout — so it is excluded unless the operator asked for it by name.
  */
 export function subtitleSelector(languages: string): string {
-  const langs = (languages || "").trim();
-  const base = (!langs || langs.toLowerCase() === "all" ? "all.*" : langs).replace(/,+$/, "");
-  return /live[_-]?chat/i.test(base) ? base : `${base},-live_chat`;
+  if (nativeCore && languages.isWellFormed()) {
+    return nativeValue<string>(nativeCore.subtitleSelector(languages));
+  }
+  return subtitleSelectorTypeScript(languages);
 }
 
-/** The yt-dlp flags that write subtitle sidecar files (pure, unit-tested). */
-export function subtitleArgs(config: {
+function subtitleArgsTypeScript(config: {
   subtitleLanguages: string;
   subtitleFormat: string;
 }): string[] {
@@ -29,18 +45,51 @@ export function subtitleArgs(config: {
     "--write-subs",
     "--write-auto-subs",
     "--sub-langs",
-    subtitleSelector(config.subtitleLanguages),
+    subtitleSelectorTypeScript(config.subtitleLanguages),
     "--convert-subs",
     config.subtitleFormat || "srt",
   ];
 }
 
+/** The yt-dlp flags that write subtitle sidecar files (pure, unit-tested). */
+export function subtitleArgs(config: {
+  subtitleLanguages: string;
+  subtitleFormat: string;
+}): string[] {
+  if (nativeCore && config.subtitleLanguages.isWellFormed() && config.subtitleFormat.isWellFormed()) {
+    const args = nativeValue<unknown>(nativeCore.subtitleArgs(JSON.stringify(config)));
+    if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) {
+      return invalidNativeSubtitleResult("expected an argument string array");
+    }
+    return args;
+  }
+  return subtitleArgsTypeScript(config);
+}
+
 /** Subtitle file extensions ffmpeg can read as an input track. */
 export const EMBEDDABLE_SUBTITLE_EXTENSIONS = [".srt", ".vtt", ".ass", ".ssa"] as const;
 
-export function isEmbeddableSubtitleFile(filename: string): boolean {
+function isEmbeddableSubtitleFileTypeScript(filename: string): boolean {
   const lower = filename.toLowerCase();
   return EMBEDDABLE_SUBTITLE_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+
+export function isEmbeddableSubtitleFile(filename: string): boolean {
+  if (nativeCore && filename.isWellFormed()) {
+    return nativeValue<boolean>(nativeCore.isEmbeddableSubtitleFile(filename));
+  }
+  return isEmbeddableSubtitleFileTypeScript(filename);
+}
+
+function parseSubtitleLanguageTypeScript(filename: string, mediaBase: string): string | null {
+  const prefix = `${mediaBase}.`.toLowerCase();
+  const lower = filename.toLowerCase();
+  if (!lower.startsWith(prefix)) return null;
+  const rest = lower.slice(prefix.length);
+  if (!isEmbeddableSubtitleFileTypeScript(rest)) return null;
+  const tag = rest.replace(/\.[^.]+$/, "");
+  if (!tag) return null;
+  return /^[a-z]{2,3}(?:[-_][a-z0-9]{2,8})*$/.test(tag) ? tag : null;
 }
 
 /**
@@ -52,14 +101,14 @@ export function isEmbeddableSubtitleFile(filename: string): boolean {
  * than tagged with a whole title.
  */
 export function parseSubtitleLanguage(filename: string, mediaBase: string): string | null {
-  const prefix = `${mediaBase}.`.toLowerCase();
-  const lower = filename.toLowerCase();
-  if (!lower.startsWith(prefix)) return null;
-  const rest = lower.slice(prefix.length);
-  if (!isEmbeddableSubtitleFile(rest)) return null;
-  const tag = rest.replace(/\.[^.]+$/, "");
-  if (!tag) return null;
-  return /^[a-z]{2,3}(?:[-_][a-z0-9]{2,8})*$/.test(tag) ? tag : null;
+  if (nativeCore && filename.isWellFormed() && mediaBase.isWellFormed()) {
+    const language = nativeValue<unknown>(nativeCore.parseSubtitleLanguage(filename, mediaBase));
+    if (language !== null && typeof language !== "string") {
+      return invalidNativeSubtitleResult("expected a language string or null");
+    }
+    return language;
+  }
+  return parseSubtitleLanguageTypeScript(filename, mediaBase);
 }
 
 /**
@@ -91,10 +140,17 @@ const ISO639_1_TO_2: Record<string, string> = {
   iw: "heb", in: "ind", ji: "yid", jw: "jav", mo: "ron",
 };
 
-export function iso639_2(language: string | null | undefined): string {
+function iso639_2TypeScript(language: string | null | undefined): string {
   if (!language) return "und";
   const base = language.toLowerCase().split(/[-_]/)[0]?.trim() ?? "";
   if (!base) return "und";
   if (base.length === 3) return base;
   return ISO639_1_TO_2[base] ?? "und";
+}
+
+export function iso639_2(language: string | null | undefined): string {
+  if (nativeCore && (!language || language.isWellFormed())) {
+    return nativeValue<string>(nativeCore.iso639_2(language));
+  }
+  return iso639_2TypeScript(language);
 }

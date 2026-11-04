@@ -11,7 +11,9 @@
 //
 // Pure module (no spawning): the converter probes the source with ffmpeg and
 // passes the parsed stream list in, so the argument contract is unit-testable.
+// Rust implements the same parser/planner; ffmpeg execution stays in Bun.
 
+import { NativeCoreError, nativeCore, nativeValue } from "./native-core";
 import { iso639_2 } from "./subtitles";
 
 export interface MediaStreamProbe {
@@ -36,15 +38,37 @@ export const EMPTY_MEDIA_PROBE: MediaStreamProbe = {
   hasCoverAttachment: false,
 };
 
-/**
- * Parse the stream list from ffmpeg's `-i` banner.
- *
- * Real lines look like:
- *   Stream #0:2(eng): Subtitle: subrip (srt)
- *   Stream #0:3: Video: mjpeg (Baseline), 320x180 (attached pic)
- *   Stream #0:4: Attachment: cover.jpg
- */
-export function parseMediaStreamProbe(banner: string): MediaStreamProbe {
+function invalidNativeMediaResult(detail: string): never {
+  throw new NativeCoreError(
+    `Rust native core returned an invalid media result (${detail})`,
+    "NATIVE_INVALID_RESPONSE",
+  );
+}
+
+function mediaProbeResult(value: unknown): MediaStreamProbe {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return invalidNativeMediaResult("expected a stream probe object");
+  }
+  const probe = value as Record<string, unknown>;
+  const counts = ["videoStreams", "audioStreams", "subtitleStreams", "attachmentStreams"] as const;
+  const flags = ["hasAttachedPicture", "hasCoverAttachment"] as const;
+  if (
+    counts.some((key) => !Number.isSafeInteger(probe[key]) || (probe[key] as number) < 0) ||
+    flags.some((key) => typeof probe[key] !== "boolean")
+  ) {
+    return invalidNativeMediaResult("malformed stream counts or flags");
+  }
+  return probe as unknown as MediaStreamProbe;
+}
+
+function argumentResult(value: unknown): string[] {
+  if (!Array.isArray(value) || value.some((argument) => typeof argument !== "string")) {
+    return invalidNativeMediaResult("expected an argument string array");
+  }
+  return value;
+}
+
+function parseMediaStreamProbeTypeScript(banner: string): MediaStreamProbe {
   const probe: MediaStreamProbe = { ...EMPTY_MEDIA_PROBE };
   const streamLine = /^\s*Stream #\d+:\d+(?:\([^)]*\))?:\s*(Video|Audio|Subtitle|Attachment|Data):/i;
   for (const line of banner.split(/\r?\n/)) {
@@ -70,8 +94,22 @@ export function parseMediaStreamProbe(banner: string): MediaStreamProbe {
   return probe;
 }
 
-/** Containers that can carry subtitle tracks, and the codec ffmpeg needs. */
-export function subtitleCodecFor(container: string): string | null {
+/**
+ * Parse the stream list from ffmpeg's `-i` banner.
+ *
+ * Real lines look like:
+ *   Stream #0:2(eng): Subtitle: subrip (srt)
+ *   Stream #0:3: Video: mjpeg (Baseline), 320x180 (attached pic)
+ *   Stream #0:4: Attachment: cover.jpg
+ */
+export function parseMediaStreamProbe(banner: string): MediaStreamProbe {
+  if (nativeCore && banner.isWellFormed()) {
+    return mediaProbeResult(nativeValue<unknown>(nativeCore.parseMediaStreamProbe(banner)));
+  }
+  return parseMediaStreamProbeTypeScript(banner);
+}
+
+function subtitleCodecForTypeScript(container: string): string | null {
   switch (container) {
     case "mp4":
       return "mov_text";
@@ -84,9 +122,28 @@ export function subtitleCodecFor(container: string): string | null {
   }
 }
 
+/** Containers that can carry subtitle tracks, and the codec ffmpeg needs. */
+export function subtitleCodecFor(container: string): string | null {
+  if (nativeCore && container.isWellFormed()) {
+    const codec = nativeValue<unknown>(nativeCore.subtitleCodecFor(container));
+    if (codec !== null && typeof codec !== "string") {
+      return invalidNativeMediaResult("expected a subtitle codec or null");
+    }
+    return codec;
+  }
+  return subtitleCodecForTypeScript(container);
+}
+
+function supportsCoverArtTypeScript(container: string): boolean {
+  return container === "mp4" || container === "mkv" || container === "m4a" || container === "mp3";
+}
+
 /** Containers that can carry cover art. WebM cannot. */
 export function supportsCoverArt(container: string): boolean {
-  return container === "mp4" || container === "mkv" || container === "m4a" || container === "mp3";
+  if (nativeCore && container.isWellFormed()) {
+    return nativeValue<boolean>(nativeCore.supportsCoverArt(container));
+  }
+  return supportsCoverArtTypeScript(container);
 }
 
 export interface SubtitleEmbedInput {
@@ -106,26 +163,15 @@ export interface RemuxInput {
   coverPath: string | null;
 }
 
-/**
- * The full ffmpeg argv (without the binary) for the post-download remux:
- * target container, embedded subtitle sidecars, cover art, chapters and tags.
- *
- * Stream rules:
- *  - a sidecar subtitle set is authoritative — existing subtitle tracks are
- *    dropped and re-added, so a retried embed can never duplicate languages;
- *  - a sidecar cover replaces the source's art; otherwise the source's cover
- *    (attached-pic stream or MKV attachment) is carried over;
- *  - video and audio are stream-copied (mp4 audio becomes AAC, as before).
- */
-export function buildRemuxArgs(input: RemuxInput): string[] {
+function buildRemuxArgsTypeScript(input: RemuxInput): string[] {
   const { sourcePath, outputPath, container, probe, coverPath } = input;
-  const subtitleCodec = subtitleCodecFor(container);
+  const subtitleCodec = subtitleCodecForTypeScript(container);
   const subtitleInputs = subtitleCodec ? input.subtitles : [];
 
   const args = ["-y", "-i", sourcePath];
   for (const sub of subtitleInputs) args.push("-i", sub.path);
   const coverInput = 1 + subtitleInputs.length;
-  const addCover = Boolean(coverPath) && supportsCoverArt(container);
+  const addCover = Boolean(coverPath) && supportsCoverArtTypeScript(container);
   if (addCover) args.push("-i", coverPath!);
 
   // Keep the source's own subtitles only when no sidecar set replaces them.
@@ -133,7 +179,7 @@ export function buildRemuxArgs(input: RemuxInput): string[] {
   // A cover the target cannot store would make ffmpeg fail (WebM), so it is
   // dropped there instead of being mapped.
   const keepSourceCover =
-    !addCover && (supportsCoverArt(container) || !probe.hasAttachedPicture);
+    !addCover && (supportsCoverArtTypeScript(container) || !probe.hasAttachedPicture);
 
   args.push("-map", keepSourceCover ? "0:v?" : "0:V?");
   args.push("-map", "0:a?");
@@ -166,6 +212,39 @@ export function buildRemuxArgs(input: RemuxInput): string[] {
   return args;
 }
 
+function nativeCompatibleProbe(probe: MediaStreamProbe): boolean {
+  const counts = [probe.videoStreams, probe.audioStreams, probe.subtitleStreams, probe.attachmentStreams];
+  return counts.every((count) => Number.isSafeInteger(count) && count >= 0) &&
+    typeof probe.hasAttachedPicture === "boolean" && typeof probe.hasCoverAttachment === "boolean";
+}
+
+function nativeCompatibleRemux(input: RemuxInput): boolean {
+  return nativeCompatibleProbe(input.probe) &&
+    input.sourcePath.isWellFormed() && input.outputPath.isWellFormed() && input.container.isWellFormed() &&
+    (input.coverPath === null || input.coverPath.isWellFormed()) &&
+    input.subtitles.every((subtitle) =>
+      subtitle.path.isWellFormed() && (subtitle.language === null || subtitle.language.isWellFormed())
+    );
+}
+
+/**
+ * The full ffmpeg argv (without the binary) for the post-download remux:
+ * target container, embedded subtitle sidecars, cover art, chapters and tags.
+ *
+ * Stream rules:
+ *  - a sidecar subtitle set is authoritative — existing subtitle tracks are
+ *    dropped and re-added, so a retried embed can never duplicate languages;
+ *  - a sidecar cover replaces the source's art; otherwise the source's cover
+ *    (attached-pic stream or MKV attachment) is carried over;
+ *  - video and audio are stream-copied (mp4 audio becomes AAC, as before).
+ */
+export function buildRemuxArgs(input: RemuxInput): string[] {
+  if (nativeCore && nativeCompatibleRemux(input)) {
+    return argumentResult(nativeValue<unknown>(nativeCore.buildRemuxArgs(JSON.stringify(input))));
+  }
+  return buildRemuxArgsTypeScript(input);
+}
+
 export interface Mp3Input {
   sourcePath: string;
   outputPath: string;
@@ -174,12 +253,7 @@ export interface Mp3Input {
   coverPath: string | null;
 }
 
-/**
- * MP3 transcode argv. The old command used `-vn`, which silently threw away
- * the cover art yt-dlp had embedded; the cover is now carried (or added) as
- * the ID3 attached picture.
- */
-export function buildMp3Args(input: Mp3Input): string[] {
+function buildMp3ArgsTypeScript(input: Mp3Input): string[] {
   const { sourcePath, outputPath, probe, coverPath } = input;
   const args = ["-y", "-i", sourcePath, "-map", "0:a:0"];
   if (coverPath) {
@@ -204,12 +278,38 @@ export function buildMp3Args(input: Mp3Input): string[] {
   return args;
 }
 
+/**
+ * MP3 transcode argv. The old command used `-vn`, which silently threw away
+ * the cover art yt-dlp had embedded; the cover is now carried (or added) as
+ * the ID3 attached picture.
+ */
+export function buildMp3Args(input: Mp3Input): string[] {
+  if (
+    nativeCore && nativeCompatibleProbe(input.probe) &&
+    input.sourcePath.isWellFormed() && input.outputPath.isWellFormed() &&
+    (input.coverPath === null || input.coverPath.isWellFormed())
+  ) {
+    return argumentResult(nativeValue<unknown>(nativeCore.buildMp3Args(JSON.stringify(input))));
+  }
+  return buildMp3ArgsTypeScript(input);
+}
+
+function coverNeedsJpegTypeScript(coverPath: string): boolean {
+  return !/\.(?:jpe?g)$/i.test(coverPath);
+}
+
 /** ffmpeg needs a JPEG/PNG for cover art in every container we write. */
 export function coverNeedsJpeg(coverPath: string): boolean {
-  return !/\.(?:jpe?g)$/i.test(coverPath);
+  if (nativeCore && coverPath.isWellFormed()) {
+    return nativeValue<boolean>(nativeCore.coverNeedsJpeg(coverPath));
+  }
+  return coverNeedsJpegTypeScript(coverPath);
 }
 
 /** argv (without the binary) that normalises any image to a single JPEG frame. */
 export function coverToJpegArgs(sourcePath: string, outputPath: string): string[] {
+  if (nativeCore && sourcePath.isWellFormed() && outputPath.isWellFormed()) {
+    return argumentResult(nativeValue<unknown>(nativeCore.coverToJpegArgs(sourcePath, outputPath)));
+  }
   return ["-y", "-i", sourcePath, "-frames:v", "1", "-c:v", "mjpeg", "-q:v", "2", outputPath];
 }

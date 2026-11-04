@@ -9,7 +9,7 @@ import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const NATIVE_ABI_VERSION = 4;
+export const NATIVE_ABI_VERSION = 5;
 
 export interface NativeCore {
   abiVersion(): number;
@@ -68,6 +68,23 @@ export interface NativeCore {
   prepareIngestBatch(request: string): string;
   parseArchiveIds(text: string): string;
   removeArchiveId(text: string, videoId: string): string;
+  findSidecarFiles(entries: string, mediaBase: string, mediaFilename: string): string;
+  parseUnavailableMetadataKinds(value?: string | null): string;
+  hasMetadataKind(sidecars: string, kind: string): string;
+  updateUnavailableMetadataKinds(request: string): string;
+  missingMetadataKinds(request: string): string;
+  subtitleSelector(languages: string): string;
+  subtitleArgs(config: string): string;
+  isEmbeddableSubtitleFile(filename: string): string;
+  parseSubtitleLanguage(filename: string, mediaBase: string): string;
+  iso639_2(language?: string | null): string;
+  parseMediaStreamProbe(banner: string): string;
+  subtitleCodecFor(container: string): string;
+  supportsCoverArt(container: string): string;
+  buildRemuxArgs(request: string): string;
+  buildMp3Args(request: string): string;
+  coverNeedsJpeg(coverPath: string): string;
+  coverToJpegArgs(sourcePath: string, outputPath: string): string;
 }
 
 export const NATIVE_CORE_METHODS = [
@@ -127,6 +144,23 @@ export const NATIVE_CORE_METHODS = [
   "prepareIngestBatch",
   "parseArchiveIds",
   "removeArchiveId",
+  "findSidecarFiles",
+  "parseUnavailableMetadataKinds",
+  "hasMetadataKind",
+  "updateUnavailableMetadataKinds",
+  "missingMetadataKinds",
+  "subtitleSelector",
+  "subtitleArgs",
+  "isEmbeddableSubtitleFile",
+  "parseSubtitleLanguage",
+  "iso639_2",
+  "parseMediaStreamProbe",
+  "subtitleCodecFor",
+  "supportsCoverArt",
+  "buildRemuxArgs",
+  "buildMp3Args",
+  "coverNeedsJpeg",
+  "coverToJpegArgs",
 ] as const;
 
 export interface NativeIssue {

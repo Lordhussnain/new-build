@@ -5,6 +5,8 @@ mod config;
 mod download_args;
 mod download_output;
 mod lease;
+mod media_embed;
+mod metadata_files;
 mod reconcile;
 mod retry;
 mod runtime;
@@ -12,6 +14,7 @@ mod scaling;
 mod scanner;
 mod settings;
 mod sources;
+mod subtitles;
 mod text;
 mod tools;
 
@@ -21,7 +24,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-const YTA_CORE_ABI_VERSION: u32 = 4;
+const YTA_CORE_ABI_VERSION: u32 = 5;
 
 #[derive(Serialize)]
 struct ErrorBody {
@@ -609,6 +612,138 @@ pub fn native_parse_archive_ids(text: String) -> String {
 #[napi(js_name = "removeArchiveId")]
 pub fn native_remove_archive_id(text: String, video_id: String) -> String {
     guarded(|| success(archive::remove_archive_id(&text, &video_id)))
+}
+
+#[napi(js_name = "findSidecarFiles")]
+pub fn native_find_sidecar_files(
+    entries: String,
+    media_base: String,
+    media_filename: String,
+) -> String {
+    guarded(|| match parse_json::<Vec<String>>(&entries) {
+        Ok(entries) => success(metadata_files::find_sidecar_files(
+            entries,
+            &media_base,
+            &media_filename,
+        )),
+        Err(error) => failure(error),
+    })
+}
+
+#[napi(js_name = "parseUnavailableMetadataKinds")]
+pub fn native_parse_unavailable_metadata_kinds(value: Option<String>) -> String {
+    guarded(|| {
+        success(metadata_files::parse_unavailable_metadata_kinds(
+            value.as_deref(),
+        ))
+    })
+}
+
+#[napi(js_name = "hasMetadataKind")]
+pub fn native_has_metadata_kind(sidecars: String, kind: String) -> String {
+    guarded(|| match parse_json::<Vec<String>>(&sidecars) {
+        Ok(sidecars) => success(metadata_files::has_metadata_kind(&sidecars, &kind)),
+        Err(error) => failure(error),
+    })
+}
+
+#[napi(js_name = "updateUnavailableMetadataKinds")]
+pub fn native_update_unavailable_metadata_kinds(request: String) -> String {
+    guarded(
+        || match parse_json::<metadata_files::UpdateUnavailableRequest>(&request) {
+            Ok(request) => success(metadata_files::update_unavailable_metadata_kinds(request)),
+            Err(error) => failure(error),
+        },
+    )
+}
+
+#[napi(js_name = "missingMetadataKinds")]
+pub fn native_missing_metadata_kinds(request: String) -> String {
+    guarded(
+        || match parse_json::<metadata_files::MissingMetadataRequest>(&request) {
+            Ok(request) => success(metadata_files::missing_metadata_kinds(request)),
+            Err(error) => failure(error),
+        },
+    )
+}
+
+#[napi(js_name = "subtitleSelector")]
+pub fn native_subtitle_selector(languages: String) -> String {
+    guarded(|| success(subtitles::subtitle_selector(&languages)))
+}
+
+#[napi(js_name = "subtitleArgs")]
+pub fn native_subtitle_args(config: String) -> String {
+    guarded(|| match parse_json::<subtitles::SubtitleArgsConfig>(&config) {
+        Ok(config) => success(subtitles::subtitle_args(config)),
+        Err(error) => failure(error),
+    })
+}
+
+#[napi(js_name = "isEmbeddableSubtitleFile")]
+pub fn native_is_embeddable_subtitle_file(filename: String) -> String {
+    guarded(|| success(subtitles::is_embeddable_subtitle_file(&filename)))
+}
+
+#[napi(js_name = "parseSubtitleLanguage")]
+pub fn native_parse_subtitle_language(filename: String, media_base: String) -> String {
+    guarded(|| {
+        success(subtitles::parse_subtitle_language(
+            &filename,
+            &media_base,
+        ))
+    })
+}
+
+#[napi(js_name = "iso639_2")]
+pub fn native_iso639_2(language: Option<String>) -> String {
+    guarded(|| success(subtitles::iso639_2(language.as_deref())))
+}
+
+#[napi(js_name = "parseMediaStreamProbe")]
+pub fn native_parse_media_stream_probe(banner: String) -> String {
+    guarded(|| success(media_embed::parse_media_stream_probe(&banner)))
+}
+
+#[napi(js_name = "subtitleCodecFor")]
+pub fn native_subtitle_codec_for(container: String) -> String {
+    guarded(|| success(media_embed::subtitle_codec_for(&container)))
+}
+
+#[napi(js_name = "supportsCoverArt")]
+pub fn native_supports_cover_art(container: String) -> String {
+    guarded(|| success(media_embed::supports_cover_art(&container)))
+}
+
+#[napi(js_name = "buildRemuxArgs")]
+pub fn native_build_remux_args(request: String) -> String {
+    guarded(|| match parse_json::<media_embed::RemuxInput>(&request) {
+        Ok(request) => success(media_embed::build_remux_args(request)),
+        Err(error) => failure(error),
+    })
+}
+
+#[napi(js_name = "buildMp3Args")]
+pub fn native_build_mp3_args(request: String) -> String {
+    guarded(|| match parse_json::<media_embed::Mp3Input>(&request) {
+        Ok(request) => success(media_embed::build_mp3_args(request)),
+        Err(error) => failure(error),
+    })
+}
+
+#[napi(js_name = "coverNeedsJpeg")]
+pub fn native_cover_needs_jpeg(cover_path: String) -> String {
+    guarded(|| success(media_embed::cover_needs_jpeg(&cover_path)))
+}
+
+#[napi(js_name = "coverToJpegArgs")]
+pub fn native_cover_to_jpeg_args(source_path: String, output_path: String) -> String {
+    guarded(|| {
+        success(media_embed::cover_to_jpeg_args(
+            &source_path,
+            &output_path,
+        ))
+    })
 }
 
 #[cfg(test)]

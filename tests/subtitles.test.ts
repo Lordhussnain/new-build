@@ -23,7 +23,13 @@ describe("subtitleSelector", () => {
 
   test("an explicit live-chat request is respected", () => {
     expect(subtitleSelector("live_chat")).toBe("live_chat");
+    expect(subtitleSelector("LIVE-CHAT")).toBe("LIVE-CHAT");
     expect(subtitleSelector("all.*,-live_chat")).toBe("all.*,-live_chat");
+  });
+
+  test("only trailing commas are removed before the live-chat exclusion", () => {
+    expect(subtitleSelector("en,es,,")).toBe("en,es,-live_chat");
+    expect(subtitleSelector(",,")).toBe(",-live_chat");
   });
 });
 
@@ -48,9 +54,17 @@ describe("parseSubtitleLanguage", () => {
   test("only ffmpeg-readable subtitle extensions count", () => {
     expect(EMBEDDABLE_SUBTITLE_EXTENSIONS).toContain(".srt");
     expect(isEmbeddableSubtitleFile("a.en.srt")).toBe(true);
+    expect(isEmbeddableSubtitleFile("a.en.SSA")).toBe(true);
     expect(isEmbeddableSubtitleFile("a.en.lrc")).toBe(false);
     expect(isEmbeddableSubtitleFile("a.info.json")).toBe(false);
     expect(parseSubtitleLanguage("001 - Video.en.lrc", "001 - Video")).toBeNull();
+  });
+
+  test("language variants have bounded ASCII segments", () => {
+    expect(parseSubtitleLanguage("001.pt_BR.srt", "001")).toBe("pt_br");
+    expect(parseSubtitleLanguage("001.en-.srt", "001")).toBeNull();
+    expect(parseSubtitleLanguage("001.en-abcdefghijk.srt", "001")).toBeNull();
+    expect(parseSubtitleLanguage("001.e.srt", "001")).toBeNull();
   });
 });
 
@@ -70,5 +84,8 @@ describe("iso639_2", () => {
     expect(iso639_2("")).toBe("und");
     expect(iso639_2(null)).toBe("und");
     expect(iso639_2("zz")).toBe("und");
+    expect(iso639_2(" en -US")).toBe("eng");
+    // The legacy three-code-unit pass-through uses UTF-16 length, not bytes.
+    expect(iso639_2("😀a")).toBe("😀a");
   });
 });

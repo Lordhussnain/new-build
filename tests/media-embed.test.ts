@@ -66,6 +66,26 @@ describe("parseMediaStreamProbe", () => {
   test("an unreadable banner is an empty probe, never a crash", () => {
     expect(parseMediaStreamProbe("video.mp4: No such file or directory")).toEqual(EMPTY_MEDIA_PROBE);
   });
+
+  test("stream matching keeps ASCII digits, optional language and word-boundary rules", () => {
+    const parsed = parseMediaStreamProbe([
+      "  stream #0:12(en): video: h264",
+      "Stream #0:13(): AUDIO: aac",
+      "Stream #0:14 (eng): Audio: rejected-space-before-language",
+      "Stream #٠:15: Audio: rejected-non-ascii-digit",
+      "Stream #0:16: Attachment: cover_next.jpg",
+      "Stream #0:17: Attachment: prefix attachment:\tCOVER.png",
+      "Stream #0:18: Data: bin_data",
+    ].join("\r\n"));
+    expect(parsed).toEqual({
+      videoStreams: 1,
+      audioStreams: 1,
+      subtitleStreams: 0,
+      attachmentStreams: 2,
+      hasAttachedPicture: false,
+      hasCoverAttachment: true,
+    });
+  });
 });
 
 describe("container capabilities", () => {
@@ -178,6 +198,33 @@ describe("buildRemuxArgs", () => {
     expect(pairs(args, "-map")).toEqual(["0:V?", "0:a?", "1:s:0"]);
     expect(flagValue(args, "-c:s")).toBe("webvtt");
     expect(args).not.toContain("-disposition:v:1");
+  });
+
+  test("unknown languages stay untagged and unsupported containers ignore subtitle inputs", () => {
+    const unknown = buildRemuxArgs({
+      sourcePath: "in.mkv",
+      outputPath: "out.mkv",
+      container: "mkv",
+      probe: probe({ videoStreams: 1 }),
+      subtitles: [{ path: "001.zz.srt", language: "zz" }],
+      coverPath: null,
+    });
+    expect(unknown).not.toContain("language=und");
+    expect(unknown.some((arg) => arg.startsWith("-metadata:s:s:"))).toBe(false);
+
+    const mp3 = buildRemuxArgs({
+      sourcePath: "in.webm",
+      outputPath: "out.mp3",
+      container: "mp3",
+      probe: probe({ audioStreams: 1, subtitleStreams: 1 }),
+      subtitles: [{ path: "001.en.srt", language: "en" }],
+      coverPath: null,
+    });
+    expect(mp3).not.toContain("001.en.srt");
+    // The legacy planner still maps an existing source subtitle stream here;
+    // only the supplied sidecar inputs are ignored for an unsupported target.
+    expect(pairs(mp3, "-map")).toEqual(["0:v?", "0:a?", "0:s?"]);
+    expect(flagValue(mp3, "-c:s")).toBeUndefined();
   });
 });
 
