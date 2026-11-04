@@ -22,7 +22,7 @@ import {
 } from "../db";
 import { computeBackoffMs } from "../retry";
 import { SIDECAR_SUFFIXES, hashFile } from "../util";
-import { updateAbsoluteLine } from "../dashboard";
+import { updateConvertWorkerLine } from "../dashboard";
 import {
   abortController,
   activeConvertJobs,
@@ -30,7 +30,6 @@ import {
   getConfig,
   isPaused,
   stats,
-  workerStatuses,
 } from "../state";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
 import { logError } from "../logger";
@@ -257,6 +256,7 @@ export async function converterWorker(id: number, config: Config): Promise<void>
     });
     activeConvertJobs.set(id, job.id);
     try {
+      updateConvertWorkerLine(id, `⏳ Preparing | ${job.title}`, config);
       await convertJob(job, config, id);
     } catch (err: any) {
       // The failure handler must never break the loop — supervise() would
@@ -691,9 +691,4 @@ async function handleConvertFailure(job: Job, config: Config, err: any, id: numb
     updateConvertWorkerLine(id, `🔁 Retrying in ${Math.max(1, Math.round(backoff / 1000))}s | ${job.title}`, config);
     await Bun.sleep(backoff);
   }
-}
-
-function updateConvertWorkerLine(id: number, text: string, config: Config): void {
-  workerStatuses.set(`CV${id}`, text);
-  updateAbsoluteLine(2 + config.maxDownloadWorkers + id, `[CV${id}] ${text}`);
 }

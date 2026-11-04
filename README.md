@@ -591,9 +591,9 @@ the dashboard showed a network error while the scan kept running — and emitted
 appeared when pressing Ctrl+C. It is gone: the server always passes that
 `idleTimeout` setting now.
 
-The terminal UI carries the same signal: the header line gains a `Res:n` field
-whenever jobs are holding a partial they will resume from, so a paused engine
-reports its resume state without needing the browser open.
+The terminal dashboard also shows `Resumable` (or `Res` in a narrow window)
+when jobs have a recorded partial path, including while the engine is paused.
+This is a count of recorded partials, not a guarantee that every file is usable.
 
 **How resume works with aria2c.** aria2c keeps a *control file* next to every
 in-progress download (`<name>.part.aria2`) recording which pieces have arrived.
@@ -624,9 +624,32 @@ support command-line config or format overrides. Edit settings with the
 interactive `bun run config` manager or, while the engine is running, the
 allowed options in the dashboard Settings panel.
 
-The TUI shows live status for every video across all active workers. The web
-dashboard (`http://127.0.0.1:3000` by default) adds bulk actions, the failed-job
-tab, run history, and a live reliability panel.
+### Terminal dashboard
+
+In an interactive terminal the dashboard keeps a status panel above the
+scrolling activity log. It shows whether the engine is **RUNNING**, **PAUSED**
+(with its reason), or **OFFLINE**, together with downloaded/total, active
+**download** slots, queued and failed jobs, paused jobs when present, transfer
+rate and recorded resumable partials. `Failed` includes failures in any pipeline
+stage; `Queued` counts downloads in the pending state. Downloaded means the
+download stage is complete; a file may still be waiting for metadata or
+conversion. The web URL is shown when it fits and is always printed in the
+startup log.
+
+Worker rows are labeled `DL` (download), `CV` (conversion), and `MD` (metadata).
+Download progress includes a bar, percentage, speed and ETA when available and
+when the terminal is wide enough. On shorter screens active workers take
+priority; `+N more workers` reports the hidden rows and, if active work does not
+fit, cycles through it every eight seconds. Enlarge the window to see more rows.
+At least four rows remain available for the activity log.
+
+The panel needs at least **40 columns × 11 rows**. Smaller windows use ordinary
+logs and automatically restore the panel when enlarged. Piped output and
+`TERM=dumb` stay in plain-log mode; set `NO_COLOR` or `CLICOLOR=0` to keep the
+panel but disable its colors. `Ctrl+C` requests a graceful stop.
+
+The web dashboard (`http://127.0.0.1:3000` by default) adds bulk actions, the
+failed-job tab, run history, and a live reliability panel.
 
 ## Architecture
 

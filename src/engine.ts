@@ -302,10 +302,11 @@ export async function main(): Promise<void> {
     await Promise.all(workers);
   }
 
-  initDashboard(config);
   const uiHost = !bindHost || bindHost === "0.0.0.0" ? "127.0.0.1" : bindHost;
+  const dashboardUrl = `http://${uiHost}:${listenPort}`;
+  initDashboard(config, { webUrl: dashboardUrl });
   console.log(
-    `Web UI: http://${uiHost}:${listenPort}${webToken ? "  (token required)" : ""}${bindHost === "0.0.0.0" ? "  — listening on ALL interfaces (LAN)" : ""}`,
+    `Web UI: ${dashboardUrl}${webToken ? "  (token required)" : ""}${bindHost === "0.0.0.0" ? "  — listening on ALL interfaces (LAN)" : ""}`,
   );
 
   // These services are registered even when the engine starts offline; each

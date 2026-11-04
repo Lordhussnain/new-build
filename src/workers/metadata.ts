@@ -28,7 +28,7 @@ import {
   type MetadataKind,
 } from "../metadata-files";
 import { subtitleArgs } from "../subtitles";
-import { updateAbsoluteLine } from "../dashboard";
+import { updateMetadataWorkerLine } from "../dashboard";
 import {
   abortController,
   activeMetadataJobs,
@@ -36,7 +36,6 @@ import {
   getConfig,
   isPaused,
   stats,
-  workerStatuses,
 } from "../state";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
 import { logError } from "../logger";
@@ -178,6 +177,7 @@ export async function metadataWorker(id: number, config: Config): Promise<void> 
     });
     activeMetadataJobs.set(id, job.id);
     try {
+      updateMetadataWorkerLine(id, `⏳ Preparing | ${job.title}`, config);
       await runMetadataJob(job, config, id, fencing);
     } catch (err: any) {
       // The failure handler must never break the loop — supervise() would
@@ -400,9 +400,4 @@ async function handleMetadataFailure(job: Job, config: Config, err: any, id: num
     updateMetadataWorkerLine(id, `🔁 Retrying in ${Math.max(1, Math.round(backoff / 1000))}s | ${job.title}`, config);
     await Bun.sleep(backoff);
   }
-}
-
-function updateMetadataWorkerLine(id: number, text: string, config: Config): void {
-  workerStatuses.set(`MD${id}`, text);
-  updateAbsoluteLine(2 + config.maxDownloadWorkers + config.maxConcurrentConverts + id, `[MD${id}] ${text}`);
 }

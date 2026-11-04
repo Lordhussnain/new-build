@@ -208,6 +208,9 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
 
     const cookie = createCookieInvocation(config);
     try {
+      // A track probe can take a while; don't leave the previous job's status
+      // visible while this worker has already claimed a new one.
+      updateWorkerLine(id, `⏳ Preparing | ${job.title}`, config);
       await runDownload(id, job, config, cookie.args, fencing);
       stopHeartbeat();
     } catch (err: any) {

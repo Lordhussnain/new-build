@@ -851,7 +851,8 @@ setup; `db` is an exported live ESM binding because `initDatabase()` replaces it
 | `tests/settings.test.ts` | the dashboard settings allow-list, type coercion (including every accepted boolean spelling and the rejection of `"maybe"`/empty — an invalid value must never coerce to `false`), Zod + cross-field validation, persistence, live-config propagation, and auth |
 | `tests/config-manager.test.ts` | every schema key is reachable from `update_config.ts`; the manager reads the sweep thresholds from `STALE_CLAIM_THRESHOLDS` and counts partials with the engine's predicate |
 | `tests/offline-mode.test.ts` | the run-level switch (`--offline`/`YTA_OFFLINE`, last flag wins, argv beats env, unparsable ≠ false), the settings round-trip (live + persisted), `isPathInside` (siblings sharing a prefix are NOT inside), and `relocateFinishedJobs`: move + sidecar + recorded path, idempotence, no-op without `secondaryStoragePath`, crash-window adoption, "already under the root", a non-candidate table (downloading / needs conversion / mid-metadata / failed), a failed move that keeps the only copy, and the stale-path CAS |
-| `tests/dashboard.test.ts` | `formatHeaderLine` counters, and the `Res:n` field appearing only when partials are held |
+| `tests/dashboard.test.ts` | legacy `formatHeaderLine` counters and its conditional `Res:n` field |
+| `tests/tui-layout.test.ts` | responsive frames, paused/offline/resumable state, active-worker overflow rotation, Unicode/control safety, color opt-outs, cursor/scroll handling, resizing and too-small recovery |
 | `tests/web-ui-contract.test.ts` | the dashboard page vs the API it calls: every `/api/…` path `web_ui.html` fetches must resolve, the manual metadata-scan button calls its route and reports the result, and the real inline `<script>` (run over a stub DOM against `handleRequest`) must render one row per job with no `undefined` on a card (gotcha 41) |
 | `tests/integration.test.ts` | **end-to-end engine runs** (see 9.3) |
 
@@ -1063,9 +1064,19 @@ Windows — an environment assumption is still a broken test:
    keep DB writes inside the progress loop cheap.
 9. **Don't add blocking work to the worker claim path.** Long operations belong
    inside the try-block after a claim, or the whole pool stalls.
-10. **TUI vs piped output.** `dashboard.ts` no-ops when `isTty()` is false;
-    log lines must remain parseable when stdout is a pipe (integration tests
-    rely on this).
+10. **TUI vs piped output.** `dashboard.ts` only observes worker/DB snapshots;
+    it must never change jobs. Use its named `updateWorkerLine`,
+    `updateConvertWorkerLine`, and `updateMetadataWorkerLine` helpers rather
+    than computing terminal rows in workers: the download pool can grow live,
+    and the visible worker viewport can change on resize. The frame reserves
+    at least four activity-log rows, prioritizes active workers and rotates them
+    when they overflow. Below 40×11 it falls back to plain logs, with a resize
+    listener even if the initial window was too small. Sanitize untrusted text,
+    fit graphemes to display columns, and leave the last column unused to avoid
+    wrapping; keep rendering bounded so it cannot delay lease heartbeats.
+    `NO_COLOR`/`CLICOLOR=0` disable styles, `TERM=dumb` and piped stdout get no
+    cursor sequences, and shutdown restores the scroll margins. Log lines must
+    remain parseable when stdout is a pipe (integration tests rely on this).
 11. **Backwards compatibility.** Existing users have `archive.db` files from
     older versions. New columns go through `ensureColumn()`; never assume a
     fresh schema. The legacy-migration test in `tests/db.test.ts` is the guard.

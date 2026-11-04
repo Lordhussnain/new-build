@@ -1923,6 +1923,8 @@ describe("integration: degradation paths (missing tool, failed audio probe)", ()
       await waitFor("audio probe to start", async () => existsSync(probes), 15_000);
       const pid = Number((await readFile(probes, "utf8")).trim().split("\n")[0]);
       expect(pid).toBeGreaterThan(1);
+      const worker = (await engine.api("/api/status")).workers.find((w: any) => w.id === "DL1");
+      expect(worker?.status).toContain("Preparing"); // no stale previous job during the probe
       await engine.api("/api/pause", { method: "POST" });
       await waitFor("the interrupted claim to be released", async () => {
         const row = inspection.query(`SELECT download_status, pause_reason, download_claim_token FROM jobs
